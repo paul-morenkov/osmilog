@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::default;
+use std::thread::AccessError;
 
+use camera::mouse;
 use macroquad::ui::widgets::{Button, Group, TreeNode};
 use macroquad::ui::{hash, root_ui, Drag, Skin, Ui};
 use macroquad::{prelude::*, ui::widgets::Window};
@@ -9,7 +12,7 @@ use petgraph::{
     Graph,
 };
 
-#[derive(Debug, Eq, PartialEq, Hash)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone)]
 enum Gate {
     Not,
     Or,
@@ -32,7 +35,7 @@ impl Gate {
         }
     }
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CompKind {
     Gate(Gate),
     Input,
@@ -77,7 +80,7 @@ impl CompKind {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Component {
     kind: CompKind,
     position: Vec2,
@@ -136,16 +139,6 @@ impl Component {
     }
 }
 
-enum WireDrawState {
-    Not,
-    StartAt(Vec2),
-}
-
-struct CompInfo {
-    tex_info: TexInfo,
-    input_locs: Vec<Vec2>,
-    output_locs: Vec<Vec2>,
-}
 struct TexInfo {
     offset: Vec2,
     size: Vec2,
@@ -162,25 +155,28 @@ impl TexInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Default, Debug)]
+enum ActionState {
+    #[default]
+    Idle,
+    HoldingComponent(Component),
+    SelectingComponent,
+    DrawingWire,
+}
+
+#[derive(Debug, Default)]
 struct App {
     textures: HashMap<&'static str, Texture2D>,
-    held_component: Option<Component>,
     selected_component: Option<NodeIndex>,
-    components: Vec<Component>,
     graph: StableGraph<Component, ()>,
-    mouse_drag_start: Option<Vec2>,
+    action_state: ActionState,
 }
 
 impl App {
     async fn new() -> Self {
         App {
             textures: Self::load_textures().await,
-            held_component: Default::default(),
-            selected_component: None,
-            components: Vec::new(),
-            graph: StableGraph::default(),
-            mouse_drag_start: Default::default(),
+            ..Default::default()
         }
     }
     async fn load_textures() -> HashMap<&'static str, Texture2D> {
@@ -189,11 +185,7 @@ impl App {
             load_texture("assets/logic_gates.png").await.unwrap(),
         )])
     }
-    fn add_held_component(&mut self) {
-        if let Some(comp) = self.held_component.take() {
-            self.graph.add_node(comp);
-        }
-    }
+
     fn draw_all_components(&self) {
         for i in self.graph.node_indices() {
             // draw each component
@@ -213,12 +205,10 @@ impl App {
         }
     }
 
-    fn draw_held_component(&self) {
+    fn draw_held_component(&self, comp: &Component) {
         // need to update held_component position first
 
-        if let Some(comp) = &self.held_component {
-            comp.draw(&self.textures);
-        }
+        comp.draw(&self.textures);
     }
 
     fn handle_right_click(&mut self) {
@@ -324,7 +314,8 @@ async fn main() {
                                         "Input" => CompKind::Input,
                                         _ => panic!("Unknown component attempted to be created."),
                                     };
-                                    app.held_component = Some(Component::new(kind, Vec2::ZERO));
+                                    let new_comp = Component::new(kind, Vec2::ZERO);
+                                    app.action_state = ActionState::HoldingComponent(new_comp);
                                 };
                             }
                         });
@@ -340,24 +331,33 @@ async fn main() {
         );
         // Draw in sandbox area
         if in_sandbox_area(mouse_pos) {
-            match &mut app.held_component {
-                Some(comp) => {
+            // Temporarily remove ActionState use its value without mutating App.
+            let state = std::mem::take(&mut app.action_state);
+            app.action_state = match state {
+                ActionState::Idle => {
+                    if is_mouse_button_released(MouseButton::Right) {
+                        app.handle_right_click();
+                    } else {
+                        app.draw_pin_highlight();
+                    }
+                    ActionState::Idle
+                }
+                ActionState::HoldingComponent(mut comp) => {
                     comp.position = mouse_pos;
-                    app.draw_held_component();
-                }
-                None => {
-                    app.draw_pin_highlight();
-                }
-            }
 
-            // left mouse btn for placing components
-            if is_mouse_button_released(MouseButton::Left) {
-                app.add_held_component();
-            }
-            // right mouse btn for toggling inputs (for now)
-            if is_mouse_button_released(MouseButton::Right) {
-                app.handle_right_click();
-            }
+                    if is_mouse_button_released(MouseButton::Left) {
+                        app.graph.add_node(comp);
+                        ActionState::Idle
+                    } else if is_mouse_button_released(MouseButton::Right) {
+                        ActionState::Idle
+                    } else {
+                        app.draw_held_component(&comp);
+                        ActionState::HoldingComponent(comp)
+                    }
+                }
+                ActionState::SelectingComponent => ActionState::SelectingComponent,
+                ActionState::DrawingWire => ActionState::DrawingWire,
+            };
         }
         app.draw_all_components();
         next_frame().await;
