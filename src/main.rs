@@ -4,6 +4,7 @@ use macroquad::ui::widgets::{Button, TreeNode};
 use macroquad::ui::{hash, root_ui, Skin};
 use macroquad::{prelude::*, ui::widgets::Window};
 
+use petgraph::algo::toposort;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
 use scene::Node;
 
@@ -29,6 +30,14 @@ impl Gate {
             Gate::And => vec![vec2(0., 8.), vec2(0., 25.)],
         }
     }
+    fn evaluate(&self, inputs: &[bool]) -> bool {
+        // TODO: make this work for any number of inputs
+        match self {
+            Gate::Not => !inputs[0],
+            Gate::Or => inputs[0] || inputs[1],
+            Gate::And => inputs[0] && inputs[1],
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -41,6 +50,7 @@ enum PinIndex {
 enum CompKind {
     Gate(Gate),
     Input,
+    Output,
 }
 
 impl CompKind {
@@ -48,12 +58,14 @@ impl CompKind {
         match self {
             CompKind::Gate(_) => 2,
             CompKind::Input => 0,
+            CompKind::Output => 1,
         }
     }
     fn n_outputs(&self) -> usize {
         match self {
             CompKind::Gate(_) => 1,
             CompKind::Input => 1,
+            CompKind::Output => 0,
         }
     }
     fn size(&self) -> Vec2 {
@@ -62,13 +74,14 @@ impl CompKind {
                 let tex_info = g.tex_info();
                 tex_info.size / tex_info.scale
             }
-            CompKind::Input => vec2(20., 20.),
+            CompKind::Input | CompKind::Output => vec2(20., 20.),
         }
     }
     fn input_positions(&self) -> Vec<Vec2> {
         match self {
             CompKind::Gate(g) => g.input_positions(),
             CompKind::Input => vec![],
+            CompKind::Output => vec![vec2(0., 10.)],
         }
     }
     fn output_positions(&self) -> Vec<Vec2> {
@@ -78,6 +91,7 @@ impl CompKind {
                 vec![vec2(tex_info.size.x, tex_info.size.y / 2.) / tex_info.scale]
             }
             CompKind::Input => vec![vec2(20., 10.)],
+            CompKind::Output => vec![],
         }
     }
 }
@@ -106,6 +120,12 @@ impl Component {
             kind,
         }
     }
+    fn evaluate(&mut self) {
+        match &self.kind {
+            CompKind::Gate(g) => self.outputs[0] = g.evaluate(&self.inputs),
+            _ => (),
+        }
+    }
     fn draw(&self, textures: &HashMap<&str, Texture2D>) {
         match &self.kind {
             CompKind::Gate(g) => {
@@ -114,6 +134,10 @@ impl Component {
             CompKind::Input => {
                 // Input component has exactly one output
                 let color = if self.outputs[0] { GREEN } else { RED };
+                draw_rectangle(self.position.x, self.position.y, 20., 20., color);
+            }
+            CompKind::Output => {
+                let color = if self.inputs[0] { GREEN } else { RED };
                 draw_rectangle(self.position.x, self.position.y, 20., 20., color);
             }
         }
@@ -157,6 +181,27 @@ impl TexInfo {
     }
 }
 
+#[derive(Debug)]
+struct Wire {
+    start_comp: NodeIndex,
+    start_pin: usize,
+    end_comp: NodeIndex,
+    end_pin: usize,
+    value: bool,
+}
+
+impl Wire {
+    fn new(start_comp: NodeIndex, start_pin: usize, end_comp: NodeIndex, end_pin: usize) -> Self {
+        Self {
+            start_comp,
+            start_pin,
+            end_comp,
+            end_pin,
+            value: false,
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 enum ActionState {
     #[default]
@@ -176,7 +221,7 @@ enum WireDrawState {
 struct App {
     textures: HashMap<&'static str, Texture2D>,
     selected_component: Option<NodeIndex>,
-    graph: StableGraph<Component, ()>,
+    graph: StableGraph<Component, Wire>,
     action_state: ActionState,
 }
 
@@ -216,6 +261,23 @@ impl App {
         }
     }
 
+    fn draw_all_wires(&self) {
+        for wire in self.graph.edge_weights() {
+            self.draw_wire(wire);
+        }
+    }
+    fn draw_wire(&self, wire: &Wire) {
+        let comp_a = self.graph.node_weight(wire.start_comp).unwrap();
+        let comp_b = self.graph.node_weight(wire.end_comp).unwrap();
+        let pos_a = comp_a.position + comp_a.output_pos[wire.start_pin];
+        let pos_b = comp_b.position + comp_b.input_pos[wire.end_pin];
+        let color = match wire.value {
+            true => GREEN,
+            false => BLUE,
+        };
+        draw_ortho_lines(pos_a, pos_b, color);
+    }
+
     fn draw_held_component(&self, comp: &Component) {
         // need to update held_component position first
 
@@ -242,17 +304,17 @@ impl App {
 
         self.selected_component = target;
         if let Some(i) = target {
-            Self::right_click_on(
-                self.graph
-                    .node_weight_mut(i)
-                    .expect("Node index should be valid"),
-            );
+            self.right_click_on(i);
         }
     }
-    fn right_click_on(comp: &mut Component) {
+    fn right_click_on(&mut self, comp: NodeIndex) {
+        let comp = &mut self.graph[comp];
         match comp.kind {
-            CompKind::Gate(_) => {}
-            CompKind::Input => comp.outputs[0] = !comp.outputs[0],
+            CompKind::Input => {
+                comp.outputs[0] = !comp.outputs[0];
+                self.update_signals();
+            }
+            _ => (),
         };
     }
     fn draw_pin_highlight(&self, comp_idx: NodeIndex, pin_idx: PinIndex) {
@@ -316,6 +378,34 @@ impl App {
         }
         None
     }
+    fn add_wire(&mut self, comp_a: NodeIndex, pin_a: usize, comp_b: NodeIndex, pin_b: usize) {
+        // pin_a and pin_b are usize because their Input/Output parity is known
+        let wire = Wire::new(comp_a, pin_a, comp_b, pin_b);
+        self.graph.add_edge(comp_a, comp_b, wire);
+        self.update_signals();
+    }
+
+    fn update_signals(&mut self) {
+        let order = toposort(&self.graph, None).expect("No cycles in circuit (yet)");
+        let tmp = order.iter().map(|i| &self.graph[*i]).collect::<Vec<_>>();
+
+        // step through all components in order of evaluation
+        for comp_idx in order {
+            self.graph[comp_idx].evaluate();
+            let mut edges = self.graph.neighbors(comp_idx).detach();
+            // step through all connected wires and their corresponding components
+            while let Some((wire_idx, next_node_idx)) = edges.next(&self.graph) {
+                let start_pin = self.graph[wire_idx].start_pin;
+                let end_pin = self.graph[wire_idx].end_pin;
+                // use wire to determine relevant output and input pins
+                // TODO: maybe rework the graph so that edges are between the pins, not the components?
+                let signal_to_transmit = self.graph[comp_idx].outputs[start_pin];
+                self.graph[next_node_idx].inputs[end_pin] = signal_to_transmit;
+                self.graph[wire_idx].value = signal_to_transmit;
+            }
+        }
+    }
+
     fn draw_temp_wire(&self, comp_idx: NodeIndex, pin_idx: PinIndex) {
         let comp = self
             .graph
@@ -327,12 +417,11 @@ impl App {
         };
         let start_pos = comp.position + pin_pos;
         let end_pos = Vec2::from(mouse_position());
-        // draw wire so that it only travels orthogonally
-        // TODO: make this more sophisticated so that it chooses the right order (horiz/vert first)
-        draw_line(start_pos.x, start_pos.y, end_pos.x, start_pos.y, 1., BLACK);
-        draw_line(end_pos.x, start_pos.y, end_pos.x, end_pos.y, 1., BLACK);
+
+        draw_ortho_lines(start_pos, end_pos, BLACK);
     }
-    fn update(&mut self) {
+    // draw wire so that it only travels orthogonally
+    fn update(&mut self, selected_menu_comp_name: &mut Option<&str>) {
         let mouse_pos = Vec2::from(mouse_position());
         if in_sandbox_area(mouse_pos) {
             // Temporarily remove ActionState use its value without mutating App.
@@ -370,6 +459,7 @@ impl App {
 
                     if is_mouse_button_released(MouseButton::Left) {
                         self.graph.add_node(comp);
+                        *selected_menu_comp_name = None;
                         ActionState::Idle
                     } else if is_mouse_button_released(MouseButton::Right) {
                         ActionState::Idle
@@ -393,15 +483,13 @@ impl App {
                                         // On a different pin somewhere
                                     } else {
                                         // Check for valid variation of pin combinations
-                                        match (end_pin, pin) {
+                                        match (pin, end_pin) {
                                             // TODO: figure out how edges/wires will work
-                                            (PinIndex::Input(_), PinIndex::Output(_)) => {
-                                                println!("Drawing out to in");
-                                                self.graph.add_edge(comp, end_comp, ());
+                                            (PinIndex::Output(a), PinIndex::Input(b)) => {
+                                                self.add_wire(comp, a, end_comp, b);
                                             }
-                                            (PinIndex::Output(_), PinIndex::Input(_)) => {
-                                                println!("Drawing in to out");
-                                                self.graph.add_edge(end_comp, comp, ());
+                                            (PinIndex::Input(b), PinIndex::Output(a)) => {
+                                                self.add_wire(end_comp, a, comp, b);
                                             }
                                             _ => (), // Invalid pin combination
                                         };
@@ -426,6 +514,7 @@ impl App {
             };
         }
         self.draw_all_components();
+        self.draw_all_wires();
     }
 }
 
@@ -466,7 +555,6 @@ async fn main() {
     loop {
         clear_background(GRAY);
         set_default_camera();
-        let mouse_pos = Vec2::from(mouse_position());
         // Draw Components Menu
         Window::new(hash!(), Vec2::ZERO, MENU_SIZE)
             .label("Components")
@@ -490,7 +578,10 @@ async fn main() {
                                         "AND" => CompKind::Gate(Gate::And),
                                         "OR" => CompKind::Gate(Gate::Or),
                                         "Input" => CompKind::Input,
-                                        _ => panic!("Unknown component attempted to be created."),
+                                        "Output" => CompKind::Output,
+                                        _ => {
+                                            panic!("Unknown component attempted to be created.")
+                                        }
                                     };
                                     let new_comp = Component::new(kind, Vec2::ZERO);
                                     app.action_state = ActionState::HoldingComponent(new_comp);
@@ -508,7 +599,7 @@ async fn main() {
             GRAY,
         );
         // Draw in sandbox area
-        app.update();
+        app.update(&mut selected_menu_comp_name);
 
         next_frame().await;
     }
@@ -520,5 +611,14 @@ fn in_sandbox_area(pos: Vec2) -> bool {
 }
 
 fn get_folder_structure() -> HashMap<&'static str, Vec<&'static str>> {
-    HashMap::from([("Gates", vec!["NOT", "AND", "OR"]), ("Misc", vec!["Input"])])
+    HashMap::from([
+        ("Gates", vec!["NOT", "AND", "OR"]),
+        ("Misc", vec!["Input", "Output"]),
+    ])
+}
+
+fn draw_ortho_lines(start: Vec2, end: Vec2, color: Color) {
+    // TODO: make this more sophisticated so that it chooses the right order (horiz/vert first)
+    draw_line(start.x, start.y, end.x, start.y, 1., color);
+    draw_line(end.x, start.y, end.x, end.y, 1., color);
 }
