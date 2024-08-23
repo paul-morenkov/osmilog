@@ -6,7 +6,7 @@ use macroquad::{prelude::*, ui::widgets::Window};
 
 use petgraph::algo::toposort;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
-use scene::Node;
+use petgraph::visit::{EdgeFiltered, EdgeRef};
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 enum Gate {
@@ -51,6 +51,9 @@ enum CompKind {
     Gate(Gate),
     Input,
     Output,
+    Mux,
+    Demux,
+    Register,
 }
 
 impl CompKind {
@@ -59,6 +62,9 @@ impl CompKind {
             CompKind::Gate(_) => 2,
             CompKind::Input => 0,
             CompKind::Output => 1,
+            CompKind::Register => 2,
+            CompKind::Mux => 3,
+            CompKind::Demux => 2,
         }
     }
     fn n_outputs(&self) -> usize {
@@ -66,6 +72,9 @@ impl CompKind {
             CompKind::Gate(_) => 1,
             CompKind::Input => 1,
             CompKind::Output => 0,
+            CompKind::Register => 1,
+            CompKind::Mux => 1,
+            CompKind::Demux => 2,
         }
     }
     fn size(&self) -> Vec2 {
@@ -75,13 +84,30 @@ impl CompKind {
                 tex_info.size / tex_info.scale
             }
             CompKind::Input | CompKind::Output => vec2(20., 20.),
+            CompKind::Register => vec2(40., 60.),
+            CompKind::Mux => vec2(30., 50.),
+            CompKind::Demux => vec2(30., 50.),
         }
     }
     fn input_positions(&self) -> Vec<Vec2> {
         match self {
             CompKind::Gate(g) => g.input_positions(),
-            CompKind::Input => vec![],
-            CompKind::Output => vec![vec2(0., 10.)],
+            CompKind::Mux | CompKind::Demux => {
+                let n_inputs = self.n_inputs() - 1;
+                // n-1 inputs on the left side
+                let mut input_pos = (0..n_inputs)
+                    .map(|i| vec2(0., (i + 1) as f32 * self.size().y / (n_inputs + 1) as f32))
+                    .collect::<Vec<_>>();
+                // in_sel pin on the bottom
+                input_pos.push(vec2(self.size().x / 2., self.size().y - 5.));
+                input_pos
+            }
+            _ => {
+                let n_inputs = self.n_inputs();
+                (0..n_inputs)
+                    .map(|i| vec2(0., (i + 1) as f32 * self.size().y / (n_inputs + 1) as f32))
+                    .collect()
+            }
         }
     }
     fn output_positions(&self) -> Vec<Vec2> {
@@ -90,8 +116,17 @@ impl CompKind {
                 let tex_info = g.tex_info();
                 vec![vec2(tex_info.size.x, tex_info.size.y / 2.) / tex_info.scale]
             }
-            CompKind::Input => vec![vec2(20., 10.)],
-            CompKind::Output => vec![],
+            _ => {
+                let n_outputs = self.n_outputs();
+                (0..n_outputs)
+                    .map(|i| {
+                        vec2(
+                            self.size().x,
+                            (i + 1) as f32 * self.size().y / (n_outputs + 1) as f32,
+                        )
+                    })
+                    .collect()
+            }
         }
     }
 }
@@ -99,6 +134,7 @@ impl CompKind {
 #[derive(Debug, Clone)]
 struct Component {
     kind: CompKind,
+    is_clocked: bool,
     position: Vec2,
     size: Vec2,
     // pins have a value and a position
@@ -113,6 +149,10 @@ impl Component {
         Self {
             position,
             size: kind.size(),
+            is_clocked: match &kind {
+                CompKind::Register => true,
+                _ => false,
+            },
             inputs: vec![false; kind.n_inputs()],
             outputs: vec![false; kind.n_outputs()],
             input_pos: kind.input_positions(),
@@ -122,8 +162,37 @@ impl Component {
     }
     fn evaluate(&mut self) {
         match &self.kind {
+            // TODO: allow for gates with variable number of inputs. Gates always only have one output.
             CompKind::Gate(g) => self.outputs[0] = g.evaluate(&self.inputs),
-            _ => (),
+            CompKind::Mux => {
+                let in_sel = if self.inputs[2] { 1 } else { 0 };
+                self.outputs[0] = self.inputs[in_sel];
+            }
+            CompKind::Demux => {
+                let out_sel = if self.inputs[1] { 1 } else { 0 };
+                for x in &mut self.outputs {
+                    *x = false;
+                }
+                self.outputs[out_sel] = self.inputs[0];
+            }
+            // Registers do not evaluate, they clock update (The inputs and outputs do not interact combinationally).
+            CompKind::Input | CompKind::Output | CompKind::Register => (),
+        }
+    }
+    fn clock_update(&mut self) {
+        // TODO: make is_clocked part of the type structure
+        if self.is_clocked {
+            match &self.kind {
+                // inputs[0] => the data input
+                // inputs[1] => the write-enable
+                CompKind::Register => {
+                    // Only send input to output if the WE pin is on.
+                    if self.inputs[1] {
+                        self.outputs[0] = self.inputs[0]
+                    }
+                }
+                _ => (),
+            }
         }
     }
     fn draw(&self, textures: &HashMap<&str, Texture2D>) {
@@ -139,6 +208,44 @@ impl Component {
             CompKind::Output => {
                 let color = if self.inputs[0] { GREEN } else { RED };
                 draw_rectangle(self.position.x, self.position.y, 20., 20., color);
+            }
+            CompKind::Register => {
+                let in_color = if self.inputs[0] { GREEN } else { RED };
+                draw_rectangle(
+                    self.position.x,
+                    self.position.y,
+                    self.size.x / 2.,
+                    self.size.y,
+                    in_color,
+                );
+                let out_color = if self.outputs[0] { GREEN } else { RED };
+                draw_rectangle(
+                    self.position.x + self.size.x / 2.,
+                    self.position.y,
+                    self.size.x / 2.,
+                    self.size.y,
+                    out_color,
+                );
+            }
+            CompKind::Mux => {
+                let a = self.position;
+                let b = self.position + vec2(self.size.x, 10.);
+                let c = self.position + vec2(self.size.x, self.size.y - 10.);
+                let d = self.position + vec2(0., self.size.y);
+                draw_line(a.x, a.y, b.x, b.y, 1., BLACK);
+                draw_line(b.x, b.y, c.x, c.y, 1., BLACK);
+                draw_line(c.x, c.y, d.x, d.y, 1., BLACK);
+                draw_line(d.x, d.y, a.x, a.y, 1., BLACK);
+            }
+            CompKind::Demux => {
+                let a = self.position + vec2(0., 10.);
+                let b = self.position + vec2(self.size.x, 0.);
+                let c = self.position + vec2(self.size.x, self.size.y);
+                let d = self.position + vec2(0., self.size.y - 10.);
+                draw_line(a.x, a.y, b.x, b.y, 1., BLACK);
+                draw_line(b.x, b.y, c.x, c.y, 1., BLACK);
+                draw_line(c.x, c.y, d.x, d.y, 1., BLACK);
+                draw_line(d.x, d.y, a.x, a.y, 1., BLACK);
             }
         }
     }
@@ -385,12 +492,23 @@ impl App {
         self.update_signals();
     }
 
+    fn tick_clock(&mut self) {
+        for comp in self.graph.node_weights_mut() {
+            comp.clock_update();
+        }
+        self.update_signals();
+    }
+
     fn update_signals(&mut self) {
-        let order = toposort(&self.graph, None).expect("No cycles in circuit (yet)");
-        let tmp = order.iter().map(|i| &self.graph[*i]).collect::<Vec<_>>();
+        // Remove (valid) cycles by ignoring edges which lead into a clocked component.
+        let de_cycled = EdgeFiltered::from_fn(&self.graph, |e| !self.graph[e.target()].is_clocked);
+        let order =
+            toposort(&de_cycled, None).expect("Cycles should only involve clocked components");
 
         // step through all components in order of evaluation
         for comp_idx in order {
+            // When visiting a component, perform logic to convert inputs to outputs.
+            // This also applies to clocked components, whose inputs will still be based on the previous clock cycle.
             self.graph[comp_idx].evaluate();
             let mut edges = self.graph.neighbors(comp_idx).detach();
             // step through all connected wires and their corresponding components
@@ -513,6 +631,11 @@ impl App {
                 },
             };
         }
+        // Tick clock on spacebar
+        if is_key_pressed(KeyCode::Space) {
+            self.tick_clock();
+        }
+
         self.draw_all_components();
         self.draw_all_wires();
     }
@@ -579,6 +702,9 @@ async fn main() {
                                         "OR" => CompKind::Gate(Gate::Or),
                                         "Input" => CompKind::Input,
                                         "Output" => CompKind::Output,
+                                        "Register" => CompKind::Register,
+                                        "Mux" => CompKind::Mux,
+                                        "Demux" => CompKind::Demux,
                                         _ => {
                                             panic!("Unknown component attempted to be created.")
                                         }
@@ -613,7 +739,9 @@ fn in_sandbox_area(pos: Vec2) -> bool {
 fn get_folder_structure() -> HashMap<&'static str, Vec<&'static str>> {
     HashMap::from([
         ("Gates", vec!["NOT", "AND", "OR"]),
-        ("Misc", vec!["Input", "Output"]),
+        ("I/O", vec!["Input", "Output"]),
+        ("Plexers", vec!["Mux", "Demux"]),
+        ("Memory", vec!["Register"]),
     ])
 }
 
