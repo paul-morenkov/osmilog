@@ -226,6 +226,15 @@ impl Component {
                     self.size.y,
                     out_color,
                 );
+                draw_text("D", self.position.x, self.position.y + 25., 20., BLACK);
+                draw_text("WE", self.position.x, self.position.y + 45., 20., BLACK);
+                draw_text(
+                    "Q",
+                    self.position.x + 30.,
+                    self.position.y + 25.,
+                    20.,
+                    BLACK,
+                );
             }
             CompKind::Mux => {
                 let a = self.position;
@@ -314,20 +323,13 @@ enum ActionState {
     #[default]
     Idle,
     HoldingComponent(Component),
-    SelectingComponent,
-    DrawingWire(WireDrawState),
-}
-
-#[derive(Debug)]
-enum WireDrawState {
-    Started(NodeIndex, PinIndex),
-    Drawing,
+    SelectingComponent(NodeIndex),
+    DrawingWire(NodeIndex, PinIndex),
 }
 
 #[derive(Debug, Default)]
 struct App {
     textures: HashMap<&'static str, Texture2D>,
-    selected_component: Option<NodeIndex>,
     graph: StableGraph<Component, Wire>,
     action_state: ActionState,
 }
@@ -347,25 +349,22 @@ impl App {
     }
 
     fn draw_all_components(&self) {
-        for i in self.graph.node_indices() {
-            // draw each component
-            let comp = self
-                .graph
-                .node_weight(i)
-                .expect("Node index should be valid");
+        for comp in self.graph.node_weights() {
             comp.draw(&self.textures);
-            //draw selection box around selected component
-            if self.selected_component == Some(i) {
-                draw_rectangle_lines(
-                    comp.position.x,
-                    comp.position.y,
-                    comp.size.x,
-                    comp.size.y,
-                    2.,
-                    BLACK,
-                );
-            }
         }
+    }
+
+    fn draw_selected_component_box(&self, cx: NodeIndex) {
+        let comp = &self.graph[cx];
+
+        draw_rectangle_lines(
+            comp.position.x,
+            comp.position.y,
+            comp.size.x,
+            comp.size.y,
+            2.,
+            BLACK,
+        );
     }
 
     fn draw_all_wires(&self) {
@@ -391,30 +390,7 @@ impl App {
         comp.draw(&self.textures);
     }
 
-    fn handle_right_click(&mut self) {
-        let (mx, my) = mouse_position();
-        let mut target = None;
-        for i in self.graph.node_indices() {
-            let comp = self
-                .graph
-                .node_weight(i)
-                .expect("Node index should be valid");
-            if mx >= comp.position.x
-                && mx <= comp.position.x + comp.size.x
-                && my >= comp.position.y
-                && my <= comp.position.y + comp.size.y
-            {
-                target = Some(i);
-                break;
-            }
-        }
-
-        self.selected_component = target;
-        if let Some(i) = target {
-            self.right_click_on(i);
-        }
-    }
-    fn right_click_on(&mut self, comp: NodeIndex) {
+    fn select_component(&mut self, comp: NodeIndex) {
         let comp = &mut self.graph[comp];
         match comp.kind {
             CompKind::Input => {
@@ -438,48 +414,44 @@ impl App {
         draw_circle_lines(pin_pos.x, pin_pos.y, 5., 1., GREEN);
     }
 
-    fn find_hovered_comp_and_pin(&self) -> Option<(NodeIndex, PinIndex)> {
-        self.find_hovered_comp().and_then(|comp_idx| {
-            self.find_hovered_pin(comp_idx)
-                .map(|pin_idx| (comp_idx, pin_idx))
-        })
+    fn find_hovered_comp_and_pin(&self) -> Option<(NodeIndex, Option<PinIndex>)> {
+        // Looks for a hovered component, and then for a hovered pin if a component is found.
+        let comp = self.find_hovered_comp()?;
+        let pin = self.find_hovered_pin(comp);
+        Some((comp, pin))
     }
+
     fn find_hovered_comp(&self) -> Option<NodeIndex> {
         let (mx, my) = mouse_position();
 
-        for i in self.graph.node_indices() {
-            let comp = self
-                .graph
-                .node_weight(i)
-                .expect("Node index should be valid");
+        for cx in self.graph.node_indices() {
+            let comp = &self.graph[cx];
             if mx >= comp.position.x
                 && mx <= comp.position.x + comp.size.x
                 && my >= comp.position.y
                 && my <= comp.position.y + comp.size.y
             {
-                return Some(i);
+                return Some(cx);
             }
         }
         None
     }
 
-    fn find_hovered_pin(&self, comp_idx: NodeIndex) -> Option<PinIndex> {
+    fn find_hovered_pin(&self, cx: NodeIndex) -> Option<PinIndex> {
         let mouse_pos = Vec2::from(mouse_position());
 
-        let comp = self
-            .graph
-            .node_weight(comp_idx)
-            .expect("Node Index should be valid");
+        let comp = &self.graph[cx];
+        let max_dist = 10.;
 
         for (i, pin_pos) in comp.input_pos.iter().enumerate() {
             let pin_pos = vec2(comp.position.x + pin_pos.x, comp.position.y + pin_pos.y);
-            if mouse_pos.distance(pin_pos) < 10. {
+            if mouse_pos.distance(pin_pos) < max_dist {
                 return Some(PinIndex::Input(i));
             }
         }
         for (i, pin_pos) in comp.output_pos.iter().enumerate() {
             let pin_pos = vec2(comp.position.x + pin_pos.x, comp.position.y + pin_pos.y);
-            if mouse_pos.distance(pin_pos) < 10. {
+            if mouse_pos.distance(pin_pos) < max_dist {
                 return Some(PinIndex::Output(i));
             }
         }
@@ -490,6 +462,11 @@ impl App {
         let wire = Wire::new(comp_a, pin_a, comp_b, pin_b);
         self.graph.add_edge(comp_a, comp_b, wire);
         self.update_signals();
+    }
+
+    fn remove_component(&mut self, cx: NodeIndex) {
+        self.graph.remove_node(cx);
+        // TODO: decouple or get rid of self.selected_component
     }
 
     fn tick_clock(&mut self) {
@@ -524,12 +501,9 @@ impl App {
         }
     }
 
-    fn draw_temp_wire(&self, comp_idx: NodeIndex, pin_idx: PinIndex) {
-        let comp = self
-            .graph
-            .node_weight(comp_idx)
-            .expect("Node index should be valid");
-        let pin_pos = match pin_idx {
+    fn draw_temp_wire(&self, cx: NodeIndex, px: PinIndex) {
+        let comp = &self.graph[cx];
+        let pin_pos = match px {
             PinIndex::Input(i) => comp.input_pos[i],
             PinIndex::Output(i) => comp.output_pos[i],
         };
@@ -541,36 +515,31 @@ impl App {
     // draw wire so that it only travels orthogonally
     fn update(&mut self, selected_menu_comp_name: &mut Option<&str>) {
         let mouse_pos = Vec2::from(mouse_position());
+        let hover_result = self.find_hovered_comp_and_pin();
         if in_sandbox_area(mouse_pos) {
             // Temporarily remove ActionState use its value without mutating App.
             let state = std::mem::take(&mut self.action_state);
             // Immediately set it back after deciding what the new state should be.
             self.action_state = match state {
-                ActionState::Idle => {
-                    if is_mouse_button_released(MouseButton::Right) {
-                        self.handle_right_click();
-                        ActionState::Idle
-                    } else {
-                        if let Some(hovered_comp_idx) = self.find_hovered_comp() {
-                            if let Some(hovered_pin_idx) = self.find_hovered_pin(hovered_comp_idx) {
-                                self.draw_pin_highlight(hovered_comp_idx, hovered_pin_idx);
-
-                                if is_mouse_button_pressed(MouseButton::Left) {
-                                    // start a wire draw?
-                                    ActionState::DrawingWire(WireDrawState::Started(
-                                        hovered_comp_idx,
-                                        hovered_pin_idx,
-                                    ))
-                                } else {
-                                    ActionState::Idle
-                                }
-                            } else {
-                                ActionState::Idle
+                ActionState::Idle => 'idle: {
+                    match hover_result {
+                        // Hovering  on component, but NOT pin
+                        Some((cx, None)) => {
+                            if is_mouse_button_pressed(MouseButton::Left) {
+                                self.select_component(cx);
+                                break 'idle ActionState::SelectingComponent(cx);
                             }
-                        } else {
-                            ActionState::Idle
                         }
+                        // Hovering on pin
+                        Some((cx, Some(px))) => {
+                            if is_mouse_button_pressed(MouseButton::Left) {
+                                break 'idle ActionState::DrawingWire(cx, px);
+                            }
+                        }
+                        // Not hovering anything
+                        None => break 'idle ActionState::Idle,
                     }
+                    ActionState::Idle
                 }
                 ActionState::HoldingComponent(mut comp) => {
                     comp.position = mouse_pos;
@@ -579,56 +548,73 @@ impl App {
                         self.graph.add_node(comp);
                         *selected_menu_comp_name = None;
                         ActionState::Idle
-                    } else if is_mouse_button_released(MouseButton::Right) {
+                    } else if is_mouse_button_released(MouseButton::Right)
+                        || is_key_released(KeyCode::Escape)
+                    {
                         ActionState::Idle
                     } else {
                         self.draw_held_component(&comp);
                         ActionState::HoldingComponent(comp)
                     }
                 }
-                ActionState::SelectingComponent => ActionState::SelectingComponent,
-                ActionState::DrawingWire(state) => match state {
-                    WireDrawState::Started(comp, pin) => {
-                        // Potentially finalizing the wire
-                        if is_mouse_button_released(MouseButton::Left) {
-                            match self.find_hovered_comp_and_pin() {
-                                // Landed on a pin
-                                Some((end_comp, end_pin)) => {
-                                    // On the same component we started from -> don't add a wire
-                                    // TODO: Some components might allow this?
-                                    if end_comp == comp {
-                                        // Let go on the same pin you started -> don't add a wire
-                                        // On a different pin somewhere
-                                    } else {
-                                        // Check for valid variation of pin combinations
-                                        match (pin, end_pin) {
-                                            // TODO: figure out how edges/wires will work
-                                            (PinIndex::Output(a), PinIndex::Input(b)) => {
-                                                self.add_wire(comp, a, end_comp, b);
-                                            }
-                                            (PinIndex::Input(b), PinIndex::Output(a)) => {
-                                                self.add_wire(end_comp, a, comp, b);
-                                            }
-                                            _ => (), // Invalid pin combination
-                                        };
-                                    }
-                                }
-                                None => (),
+                ActionState::SelectingComponent(cx) => {
+                    // `D` deletes the component
+                    if is_key_released(KeyCode::D) {
+                        self.remove_component(cx);
+                        ActionState::Idle
+                    // `Esc` de-selects the component
+                    } else if is_key_released(KeyCode::Escape) {
+                        ActionState::Idle
+                    // Clicking either de-selects the component, selects a new component, or begins drawing a wire
+                    } else if is_mouse_button_pressed(MouseButton::Left) {
+                        match hover_result {
+                            // Hovering  on component, but NOT pin
+                            Some((cx, None)) => {
+                                self.select_component(cx);
+                                ActionState::SelectingComponent(cx)
                             }
-                            ActionState::Idle
-                        // In the process of drawing the wire
-                        } else if is_mouse_button_down(MouseButton::Left) {
-                            self.draw_temp_wire(comp, pin);
-                            if let Some((comp_idx, pin_idx)) = self.find_hovered_comp_and_pin() {
-                                self.draw_pin_highlight(comp_idx, pin_idx);
-                            }
-                            ActionState::DrawingWire(state)
-                        } else {
-                            ActionState::Idle
+                            // Hovering on pin
+                            Some((cx, Some(px))) => ActionState::DrawingWire(cx, px),
+                            // Not hovering anything
+                            None => ActionState::Idle,
                         }
+                    } else {
+                        ActionState::SelectingComponent(cx)
                     }
-                    WireDrawState::Drawing => todo!(),
-                },
+                }
+                ActionState::DrawingWire(start_cx, start_px) => {
+                    // Potentially finalizing the wire
+                    if is_mouse_button_released(MouseButton::Left) {
+                        // Landed on a pin
+                        if let Some((end_cx, Some(end_px))) = hover_result {
+                            // On the same component we started from -> don't add a wire
+                            // TODO: Some components might allow this?
+                            if start_cx == end_cx {
+                                // Let go on the same pin you started -> don't add a wire
+                                // On a different pin somewhere
+                            } else {
+                                // Check for valid variation of pin combinations
+                                match (start_px, end_px) {
+                                    (PinIndex::Output(a), PinIndex::Input(b)) => {
+                                        self.add_wire(start_cx, a, end_cx, b);
+                                    }
+                                    (PinIndex::Input(b), PinIndex::Output(a)) => {
+                                        self.add_wire(end_cx, a, start_cx, b);
+                                    }
+                                    _ => (), // Invalid pin combination
+                                };
+                            }
+                        }
+                        ActionState::Idle
+                    // In the process of drawing the wire
+                    } else if is_mouse_button_down(MouseButton::Left) {
+                        self.draw_temp_wire(start_cx, start_px);
+                        ActionState::DrawingWire(start_cx, start_px)
+                    // Let go of wire without completing it
+                    } else {
+                        ActionState::Idle
+                    }
+                }
             };
         }
         // Tick clock on spacebar
@@ -636,8 +622,16 @@ impl App {
             self.tick_clock();
         }
 
+        // Do all drawing at the end to make sure everything is updated
+        // and so that the z-order is maintained.
         self.draw_all_components();
         self.draw_all_wires();
+        if let Some((cx, Some(px))) = self.find_hovered_comp_and_pin() {
+            self.draw_pin_highlight(cx, px);
+        }
+        if let ActionState::SelectingComponent(cx) = self.action_state {
+            self.draw_selected_component_box(cx);
+        }
     }
 }
 
@@ -684,8 +678,8 @@ async fn main() {
             .titlebar(true)
             .movable(false)
             .ui(&mut root_ui(), |ui| {
-                for (&folder, comp_names) in &folder_structure {
-                    TreeNode::new(hash!(folder), folder)
+                for (folder, comp_names) in &folder_structure {
+                    TreeNode::new(hash!(*folder), *folder)
                         .init_unfolded()
                         .ui(ui, |ui| {
                             for &comp_name in comp_names {
@@ -736,13 +730,13 @@ fn in_sandbox_area(pos: Vec2) -> bool {
     sandbox_rect.contains(pos)
 }
 
-fn get_folder_structure() -> HashMap<&'static str, Vec<&'static str>> {
-    HashMap::from([
+fn get_folder_structure() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
         ("Gates", vec!["NOT", "AND", "OR"]),
         ("I/O", vec!["Input", "Output"]),
         ("Plexers", vec!["Mux", "Demux"]),
         ("Memory", vec!["Register"]),
-    ])
+    ]
 }
 
 fn draw_ortho_lines(start: Vec2, end: Vec2, color: Color) {
