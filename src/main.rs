@@ -7,6 +7,7 @@ use macroquad::{prelude::*, ui::widgets::Window};
 use petgraph::algo::toposort;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
 use petgraph::visit::{EdgeFiltered, EdgeRef};
+use petgraph::Direction::Incoming;
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 enum Gate {
@@ -324,6 +325,7 @@ enum ActionState {
     Idle,
     HoldingComponent(Component),
     SelectingComponent(NodeIndex),
+    MovingComponent(NodeIndex),
     DrawingWire(NodeIndex, PinIndex),
 }
 
@@ -373,10 +375,10 @@ impl App {
         }
     }
     fn draw_wire(&self, wire: &Wire) {
-        let comp_a = self.graph.node_weight(wire.start_comp).unwrap();
-        let comp_b = self.graph.node_weight(wire.end_comp).unwrap();
-        let pos_a = comp_a.position + comp_a.output_pos[wire.start_pin];
-        let pos_b = comp_b.position + comp_b.input_pos[wire.end_pin];
+        let cx_a = &self.graph[wire.start_comp];
+        let cx_b = &self.graph[wire.end_comp];
+        let pos_a = cx_a.position + cx_a.output_pos[wire.start_pin];
+        let pos_b = cx_b.position + cx_b.input_pos[wire.end_pin];
         let color = match wire.value {
             true => GREEN,
             false => BLUE,
@@ -400,12 +402,9 @@ impl App {
             _ => (),
         };
     }
-    fn draw_pin_highlight(&self, comp_idx: NodeIndex, pin_idx: PinIndex) {
-        let comp = self
-            .graph
-            .node_weight(comp_idx)
-            .expect("Node index is valid");
-        let pin_pos = match pin_idx {
+    fn draw_pin_highlight(&self, cx: NodeIndex, px: PinIndex) {
+        let comp = &self.graph[cx];
+        let pin_pos = match px {
             PinIndex::Input(i) => comp.input_pos[i],
             PinIndex::Output(i) => comp.output_pos[i],
         };
@@ -414,7 +413,7 @@ impl App {
         draw_circle_lines(pin_pos.x, pin_pos.y, 5., 1., GREEN);
     }
 
-    fn find_hovered_comp_and_pin(&self) -> Option<(NodeIndex, Option<PinIndex>)> {
+    fn find_hovered_cx_and_pin(&self) -> Option<(NodeIndex, Option<PinIndex>)> {
         // Looks for a hovered component, and then for a hovered pin if a component is found.
         let comp = self.find_hovered_comp()?;
         let pin = self.find_hovered_pin(comp);
@@ -457,16 +456,41 @@ impl App {
         }
         None
     }
-    fn add_wire(&mut self, comp_a: NodeIndex, pin_a: usize, comp_b: NodeIndex, pin_b: usize) {
-        // pin_a and pin_b are usize because their Input/Output parity is known
-        let wire = Wire::new(comp_a, pin_a, comp_b, pin_b);
-        self.graph.add_edge(comp_a, comp_b, wire);
+    fn try_add_wire(
+        &mut self,
+        cx_a: NodeIndex,
+        px_a: PinIndex,
+        cx_b: NodeIndex,
+        px_b: PinIndex,
+    ) -> bool {
+        // Do not allow wires within a single component
+        if cx_a == cx_b {
+            return false;
+        }
+        // determine which pin is the output (sender) and which is the input (receiver)
+        let (cx_a, pin_a, cx_b, pin_b) = match (px_a, px_b) {
+            (PinIndex::Output(pin_a), PinIndex::Input(pin_b)) => (cx_a, pin_a, cx_b, pin_b),
+            (PinIndex::Input(pin_a), PinIndex::Output(pin_b)) => (cx_b, pin_b, cx_a, pin_a),
+            // input->input or output->output are invalid connections; don't create the wire.
+            _ => return false,
+        };
+        // Check that the input pin is not already occupied
+        if self
+            .graph
+            .edges_directed(cx_b, Incoming)
+            .any(|e| e.weight().end_pin == pin_b)
+        {
+            return false;
+        }
+
+        let wire = Wire::new(cx_a, pin_a, cx_b, pin_b);
+        self.graph.add_edge(cx_a, cx_b, wire);
         self.update_signals();
+        true
     }
 
     fn remove_component(&mut self, cx: NodeIndex) {
         self.graph.remove_node(cx);
-        // TODO: decouple or get rid of self.selected_component
     }
 
     fn tick_clock(&mut self) {
@@ -483,20 +507,20 @@ impl App {
             toposort(&de_cycled, None).expect("Cycles should only involve clocked components");
 
         // step through all components in order of evaluation
-        for comp_idx in order {
+        for cx in order {
             // When visiting a component, perform logic to convert inputs to outputs.
             // This also applies to clocked components, whose inputs will still be based on the previous clock cycle.
-            self.graph[comp_idx].evaluate();
-            let mut edges = self.graph.neighbors(comp_idx).detach();
+            self.graph[cx].evaluate();
+            let mut edges = self.graph.neighbors(cx).detach();
             // step through all connected wires and their corresponding components
-            while let Some((wire_idx, next_node_idx)) = edges.next(&self.graph) {
-                let start_pin = self.graph[wire_idx].start_pin;
-                let end_pin = self.graph[wire_idx].end_pin;
+            while let Some((wx, next_node_idx)) = edges.next(&self.graph) {
+                let start_pin = self.graph[wx].start_pin;
+                let end_pin = self.graph[wx].end_pin;
                 // use wire to determine relevant output and input pins
                 // TODO: maybe rework the graph so that edges are between the pins, not the components?
-                let signal_to_transmit = self.graph[comp_idx].outputs[start_pin];
+                let signal_to_transmit = self.graph[cx].outputs[start_pin];
                 self.graph[next_node_idx].inputs[end_pin] = signal_to_transmit;
-                self.graph[wire_idx].value = signal_to_transmit;
+                self.graph[wx].value = signal_to_transmit;
             }
         }
     }
@@ -515,12 +539,12 @@ impl App {
     // draw wire so that it only travels orthogonally
     fn update(&mut self, selected_menu_comp_name: &mut Option<&str>) {
         let mouse_pos = Vec2::from(mouse_position());
-        let hover_result = self.find_hovered_comp_and_pin();
+        let hover_result = self.find_hovered_cx_and_pin();
         if in_sandbox_area(mouse_pos) {
             // Temporarily remove ActionState use its value without mutating App.
-            let state = std::mem::take(&mut self.action_state);
+            let prev_state = std::mem::take(&mut self.action_state);
             // Immediately set it back after deciding what the new state should be.
-            self.action_state = match state {
+            self.action_state = match prev_state {
                 ActionState::Idle => 'idle: {
                     match hover_result {
                         // Hovering  on component, but NOT pin
@@ -542,7 +566,7 @@ impl App {
                     ActionState::Idle
                 }
                 ActionState::HoldingComponent(mut comp) => {
-                    comp.position = mouse_pos;
+                    comp.position = mouse_pos - comp.size / 2.;
 
                     if is_mouse_button_released(MouseButton::Left) {
                         self.graph.add_node(comp);
@@ -569,17 +593,33 @@ impl App {
                     } else if is_mouse_button_pressed(MouseButton::Left) {
                         match hover_result {
                             // Hovering  on component, but NOT pin
-                            Some((cx, None)) => {
-                                self.select_component(cx);
-                                ActionState::SelectingComponent(cx)
+                            Some((new_cx, None)) => {
+                                self.select_component(new_cx);
+                                ActionState::SelectingComponent(new_cx)
                             }
                             // Hovering on pin
-                            Some((cx, Some(px))) => ActionState::DrawingWire(cx, px),
+                            Some((new_cx, Some(new_px))) => {
+                                ActionState::DrawingWire(new_cx, new_px)
+                            }
                             // Not hovering anything
                             None => ActionState::Idle,
                         }
+                    // If mouse is dragging, switch from selecting to moving component.
+                    } else if is_mouse_button_down(MouseButton::Left)
+                        && mouse_delta_position() != Vec2::ZERO
+                    {
+                        ActionState::MovingComponent(cx)
                     } else {
+                        prev_state
+                    }
+                }
+                ActionState::MovingComponent(cx) => {
+                    // Update component position (and center on mouse)
+                    self.graph[cx].position = mouse_pos - self.graph[cx].size / 2.;
+                    if is_mouse_button_released(MouseButton::Left) {
                         ActionState::SelectingComponent(cx)
+                    } else {
+                        prev_state
                     }
                 }
                 ActionState::DrawingWire(start_cx, start_px) => {
@@ -587,23 +627,8 @@ impl App {
                     if is_mouse_button_released(MouseButton::Left) {
                         // Landed on a pin
                         if let Some((end_cx, Some(end_px))) = hover_result {
-                            // On the same component we started from -> don't add a wire
-                            // TODO: Some components might allow this?
-                            if start_cx == end_cx {
-                                // Let go on the same pin you started -> don't add a wire
-                                // On a different pin somewhere
-                            } else {
-                                // Check for valid variation of pin combinations
-                                match (start_px, end_px) {
-                                    (PinIndex::Output(a), PinIndex::Input(b)) => {
-                                        self.add_wire(start_cx, a, end_cx, b);
-                                    }
-                                    (PinIndex::Input(b), PinIndex::Output(a)) => {
-                                        self.add_wire(end_cx, a, start_cx, b);
-                                    }
-                                    _ => (), // Invalid pin combination
-                                };
-                            }
+                            // This function handles all error cases like bad pin match-up, self-connection, and multiple output connections
+                            self.try_add_wire(start_cx, start_px, end_cx, end_px);
                         }
                         ActionState::Idle
                     // In the process of drawing the wire
@@ -626,7 +651,7 @@ impl App {
         // and so that the z-order is maintained.
         self.draw_all_components();
         self.draw_all_wires();
-        if let Some((cx, Some(px))) = self.find_hovered_comp_and_pin() {
+        if let Some((cx, Some(px))) = self.find_hovered_cx_and_pin() {
             self.draw_pin_highlight(cx, px);
         }
         if let ActionState::SelectingComponent(cx) = self.action_state {
