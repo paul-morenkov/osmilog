@@ -323,8 +323,11 @@ impl Wire {
 enum ActionState {
     #[default]
     Idle,
-    HoldingComponent(Component),
+    // A new component from the menu that has been temporarily added to the graph
+    HoldingComponent(NodeIndex),
+    // Left-clicked on a component in the sandbox area
     SelectingComponent(NodeIndex),
+    // Moving a component that already was in the sandbox area
     MovingComponent(NodeIndex),
     DrawingWire(NodeIndex, PinIndex),
 }
@@ -384,12 +387,6 @@ impl App {
             false => BLUE,
         };
         draw_ortho_lines(pos_a, pos_b, color);
-    }
-
-    fn draw_held_component(&self, comp: &Component) {
-        // need to update held_component position first
-
-        comp.draw(&self.textures);
     }
 
     fn select_component(&mut self, comp: NodeIndex) {
@@ -565,20 +562,22 @@ impl App {
                     }
                     ActionState::Idle
                 }
-                ActionState::HoldingComponent(mut comp) => {
-                    comp.position = mouse_pos - comp.size / 2.;
+                ActionState::HoldingComponent(cx) => {
+                    self.graph[cx].position = mouse_pos - self.graph[cx].size / 2.;
 
                     if is_mouse_button_released(MouseButton::Left) {
-                        self.graph.add_node(comp);
+                        // component is completely added to sandbox, so get rid of menu selection.
                         *selected_menu_comp_name = None;
                         ActionState::Idle
                     } else if is_mouse_button_released(MouseButton::Right)
                         || is_key_released(KeyCode::Escape)
                     {
+                        // Remove temporary component from graph
+                        self.graph.remove_node(cx);
                         ActionState::Idle
                     } else {
-                        self.draw_held_component(&comp);
-                        ActionState::HoldingComponent(comp)
+                        // self.draw_held_component(&comp);
+                        prev_state
                     }
                 }
                 ActionState::SelectingComponent(cx) => {
@@ -729,7 +728,8 @@ async fn main() {
                                         }
                                     };
                                     let new_comp = Component::new(kind, Vec2::ZERO);
-                                    app.action_state = ActionState::HoldingComponent(new_comp);
+                                    let new_cx = app.graph.add_node(new_comp);
+                                    app.action_state = ActionState::HoldingComponent(new_cx);
                                 };
                             }
                         });
