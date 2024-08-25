@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use macroquad::ui::widgets::{Button, TreeNode};
-use macroquad::ui::{hash, root_ui, Skin};
+use macroquad::ui::widgets::{Button, Group, TreeNode};
+use macroquad::ui::{hash, root_ui, Skin, Ui};
 use macroquad::{prelude::*, ui::widgets::Window};
 
 use petgraph::algo::toposort;
@@ -41,6 +41,37 @@ impl Gate {
     }
 }
 
+#[derive(Debug, Clone)]
+struct Mux {
+    sel_bits: u8,
+    data_bits: u8,
+}
+impl Mux {
+    fn n_inputs(&self) -> usize {
+        // The first input is the select input
+        // TODO: make inputs of varying sizes and separate the select input from the other inputs
+        (1 << self.sel_bits) + 1
+    }
+    fn evaluate(&self, inputs: &[bool]) -> bool {
+        if inputs.len() > 3 {
+            unimplemented!()
+        }
+        if inputs[0] {
+            inputs[2]
+        } else {
+            inputs[1]
+        }
+    }
+}
+impl Default for Mux {
+    fn default() -> Self {
+        Self {
+            sel_bits: 1,
+            data_bits: 1,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum PinIndex {
     Input(usize),
@@ -52,7 +83,7 @@ enum CompKind {
     Gate(Gate),
     Input,
     Output,
-    Mux,
+    Mux(Mux),
     Demux,
     Register,
 }
@@ -60,11 +91,14 @@ enum CompKind {
 impl CompKind {
     fn n_inputs(&self) -> usize {
         match self {
-            CompKind::Gate(_) => 2,
+            CompKind::Gate(g) => match g {
+                Gate::Not => 1,
+                _ => 2,
+            },
             CompKind::Input => 0,
             CompKind::Output => 1,
             CompKind::Register => 2,
-            CompKind::Mux => 3,
+            CompKind::Mux(mux) => mux.n_inputs(),
             CompKind::Demux => 2,
         }
     }
@@ -74,7 +108,7 @@ impl CompKind {
             CompKind::Input => 1,
             CompKind::Output => 0,
             CompKind::Register => 1,
-            CompKind::Mux => 1,
+            CompKind::Mux(_) => 1,
             CompKind::Demux => 2,
         }
     }
@@ -86,21 +120,22 @@ impl CompKind {
             }
             CompKind::Input | CompKind::Output => vec2(20., 20.),
             CompKind::Register => vec2(40., 60.),
-            CompKind::Mux => vec2(30., 50.),
+            CompKind::Mux(mux) => vec2(30., (mux.n_inputs() * 20) as f32),
             CompKind::Demux => vec2(30., 50.),
         }
     }
     fn input_positions(&self) -> Vec<Vec2> {
         match self {
             CompKind::Gate(g) => g.input_positions(),
-            CompKind::Mux | CompKind::Demux => {
+            CompKind::Mux(_) | CompKind::Demux => {
                 let n_inputs = self.n_inputs() - 1;
+                let mut input_pos = vec![vec2(self.size().x / 2., self.size().y - 5.)];
                 // n-1 inputs on the left side
-                let mut input_pos = (0..n_inputs)
-                    .map(|i| vec2(0., (i + 1) as f32 * self.size().y / (n_inputs + 1) as f32))
-                    .collect::<Vec<_>>();
+                input_pos.extend(
+                    (0..n_inputs)
+                        .map(|i| vec2(0., (i + 1) as f32 * self.size().y / (n_inputs + 1) as f32)),
+                );
                 // in_sel pin on the bottom
-                input_pos.push(vec2(self.size().x / 2., self.size().y - 5.));
                 input_pos
             }
             _ => {
@@ -128,6 +163,20 @@ impl CompKind {
                     })
                     .collect()
             }
+        }
+    }
+    fn name(&self) -> &'static str {
+        match self {
+            CompKind::Gate(g) => match g {
+                Gate::Not => "Gate: NOT",
+                Gate::Or => "Gate: OR",
+                Gate::And => "Gate: AND",
+            },
+            CompKind::Input => "Input",
+            CompKind::Output => "Output",
+            CompKind::Mux(_) => "Multiplexer",
+            CompKind::Demux => "Demultiplexer",
+            CompKind::Register => "Register",
         }
     }
 }
@@ -165,9 +214,8 @@ impl Component {
         match &self.kind {
             // TODO: allow for gates with variable number of inputs. Gates always only have one output.
             CompKind::Gate(g) => self.outputs[0] = g.evaluate(&self.inputs),
-            CompKind::Mux => {
-                let in_sel = if self.inputs[2] { 1 } else { 0 };
-                self.outputs[0] = self.inputs[in_sel];
+            CompKind::Mux(mux) => {
+                self.outputs[0] = mux.evaluate(&self.inputs);
             }
             CompKind::Demux => {
                 let out_sel = if self.inputs[1] { 1 } else { 0 };
@@ -237,7 +285,7 @@ impl Component {
                     BLACK,
                 );
             }
-            CompKind::Mux => {
+            CompKind::Mux(_) => {
                 let a = self.position;
                 let b = self.position + vec2(self.size.x, 10.);
                 let c = self.position + vec2(self.size.x, self.size.y - 10.);
@@ -533,6 +581,41 @@ impl App {
 
         draw_ortho_lines(start_pos, end_pos, BLACK);
     }
+
+    fn get_properties_ui(&self, prop_ui: &mut Ui) {
+        if let ActionState::SelectingComponent(cx) = self.action_state {
+            let comp = &self.graph[cx];
+            Group::new(hash!(), vec2(MENU_SIZE.x, 30.))
+                .position(Vec2::ZERO)
+                .ui(prop_ui, |ui| {
+                    ui.label(vec2(0., 0.), "ID");
+                    ui.label(vec2(50., 0.), comp.kind.name());
+                });
+            Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(prop_ui, |ui| {
+                ui.label(vec2(0., 0.), "Value:");
+                let value = match comp.kind {
+                    CompKind::Output => comp.inputs[0],
+                    _ => comp.outputs[0],
+                };
+                ui.label(vec2(50., 0.), &format!("{}", value));
+            });
+            if let CompKind::Mux(mux) = &comp.kind {
+                Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(prop_ui, |ui| {
+                    let sel_bits = (ui.combo_box(
+                        hash!(),
+                        "Select Bits",
+                        &["1", "2", "3", "4", "5"],
+                        None,
+                    ) + 1) as u8;
+                    // TODO: Actually update the component
+                    if sel_bits != mux.sel_bits {
+                        println!("new sel bits: {}", sel_bits);
+                    }
+                });
+            }
+        }
+    }
+
     // draw wire so that it only travels orthogonally
     fn update(&mut self, selected_menu_comp_name: &mut Option<&str>) {
         let mouse_pos = Vec2::from(mouse_position());
@@ -611,7 +694,7 @@ impl App {
                     {
                         ActionState::MovingComponent(cx)
                     } else {
-                        prev_state
+                        ActionState::SelectingComponent(cx)
                     }
                 }
                 ActionState::MovingComponent(cx) => {
@@ -698,44 +781,54 @@ async fn main() {
     loop {
         clear_background(GRAY);
         set_default_camera();
-        // Draw Components Menu
-        Window::new(hash!(), Vec2::ZERO, MENU_SIZE)
+        // Draw Left-Side Menu
+        Window::new(hash!("left-menu"), Vec2::ZERO, MENU_SIZE)
             .label("Components")
             .titlebar(true)
             .movable(false)
             .ui(&mut root_ui(), |ui| {
-                for (folder, comp_names) in &folder_structure {
-                    TreeNode::new(hash!(*folder), *folder)
-                        .init_unfolded()
-                        .ui(ui, |ui| {
-                            for &comp_name in comp_names {
-                                if Button::new(comp_name)
-                                    .selected(selected_menu_comp_name == Some(comp_name))
-                                    .ui(ui)
-                                {
-                                    // track selection in menu UI
-                                    selected_menu_comp_name = Some(comp_name);
-                                    // create component in for App
-                                    let kind = match comp_name {
-                                        "NOT" => CompKind::Gate(Gate::Not),
-                                        "AND" => CompKind::Gate(Gate::And),
-                                        "OR" => CompKind::Gate(Gate::Or),
-                                        "Input" => CompKind::Input,
-                                        "Output" => CompKind::Output,
-                                        "Register" => CompKind::Register,
-                                        "Mux" => CompKind::Mux,
-                                        "Demux" => CompKind::Demux,
-                                        _ => {
-                                            panic!("Unknown component attempted to be created.")
-                                        }
+                // Draw Components menu
+                Group::new(hash!("components"), vec2(MENU_SIZE.x, MENU_SIZE.y / 2.))
+                    .position(Vec2::ZERO)
+                    .ui(ui, |ui| {
+                        for (folder, comp_names) in &folder_structure {
+                            TreeNode::new(hash!(*folder), *folder)
+                            .init_unfolded()
+                            .ui(ui, |ui| {
+                                for &comp_name in comp_names {
+                                    if Button::new(comp_name)
+                                        .selected(selected_menu_comp_name == Some(comp_name))
+                                        .ui(ui)
+                                    {
+                                        // track selection in menu UI
+                                        selected_menu_comp_name = Some(comp_name);
+                                        // create component for App
+                                        let kind = match comp_name {
+                                            "NOT" => CompKind::Gate(Gate::Not),
+                                            "AND" => CompKind::Gate(Gate::And),
+                                            "OR" => CompKind::Gate(Gate::Or),
+                                            "Input" => CompKind::Input,
+                                            "Output" => CompKind::Output,
+                                            "Register" => CompKind::Register,
+                                            "Mux" => CompKind::Mux(Mux::default()),
+                                            "Demux" => CompKind::Demux,
+                                            _ => {
+                                                panic!("Unknown component attempted to be created.")
+                                            }
+                                        };
+                                        let new_comp = Component::new(kind, Vec2::ZERO);
+                                        let new_cx = app.graph.add_node(new_comp);
+                                        app.action_state = ActionState::HoldingComponent(new_cx);
                                     };
-                                    let new_comp = Component::new(kind, Vec2::ZERO);
-                                    let new_cx = app.graph.add_node(new_comp);
-                                    app.action_state = ActionState::HoldingComponent(new_cx);
-                                };
-                            }
-                        });
-                }
+                                }
+                            });
+                        }
+                    });
+                Group::new(hash!("properties"), vec2(MENU_SIZE.x, MENU_SIZE.y / 2.))
+                    .position(vec2(0., MENU_SIZE.y / 2.))
+                    .ui(ui, |ui| {
+                        app.get_properties_ui(ui);
+                    });
             });
         // Draw circuit sandbox area
         draw_rectangle(
