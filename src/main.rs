@@ -32,7 +32,7 @@ impl Gate {
         }
     }
     fn evaluate(&self, inputs: &[bool]) -> bool {
-        // TODO: make this work for any number of inputs
+        //TODO: make this work for any number of inputs
         match self {
             Gate::Not => !inputs[0],
             Gate::Or => inputs[0] || inputs[1],
@@ -319,7 +319,7 @@ impl Wire {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Copy)]
 enum ActionState {
     #[default]
     Idle,
@@ -538,9 +538,12 @@ impl App {
         let mouse_pos = Vec2::from(mouse_position());
         let hover_result = self.find_hovered_cx_and_pin();
         if in_sandbox_area(mouse_pos) {
-            // Temporarily remove ActionState use its value without mutating App.
-            let prev_state = std::mem::take(&mut self.action_state);
-            // Immediately set it back after deciding what the new state should be.
+            // Alternatively could remove ActionState to use its value without mutating App.
+            // let prev_state = std::mem::take(&mut self.action_state);
+
+            // Clone the current ActionState to allow mutation
+            let prev_state = self.action_state;
+            // Return the new ActionState from the match. This makes it hard to mess up.
             self.action_state = match prev_state {
                 ActionState::Idle => 'idle: {
                     match hover_result {
@@ -576,7 +579,6 @@ impl App {
                         self.graph.remove_node(cx);
                         ActionState::Idle
                     } else {
-                        // self.draw_held_component(&comp);
                         prev_state
                     }
                 }
