@@ -8,36 +8,161 @@ use petgraph::algo::toposort;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
 use petgraph::visit::{EdgeFiltered, EdgeRef};
 use petgraph::Direction::Incoming;
+use std::fmt::Debug;
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
-enum Gate {
+use bitvec::prelude::*;
+
+type Signal = BitVec<u32, Lsb0>;
+
+fn signal_zeros(n: u8) -> Signal {
+    bitvec![u32, Lsb0; 0; n as usize]
+}
+
+trait Logic {
+    fn name(&self) -> &'static str;
+    fn n_in_pins(&self) -> usize;
+    fn n_out_pins(&self) -> usize;
+    fn get_pin_value(&self, px: PinIndex) -> &Signal;
+    fn set_pin_value(&mut self, px: PinIndex, value: &Signal);
+    fn do_logic(&mut self);
+    fn is_clocked(&self) -> bool {
+        false
+    }
+    fn tick_clock(&mut self) {}
+    // Any additional changes that happen when you click on the component
+    fn interact(&mut self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug, Clone)]
+enum GateKind {
     Not,
     Or,
     And,
 }
 
-impl Gate {
-    fn tex_info(&self) -> TexInfo {
-        match self {
-            Gate::Not => TexInfo::new(vec2(448., 111.), vec2(80., 80.), 2.),
-            Gate::And => TexInfo::new(vec2(72., 0.), vec2(90., 69.), 2.),
-            Gate::Or => TexInfo::new(vec2(72., 233.), vec2(90., 78.), 2.),
+#[derive(Debug, Clone)]
+struct Gate {
+    kind: GateKind,
+    data_bits: u8,
+    n_inputs: usize,
+    inputs: Vec<Signal>,
+    output: Signal,
+}
+
+impl Logic for Gate {
+    fn name(&self) -> &'static str {
+        match self.kind {
+            GateKind::Not => "Gate: NOT",
+            GateKind::Or => "Gate: OR",
+            GateKind::And => "Gate: AND",
         }
+    }
+    fn n_in_pins(&self) -> usize {
+        self.n_inputs
+    }
+    fn n_out_pins(&self) -> usize {
+        1
+    }
+
+    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+        match px {
+            PinIndex::Input(i) => &self.inputs[i],
+            PinIndex::Output(i) => {
+                if i == 0 {
+                    &self.output
+                } else {
+                    panic!()
+                }
+            }
+        }
+    }
+
+    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+        match px {
+            PinIndex::Input(i) => {
+                if i < self.n_inputs {
+                    self.inputs[i].copy_from_bitslice(value);
+                } else {
+                    panic!()
+                }
+            }
+            PinIndex::Output(i) => {
+                if i == 0 {
+                    self.output.copy_from_bitslice(value);
+                } else {
+                    panic!()
+                }
+            }
+        }
+    }
+
+    fn do_logic(&mut self) {
+        self.output = match self.kind {
+            GateKind::Not => !self.inputs[0].clone(),
+            GateKind::Or => self.inputs.iter().fold(signal_zeros(1), |x, y| x | y),
+            GateKind::And => self
+                .inputs
+                .iter()
+                .fold(self.inputs[0].clone(), |x, y| x & y),
+        };
+    }
+}
+
+impl Draw for Gate {
+    fn size(&self) -> Vec2 {
+        let tex_info = self.tex_info();
+        tex_info.size / tex_info.scale
+    }
+
+    fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>) {
+        self.draw_from_texture_slice(pos, textures.get("gates").unwrap(), self.tex_info());
     }
     fn input_positions(&self) -> Vec<Vec2> {
-        match self {
-            Gate::Not => vec![vec2(0., 20.)],
-            Gate::Or => vec![vec2(0., 10.), vec2(0., 28.)],
-            Gate::And => vec![vec2(0., 8.), vec2(0., 25.)],
+        match self.kind {
+            GateKind::Not => vec![vec2(0., 20.)],
+            GateKind::Or => vec![vec2(0., 10.), vec2(0., 28.)],
+            GateKind::And => vec![vec2(0., 8.), vec2(0., 25.)],
         }
     }
-    fn evaluate(&self, inputs: &[bool]) -> bool {
-        //TODO: make this work for any number of inputs
-        match self {
-            Gate::Not => !inputs[0],
-            Gate::Or => inputs[0] || inputs[1],
-            Gate::And => inputs[0] && inputs[1],
+
+    fn output_positions(&self) -> Vec<Vec2> {
+        let tex_info = self.tex_info();
+        vec![vec2(tex_info.size.x, tex_info.size.y / 2.) / tex_info.scale]
+    }
+}
+
+impl Gate {
+    fn new(kind: GateKind, data_bits: u8, n_inputs: usize) -> Self {
+        Self {
+            kind,
+            data_bits,
+            n_inputs,
+            inputs: vec![signal_zeros(data_bits); n_inputs as usize],
+            output: signal_zeros(data_bits),
         }
+    }
+    fn default_of_kind(kind: GateKind) -> Self {
+        match kind {
+            GateKind::Not => Self::new(kind, 1, 1),
+            GateKind::Or => Self::new(kind, 1, 2),
+            GateKind::And => Self::new(kind, 1, 2),
+        }
+    }
+    fn tex_info(&self) -> TexInfo {
+        match self.kind {
+            GateKind::Not => TexInfo::new(vec2(448., 111.), vec2(80., 80.), 2.),
+            GateKind::And => TexInfo::new(vec2(72., 0.), vec2(90., 69.), 2.),
+            GateKind::Or => TexInfo::new(vec2(72., 233.), vec2(90., 78.), 2.),
+        }
+    }
+
+    fn create_inputs(&self) -> Vec<Signal> {
+        vec![signal_zeros(self.data_bits); self.n_inputs as usize]
+    }
+    fn create_outputs(&self) -> Vec<Signal> {
+        vec![signal_zeros(self.data_bits)]
     }
 }
 
@@ -45,273 +170,498 @@ impl Gate {
 struct Mux {
     sel_bits: u8,
     data_bits: u8,
+    inputs: Vec<Signal>,
+    output: Signal,
+    selector: Signal,
 }
+
+impl Logic for Mux {
+    fn name(&self) -> &'static str {
+        "Multiplexer"
+    }
+    fn do_logic(&mut self) {
+        let sel = self.selector.load::<usize>();
+        self.output.copy_from_bitslice(&self.inputs[sel]);
+    }
+
+    fn n_in_pins(&self) -> usize {
+        // Count the inputs and the selector pin
+        self.inputs.len() + 1
+    }
+
+    fn n_out_pins(&self) -> usize {
+        1
+    }
+
+    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+        match px {
+            PinIndex::Input(i) => {
+                // 0 -> selector, then inputs
+                if i == 0 {
+                    &self.selector
+                } else {
+                    &self.inputs[i - 1]
+                }
+            }
+            PinIndex::Output(i) => {
+                if i == 0 {
+                    &self.output
+                } else {
+                    panic!()
+                }
+            }
+        }
+    }
+
+    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+        match px {
+            PinIndex::Input(i) => {
+                if i == 0 {
+                    self.selector.copy_from_bitslice(value);
+                } else {
+                    self.inputs[i - 1].copy_from_bitslice(value)
+                }
+            }
+            PinIndex::Output(i) => {
+                if i == 0 {
+                    self.output.copy_from_bitslice(value)
+                } else {
+                    panic!()
+                }
+            }
+        }
+    }
+}
+
+impl Draw for Mux {
+    fn size(&self) -> Vec2 {
+        vec2(30., (self.inputs.len() * 20) as f32)
+    }
+
+    fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
+        let (w, h) = self.size().into();
+        let a = pos;
+        let b = pos + vec2(w, 10.);
+        let c = pos + vec2(w, h - 10.);
+        let d = pos + vec2(0., h);
+        draw_line(a.x, a.y, b.x, b.y, 1., BLACK);
+        draw_line(b.x, b.y, c.x, c.y, 1., BLACK);
+        draw_line(c.x, c.y, d.x, d.y, 1., BLACK);
+        draw_line(d.x, d.y, a.x, a.y, 1., BLACK);
+    }
+
+    fn input_positions(&self) -> Vec<Vec2> {
+        let mut input_pos = vec![vec2(self.size().x / 2., self.size().y - 5.)];
+        let n_inputs = self.inputs.len();
+        input_pos.extend(
+            (0..n_inputs).map(|i| vec2(0., (i + 1) as f32 * self.size().y / (n_inputs + 1) as f32)),
+        );
+        input_pos
+    }
+}
+
 impl Mux {
-    fn n_inputs(&self) -> usize {
+    fn n_inputs(&self) -> u8 {
+        // FIXME: probably unnecessary due to Mux owning its inputs now
         // The first input is the select input
-        // TODO: make inputs of varying sizes and separate the select input from the other inputs
-        (1 << self.sel_bits) + 1
+        1 << self.sel_bits
     }
-    fn evaluate(&self, inputs: &[bool]) -> bool {
-        if inputs.len() > 3 {
-            unimplemented!()
-        }
-        if inputs[0] {
-            inputs[2]
-        } else {
-            inputs[1]
-        }
+
+    fn create_inputs(&self) -> Vec<Signal> {
+        // first input is the select pin
+        let mut inputs = vec![signal_zeros(1)];
+        // then the actual input pins
+        inputs.extend(vec![signal_zeros(self.data_bits); self.n_inputs() as usize]);
+        inputs
     }
 }
+
 impl Default for Mux {
     fn default() -> Self {
         Self {
             sel_bits: 1,
             data_bits: 1,
+            inputs: vec![signal_zeros(1); 2],
+            output: signal_zeros(1),
+            selector: signal_zeros(1),
+        }
+    }
+}
+#[derive(Debug, Clone)]
+struct Demux {
+    sel_bits: u8,
+    data_bits: u8,
+    input: Signal,
+    outputs: Vec<Signal>,
+    selector: Signal,
+}
+
+impl Logic for Demux {
+    fn name(&self) -> &'static str {
+        "Demultiplexer"
+    }
+    fn do_logic(&mut self) {
+        let sel = self.selector.load::<usize>();
+        for output in &mut self.outputs {
+            output.fill(false);
+        }
+        self.outputs[sel].copy_from_bitslice(&self.input);
+    }
+
+    fn n_in_pins(&self) -> usize {
+        2
+    }
+
+    fn n_out_pins(&self) -> usize {
+        // Count selector as well
+        self.outputs.len()
+    }
+
+    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+        match px {
+            PinIndex::Input(i) => match i {
+                0 => &self.selector,
+                1 => &self.input,
+                _ => panic!(),
+            },
+            PinIndex::Output(i) => &self.outputs[i],
+        }
+    }
+
+    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+        match px {
+            PinIndex::Input(i) => match i {
+                0 => self.selector.copy_from_bitslice(value),
+                1 => self.input.copy_from_bitslice(value),
+                _ => panic!(),
+            },
+            PinIndex::Output(i) => self.outputs[i].copy_from_bitslice(value),
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum PinIndex {
-    Input(usize),
-    Output(usize),
+impl Draw for Demux {
+    fn size(&self) -> Vec2 {
+        vec2(30., self.outputs.len() as f32 * 20.)
+    }
+
+    fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>) {
+        let (w, h) = self.size().into();
+        let a = pos + vec2(0., 10.);
+        let b = pos + vec2(w, 0.);
+        let c = pos + vec2(w, h);
+        let d = pos + vec2(0., h - 10.);
+        draw_line(a.x, a.y, b.x, b.y, 1., BLACK);
+        draw_line(b.x, b.y, c.x, c.y, 1., BLACK);
+        draw_line(c.x, c.y, d.x, d.y, 1., BLACK);
+        draw_line(d.x, d.y, a.x, a.y, 1., BLACK);
+    }
+
+    fn input_positions(&self) -> Vec<Vec2> {
+        vec![
+            vec2(self.size().x / 2., self.size().y - 5.),
+            vec2(0., self.size().y / 2.),
+        ]
+    }
+}
+
+impl Demux {
+    fn n_outputs(&self) -> u8 {
+        1 << self.sel_bits
+    }
+
+    fn create_inputs(&self) -> Vec<Signal> {
+        // first input is the select pin
+        // second input is the data
+        vec![signal_zeros(self.sel_bits), signal_zeros(self.data_bits)]
+    }
+
+    fn create_outputs(&self) -> Vec<Signal> {
+        vec![signal_zeros(self.data_bits); self.n_outputs() as usize]
+    }
+}
+impl Default for Demux {
+    fn default() -> Self {
+        Self {
+            sel_bits: 1,
+            data_bits: 1,
+            input: signal_zeros(1),
+            outputs: vec![signal_zeros(1); 2],
+            selector: signal_zeros(1),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
-enum CompKind {
-    Gate(Gate),
-    Input,
-    Output,
-    Mux(Mux),
-    Demux,
-    Register,
+struct Register {
+    data_bits: u8,
+    write_enable: Signal,
+    input: Signal,
+    output: Signal,
 }
 
-impl CompKind {
-    fn n_inputs(&self) -> usize {
-        match self {
-            CompKind::Gate(g) => match g {
-                Gate::Not => 1,
-                _ => 2,
+impl Logic for Register {
+    fn name(&self) -> &'static str {
+        "Register"
+    }
+    fn do_logic(&mut self) {}
+    fn is_clocked(&self) -> bool {
+        true
+    }
+    fn tick_clock(&mut self) {
+        if self.write_enable[0] {
+            self.output.copy_from_bitslice(&self.input);
+        }
+    }
+
+    fn n_in_pins(&self) -> usize {
+        2
+    }
+
+    fn n_out_pins(&self) -> usize {
+        1
+    }
+
+    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+        match px {
+            PinIndex::Input(i) => match i {
+                0 => &self.write_enable,
+                1 => &self.input,
+                _ => panic!(),
             },
-            CompKind::Input => 0,
-            CompKind::Output => 1,
-            CompKind::Register => 2,
-            CompKind::Mux(mux) => mux.n_inputs(),
-            CompKind::Demux => 2,
-        }
-    }
-    fn n_outputs(&self) -> usize {
-        match self {
-            CompKind::Gate(_) => 1,
-            CompKind::Input => 1,
-            CompKind::Output => 0,
-            CompKind::Register => 1,
-            CompKind::Mux(_) => 1,
-            CompKind::Demux => 2,
-        }
-    }
-    fn size(&self) -> Vec2 {
-        match self {
-            CompKind::Gate(g) => {
-                let tex_info = g.tex_info();
-                tex_info.size / tex_info.scale
+            PinIndex::Output(i) => {
+                if i == 0 {
+                    &self.output
+                } else {
+                    panic!()
+                }
             }
-            CompKind::Input | CompKind::Output => vec2(20., 20.),
-            CompKind::Register => vec2(40., 60.),
-            CompKind::Mux(mux) => vec2(30., (mux.n_inputs() * 20) as f32),
-            CompKind::Demux => vec2(30., 50.),
         }
+    }
+
+    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+        match px {
+            PinIndex::Input(i) => match i {
+                0 => self.write_enable.copy_from_bitslice(value),
+                1 => self.input.copy_from_bitslice(value),
+                _ => panic!(),
+            },
+            PinIndex::Output(i) => {
+                if i == 0 {
+                    self.output.copy_from_bitslice(value);
+                } else {
+                    panic!()
+                }
+            }
+        }
+    }
+}
+
+impl Draw for Register {
+    fn size(&self) -> Vec2 {
+        Vec2::new(40., 60.)
+    }
+
+    fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
+        let (w, h) = self.size().into();
+        let in_color = if self.input.any() { GREEN } else { RED };
+        draw_rectangle(pos.x, pos.y, w / 2., h, in_color);
+        let out_color = if self.output.any() { GREEN } else { RED };
+        draw_rectangle(pos.x + w / 2., pos.y, w / 2., h, out_color);
+        draw_text("D", pos.x, pos.y + 25., 20., BLACK);
+        draw_text("WE", pos.x, pos.y + 45., 20., BLACK);
+        draw_text("Q", pos.x + 30., pos.y + 25., 20., BLACK);
     }
     fn input_positions(&self) -> Vec<Vec2> {
-        match self {
-            CompKind::Gate(g) => g.input_positions(),
-            CompKind::Mux(_) | CompKind::Demux => {
-                let n_inputs = self.n_inputs() - 1;
-                let mut input_pos = vec![vec2(self.size().x / 2., self.size().y - 5.)];
-                // n-1 inputs on the left side
-                input_pos.extend(
-                    (0..n_inputs)
-                        .map(|i| vec2(0., (i + 1) as f32 * self.size().y / (n_inputs + 1) as f32)),
-                );
-                // in_sel pin on the bottom
-                input_pos
-            }
-            _ => {
-                let n_inputs = self.n_inputs();
-                (0..n_inputs)
-                    .map(|i| vec2(0., (i + 1) as f32 * self.size().y / (n_inputs + 1) as f32))
-                    .collect()
-            }
-        }
+        vec![
+            Vec2::new(0., 40.), // Write Enable
+            Vec2::new(0., 20.),
+        ]
     }
-    fn output_positions(&self) -> Vec<Vec2> {
-        match self {
-            CompKind::Gate(g) => {
-                let tex_info = g.tex_info();
-                vec![vec2(tex_info.size.x, tex_info.size.y / 2.) / tex_info.scale]
-            }
-            _ => {
-                let n_outputs = self.n_outputs();
-                (0..n_outputs)
-                    .map(|i| {
-                        vec2(
-                            self.size().x,
-                            (i + 1) as f32 * self.size().y / (n_outputs + 1) as f32,
-                        )
-                    })
-                    .collect()
-            }
-        }
-    }
-    fn name(&self) -> &'static str {
-        match self {
-            CompKind::Gate(g) => match g {
-                Gate::Not => "Gate: NOT",
-                Gate::Or => "Gate: OR",
-                Gate::And => "Gate: AND",
-            },
-            CompKind::Input => "Input",
-            CompKind::Output => "Output",
-            CompKind::Mux(_) => "Multiplexer",
-            CompKind::Demux => "Demultiplexer",
-            CompKind::Register => "Register",
+}
+
+impl Default for Register {
+    fn default() -> Self {
+        Self {
+            data_bits: 1,
+            write_enable: signal_zeros(1),
+            input: signal_zeros(1),
+            output: signal_zeros(1),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-struct Component {
-    kind: CompKind,
-    is_clocked: bool,
-    position: Vec2,
-    size: Vec2,
-    // pins have a value and a position
-    inputs: Vec<bool>,
-    outputs: Vec<bool>,
-    input_pos: Vec<Vec2>,
-    output_pos: Vec<Vec2>,
+struct Input {
+    data_bits: u8,
+    value: Signal,
 }
 
-impl Component {
-    fn new(kind: CompKind, position: Vec2) -> Self {
+impl Logic for Input {
+    fn name(&self) -> &'static str {
+        "Input"
+    }
+    fn do_logic(&mut self) {}
+
+    fn n_in_pins(&self) -> usize {
+        0
+    }
+
+    fn n_out_pins(&self) -> usize {
+        1
+    }
+
+    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+        match px {
+            PinIndex::Input(_) => panic!(),
+            PinIndex::Output(i) => {
+                if i == 0 {
+                    &self.value
+                } else {
+                    panic!()
+                }
+            }
+        }
+    }
+
+    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+        match px {
+            PinIndex::Input(_) => panic!(),
+            PinIndex::Output(i) => {
+                if i == 0 {
+                    self.value.copy_from_bitslice(value)
+                } else {
+                    panic!()
+                }
+            }
+        }
+    }
+    fn interact(&mut self) -> bool {
+        if self.data_bits == 1 {
+            let prev_value = self.value[0];
+            self.value.set(0, !prev_value);
+        } else {
+            let prev_value = self.value.load::<u32>();
+            self.value.copy_from_bitslice(
+                &(prev_value + 1).view_bits::<Lsb0>()[..self.data_bits as usize],
+            );
+        }
+        true
+    }
+}
+
+impl Draw for Input {
+    fn size(&self) -> Vec2 {
+        Vec2::new(20., 20.)
+    }
+
+    fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>) {
+        let color = if self.value.any() { GREEN } else { RED };
+        draw_rectangle(pos.x, pos.y, 20., 20., color);
+    }
+}
+
+impl Default for Input {
+    fn default() -> Self {
         Self {
-            position,
-            size: kind.size(),
-            is_clocked: match &kind {
-                CompKind::Register => true,
-                _ => false,
-            },
-            inputs: vec![false; kind.n_inputs()],
-            outputs: vec![false; kind.n_outputs()],
-            input_pos: kind.input_positions(),
-            output_pos: kind.output_positions(),
-            kind,
+            data_bits: 1,
+            value: signal_zeros(1),
         }
     }
-    fn evaluate(&mut self) {
-        match &self.kind {
-            // TODO: allow for gates with variable number of inputs. Gates always only have one output.
-            CompKind::Gate(g) => self.outputs[0] = g.evaluate(&self.inputs),
-            CompKind::Mux(mux) => {
-                self.outputs[0] = mux.evaluate(&self.inputs);
-            }
-            CompKind::Demux => {
-                let out_sel = if self.inputs[1] { 1 } else { 0 };
-                for x in &mut self.outputs {
-                    *x = false;
+}
+
+#[derive(Debug, Clone)]
+struct Output {
+    data_bits: u8,
+    value: Signal,
+}
+
+impl Logic for Output {
+    fn name(&self) -> &'static str {
+        "Output"
+    }
+    fn do_logic(&mut self) {}
+
+    fn n_in_pins(&self) -> usize {
+        1
+    }
+
+    fn n_out_pins(&self) -> usize {
+        0
+    }
+
+    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+        match px {
+            PinIndex::Input(i) => {
+                if i == 0 {
+                    &self.value
+                } else {
+                    panic!()
                 }
-                self.outputs[out_sel] = self.inputs[0];
             }
-            // Registers do not evaluate, they clock update (The inputs and outputs do not interact combinationally).
-            CompKind::Input | CompKind::Output | CompKind::Register => (),
+            PinIndex::Output(_) => panic!(),
         }
     }
-    fn clock_update(&mut self) {
-        // TODO: make is_clocked part of the type structure
-        if self.is_clocked {
-            match &self.kind {
-                // inputs[0] => the data input
-                // inputs[1] => the write-enable
-                CompKind::Register => {
-                    // Only send input to output if the WE pin is on.
-                    if self.inputs[1] {
-                        self.outputs[0] = self.inputs[0]
-                    }
+
+    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+        match px {
+            PinIndex::Input(i) => {
+                if i == 0 {
+                    self.value.copy_from_bitslice(value)
+                } else {
+                    panic!()
                 }
-                _ => (),
             }
+            PinIndex::Output(_) => panic!(),
         }
     }
-    fn draw(&self, textures: &HashMap<&str, Texture2D>) {
-        match &self.kind {
-            CompKind::Gate(g) => {
-                self.draw_from_texture_slice(textures.get("gates").unwrap(), g.tex_info());
-            }
-            CompKind::Input => {
-                // Input component has exactly one output
-                let color = if self.outputs[0] { GREEN } else { RED };
-                draw_rectangle(self.position.x, self.position.y, 20., 20., color);
-            }
-            CompKind::Output => {
-                let color = if self.inputs[0] { GREEN } else { RED };
-                draw_rectangle(self.position.x, self.position.y, 20., 20., color);
-            }
-            CompKind::Register => {
-                let in_color = if self.inputs[0] { GREEN } else { RED };
-                draw_rectangle(
-                    self.position.x,
-                    self.position.y,
-                    self.size.x / 2.,
-                    self.size.y,
-                    in_color,
-                );
-                let out_color = if self.outputs[0] { GREEN } else { RED };
-                draw_rectangle(
-                    self.position.x + self.size.x / 2.,
-                    self.position.y,
-                    self.size.x / 2.,
-                    self.size.y,
-                    out_color,
-                );
-                draw_text("D", self.position.x, self.position.y + 25., 20., BLACK);
-                draw_text("WE", self.position.x, self.position.y + 45., 20., BLACK);
-                draw_text(
-                    "Q",
-                    self.position.x + 30.,
-                    self.position.y + 25.,
-                    20.,
-                    BLACK,
-                );
-            }
-            CompKind::Mux(_) => {
-                let a = self.position;
-                let b = self.position + vec2(self.size.x, 10.);
-                let c = self.position + vec2(self.size.x, self.size.y - 10.);
-                let d = self.position + vec2(0., self.size.y);
-                draw_line(a.x, a.y, b.x, b.y, 1., BLACK);
-                draw_line(b.x, b.y, c.x, c.y, 1., BLACK);
-                draw_line(c.x, c.y, d.x, d.y, 1., BLACK);
-                draw_line(d.x, d.y, a.x, a.y, 1., BLACK);
-            }
-            CompKind::Demux => {
-                let a = self.position + vec2(0., 10.);
-                let b = self.position + vec2(self.size.x, 0.);
-                let c = self.position + vec2(self.size.x, self.size.y);
-                let d = self.position + vec2(0., self.size.y - 10.);
-                draw_line(a.x, a.y, b.x, b.y, 1., BLACK);
-                draw_line(b.x, b.y, c.x, c.y, 1., BLACK);
-                draw_line(c.x, c.y, d.x, d.y, 1., BLACK);
-                draw_line(d.x, d.y, a.x, a.y, 1., BLACK);
-            }
+}
+
+impl Draw for Output {
+    fn size(&self) -> Vec2 {
+        Vec2::new(20., 20.)
+    }
+
+    fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
+        let color = if self.value.any() { GREEN } else { RED };
+        draw_rectangle(pos.x, pos.y, 20., 20., color);
+    }
+}
+
+impl Default for Output {
+    fn default() -> Self {
+        Self {
+            data_bits: 1,
+            value: signal_zeros(1),
         }
     }
-    fn draw_from_texture_slice(&self, tex: &Texture2D, tex_info: TexInfo) {
+}
+
+trait Draw: Logic {
+    fn size(&self) -> Vec2;
+    fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>);
+    fn input_positions(&self) -> Vec<Vec2> {
+        let n_inputs = self.n_in_pins();
+        (0..n_inputs)
+            .map(|i| vec2(0., (i + 1) as f32 * self.size().y / (n_inputs + 1) as f32))
+            .collect()
+    }
+    fn output_positions(&self) -> Vec<Vec2> {
+        let n_outputs = self.n_out_pins();
+        (0..n_outputs)
+            .map(|i| {
+                vec2(
+                    self.size().x,
+                    (i + 1) as f32 * self.size().y / (n_outputs + 1) as f32,
+                )
+            })
+            .collect()
+    }
+    fn draw_from_texture_slice(&self, pos: Vec2, tex: &Texture2D, tex_info: TexInfo) {
         draw_texture_ex(
             tex,
-            self.position.x,
-            self.position.y,
+            pos.x,
+            pos.y,
             WHITE,
             DrawTextureParams {
                 dest_size: Some(tex_info.size / tex_info.scale),
@@ -327,6 +677,44 @@ impl Component {
                 pivot: None,
             },
         );
+    }
+}
+
+trait Comp: Logic + Draw + Debug {}
+impl<T: Logic + Draw + Debug> Comp for T {}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum PinIndex {
+    Input(usize),
+    Output(usize),
+}
+
+#[derive(Debug)]
+struct Component {
+    kind: Box<dyn Comp>,
+    position: Vec2,
+    // pins have a value and a position
+    input_pos: Vec<Vec2>,
+    output_pos: Vec<Vec2>,
+}
+
+impl Component {
+    fn new(kind: Box<dyn Comp>, position: Vec2) -> Self {
+        Self {
+            position,
+            input_pos: kind.input_positions(),
+            output_pos: kind.output_positions(),
+            kind,
+        }
+    }
+    fn do_logic(&mut self) {
+        self.kind.do_logic();
+    }
+    fn clock_update(&mut self) {
+        // TODO: make is_clocked part of the type structure
+        if self.kind.is_clocked() {
+            self.kind.tick_clock();
+        }
     }
 }
 
@@ -348,21 +736,30 @@ impl TexInfo {
 
 #[derive(Debug)]
 struct Wire {
+    // TODO: does Wire even need data_bits? Can just use Signal::len
     start_comp: NodeIndex,
     start_pin: usize,
     end_comp: NodeIndex,
     end_pin: usize,
-    value: bool,
+    data_bits: u8,
+    value: Signal,
 }
 
 impl Wire {
-    fn new(start_comp: NodeIndex, start_pin: usize, end_comp: NodeIndex, end_pin: usize) -> Self {
+    fn new(
+        start_comp: NodeIndex,
+        start_pin: usize,
+        end_comp: NodeIndex,
+        end_pin: usize,
+        data_bits: u8,
+    ) -> Self {
         Self {
             start_comp,
             start_pin,
             end_comp,
             end_pin,
-            value: false,
+            data_bits,
+            value: signal_zeros(data_bits),
         }
     }
 }
@@ -380,7 +777,7 @@ enum ActionState {
     DrawingWire(NodeIndex, PinIndex),
 }
 
-#[derive(Debug, Default)]
+#[derive(Default, Debug)]
 struct App {
     textures: HashMap<&'static str, Texture2D>,
     graph: StableGraph<Component, Wire>,
@@ -403,21 +800,14 @@ impl App {
 
     fn draw_all_components(&self) {
         for comp in self.graph.node_weights() {
-            comp.draw(&self.textures);
+            comp.kind.draw(comp.position, &self.textures);
         }
     }
 
     fn draw_selected_component_box(&self, cx: NodeIndex) {
         let comp = &self.graph[cx];
-
-        draw_rectangle_lines(
-            comp.position.x,
-            comp.position.y,
-            comp.size.x,
-            comp.size.y,
-            2.,
-            BLACK,
-        );
+        let (w, h) = comp.kind.size().into();
+        draw_rectangle_lines(comp.position.x, comp.position.y, w, h, 2., BLACK);
     }
 
     fn draw_all_wires(&self) {
@@ -430,22 +820,16 @@ impl App {
         let cx_b = &self.graph[wire.end_comp];
         let pos_a = cx_a.position + cx_a.output_pos[wire.start_pin];
         let pos_b = cx_b.position + cx_b.input_pos[wire.end_pin];
-        let color = match wire.value {
-            true => GREEN,
-            false => BLUE,
-        };
-        draw_ortho_lines(pos_a, pos_b, color);
+        let color = if wire.value.any() { GREEN } else { BLUE };
+        let thickness = if wire.data_bits == 1 { 1. } else { 2. };
+        draw_ortho_lines(pos_a, pos_b, color, thickness);
     }
 
-    fn select_component(&mut self, comp: NodeIndex) {
-        let comp = &mut self.graph[comp];
-        match comp.kind {
-            CompKind::Input => {
-                comp.outputs[0] = !comp.outputs[0];
-                self.update_signals();
-            }
-            _ => (),
-        };
+    fn select_component(&mut self, cx: NodeIndex) {
+        let comp = &mut self.graph[cx];
+        if comp.kind.interact() {
+            self.update_signals();
+        }
     }
     fn draw_pin_highlight(&self, cx: NodeIndex, px: PinIndex) {
         let comp = &self.graph[cx];
@@ -470,11 +854,9 @@ impl App {
 
         for cx in self.graph.node_indices() {
             let comp = &self.graph[cx];
-            if mx >= comp.position.x
-                && mx <= comp.position.x + comp.size.x
-                && my >= comp.position.y
-                && my <= comp.position.y + comp.size.y
-            {
+            let (x, y) = comp.position.into();
+            let (w, h) = comp.kind.size().into();
+            if mx >= x && mx <= x + w && my >= y && my <= y + h {
                 return Some(cx);
             }
         }
@@ -527,8 +909,9 @@ impl App {
         {
             return false;
         }
-
-        let wire = Wire::new(cx_a, pin_a, cx_b, pin_b);
+        // FIXME: Figure out how to determine the number of data_bits based on start_comp and
+        // end_comp
+        let wire = Wire::new(cx_a, pin_a, cx_b, pin_b, 1);
         self.graph.add_edge(cx_a, cx_b, wire);
         self.update_signals();
         true
@@ -547,7 +930,8 @@ impl App {
 
     fn update_signals(&mut self) {
         // Remove (valid) cycles by ignoring edges which lead into a clocked component.
-        let de_cycled = EdgeFiltered::from_fn(&self.graph, |e| !self.graph[e.target()].is_clocked);
+        let de_cycled =
+            EdgeFiltered::from_fn(&self.graph, |e| !self.graph[e.target()].kind.is_clocked());
         let order =
             toposort(&de_cycled, None).expect("Cycles should only involve clocked components");
 
@@ -555,17 +939,19 @@ impl App {
         for cx in order {
             // When visiting a component, perform logic to convert inputs to outputs.
             // This also applies to clocked components, whose inputs will still be based on the previous clock cycle.
-            self.graph[cx].evaluate();
+            self.graph[cx].do_logic();
             let mut edges = self.graph.neighbors(cx).detach();
             // step through all connected wires and their corresponding components
             while let Some((wx, next_node_idx)) = edges.next(&self.graph) {
-                let start_pin = self.graph[wx].start_pin;
-                let end_pin = self.graph[wx].end_pin;
+                let start_pin = PinIndex::Output(self.graph[wx].start_pin);
+                let end_pin = PinIndex::Input(self.graph[wx].end_pin);
                 // use wire to determine relevant output and input pins
                 // TODO: maybe rework the graph so that edges are between the pins, not the components?
-                let signal_to_transmit = self.graph[cx].outputs[start_pin];
-                self.graph[next_node_idx].inputs[end_pin] = signal_to_transmit;
-                self.graph[wx].value = signal_to_transmit;
+                let signal_to_transmit = self.graph[cx].kind.get_pin_value(start_pin).clone();
+                self.graph[next_node_idx]
+                    .kind
+                    .set_pin_value(end_pin, &signal_to_transmit);
+                self.graph[wx].value.copy_from_bitslice(&signal_to_transmit);
             }
         }
     }
@@ -579,10 +965,10 @@ impl App {
         let start_pos = comp.position + pin_pos;
         let end_pos = Vec2::from(mouse_position());
 
-        draw_ortho_lines(start_pos, end_pos, BLACK);
+        draw_ortho_lines(start_pos, end_pos, BLACK, 1.);
     }
 
-    fn get_properties_ui(&self, prop_ui: &mut Ui) {
+    fn get_properties_ui(&mut self, prop_ui: &mut Ui) {
         if let ActionState::SelectingComponent(cx) = self.action_state {
             let comp = &self.graph[cx];
             Group::new(hash!(), vec2(MENU_SIZE.x, 30.))
@@ -591,30 +977,46 @@ impl App {
                     ui.label(vec2(0., 0.), "ID");
                     ui.label(vec2(50., 0.), comp.kind.name());
                 });
-            Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(prop_ui, |ui| {
-                ui.label(vec2(0., 0.), "Value:");
-                let value = match comp.kind {
-                    CompKind::Output => comp.inputs[0],
-                    _ => comp.outputs[0],
-                };
-                ui.label(vec2(50., 0.), &format!("{}", value));
-            });
-            if let CompKind::Mux(mux) = &comp.kind {
-                Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(prop_ui, |ui| {
-                    let sel_bits = (ui.combo_box(
-                        hash!(),
-                        "Select Bits",
-                        &["1", "2", "3", "4", "5"],
-                        None,
-                    ) + 1) as u8;
-                    // TODO: Actually update the component
-                    if sel_bits != mux.sel_bits {
-                        println!("new sel bits: {}", sel_bits);
-                    }
-                });
-            }
+            // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(prop_ui, |ui| {
+            //     ui.label(vec2(0., 0.), "Value:");
+            //     let value = match comp.kind {
+            //         CompKind::Output { .. } => comp.inputs[0].load::<u32>(),
+            //         _ => comp.outputs[0].load::<u32>(),
+            //     };
+            //     ui.label(vec2(50., 0.), &format!("{}", value));
+            // });
+            // TODO: Make custom property ui fields
         }
     }
+
+    // fn sel_bits_ui(&self, comp_kind: &CompKind, ui: &mut Ui) {
+    //     let sel_bits = match comp_kind {
+    //         CompKind::Mux(mux) => mux.sel_bits,
+    //         CompKind::Demux(demux) => demux.sel_bits,
+    //         _ => return, // No sel_bits on comp, so don't render the config option
+    //     };
+    //
+    //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+    //         let new_sel_bits =
+    //             (ui.combo_box(hash!(), "Select Bits", &["1", "2", "3", "4", "5"], None) + 1) as u8;
+    //         // TODO: Actually update the component
+    //
+    //         if sel_bits == new_sel_bits {
+    //             return;
+    //         }
+    //         let new_comp_kind = match comp_kind {
+    //             CompKind::Mux(mux) => CompKind::Mux(Mux {
+    //                 sel_bits: new_sel_bits,
+    //                 data_bits: mux.data_bits,
+    //             }),
+    //             CompKind::Demux(demux) => CompKind::Demux(Demux {
+    //                 sel_bits: new_sel_bits,
+    //                 data_bits: demux.data_bits,
+    //             }),
+    //             _ => unreachable!("Only components with select bits possible"),
+    //         };
+    //     });
+    // }
 
     // draw wire so that it only travels orthogonally
     fn update(&mut self, selected_menu_comp_name: &mut Option<&str>) {
@@ -649,7 +1051,7 @@ impl App {
                     ActionState::Idle
                 }
                 ActionState::HoldingComponent(cx) => {
-                    self.graph[cx].position = mouse_pos - self.graph[cx].size / 2.;
+                    self.graph[cx].position = mouse_pos - self.graph[cx].kind.size() / 2.;
 
                     if is_mouse_button_released(MouseButton::Left) {
                         // component is completely added to sandbox, so get rid of menu selection.
@@ -699,7 +1101,7 @@ impl App {
                 }
                 ActionState::MovingComponent(cx) => {
                     // Update component position (and center on mouse)
-                    self.graph[cx].position = mouse_pos - self.graph[cx].size / 2.;
+                    self.graph[cx].position = mouse_pos - self.graph[cx].kind.size() / 2.;
                     if is_mouse_button_released(MouseButton::Left) {
                         ActionState::SelectingComponent(cx)
                     } else {
@@ -803,15 +1205,15 @@ async fn main() {
                                         // track selection in menu UI
                                         selected_menu_comp_name = Some(comp_name);
                                         // create component for App
-                                        let kind = match comp_name {
-                                            "NOT" => CompKind::Gate(Gate::Not),
-                                            "AND" => CompKind::Gate(Gate::And),
-                                            "OR" => CompKind::Gate(Gate::Or),
-                                            "Input" => CompKind::Input,
-                                            "Output" => CompKind::Output,
-                                            "Register" => CompKind::Register,
-                                            "Mux" => CompKind::Mux(Mux::default()),
-                                            "Demux" => CompKind::Demux,
+                                        let kind: Box<dyn Comp> = match comp_name {
+                                            "NOT" => Box::new(Gate::default_of_kind(GateKind::Not)),
+                                            "AND" => Box::new(Gate::default_of_kind(GateKind::And)),
+                                            "OR" => Box::new(Gate::default_of_kind(GateKind::Or)),
+                                            "Input" => Box::new(Input::default()),
+                                            "Output" => Box::new( Output::default()),
+                                            "Register" => Box::new(Register::default()),
+                                            "Mux" => Box::new(Mux::default()),
+                                            "Demux" => Box::new(Demux::default()), 
                                             _ => {
                                                 panic!("Unknown component attempted to be created.")
                                             }
@@ -859,8 +1261,8 @@ fn get_folder_structure() -> Vec<(&'static str, Vec<&'static str>)> {
     ]
 }
 
-fn draw_ortho_lines(start: Vec2, end: Vec2, color: Color) {
+fn draw_ortho_lines(start: Vec2, end: Vec2, color: Color, thickness: f32) {
     // TODO: make this more sophisticated so that it chooses the right order (horiz/vert first)
     draw_line(start.x, start.y, end.x, start.y, 1., color);
-    draw_line(end.x, start.y, end.x, end.y, 1., color);
+    draw_line(end.x, start.y, end.x, end.y, thickness, color);
 }
