@@ -132,13 +132,11 @@ impl App {
     }
 
     fn find_hovered_comp(&self) -> Option<NodeIndex> {
-        let (mx, my) = mouse_position();
+        let mouse_pos = Vec2::from(mouse_position());
 
         for cx in self.graph.node_indices() {
             let comp = &self.graph[cx];
-            let (x, y) = comp.position.into();
-            let (w, h) = comp.kind.size().into();
-            if mx >= x && mx <= x + w && my >= y && my <= y + h {
+            if comp.contains(mouse_pos) {
                 return Some(cx);
             }
         }
@@ -176,6 +174,12 @@ impl App {
         if cx_a == cx_b {
             return false;
         }
+        // Check that the two pins have the same number of data_bits
+        let data_bits_a = self.graph[cx_a].kind.get_pin_value(px_a).len();
+        let data_bits_b = self.graph[cx_b].kind.get_pin_value(px_b).len();
+        if data_bits_a != data_bits_b {
+            return false;
+        }
         // determine which pin is the output (sender) and which is the input (receiver)
         let (cx_a, pin_a, cx_b, pin_b) = match (px_a, px_b) {
             (PinIndex::Output(pin_a), PinIndex::Input(pin_b)) => (cx_a, pin_a, cx_b, pin_b),
@@ -191,9 +195,9 @@ impl App {
         {
             return false;
         }
-        // FIXME: Figure out how to determine the number of data_bits based on start_comp and
-        // end_comp
-        let wire = Wire::new(cx_a, pin_a, cx_b, pin_b, 1);
+        // We know the pins match in terms of data bits, so arbitrarily set wire data bits to
+        // data_bits_a
+        let wire = Wire::new(cx_a, pin_a, cx_b, pin_b, data_bits_a as u8);
         self.graph.add_edge(cx_a, cx_b, wire);
         self.update_signals();
         true

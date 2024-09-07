@@ -18,6 +18,7 @@ pub enum PinIndex {
 pub struct Component {
     pub(crate) kind: Box<dyn Comp>,
     pub(crate) position: Vec2,
+    bboxes: Vec<Rect>,
     pub(crate) input_pos: Vec<Vec2>,
     pub(crate) output_pos: Vec<Vec2>,
 }
@@ -28,8 +29,17 @@ impl Component {
             position,
             input_pos: kind.input_positions(),
             output_pos: kind.output_positions(),
+            bboxes: kind.bboxes(),
             kind,
         }
+    }
+    pub(crate) fn contains(&self, point: Vec2) -> bool {
+        for bbox in &self.bboxes {
+            if bbox.offset(self.position).contains(point) {
+                return true;
+            }
+        }
+        false
     }
     pub(crate) fn do_logic(&mut self) {
         self.kind.do_logic();
@@ -162,11 +172,10 @@ impl Logic for Gate {
     }
 }
 
-const DATA_BITS_COMBO_OPTS: &[&str] = &[
+const COMBO_OPTS: &[&str] = &[
     "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
     "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32",
 ];
-const GATE_N_INPUTS_COMBO_OPTS: &[&str] = &["2", "3", "4", "5", "6", "7", "8", "9", "10"];
 
 impl Draw for Gate {
     fn size(&self) -> Vec2 {
@@ -188,6 +197,19 @@ impl Draw for Gate {
             )
         }
     }
+    fn bboxes(&self) -> Vec<Rect> {
+        let mut bboxes = vec![Rect::new(0., 0., self.size().x, self.size().y)];
+        if self.n_inputs > 2 {
+            let y_offset = (self.n_inputs as f32 - 1.) / 2. * 20.;
+            bboxes.push(Rect::new(
+                -5.,
+                -y_offset + self.size().y / 2.,
+                5.,
+                2. * y_offset,
+            ));
+        }
+        bboxes
+    }
     fn input_positions(&self) -> Vec<Vec2> {
         if self.n_inputs <= 2 {
             match self.kind {
@@ -198,12 +220,7 @@ impl Draw for Gate {
         } else {
             let y_offset = (self.n_inputs as f32 - 1.) / 2. * 20.;
             (0..self.n_inputs)
-                .map(|i| {
-                    vec2(
-                        0.,
-                        self.size().y / 2. - y_offset + 20. * i as f32,
-                    )
-                })
+                .map(|i| vec2(0., self.size().y / 2. - y_offset + 20. * i as f32))
                 .collect()
         }
     }
@@ -216,12 +233,7 @@ impl Draw for Gate {
         Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
             // Data bits
             let mut data_bits_sel = self.data_bits as usize - 1;
-            ui.combo_box(
-                hash!(),
-                "Data Bits:",
-                DATA_BITS_COMBO_OPTS,
-                &mut data_bits_sel,
-            );
+            ui.combo_box(hash!(), "Data Bits:", COMBO_OPTS, &mut data_bits_sel);
             let new_data_bits = data_bits_sel as u8 + 1;
 
             if new_data_bits != self.data_bits {
@@ -233,12 +245,7 @@ impl Draw for Gate {
             // Number of inputs
             Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
                 let mut n_inputs_sel = self.n_inputs - 2;
-                ui.combo_box(
-                    hash!(),
-                    "Inputs:",
-                    GATE_N_INPUTS_COMBO_OPTS,
-                    &mut n_inputs_sel,
-                );
+                ui.combo_box(hash!(), "Inputs:", &COMBO_OPTS[1..11], &mut n_inputs_sel);
                 let new_n_inputs = n_inputs_sel + 2;
                 if new_n_inputs != self.n_inputs {
                     let gate = Self::new(self.kind, self.data_bits, new_n_inputs);
@@ -368,33 +375,53 @@ impl Draw for Mux {
         );
         input_pos
     }
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+        let mut new_comp: Option<Box<dyn Comp>> = None;
+        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+            // Data bits
+            let mut data_bits_sel = self.data_bits as usize - 1;
+            ui.combo_box(hash!(), "Data Bits:", COMBO_OPTS, &mut data_bits_sel);
+            let new_data_bits = data_bits_sel as u8 + 1;
+
+            if new_data_bits != self.data_bits {
+                let mux = Self::new(self.sel_bits, new_data_bits);
+                new_comp = Some(Box::new(mux));
+            };
+        });
+
+        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+            // Selection bits
+            let mut sel_bits_sel = self.sel_bits as usize - 1;
+            ui.combo_box(hash!(), "Select Bits:", &COMBO_OPTS[..6], &mut sel_bits_sel);
+            let new_sel_bits = sel_bits_sel as u8 + 1;
+            if new_sel_bits != self.sel_bits {
+                let mux = Self::new(new_sel_bits, self.data_bits);
+                new_comp = Some(Box::new(mux));
+            }
+        });
+
+        new_comp
+    }
 }
 
 impl Mux {
-    fn n_inputs(&self) -> u8 {
-        // FIXME: probably unnecessary due to Mux owning its inputs now
-        // The first input is the select input
-        1 << self.sel_bits
+    fn new(sel_bits: u8, data_bits: u8) -> Self {
+        Self {
+            sel_bits,
+            data_bits,
+            inputs: vec![signal_zeros(data_bits); 1 << sel_bits],
+            output: signal_zeros(data_bits),
+            selector: signal_zeros(sel_bits),
+        }
     }
-
-    fn create_inputs(&self) -> Vec<Signal> {
-        // first input is the select pin
-        let mut inputs = vec![signal_zeros(1)];
-        // then the actual input pins
-        inputs.extend(vec![signal_zeros(self.data_bits); self.n_inputs() as usize]);
-        inputs
+    fn n_inputs(&self) -> u8 {
+        1 << self.sel_bits
     }
 }
 
 impl Default for Mux {
     fn default() -> Self {
-        Self {
-            sel_bits: 1,
-            data_bits: 1,
-            inputs: vec![signal_zeros(1); 2],
-            output: signal_zeros(1),
-            selector: signal_zeros(1),
-        }
+        Self::new(1, 1)
     }
 }
 #[derive(Debug, Clone)]
@@ -473,32 +500,56 @@ impl Draw for Demux {
             vec2(0., self.size().y / 2.),
         ]
     }
+
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+        let mut new_comp: Option<Box<dyn Comp>> = None;
+        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+            // Data bits
+            let mut data_bits_sel = self.data_bits as usize - 1;
+            ui.combo_box(hash!(), "Data Bits:", COMBO_OPTS, &mut data_bits_sel);
+            let new_data_bits = data_bits_sel as u8 + 1;
+
+            if new_data_bits != self.data_bits {
+                let demux = Self::new(self.sel_bits, new_data_bits);
+                new_comp = Some(Box::new(demux));
+            };
+        });
+
+        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+            // Selection bits
+            let mut sel_bits_sel = self.sel_bits as usize - 1;
+            ui.combo_box(
+                hash!(),
+                "Select Bits:",
+                &["1", "2", "3", "4", "5", "6"],
+                &mut sel_bits_sel,
+            );
+            let new_sel_bits = sel_bits_sel as u8 + 1;
+            if new_sel_bits != self.sel_bits {
+                let mux = Self::new(new_sel_bits, self.data_bits);
+                new_comp = Some(Box::new(mux));
+            }
+        });
+
+        new_comp
+    }
 }
 
 impl Demux {
-    fn n_outputs(&self) -> u8 {
-        1 << self.sel_bits
-    }
-
-    fn create_inputs(&self) -> Vec<Signal> {
-        // first input is the select pin
-        // second input is the data
-        vec![signal_zeros(self.sel_bits), signal_zeros(self.data_bits)]
-    }
-
-    fn create_outputs(&self) -> Vec<Signal> {
-        vec![signal_zeros(self.data_bits); self.n_outputs() as usize]
+    fn new(sel_bits: u8, data_bits: u8) -> Self {
+        Self {
+            sel_bits,
+            data_bits,
+            input: signal_zeros(data_bits),
+            outputs: vec![signal_zeros(data_bits); 1 << sel_bits],
+            selector: signal_zeros(sel_bits),
+        }
     }
 }
+
 impl Default for Demux {
     fn default() -> Self {
-        Self {
-            sel_bits: 1,
-            data_bits: 1,
-            input: signal_zeros(1),
-            outputs: vec![signal_zeros(1); 2],
-            selector: signal_zeros(1),
-        }
+        Self::new(1, 1)
     }
 }
 
@@ -508,6 +559,17 @@ struct Register {
     write_enable: Signal,
     input: Signal,
     output: Signal,
+}
+
+impl Register {
+    fn new(data_bits: u8) -> Self {
+        Self {
+            data_bits,
+            write_enable: signal_zeros(1),
+            input: signal_zeros(data_bits),
+            output: signal_zeros(data_bits),
+        }
+    }
 }
 
 impl Logic for Register {
@@ -588,16 +650,27 @@ impl Draw for Register {
             Vec2::new(0., 20.),
         ]
     }
+
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+        let mut new_comp: Option<Box<dyn Comp>> = None;
+        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+            // Data bits
+            let mut data_bits_sel = self.data_bits as usize - 1;
+            ui.combo_box(hash!(), "Data Bits:", COMBO_OPTS, &mut data_bits_sel);
+            let new_data_bits = data_bits_sel as u8 + 1;
+
+            if new_data_bits != self.data_bits {
+                let reg = Self::new(new_data_bits);
+                new_comp = Some(Box::new(reg));
+            };
+        });
+        new_comp
+    }
 }
 
 impl Default for Register {
     fn default() -> Self {
-        Self {
-            data_bits: 1,
-            write_enable: signal_zeros(1),
-            input: signal_zeros(1),
-            output: signal_zeros(1),
-        }
+        Self::new(1)
     }
 }
 
@@ -605,6 +678,15 @@ impl Default for Register {
 struct Input {
     data_bits: u8,
     value: Signal,
+}
+
+impl Input {
+    fn new(data_bits: u8) -> Self {
+        Self {
+            data_bits,
+            value: signal_zeros(data_bits),
+        }
+    }
 }
 
 impl Logic for Input {
@@ -669,14 +751,28 @@ impl Draw for Input {
         let color = if self.value.any() { GREEN } else { RED };
         draw_rectangle(pos.x, pos.y, 20., 20., color);
     }
+
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+        let mut new_comp: Option<Box<dyn Comp>> = None;
+        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+            // Data bits
+            let mut data_bits_sel = self.data_bits as usize - 1;
+            ui.combo_box(hash!(), "Data Bits:", COMBO_OPTS, &mut data_bits_sel);
+            let new_data_bits = data_bits_sel as u8 + 1;
+
+            if new_data_bits != self.data_bits {
+                let input = Self::new(new_data_bits);
+                new_comp = Some(Box::new(input));
+            };
+        });
+
+        new_comp
+    }
 }
 
 impl Default for Input {
     fn default() -> Self {
-        Self {
-            data_bits: 1,
-            value: signal_zeros(1),
-        }
+        Self::new(1)
     }
 }
 
@@ -684,6 +780,15 @@ impl Default for Input {
 struct Output {
     data_bits: u8,
     value: Signal,
+}
+
+impl Output {
+    fn new(data_bits: u8) -> Self {
+        Self {
+            data_bits,
+            value: signal_zeros(data_bits),
+        }
+    }
 }
 
 impl Logic for Output {
@@ -736,26 +841,45 @@ impl Draw for Output {
         let color = if self.value.any() { GREEN } else { RED };
         draw_rectangle(pos.x, pos.y, 20., 20., color);
     }
+
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+        let mut new_comp: Option<Box<dyn Comp>> = None;
+        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+            // Data bits
+            let mut data_bits_sel = self.data_bits as usize - 1;
+            ui.combo_box(hash!(), "Data Bits:", COMBO_OPTS, &mut data_bits_sel);
+            let new_data_bits = data_bits_sel as u8 + 1;
+
+            if new_data_bits != self.data_bits {
+                let output = Self::new(new_data_bits);
+                new_comp = Some(Box::new(output));
+            };
+        });
+
+        new_comp
+    }
 }
 
 impl Default for Output {
     fn default() -> Self {
-        Self {
-            data_bits: 1,
-            value: signal_zeros(1),
-        }
+        Self::new(1)
     }
 }
 
 pub(crate) trait Draw: Logic {
     fn size(&self) -> Vec2;
     fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>);
+    fn bboxes(&self) -> Vec<Rect> {
+        // Return bounding boxes for this component, located relative to its position
+        vec![Rect::new(0., 0., self.size().x, self.size().y)]
+    }
     fn input_positions(&self) -> Vec<Vec2> {
         let n_inputs = self.n_in_pins();
         (0..n_inputs)
             .map(|i| vec2(0., (i + 1) as f32 * self.size().y / (n_inputs + 1) as f32))
             .collect()
     }
+
     fn output_positions(&self) -> Vec<Vec2> {
         let n_outputs = self.n_out_pins();
         (0..n_outputs)
