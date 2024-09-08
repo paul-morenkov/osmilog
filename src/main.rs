@@ -14,6 +14,13 @@ use components::{signal_zeros, Component, PinIndex, Signal};
 
 mod components;
 
+const TILE_SIZE: f32 = 10.;
+const SANDBOX_POS: Vec2 = vec2(210., 0.);
+// TODO: make sandbox size in terms of tiles?
+const SANDBOX_SIZE: Vec2 = vec2(600., 600.);
+const WINDOW_SIZE: Vec2 = vec2(1000., 600.);
+const MENU_SIZE: Vec2 = vec2(200., WINDOW_SIZE.y);
+
 #[derive(Debug)]
 struct Wire {
     // TODO: does Wire even need data_bits? Can just use Signal::len
@@ -230,7 +237,6 @@ impl App {
                 let start_pin = PinIndex::Output(self.graph[wx].start_pin);
                 let end_pin = PinIndex::Input(self.graph[wx].end_pin);
                 // use wire to determine relevant output and input pins
-                // TODO: maybe rework the graph so that edges are between the pins, not the components?
                 let signal_to_transmit = self.graph[cx].kind.get_pin_value(start_pin).clone();
                 self.graph[next_node_idx]
                     .kind
@@ -249,6 +255,9 @@ impl App {
         let start_pos = comp.position + pin_pos;
         let end_pos = Vec2::from(mouse_position());
 
+        // FIXME: switch to grid-snapped versions when ready
+        // let start_pos = snap_to_grid(comp.position + pin_pos);
+        // let end_pos = snap_to_grid(Vec2::from(mouse_position()));
         draw_ortho_lines(start_pos, end_pos, BLACK, 1.);
     }
 
@@ -279,6 +288,19 @@ impl App {
                 for wx in wxs_to_remove {
                     self.graph.remove_edge(wx);
                 }
+            }
+        }
+    }
+
+    fn draw_grid(&self) {
+        let (nx, ny) = (SANDBOX_SIZE / TILE_SIZE).into();
+        let (nx, ny) = (nx.floor(), ny.floor());
+        for i in 0..nx as u32 {
+            for j in 0..ny as u32 {
+                let x = SANDBOX_POS.x + i as f32 * TILE_SIZE;
+                let y = SANDBOX_POS.y + j as f32 * TILE_SIZE;
+                let color = GRAY;
+                draw_line(x, y, x + 1., y + 1., 1., color);
             }
         }
     }
@@ -316,7 +338,8 @@ impl App {
                     ActionState::Idle
                 }
                 ActionState::HoldingComponent(cx) => {
-                    self.graph[cx].position = mouse_pos - self.graph[cx].kind.size() / 2.;
+                    self.graph[cx].position =
+                        snap_to_grid(mouse_pos - self.graph[cx].kind.size() / 2.);
 
                     if is_mouse_button_released(MouseButton::Left) {
                         // component is completely added to sandbox, so get rid of menu selection.
@@ -366,7 +389,8 @@ impl App {
                 }
                 ActionState::MovingComponent(cx) => {
                     // Update component position (and center on mouse)
-                    self.graph[cx].position = mouse_pos - self.graph[cx].kind.size() / 2.;
+                    self.graph[cx].position =
+                        snap_to_grid(mouse_pos - self.graph[cx].kind.size() / 2.);
                     if is_mouse_button_released(MouseButton::Left) {
                         ActionState::SelectingComponent(cx)
                     } else {
@@ -411,11 +435,6 @@ impl App {
     }
 }
 
-const SANDBOX_POS: Vec2 = vec2(210., 0.);
-const SANDBOX_SIZE: Vec2 = vec2(600., 600.);
-const WINDOW_SIZE: Vec2 = vec2(1000., 600.);
-const MENU_SIZE: Vec2 = vec2(200., WINDOW_SIZE.y);
-
 fn create_skin() -> Skin {
     let window_style = root_ui()
         .style_builder()
@@ -446,7 +465,7 @@ async fn main() {
     let mut selected_menu_comp_name = None;
 
     loop {
-        clear_background(GRAY);
+        clear_background(WHITE);
         set_default_camera();
         // Draw Left-Side Menu
         Window::new(hash!("left-menu"), Vec2::ZERO, MENU_SIZE)
@@ -491,9 +510,10 @@ async fn main() {
             SANDBOX_POS.x,
             SANDBOX_POS.y,
             SANDBOX_SIZE.x,
-            SANDBOX_POS.y,
-            GRAY,
+            SANDBOX_SIZE.y,
+            LIGHTGRAY,
         );
+        app.draw_grid();
         // Draw in sandbox area
         app.update(&mut selected_menu_comp_name);
 
@@ -519,4 +539,10 @@ fn draw_ortho_lines(start: Vec2, end: Vec2, color: Color, thickness: f32) {
     // TODO: make this more sophisticated so that it chooses the right order (horiz/vert first)
     draw_line(start.x, start.y, end.x, start.y, thickness, color);
     draw_line(end.x, start.y, end.x, end.y, thickness, color);
+}
+
+fn snap_to_grid(point: Vec2) -> Vec2 {
+    let x = (point.x / TILE_SIZE).floor() * TILE_SIZE;
+    let y = (point.y / TILE_SIZE).floor() * TILE_SIZE;
+    Vec2::new(x, y)
 }
