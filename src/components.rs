@@ -58,7 +58,7 @@ impl Component {
     }
 }
 
-struct TexInfo {
+pub(crate) struct TexInfo {
     offset: Vec2,
     size: Vec2,
     scale: f32,
@@ -233,7 +233,7 @@ impl Draw for Gate {
         Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
             // Data bits
             let mut data_bits_sel = self.data_bits as usize - 1;
-            ui.combo_box(hash!(), "Data Bits:", COMBO_OPTS, &mut data_bits_sel);
+            ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
             let new_data_bits = data_bits_sel as u8 + 1;
 
             if new_data_bits != self.data_bits {
@@ -245,7 +245,7 @@ impl Draw for Gate {
             // Number of inputs
             Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
                 let mut n_inputs_sel = self.n_inputs - 2;
-                ui.combo_box(hash!(), "Inputs:", &COMBO_OPTS[1..11], &mut n_inputs_sel);
+                ui.combo_box(hash!(), "Inputs", &COMBO_OPTS[1..11], &mut n_inputs_sel);
                 let new_n_inputs = n_inputs_sel + 2;
                 if new_n_inputs != self.n_inputs {
                     let gate = Self::new(self.kind, self.data_bits, new_n_inputs);
@@ -380,7 +380,7 @@ impl Draw for Mux {
         Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
             // Data bits
             let mut data_bits_sel = self.data_bits as usize - 1;
-            ui.combo_box(hash!(), "Data Bits:", COMBO_OPTS, &mut data_bits_sel);
+            ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
             let new_data_bits = data_bits_sel as u8 + 1;
 
             if new_data_bits != self.data_bits {
@@ -392,7 +392,7 @@ impl Draw for Mux {
         Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
             // Selection bits
             let mut sel_bits_sel = self.sel_bits as usize - 1;
-            ui.combo_box(hash!(), "Select Bits:", &COMBO_OPTS[..6], &mut sel_bits_sel);
+            ui.combo_box(hash!(), "Select Bits", &COMBO_OPTS[..6], &mut sel_bits_sel);
             let new_sel_bits = sel_bits_sel as u8 + 1;
             if new_sel_bits != self.sel_bits {
                 let mux = Self::new(new_sel_bits, self.data_bits);
@@ -413,9 +413,6 @@ impl Mux {
             output: signal_zeros(data_bits),
             selector: signal_zeros(sel_bits),
         }
-    }
-    fn n_inputs(&self) -> u8 {
-        1 << self.sel_bits
     }
 }
 
@@ -482,7 +479,7 @@ impl Draw for Demux {
         vec2(30., self.outputs.len() as f32 * 20.)
     }
 
-    fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>) {
+    fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
         let (w, h) = self.size().into();
         let a = pos + vec2(0., 10.);
         let b = pos + vec2(w, 0.);
@@ -506,7 +503,7 @@ impl Draw for Demux {
         Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
             // Data bits
             let mut data_bits_sel = self.data_bits as usize - 1;
-            ui.combo_box(hash!(), "Data Bits:", COMBO_OPTS, &mut data_bits_sel);
+            ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
             let new_data_bits = data_bits_sel as u8 + 1;
 
             if new_data_bits != self.data_bits {
@@ -520,7 +517,7 @@ impl Draw for Demux {
             let mut sel_bits_sel = self.sel_bits as usize - 1;
             ui.combo_box(
                 hash!(),
-                "Select Bits:",
+                "Select Bits",
                 &["1", "2", "3", "4", "5", "6"],
                 &mut sel_bits_sel,
             );
@@ -656,7 +653,7 @@ impl Draw for Register {
         Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
             // Data bits
             let mut data_bits_sel = self.data_bits as usize - 1;
-            ui.combo_box(hash!(), "Data Bits:", COMBO_OPTS, &mut data_bits_sel);
+            ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
             let new_data_bits = data_bits_sel as u8 + 1;
 
             if new_data_bits != self.data_bits {
@@ -747,7 +744,7 @@ impl Draw for Input {
         Vec2::new(20., 20.)
     }
 
-    fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>) {
+    fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
         let color = if self.value.any() { GREEN } else { RED };
         draw_rectangle(pos.x, pos.y, 20., 20., color);
     }
@@ -757,7 +754,7 @@ impl Draw for Input {
         Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
             // Data bits
             let mut data_bits_sel = self.data_bits as usize - 1;
-            ui.combo_box(hash!(), "Data Bits:", COMBO_OPTS, &mut data_bits_sel);
+            ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
             let new_data_bits = data_bits_sel as u8 + 1;
 
             if new_data_bits != self.data_bits {
@@ -847,7 +844,7 @@ impl Draw for Output {
         Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
             // Data bits
             let mut data_bits_sel = self.data_bits as usize - 1;
-            ui.combo_box(hash!(), "Data Bits:", COMBO_OPTS, &mut data_bits_sel);
+            ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
             let new_data_bits = data_bits_sel as u8 + 1;
 
             if new_data_bits != self.data_bits {
@@ -912,10 +909,7 @@ pub(crate) trait Draw: Logic {
             },
         );
     }
-    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        // FIXME: Remove default impl when caught up.
-        None
-    }
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>>;
 }
 
 pub(crate) trait Comp: Logic + Draw + Debug {}

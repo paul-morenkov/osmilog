@@ -10,9 +10,7 @@ use petgraph::visit::{EdgeFiltered, EdgeRef};
 use petgraph::Direction::{self, Incoming};
 use std::fmt::Debug;
 
-use bitvec::prelude::*;
-
-use components::{signal_zeros, Comp, Component, PinIndex, Signal};
+use components::{signal_zeros, Component, PinIndex, Signal};
 
 mod components;
 
@@ -103,7 +101,7 @@ impl App {
         let pos_a = cx_a.position + cx_a.output_pos[wire.start_pin];
         let pos_b = cx_b.position + cx_b.input_pos[wire.end_pin];
         let color = if wire.value.any() { GREEN } else { BLUE };
-        let thickness = if wire.data_bits == 1 { 1. } else { 2. };
+        let thickness = if wire.data_bits == 1 { 1. } else { 3. };
         draw_ortho_lines(pos_a, pos_b, color, thickness);
     }
 
@@ -519,6 +517,6 @@ fn get_folder_structure() -> Vec<(&'static str, Vec<&'static str>)> {
 
 fn draw_ortho_lines(start: Vec2, end: Vec2, color: Color, thickness: f32) {
     // TODO: make this more sophisticated so that it chooses the right order (horiz/vert first)
-    draw_line(start.x, start.y, end.x, start.y, 1., color);
+    draw_line(start.x, start.y, end.x, start.y, thickness, color);
     draw_line(end.x, start.y, end.x, end.y, thickness, color);
 }
