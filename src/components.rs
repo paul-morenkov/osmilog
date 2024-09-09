@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use std::fmt::Debug;
 
-use crate::MENU_SIZE;
+use crate::{MENU_SIZE, TILE_SIZE};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PinIndex {
@@ -61,15 +61,15 @@ impl Component {
 pub(crate) struct TexInfo {
     offset: Vec2,
     size: Vec2,
-    scale: f32,
+    render_size: Vec2,
 }
 
 impl TexInfo {
-    fn new(offset: Vec2, size: Vec2, scale: f32) -> Self {
+    fn new(offset: Vec2, size: Vec2, render_size: Vec2) -> Self {
         Self {
             offset,
             size,
-            scale,
+            render_size,
         }
     }
 }
@@ -179,8 +179,7 @@ const COMBO_OPTS: &[&str] = &[
 
 impl Draw for Gate {
     fn size(&self) -> Vec2 {
-        let tex_info = self.tex_info();
-        tex_info.size / tex_info.scale
+        self.tex_info().render_size
     }
 
     fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>) {
@@ -226,7 +225,7 @@ impl Draw for Gate {
     }
     fn output_positions(&self) -> Vec<Vec2> {
         let tex_info = self.tex_info();
-        vec![vec2(tex_info.size.x, tex_info.size.y / 2.) / tex_info.scale]
+        vec![vec2(tex_info.render_size.x, tex_info.render_size.y / 2.)]
     }
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
         let mut new_comp: Option<Box<dyn Comp>> = None;
@@ -276,9 +275,11 @@ impl Gate {
     }
     fn tex_info(&self) -> TexInfo {
         match self.kind {
-            GateKind::Not => TexInfo::new(vec2(448., 111.), vec2(80., 80.), 2.),
-            GateKind::And => TexInfo::new(vec2(72., 0.), vec2(90., 69.), 2.),
-            GateKind::Or => TexInfo::new(vec2(72., 233.), vec2(90., 78.), 2.),
+            GateKind::Not => {
+                TexInfo::new(vec2(455., 117.), vec2(70., 65.), TILE_SIZE * vec2(3., 2.))
+            }
+            GateKind::And => TexInfo::new(vec2(75., 0.), vec2(82., 67.), TILE_SIZE * vec2(4., 4.)),
+            GateKind::Or => TexInfo::new(vec2(72., 233.), vec2(82., 77.), TILE_SIZE * vec2(4., 4.)),
         }
     }
 }
@@ -895,7 +896,7 @@ pub(crate) trait Draw: Logic {
             pos.y,
             WHITE,
             DrawTextureParams {
-                dest_size: Some(tex_info.size / tex_info.scale),
+                dest_size: Some(tex_info.render_size),
                 source: Some(Rect::new(
                     tex_info.offset.x,
                     tex_info.offset.y,

@@ -126,7 +126,7 @@ impl App {
         };
         // find absolute pin_pos (it is relative position out of the box)
         let pin_pos = comp.position + pin_pos;
-        draw_circle_lines(pin_pos.x, pin_pos.y, 5., 1., GREEN);
+        draw_circle_lines(pin_pos.x, pin_pos.y, 3., 1., GREEN);
     }
 
     fn find_hovered_cx_and_pin(&self) -> Option<(NodeIndex, Option<PinIndex>)> {
@@ -294,9 +294,8 @@ impl App {
 
     fn draw_grid(&self) {
         let (nx, ny) = (SANDBOX_SIZE / TILE_SIZE).into();
-        let (nx, ny) = (nx.floor(), ny.floor());
-        for i in 0..nx as u32 {
-            for j in 0..ny as u32 {
+        for i in 0..nx.floor() as u32 {
+            for j in 0..ny.floor() as u32 {
                 let x = SANDBOX_POS.x + i as f32 * TILE_SIZE;
                 let y = SANDBOX_POS.y + j as f32 * TILE_SIZE;
                 let color = GRAY;
