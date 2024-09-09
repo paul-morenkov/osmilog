@@ -20,6 +20,7 @@ const SANDBOX_POS: Vec2 = vec2(200., 0.);
 const SANDBOX_SIZE: Vec2 = vec2(800., 800.);
 const WINDOW_SIZE: Vec2 = vec2(1000., 800.);
 const MENU_SIZE: Vec2 = vec2(200., WINDOW_SIZE.y);
+const HOVER_RADIUS: f32 = 10.;
 
 #[derive(Debug)]
 struct Wire {
@@ -131,9 +132,9 @@ impl App {
 
     fn find_hovered_cx_and_pin(&self) -> Option<(NodeIndex, Option<PinIndex>)> {
         // Looks for a hovered component, and then for a hovered pin if a component is found.
-        let comp = self.find_hovered_comp()?;
-        let pin = self.find_hovered_pin(comp);
-        Some((comp, pin))
+        let cx = self.find_hovered_comp()?;
+        let pin = self.find_hovered_pin(cx);
+        Some((cx, pin))
     }
 
     fn find_hovered_comp(&self) -> Option<NodeIndex> {
@@ -152,17 +153,16 @@ impl App {
         let mouse_pos = Vec2::from(mouse_position());
 
         let comp = &self.graph[cx];
-        let max_dist = 10.;
 
         for (i, pin_pos) in comp.input_pos.iter().enumerate() {
             let pin_pos = vec2(comp.position.x + pin_pos.x, comp.position.y + pin_pos.y);
-            if mouse_pos.distance(pin_pos) < max_dist {
+            if mouse_pos.distance(pin_pos) < HOVER_RADIUS {
                 return Some(PinIndex::Input(i));
             }
         }
         for (i, pin_pos) in comp.output_pos.iter().enumerate() {
             let pin_pos = vec2(comp.position.x + pin_pos.x, comp.position.y + pin_pos.y);
-            if mouse_pos.distance(pin_pos) < max_dist {
+            if mouse_pos.distance(pin_pos) < HOVER_RADIUS {
                 return Some(PinIndex::Output(i));
             }
         }
@@ -183,6 +183,7 @@ impl App {
         let data_bits_a = self.graph[cx_a].kind.get_pin_value(px_a).len();
         let data_bits_b = self.graph[cx_b].kind.get_pin_value(px_b).len();
         if data_bits_a != data_bits_b {
+            println!("mismatched data bits: {} {}", data_bits_a, data_bits_b);
             return false;
         }
         // determine which pin is the output (sender) and which is the input (receiver)
@@ -252,12 +253,9 @@ impl App {
             PinIndex::Input(i) => comp.input_pos[i],
             PinIndex::Output(i) => comp.output_pos[i],
         };
-        let start_pos = comp.position + pin_pos;
-        let end_pos = Vec2::from(mouse_position());
 
-        // FIXME: switch to grid-snapped versions when ready
-        // let start_pos = snap_to_grid(comp.position + pin_pos);
-        // let end_pos = snap_to_grid(Vec2::from(mouse_position()));
+        let start_pos = snap_to_grid(comp.position + pin_pos);
+        let end_pos = snap_to_grid(Vec2::from(mouse_position()));
         draw_ortho_lines(start_pos, end_pos, BLACK, 1.);
     }
 
@@ -541,7 +539,7 @@ fn draw_ortho_lines(start: Vec2, end: Vec2, color: Color, thickness: f32) {
 }
 
 fn snap_to_grid(point: Vec2) -> Vec2 {
-    let x = (point.x / TILE_SIZE).floor() * TILE_SIZE;
-    let y = (point.y / TILE_SIZE).floor() * TILE_SIZE;
+    let x = (point.x / TILE_SIZE).round() * TILE_SIZE;
+    let y = (point.y / TILE_SIZE).round() * TILE_SIZE;
     Vec2::new(x, y)
 }

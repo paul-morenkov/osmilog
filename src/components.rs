@@ -60,16 +60,16 @@ impl Component {
 
 pub(crate) struct TexInfo {
     offset: Vec2,
+    tex_size: Vec2,
     size: Vec2,
-    render_size: Vec2,
 }
 
 impl TexInfo {
-    fn new(offset: Vec2, size: Vec2, render_size: Vec2) -> Self {
+    fn new(offset: Vec2, tex_size: Vec2, size: Vec2) -> Self {
         Self {
             offset,
+            tex_size,
             size,
-            render_size,
         }
     }
 }
@@ -179,7 +179,7 @@ const COMBO_OPTS: &[&str] = &[
 
 impl Draw for Gate {
     fn size(&self) -> Vec2 {
-        self.tex_info().render_size
+        self.tex_info().size
     }
 
     fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>) {
@@ -243,7 +243,7 @@ impl Draw for Gate {
     }
     fn output_positions(&self) -> Vec<Vec2> {
         let tex_info = self.tex_info();
-        vec![vec2(tex_info.render_size.x, tex_info.render_size.y / 2.)]
+        vec![vec2(tex_info.size.x, tex_info.size.y / 2.)]
     }
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
         let mut new_comp: Option<Box<dyn Comp>> = None;
@@ -964,12 +964,12 @@ pub(crate) trait Draw: Logic {
             pos.y,
             WHITE,
             DrawTextureParams {
-                dest_size: Some(tex_info.render_size),
+                dest_size: Some(tex_info.size),
                 source: Some(Rect::new(
                     tex_info.offset.x,
                     tex_info.offset.y,
-                    tex_info.size.x,
-                    tex_info.size.y,
+                    tex_info.tex_size.x,
+                    tex_info.tex_size.y,
                 )),
                 rotation: 0.,
                 flip_x: false,
