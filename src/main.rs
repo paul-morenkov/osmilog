@@ -15,10 +15,10 @@ use components::{signal_zeros, Component, PinIndex, Signal};
 mod components;
 
 const TILE_SIZE: f32 = 10.;
-const SANDBOX_POS: Vec2 = vec2(210., 0.);
+const SANDBOX_POS: Vec2 = vec2(200., 0.);
 // TODO: make sandbox size in terms of tiles?
-const SANDBOX_SIZE: Vec2 = vec2(600., 600.);
-const WINDOW_SIZE: Vec2 = vec2(1000., 600.);
+const SANDBOX_SIZE: Vec2 = vec2(800., 800.);
+const WINDOW_SIZE: Vec2 = vec2(1000., 800.);
 const MENU_SIZE: Vec2 = vec2(200., WINDOW_SIZE.y);
 
 #[derive(Debug)]

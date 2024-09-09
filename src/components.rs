@@ -184,8 +184,9 @@ impl Draw for Gate {
 
     fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>) {
         self.draw_from_texture_slice(pos, textures.get("gates").unwrap(), self.tex_info());
-        if self.n_inputs > 2 {
-            let y_offset = (self.n_inputs as f32 - 1.) / 2. * 20.;
+        if self.n_inputs > 3 {
+            // let y_offset = (self.n_inputs as f32 - 1.) / 2. * 20.;
+            let y_offset = (self.n_inputs as f32 / 2.).floor() * TILE_SIZE;
             draw_line(
                 pos.x,
                 pos.y + self.size().y / 2. - y_offset,
@@ -212,15 +213,32 @@ impl Draw for Gate {
     fn input_positions(&self) -> Vec<Vec2> {
         if self.n_inputs <= 2 {
             match self.kind {
-                GateKind::Not => vec![vec2(0., 20.)],
-                GateKind::Or => vec![vec2(0., 10.), vec2(0., 28.)],
-                GateKind::And => vec![vec2(0., 8.), vec2(0., 25.)],
+                GateKind::Not => vec![vec2(0., TILE_SIZE)],
+                GateKind::Or => vec![vec2(0., TILE_SIZE), vec2(0., 3. * TILE_SIZE)],
+                GateKind::And => vec![vec2(0., TILE_SIZE), vec2(0., 3. * TILE_SIZE)],
             }
+        } else if self.n_inputs == 3 {
+            vec![
+                vec2(0., 0.),
+                vec2(0., 2. * TILE_SIZE),
+                vec2(0., 4. * TILE_SIZE),
+            ]
         } else {
-            let y_offset = (self.n_inputs as f32 - 1.) / 2. * 20.;
-            (0..self.n_inputs)
-                .map(|i| vec2(0., self.size().y / 2. - y_offset + 20. * i as f32))
-                .collect()
+            let mut input_positions = Vec::new();
+            let skipping_center = self.n_inputs % 2 == 0;
+            let n_tiles = if skipping_center {
+                self.n_inputs
+            } else {
+                self.n_inputs - 1
+            } as isize;
+            let y_offset = (n_tiles - 4) / 2;
+            for i in 0..=n_tiles {
+                if skipping_center && i == n_tiles / 2 {
+                    continue;
+                }
+                input_positions.push(vec2(0., (i - y_offset) as f32 * TILE_SIZE));
+            }
+            input_positions
         }
     }
     fn output_positions(&self) -> Vec<Vec2> {
@@ -276,10 +294,10 @@ impl Gate {
     fn tex_info(&self) -> TexInfo {
         match self.kind {
             GateKind::Not => {
-                TexInfo::new(vec2(455., 117.), vec2(70., 65.), TILE_SIZE * vec2(3., 2.))
+                TexInfo::new(vec2(455., 117.), vec2(67., 65.), TILE_SIZE * vec2(3., 2.))
             }
             GateKind::And => TexInfo::new(vec2(75., 0.), vec2(82., 67.), TILE_SIZE * vec2(4., 4.)),
-            GateKind::Or => TexInfo::new(vec2(72., 233.), vec2(82., 77.), TILE_SIZE * vec2(4., 4.)),
+            GateKind::Or => TexInfo::new(vec2(72., 236.), vec2(82., 73.), TILE_SIZE * vec2(4., 4.)),
         }
     }
 }
@@ -353,14 +371,28 @@ impl Logic for Mux {
 
 impl Draw for Mux {
     fn size(&self) -> Vec2 {
-        vec2(30., (self.inputs.len() * 20) as f32)
+        let width = if self.sel_bits == 1 { 3. } else { 4. };
+        TILE_SIZE * Vec2::new(width, usize::max(self.inputs.len() + 2, 4) as f32)
     }
 
     fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
         let (w, h) = self.size().into();
+        let ramp_y = if self.sel_bits == 1 {
+            draw_line(
+                pos.x + TILE_SIZE,
+                pos.y + h,
+                pos.x + TILE_SIZE,
+                pos.y + h - TILE_SIZE / 3.,
+                1.,
+                BLACK,
+            );
+            TILE_SIZE
+        } else {
+            2. * TILE_SIZE
+        };
         let a = pos;
-        let b = pos + vec2(w, 10.);
-        let c = pos + vec2(w, h - 10.);
+        let b = pos + vec2(w, ramp_y);
+        let c = pos + vec2(w, h - ramp_y);
         let d = pos + vec2(0., h);
         draw_line(a.x, a.y, b.x, b.y, 1., BLACK);
         draw_line(b.x, b.y, c.x, c.y, 1., BLACK);
@@ -369,12 +401,17 @@ impl Draw for Mux {
     }
 
     fn input_positions(&self) -> Vec<Vec2> {
-        let mut input_pos = vec![vec2(self.size().x / 2., self.size().y - 5.)];
+        if self.sel_bits == 1 {
+            return vec![
+                vec2(TILE_SIZE, self.size().y),
+                vec2(0., TILE_SIZE),
+                vec2(0., 3. * TILE_SIZE),
+            ];
+        }
+        let mut input_positions = vec![vec2(2. * TILE_SIZE, self.size().y - TILE_SIZE)];
         let n_inputs = self.inputs.len();
-        input_pos.extend(
-            (0..n_inputs).map(|i| vec2(0., (i + 1) as f32 * self.size().y / (n_inputs + 1) as f32)),
-        );
-        input_pos
+        input_positions.extend((1..=n_inputs).map(|i| vec2(0., i as f32 * TILE_SIZE)));
+        input_positions
     }
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
         let mut new_comp: Option<Box<dyn Comp>> = None;
@@ -477,15 +514,29 @@ impl Logic for Demux {
 
 impl Draw for Demux {
     fn size(&self) -> Vec2 {
-        vec2(30., self.outputs.len() as f32 * 20.)
+        let width = if self.sel_bits == 1 { 3. } else { 4. };
+        TILE_SIZE * Vec2::new(width, usize::max(self.outputs.len() + 2, 4) as f32)
     }
 
     fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
         let (w, h) = self.size().into();
-        let a = pos + vec2(0., 10.);
+        let ramp_y = if self.sel_bits == 1 {
+            draw_line(
+                pos.x + 2. * TILE_SIZE,
+                pos.y + h,
+                pos.x + 2. * TILE_SIZE,
+                pos.y + h - TILE_SIZE / 3.,
+                1.,
+                BLACK,
+            );
+            TILE_SIZE
+        } else {
+            2. * TILE_SIZE
+        };
+        let a = pos + vec2(0., ramp_y);
         let b = pos + vec2(w, 0.);
         let c = pos + vec2(w, h);
-        let d = pos + vec2(0., h - 10.);
+        let d = pos + vec2(0., h - ramp_y);
         draw_line(a.x, a.y, b.x, b.y, 1., BLACK);
         draw_line(b.x, b.y, c.x, c.y, 1., BLACK);
         draw_line(c.x, c.y, d.x, d.y, 1., BLACK);
@@ -493,10 +544,27 @@ impl Draw for Demux {
     }
 
     fn input_positions(&self) -> Vec<Vec2> {
-        vec![
-            vec2(self.size().x / 2., self.size().y - 5.),
-            vec2(0., self.size().y / 2.),
-        ]
+        if self.sel_bits == 1 {
+            vec![
+                vec2(TILE_SIZE * 2., self.size().y),
+                vec2(0., self.size().y / 2.),
+            ]
+        } else {
+            vec![
+                vec2(2. * TILE_SIZE, self.size().y - TILE_SIZE),
+                vec2(0., self.size().y / 2.),
+            ]
+        }
+    }
+
+    fn output_positions(&self) -> Vec<Vec2> {
+        if self.sel_bits == 1 {
+            return vec![TILE_SIZE * vec2(3., 1.), TILE_SIZE * vec2(3., 3.)];
+        }
+        let n_outputs = self.outputs.len();
+        (1..=n_outputs)
+            .map(|i| TILE_SIZE * vec2(4., i as f32))
+            .collect()
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
@@ -629,7 +697,7 @@ impl Logic for Register {
 
 impl Draw for Register {
     fn size(&self) -> Vec2 {
-        Vec2::new(40., 60.)
+        TILE_SIZE * Vec2::new(4., 6.)
     }
 
     fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
@@ -644,8 +712,8 @@ impl Draw for Register {
     }
     fn input_positions(&self) -> Vec<Vec2> {
         vec![
-            Vec2::new(0., 40.), // Write Enable
-            Vec2::new(0., 20.),
+            Vec2::new(0., 4. * TILE_SIZE), // Write Enable
+            Vec2::new(0., 2. * TILE_SIZE),
         ]
     }
 
@@ -742,12 +810,12 @@ impl Logic for Input {
 
 impl Draw for Input {
     fn size(&self) -> Vec2 {
-        Vec2::new(20., 20.)
+        TILE_SIZE * Vec2::new(2., 2.)
     }
 
     fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
         let color = if self.value.any() { GREEN } else { RED };
-        draw_rectangle(pos.x, pos.y, 20., 20., color);
+        draw_rectangle(pos.x, pos.y, self.size().x, self.size().y, color);
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
@@ -832,12 +900,12 @@ impl Logic for Output {
 
 impl Draw for Output {
     fn size(&self) -> Vec2 {
-        Vec2::new(20., 20.)
+        TILE_SIZE * Vec2::new(2., 2.)
     }
 
     fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
         let color = if self.value.any() { GREEN } else { RED };
-        draw_rectangle(pos.x, pos.y, 20., 20., color);
+        draw_rectangle(pos.x, pos.y, self.size().x, self.size().y, color);
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
