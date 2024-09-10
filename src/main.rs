@@ -527,6 +527,7 @@ fn get_folder_structure() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         ("Gates", vec!["NOT", "AND", "OR"]),
         ("I/O", vec!["Input", "Output"]),
+        ("Wiring", vec!["Splitter"]),
         ("Plexers", vec!["Mux", "Demux"]),
         ("Memory", vec!["Register"]),
     ]

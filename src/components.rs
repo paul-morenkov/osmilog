@@ -981,6 +981,220 @@ pub(crate) trait Draw: Logic {
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>>;
 }
 
+#[derive(Debug, Clone)]
+struct Splitter {
+    input: Signal,        // input.len = data_bits_in
+    outputs: Vec<Signal>, // outputs[i].len = data_bits_out[i]
+    data_bits_in: u8,
+    data_bits_out: Vec<u8>,
+    mapping: Vec<usize>, // mapping.len = data_bits_in; mapping[i] = idx of outputs to send input[i]
+}
+
+impl Splitter {
+    fn new(data_bits_in: u8, data_bits_out: Vec<u8>, mapping: Vec<usize>) -> Self {
+        assert!(mapping.len() == data_bits_in as usize);
+        Self {
+            input: signal_zeros(data_bits_in),
+            outputs: data_bits_out.iter().map(|&i| signal_zeros(i)).collect(),
+            data_bits_in,
+            data_bits_out,
+            mapping,
+        }
+    }
+}
+
+impl Default for Splitter {
+    fn default() -> Self {
+        Self::new(2, vec![1, 1], vec![0, 1])
+    }
+}
+
+impl Logic for Splitter {
+    fn name(&self) -> &'static str {
+        "Splitter"
+    }
+
+    fn n_in_pins(&self) -> usize {
+        1
+    }
+
+    fn n_out_pins(&self) -> usize {
+        self.outputs.len()
+    }
+
+    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+        match px {
+            PinIndex::Input(i) => {
+                if i == 0 {
+                    &self.input
+                } else {
+                    panic!()
+                }
+            }
+            PinIndex::Output(i) => &self.outputs[i],
+        }
+    }
+
+    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+        match px {
+            PinIndex::Input(i) => {
+                if i == 0 {
+                    self.input.copy_from_bitslice(value)
+                } else {
+                    panic!()
+                }
+            }
+            PinIndex::Output(i) => self.outputs[i].copy_from_bitslice(value),
+        }
+    }
+
+    fn do_logic(&mut self) {
+        for output in &mut self.outputs {
+            output.clear();
+        }
+        for (bit, &branch) in self.mapping.iter().enumerate() {
+            self.outputs[branch].push(self.input[bit]);
+        }
+    }
+}
+
+impl Draw for Splitter {
+    fn size(&self) -> Vec2 {
+        TILE_SIZE * Vec2::new(2., self.outputs.len() as f32)
+    }
+
+    fn input_positions(&self) -> Vec<Vec2> {
+        vec![Vec2::new(0., self.size().y)]
+    }
+
+    fn output_positions(&self) -> Vec<Vec2> {
+        (0..self.outputs.len())
+            .map(|i| TILE_SIZE * vec2(2., i as f32))
+            .collect()
+    }
+
+    fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>) {
+        let (w, h) = self.size().into();
+
+        draw_line(
+            pos.x,
+            pos.y + h,
+            pos.x + TILE_SIZE,
+            pos.y + h - TILE_SIZE,
+            3.,
+            BLACK,
+        );
+        draw_line(
+            pos.x + TILE_SIZE,
+            pos.y,
+            pos.x + TILE_SIZE,
+            pos.y + h - TILE_SIZE,
+            3.,
+            BLACK,
+        );
+        for i in 0..self.outputs.len() {
+            let i = i as f32;
+            draw_line(
+                pos.x + TILE_SIZE,
+                pos.y + i * TILE_SIZE,
+                pos.x + w,
+                pos.y + i * TILE_SIZE,
+                1.,
+                BLACK,
+            );
+        }
+    }
+
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+        let mut new_comp: Option<Box<dyn Comp>> = None;
+        let n_outputs = self.outputs.len();
+
+        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+            // Data bits in
+            let mut data_bits_sel = self.data_bits_in as usize - 1;
+            ui.combo_box(hash!(), "Data Bits In", COMBO_OPTS, &mut data_bits_sel);
+            let new_data_bits = data_bits_sel as u8 + 1;
+
+            if new_data_bits != self.data_bits_in {
+                let (new_data_bits_out, new_mapping) = if new_data_bits > self.data_bits_in {
+                    // add extra width to last arm, and map all the extra bits to it.
+                    let extra = new_data_bits - self.data_bits_in;
+                    let mut data_bits_out = self.data_bits_out.clone();
+                    data_bits_out[n_outputs - 1] += extra;
+                    let mut mapping = self.mapping.clone();
+                    mapping.extend(vec![n_outputs - 1; extra as usize]);
+                    (data_bits_out, mapping)
+                } else {
+                    // truncate the mapping; recalculate data_bits_out
+                    let mapping = self.mapping[..new_data_bits as usize].to_vec();
+                    let mut data_bits_out = vec![0; self.outputs.len()];
+                    for &branch in &mapping {
+                        data_bits_out[branch] += 1;
+                    }
+                    (data_bits_out, mapping)
+                };
+                let splitter = Self::new(new_data_bits, new_data_bits_out, new_mapping);
+                new_comp = Some(Box::new(splitter));
+            };
+        });
+        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+            // Number of arms
+            let mut arms_sel = n_outputs - 1;
+            ui.combo_box(hash!(), "Number of Arms", COMBO_OPTS, &mut arms_sel);
+            let new_n_outputs = arms_sel + 1;
+
+            if new_n_outputs != n_outputs {
+                let (new_data_bits_out, new_mapping) = if new_n_outputs > n_outputs {
+                    // make additional arms empty; don't change mapping
+                    let extra = new_n_outputs - n_outputs;
+                    let mut data_bits_out = self.data_bits_out.clone();
+                    data_bits_out.extend(vec![0; extra]);
+                    (data_bits_out, self.mapping.clone())
+                } else {
+                    // truncate outputs; replace with last existing arm in mapping
+                    let mapping = self
+                        .mapping
+                        .iter()
+                        .map(|&branch| {
+                            if branch >= new_n_outputs {
+                                new_n_outputs - 1
+                            } else {
+                                branch
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    (self.data_bits_out[..new_n_outputs].to_vec(), mapping)
+                };
+                let splitter = Self::new(self.data_bits_in, new_data_bits_out, new_mapping);
+                new_comp = Some(Box::new(splitter));
+            }
+        });
+        // One combobox for each output arm
+        for i in 0..self.data_bits_in {
+            let i = i as usize;
+            Group::new(hash!("arm", i), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+                // FIXME: make the branch_sel 0-indexed (requires reworking COMBO_OPTS to include a
+                // zero)
+                let mut branch_sel = self.mapping[i];
+                ui.combo_box(
+                    hash!("combo", i),
+                    &format!("Bit {}", i),
+                    &COMBO_OPTS[..n_outputs],
+                    &mut branch_sel,
+                );
+                let new_branch = branch_sel;
+                if new_branch != self.mapping[i] {
+                    let mut splitter = self.clone();
+                    splitter.mapping[i] = new_branch;
+                    new_comp = Some(Box::new(splitter));
+                }
+            });
+        }
+
+        new_comp
+    }
+}
+
 pub(crate) trait Comp: Logic + Draw + Debug {}
 impl<T: Logic + Draw + Debug> Comp for T {}
 
@@ -994,6 +1208,7 @@ pub(crate) fn default_comp_from_name(comp_name: &str) -> Component {
         "Register" => Box::new(Register::default()),
         "Mux" => Box::new(Mux::default()),
         "Demux" => Box::new(Demux::default()),
+        "Splitter" => Box::new(Splitter::default()),
         _ => {
             panic!("Unknown component attempted to be created.")
         }
