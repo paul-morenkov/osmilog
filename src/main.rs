@@ -127,7 +127,7 @@ impl App {
         };
         // find absolute pin_pos (it is relative position out of the box)
         let pin_pos = comp.position + pin_pos;
-        draw_circle_lines(pin_pos.x, pin_pos.y, 3., 1., GREEN);
+        draw_circle_lines(pin_pos.x, pin_pos.y, 3., 1., DARKGREEN);
     }
 
     fn find_hovered_cx_and_pin(&self) -> Option<(NodeIndex, Option<PinIndex>)> {

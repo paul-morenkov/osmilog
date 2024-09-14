@@ -1073,7 +1073,7 @@ impl Draw for Splitter {
             .collect()
     }
 
-    fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>) {
+    fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
         let (w, h) = self.size().into();
 
         draw_line(
