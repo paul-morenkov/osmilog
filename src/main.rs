@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use egui::{Align2, SidePanel, Ui, Window};
+use egui_macroquad::egui::ScrollArea;
 use egui_macroquad::{egui, macroquad};
 use macroquad::prelude::*;
 use petgraph::algo::toposort;
@@ -15,8 +16,7 @@ mod components;
 
 const TILE_SIZE: f32 = 10.;
 const SANDBOX_POS: Vec2 = vec2(200., 0.);
-// TODO: make sandbox size in terms of tiles?
-const SANDBOX_SIZE: Vec2 = vec2(800., 800.);
+const SANDBOX_SIZE: Vec2 = vec2(900., 700.);
 const WINDOW_SIZE: Vec2 = vec2(1000., 800.);
 const MENU_SIZE: Vec2 = vec2(200., WINDOW_SIZE.y);
 const HOVER_RADIUS: f32 = 10.;
@@ -427,7 +427,16 @@ impl App {
     }
 }
 
-#[macroquad::main("Logisim")]
+fn macroquad_config() -> Conf {
+    Conf {
+        window_title: String::from("Logisim"),
+        window_width: (SANDBOX_POS.x + SANDBOX_SIZE.x).ceil() as i32,
+        window_height: (SANDBOX_POS.y + SANDBOX_SIZE.y).ceil() as i32,
+        ..Default::default()
+    }
+}
+
+#[macroquad::main(macroquad_config)]
 async fn main() {
     let mut app = App::new().await;
 
@@ -456,36 +465,46 @@ async fn main() {
             Window::new("Logisim")
                 .movable(false)
                 .collapsible(false)
-                // .fixed_size((MENU_SIZE.x, MENU_SIZE.y))
+                .fixed_size((SANDBOX_POS.x, SANDBOX_SIZE.y - 50.))
                 .anchor(Align2::LEFT_TOP, egui::Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.set_height(SANDBOX_SIZE.y);
-                    ui.set_width(SANDBOX_POS.x);
-                    ui.vertical(|ui| {
-                        ui.set_height(300.);
-                        ui.heading("Components");
-                        for (folder, comp_names) in &folder_structure {
-                            ui.collapsing(*folder, |ui| {
-                                for &comp_name in comp_names {
-                                    if ui.button(comp_name).clicked() {
-                                        selected_menu_comp_name = Some(comp_name);
-                                        let new_comp =
-                                            components::default_comp_from_name(comp_name);
-                                        let new_cx = app.graph.add_node(new_comp);
-                                        app.action_state = ActionState::HoldingComponent(new_cx);
+                    ui.set_min_height(SANDBOX_SIZE.y -  50.);
+                    ScrollArea::vertical()
+                        .id_source("Components")
+                        .min_scrolled_height(300.)
+                        .max_height(400.)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.heading("Components");
+                            for (folder, comp_names) in &folder_structure {
+                                ui.collapsing(*folder, |ui| {
+                                    for &comp_name in comp_names {
+                                        if ui.button(comp_name).clicked() {
+                                            selected_menu_comp_name = Some(comp_name);
+                                            let new_comp =
+                                                components::default_comp_from_name(comp_name);
+                                            let new_cx = app.graph.add_node(new_comp);
+                                            app.action_state =
+                                                ActionState::HoldingComponent(new_cx);
+                                        }
                                     }
-                                }
-                            });
-                        }
+                                });
+                            }
 
-                        // ui.label(format!("{:?}", &app.action_state));
-                    });
+                            ui.label(format!("{:?}", mouse_position()));
+                        });
                     ui.separator();
-                    ui.vertical(|ui| {
-                        ui.set_height(200.);
-                        ui.heading("Properties");
-                        app.get_properties_ui(ui);
-                    });
+                    ScrollArea::vertical()
+                        .id_source("Properties")
+                        .min_scrolled_height(300.)
+                        .max_height(300.)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.set_min_height(300.);
+                            ui.heading("Properties");
+                            app.get_properties_ui(ui);
+                        });
+                    // ui.set_width(SANDBOX_POS.x);
                 });
         });
         egui_macroquad::draw();

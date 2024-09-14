@@ -1,17 +1,16 @@
 use bitvec::prelude::*;
 use egui_macroquad::{
-    egui::{self, ComboBox},
+    egui::{ComboBox, Ui},
     macroquad,
 };
 use macroquad::prelude::*;
-// use macroquad::ui::widgets::Group;
-// use macroquad::ui::{hash, Ui};
-use egui::Ui;
 use std::collections::HashMap;
 
 use std::fmt::Debug;
 
-use crate::{MENU_SIZE, TILE_SIZE};
+use crate::TILE_SIZE;
+
+const COMBO_WIDTH: f32 = 50.;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PinIndex {
@@ -177,11 +176,6 @@ impl Logic for Gate {
     }
 }
 
-const COMBO_OPTS: &[&str] = &[
-    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
-    "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32",
-];
-
 impl Draw for Gate {
     fn size(&self) -> Vec2 {
         self.tex_info().size
@@ -203,7 +197,12 @@ impl Draw for Gate {
         }
     }
     fn bboxes(&self) -> Vec<Rect> {
-        let mut bboxes = vec![Rect::new(0., 0., self.size().x, self.size().y)];
+        let mut bboxes = vec![Rect::new(
+            -TILE_SIZE,
+            -TILE_SIZE,
+            self.size().x + 2. * TILE_SIZE,
+            self.size().y + 2. * TILE_SIZE,
+        )];
         if self.n_inputs > 2 {
             let y_offset = (self.n_inputs as f32 - 1.) / 2. * 20.;
             bboxes.push(Rect::new(
@@ -279,6 +278,7 @@ impl Draw for Gate {
         if !matches!(self.kind, GateKind::Not) {
             let mut n_inputs = self.n_inputs;
             ComboBox::from_label("Inputs")
+                .width(COMBO_WIDTH)
                 .selected_text(format!("{}", n_inputs))
                 .show_ui(ui, |ui| {
                     for i in 1..=10 {
@@ -461,6 +461,7 @@ impl Draw for Mux {
         // });
         let mut data_bits = self.data_bits;
         ComboBox::from_label("Data Bits")
+            .width(COMBO_WIDTH)
             .selected_text(format!("{}", data_bits))
             .show_ui(ui, |ui| {
                 for i in 1..=32 {
@@ -483,6 +484,7 @@ impl Draw for Mux {
         // });
         let mut select_bits = self.sel_bits;
         ComboBox::from_label("Select Bits")
+            .width(COMBO_WIDTH)
             .selected_text(format!("{select_bits}"))
             .show_ui(ui, |ui| {
                 for i in 1..=6 {
@@ -638,6 +640,7 @@ impl Draw for Demux {
 
         let mut data_bits = self.data_bits;
         ComboBox::from_label("Data Bits")
+            .width(COMBO_WIDTH)
             .selected_text(format!("{}", data_bits))
             .show_ui(ui, |ui| {
                 for i in 1..=32 {
@@ -666,6 +669,7 @@ impl Draw for Demux {
 
         let mut select_bits = self.sel_bits;
         ComboBox::from_label("Select Bits")
+            .width(COMBO_WIDTH)
             .selected_text(format!("{select_bits}"))
             .show_ui(ui, |ui| {
                 for i in 1..=6 {
@@ -811,6 +815,7 @@ impl Draw for Register {
         //     });
         let mut data_bits = self.data_bits;
         ComboBox::from_label("Data Bits")
+            .width(COMBO_WIDTH)
             .selected_text(format!("{}", data_bits))
             .show_ui(ui, |ui| {
                 for i in 1..=32 {
@@ -925,6 +930,7 @@ impl Draw for Input {
         //     });
         let mut data_bits = self.data_bits;
         ComboBox::from_label("Data Bits")
+            .width(COMBO_WIDTH)
             .selected_text(format!("{}", data_bits))
             .show_ui(ui, |ui| {
                 for i in 1..=32 {
@@ -1027,6 +1033,7 @@ impl Draw for Output {
         //     });
         let mut data_bits = self.data_bits;
         ComboBox::from_label("Data Bits")
+            .width(COMBO_WIDTH)
             .selected_text(format!("{}", data_bits))
             .show_ui(ui, |ui| {
                 for i in 1..=32 {
@@ -1053,7 +1060,12 @@ pub(crate) trait Draw: Logic {
     fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>);
     fn bboxes(&self) -> Vec<Rect> {
         // Return bounding boxes for this component, located relative to its position
-        vec![Rect::new(0., 0., self.size().x, self.size().y)]
+        vec![Rect::new(
+            -TILE_SIZE,
+            -TILE_SIZE,
+            self.size().x + 2. * TILE_SIZE,
+            self.size().y + 2. * TILE_SIZE,
+        )]
     }
     fn input_positions(&self) -> Vec<Vec2> {
         let n_inputs = self.n_in_pins();
@@ -1222,40 +1234,10 @@ impl Draw for Splitter {
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        //     let mut new_comp: Option<Box<dyn Comp>> = None;
-        //     let n_outputs = self.outputs.len();
-        //
-        //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-        //         // Data bits in
-        //         let mut data_bits_sel = self.data_bits_in as usize - 1;
-        //         ui.combo_box(hash!(), "Data Bits In", COMBO_OPTS, &mut data_bits_sel);
-        //         let new_data_bits = data_bits_sel as u8 + 1;
-        //
-        //         if new_data_bits != self.data_bits_in {
-        //             let (new_data_bits_out, new_mapping) = if new_data_bits > self.data_bits_in {
-        //                 // add extra width to last arm, and map all the extra bits to it.
-        //                 let extra = new_data_bits - self.data_bits_in;
-        //                 let mut data_bits_out = self.data_bits_out.clone();
-        //                 data_bits_out[n_outputs - 1] += extra;
-        //                 let mut mapping = self.mapping.clone();
-        //                 mapping.extend(vec![n_outputs - 1; extra as usize]);
-        //                 (data_bits_out, mapping)
-        //             } else {
-        //                 // truncate the mapping; recalculate data_bits_out
-        //                 let mapping = self.mapping[..new_data_bits as usize].to_vec();
-        //                 let mut data_bits_out = vec![0; self.outputs.len()];
-        //                 for &branch in &mapping {
-        //                     data_bits_out[branch] += 1;
-        //                 }
-        //                 (data_bits_out, mapping)
-        //             };
-        //             let splitter = Self::new(new_data_bits, new_data_bits_out, new_mapping);
-        //             new_comp = Some(Box::new(splitter));
-        //         };
-        //     });
         let mut data_bits_in = self.data_bits_in;
         let n_outputs = self.outputs.len();
         ComboBox::from_label("Data Bits In")
+            .width(COMBO_WIDTH)
             .selected_text(format!("{}", data_bits_in))
             .show_ui(ui, |ui| {
                 for i in 1..=32 {
@@ -1287,46 +1269,17 @@ impl Draw for Splitter {
                 new_mapping,
             )));
         }
-        //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-        //         // Number of arms
-        //         let mut arms_sel = n_outputs - 1;
-        //         ui.combo_box(hash!(), "Number of Arms", COMBO_OPTS, &mut arms_sel);
-        //         let new_n_outputs = arms_sel + 1;
-        //
-        //         if new_n_outputs != n_outputs {
-        //             let (new_data_bits_out, new_mapping) = if new_n_outputs > n_outputs {
-        //                 // make additional arms empty; don't change mapping
-        //                 let extra = new_n_outputs - n_outputs;
-        //                 let mut data_bits_out = self.data_bits_out.clone();
-        //                 data_bits_out.extend(vec![0; extra]);
-        //                 (data_bits_out, self.mapping.clone())
-        //             } else {
-        //                 // truncate outputs; replace with last existing arm in mapping
-        //                 let mapping = self
-        //                     .mapping
-        //                     .iter()
-        //                     .map(|&branch| {
-        //                         if branch >= new_n_outputs {
-        //                             new_n_outputs - 1
-        //                         } else {
-        //                             branch
-        //                         }
-        //                     })
-        //                     .collect::<Vec<_>>();
-        //                 (self.data_bits_out[..new_n_outputs].to_vec(), mapping)
-        //             };
-        //             let splitter = Self::new(self.data_bits_in, new_data_bits_out, new_mapping);
-        //             new_comp = Some(Box::new(splitter));
-        //         }
-        //     });
+
         let mut new_n_outputs = self.outputs.len();
         ComboBox::from_label("Number of Arms")
+            .width(COMBO_WIDTH)
             .selected_text(format!("{new_n_outputs}"))
             .show_ui(ui, |ui| {
                 for i in 1..=32 {
                     ui.selectable_value(&mut new_n_outputs, i, format!("{i}"));
                 }
             });
+
         if new_n_outputs != n_outputs {
             let (new_data_bits_out, new_mapping) = if new_n_outputs > n_outputs {
                 // make additional arms empty; don't change mapping
@@ -1355,31 +1308,13 @@ impl Draw for Splitter {
                 new_mapping,
             )));
         }
-        //     // One combobox for each output arm
-        //     for i in 0..self.data_bits_in {
-        //         let i = i as usize;
-        //         Group::new(hash!("arm", i), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-        //             // FIXME: make the branch_sel 0-indexed (requires reworking COMBO_OPTS to include a
-        //             // zero)
-        //             let mut branch_sel = self.mapping[i];
-        //             ui.combo_box(
-        //                 hash!("combo", i),
-        //                 &format!("Bit {}", i),
-        //                 &COMBO_OPTS[..n_outputs],
-        //                 &mut branch_sel,
-        //             );
-        //             let new_branch = branch_sel;
-        //             if new_branch != self.mapping[i] {
-        //                 let mut splitter = self.clone();
-        //                 splitter.mapping[i] = new_branch;
-        //                 new_comp = Some(Box::new(splitter));
-        //             }
-        //         });
-        //     }
+        ui.separator();
         for bit in 0..self.data_bits_in as usize {
             let arm = self.mapping[bit];
             let mut new_arm = arm;
             ComboBox::from_label(format!("Bit {}", bit))
+                .width(COMBO_WIDTH)
+                .width(50.)
                 .selected_text(format!("{}", new_arm))
                 .show_ui(ui, |ui| {
                     for i in 0..n_outputs {
