@@ -1,14 +1,12 @@
 use std::collections::HashMap;
 
-use egui::Ui;
-use egui_macroquad::egui::Align2;
+use egui::{Align2, SidePanel, Ui, Window};
 use egui_macroquad::{egui, macroquad};
 use macroquad::prelude::*;
-use macroquad::ui::Skin;
 use petgraph::algo::toposort;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
 use petgraph::visit::{EdgeFiltered, EdgeRef};
-use petgraph::Direction::Incoming;
+use petgraph::Direction;
 use std::fmt::Debug;
 
 use components::{signal_zeros, Component, PinIndex, Signal};
@@ -197,7 +195,7 @@ impl App {
         // Check that the input pin is not already occupied
         if self
             .graph
-            .edges_directed(cx_b, Incoming)
+            .edges_directed(cx_b, Direction::Incoming)
             .any(|e| e.weight().end_pin == pin_b)
         {
             return false;
@@ -261,34 +259,29 @@ impl App {
     }
 
     fn get_properties_ui(&mut self, ui: &mut Ui) {
-        if let ActionState::SelectingComponent(cx) = self.action_state {
+        if let ActionState::SelectingComponent(cx) | ActionState::MovingComponent(cx) =
+            self.action_state
+        {
             let comp = &mut self.graph[cx];
-            // Properties UI always starts with name of the component.
-            // Group::new(hash!(), vec2(MENU_SIZE.x, 30.))
-            //     .position(Vec2::ZERO)
-            //     .ui(ui, |ui| {
-            //         ui.label(vec2(0., 0.), "ID");
-            //         ui.label(vec2(50., 0.), comp.kind.name());
-            //     });
             ui.label(comp.kind.name());
-            // let new_comp = comp.draw_properties_ui(ui);
-            // if let Some(new_comp) = new_comp {
-            //     self.graph[cx] = Component::new(new_comp, self.graph[cx].position);
-            //     // remove all wires connected to this component
-            //     let wxs_to_remove = self
-            //         .graph
-            //         .edges_directed(cx, Direction::Outgoing)
-            //         .map(|e| e.id())
-            //         .chain(
-            //             self.graph
-            //                 .edges_directed(cx, Direction::Incoming)
-            //                 .map(|e| e.id()),
-            //         )
-            //         .collect::<Vec<_>>();
-            //     for wx in wxs_to_remove {
-            //         self.graph.remove_edge(wx);
-            //     }
-            // }
+            let new_comp = comp.draw_properties_ui(ui);
+            if let Some(new_comp) = new_comp {
+                self.graph[cx] = Component::new(new_comp, self.graph[cx].position);
+                // remove all wires connected to this component
+                let wxs_to_remove = self
+                    .graph
+                    .edges_directed(cx, Direction::Outgoing)
+                    .map(|e| e.id())
+                    .chain(
+                        self.graph
+                            .edges_directed(cx, Direction::Incoming)
+                            .map(|e| e.id()),
+                    )
+                    .collect::<Vec<_>>();
+                for wx in wxs_to_remove {
+                    self.graph.remove_edge(wx);
+                }
+            }
         }
     }
 
@@ -460,31 +453,40 @@ async fn main() {
         app.update(&mut selected_menu_comp_name);
         // egui ui
         egui_macroquad::ui(|ctx| {
-            egui::Window::new("Components")
+            Window::new("Logisim")
                 .movable(false)
                 .collapsible(false)
+                // .fixed_size((MENU_SIZE.x, MENU_SIZE.y))
                 .anchor(Align2::LEFT_TOP, egui::Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.label("hello world");
-                    for (folder, comp_names) in &folder_structure {
-                        ui.collapsing(*folder, |ui| {
-                            for &comp_name in comp_names {
-                                if ui.button(comp_name).clicked() {
-                                    selected_menu_comp_name = Some(comp_name);
-                                    let new_comp = components::default_comp_from_name(comp_name);
-                                    let new_cx = app.graph.add_node(new_comp);
-                                    app.action_state = ActionState::HoldingComponent(new_cx);
+                    ui.set_height(SANDBOX_SIZE.y);
+                    ui.set_width(SANDBOX_POS.x);
+                    ui.vertical(|ui| {
+                        ui.set_height(300.);
+                        ui.heading("Components");
+                        for (folder, comp_names) in &folder_structure {
+                            ui.collapsing(*folder, |ui| {
+                                for &comp_name in comp_names {
+                                    if ui.button(comp_name).clicked() {
+                                        selected_menu_comp_name = Some(comp_name);
+                                        let new_comp =
+                                            components::default_comp_from_name(comp_name);
+                                        let new_cx = app.graph.add_node(new_comp);
+                                        app.action_state = ActionState::HoldingComponent(new_cx);
+                                    }
                                 }
-                            }
-                        });
-                    }
-                });
+                            });
+                        }
 
-            egui::Window::new("Properties")
-                .movable(false)
-                .collapsible(false)
-                .anchor(Align2::LEFT_BOTTOM, egui::Vec2::ZERO)
-                .show(ctx, |ui| app.get_properties_ui(ui));
+                        // ui.label(format!("{:?}", &app.action_state));
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.set_height(200.);
+                        ui.heading("Properties");
+                        app.get_properties_ui(ui);
+                    });
+                });
         });
         egui_macroquad::draw();
 

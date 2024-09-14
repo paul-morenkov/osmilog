@@ -4,7 +4,7 @@ use egui_macroquad::{
     macroquad,
 };
 use macroquad::prelude::*;
-use macroquad::ui::widgets::Group;
+// use macroquad::ui::widgets::Group;
 // use macroquad::ui::{hash, Ui};
 use egui::Ui;
 use std::collections::HashMap;
@@ -276,8 +276,8 @@ impl Draw for Gate {
         //         new_comp = Some(Box::new(gate));
         //     };
         // });
-        let mut n_inputs = self.n_inputs;
         if !matches!(self.kind, GateKind::Not) {
+            let mut n_inputs = self.n_inputs;
             ComboBox::from_label("Inputs")
                 .selected_text(format!("{}", n_inputs))
                 .show_ui(ui, |ui| {
@@ -447,7 +447,6 @@ impl Draw for Mux {
         input_positions
     }
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        todo!();
         // let mut new_comp: Option<Box<dyn Comp>> = None;
         // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
         //     // Data bits
@@ -460,7 +459,18 @@ impl Draw for Mux {
         //         new_comp = Some(Box::new(mux));
         //     };
         // });
-        //
+        let mut data_bits = self.data_bits;
+        ComboBox::from_label("Data Bits")
+            .selected_text(format!("{}", data_bits))
+            .show_ui(ui, |ui| {
+                for i in 1..=32 {
+                    ui.selectable_value(&mut data_bits, i, format!("{i}"));
+                }
+            });
+
+        if data_bits != self.data_bits {
+            return Some(Box::new(Self::new(self.sel_bits, data_bits)));
+        }
         // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
         //     // Selection bits
         //     let mut sel_bits_sel = self.sel_bits as usize - 1;
@@ -471,8 +481,19 @@ impl Draw for Mux {
         //         new_comp = Some(Box::new(mux));
         //     }
         // });
-        //
+        let mut select_bits = self.sel_bits;
+        ComboBox::from_label("Select Bits")
+            .selected_text(format!("{select_bits}"))
+            .show_ui(ui, |ui| {
+                for i in 1..=6 {
+                    ui.selectable_value(&mut select_bits, i, format!("{i}"));
+                }
+            });
+        if select_bits != self.sel_bits {
+            return Some(Box::new(Self::new(select_bits, self.data_bits)));
+        }
         // new_comp
+        None
     }
 }
 
@@ -602,7 +623,6 @@ impl Draw for Demux {
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        todo!();
         // let mut new_comp: Option<Box<dyn Comp>> = None;
         // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
         //     // Data bits
@@ -615,7 +635,19 @@ impl Draw for Demux {
         //         new_comp = Some(Box::new(demux));
         //     };
         // });
-        //
+
+        let mut data_bits = self.data_bits;
+        ComboBox::from_label("Data Bits")
+            .selected_text(format!("{}", data_bits))
+            .show_ui(ui, |ui| {
+                for i in 1..=32 {
+                    ui.selectable_value(&mut data_bits, i, format!("{i}"));
+                }
+            });
+
+        if data_bits != self.data_bits {
+            return Some(Box::new(Self::new(self.sel_bits, data_bits)));
+        }
         // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
         //     // Selection bits
         //     let mut sel_bits_sel = self.sel_bits as usize - 1;
@@ -631,7 +663,19 @@ impl Draw for Demux {
         //         new_comp = Some(Box::new(mux));
         //     }
         // });
-        //
+
+        let mut select_bits = self.sel_bits;
+        ComboBox::from_label("Select Bits")
+            .selected_text(format!("{select_bits}"))
+            .show_ui(ui, |ui| {
+                for i in 1..=6 {
+                    ui.selectable_value(&mut select_bits, i, format!("{i}"));
+                }
+            });
+        if select_bits != self.sel_bits {
+            return Some(Box::new(Self::new(select_bits, self.data_bits)));
+        }
+        None
         // new_comp
     }
 }
@@ -753,7 +797,6 @@ impl Draw for Register {
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        todo!()
         //     let mut new_comp: Option<Box<dyn Comp>> = None;
         //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
         //         // Data bits
@@ -766,6 +809,19 @@ impl Draw for Register {
         //             new_comp = Some(Box::new(reg));
         //         };
         //     });
+        let mut data_bits = self.data_bits;
+        ComboBox::from_label("Data Bits")
+            .selected_text(format!("{}", data_bits))
+            .show_ui(ui, |ui| {
+                for i in 1..=32 {
+                    ui.selectable_value(&mut data_bits, i, format!("{i}"));
+                }
+            });
+
+        if data_bits != self.data_bits {
+            return Some(Box::new(Self::new(data_bits)));
+        }
+        None
         //     new_comp
     }
 }
@@ -855,7 +911,6 @@ impl Draw for Input {
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        todo!();
         //     let mut new_comp: Option<Box<dyn Comp>> = None;
         //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
         //         // Data bits
@@ -868,7 +923,19 @@ impl Draw for Input {
         //             new_comp = Some(Box::new(input));
         //         };
         //     });
-        //
+        let mut data_bits = self.data_bits;
+        ComboBox::from_label("Data Bits")
+            .selected_text(format!("{}", data_bits))
+            .show_ui(ui, |ui| {
+                for i in 1..=32 {
+                    ui.selectable_value(&mut data_bits, i, format!("{i}"));
+                }
+            });
+
+        if data_bits != self.data_bits {
+            return Some(Box::new(Self::new(data_bits)));
+        }
+        None
         //     new_comp
     }
 }
@@ -946,7 +1013,6 @@ impl Draw for Output {
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        todo!();
         //     let mut new_comp: Option<Box<dyn Comp>> = None;
         //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
         //         // Data bits
@@ -959,7 +1025,19 @@ impl Draw for Output {
         //             new_comp = Some(Box::new(output));
         //         };
         //     });
-        //
+        let mut data_bits = self.data_bits;
+        ComboBox::from_label("Data Bits")
+            .selected_text(format!("{}", data_bits))
+            .show_ui(ui, |ui| {
+                for i in 1..=32 {
+                    ui.selectable_value(&mut data_bits, i, format!("{i}"));
+                }
+            });
+
+        if data_bits != self.data_bits {
+            return Some(Box::new(Self::new(data_bits)));
+        }
+        None
         //     new_comp
     }
 }
@@ -1144,7 +1222,6 @@ impl Draw for Splitter {
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        todo!();
         //     let mut new_comp: Option<Box<dyn Comp>> = None;
         //     let n_outputs = self.outputs.len();
         //
@@ -1176,6 +1253,40 @@ impl Draw for Splitter {
         //             new_comp = Some(Box::new(splitter));
         //         };
         //     });
+        let mut data_bits_in = self.data_bits_in;
+        let n_outputs = self.outputs.len();
+        ComboBox::from_label("Data Bits In")
+            .selected_text(format!("{}", data_bits_in))
+            .show_ui(ui, |ui| {
+                for i in 1..=32 {
+                    ui.selectable_value(&mut data_bits_in, i, format!("{i}"));
+                }
+            });
+
+        if data_bits_in != self.data_bits_in {
+            let (new_data_bits_out, new_mapping) = if data_bits_in > self.data_bits_in {
+                // add extra width to last arm, and map all the extra bits to it.
+                let extra = data_bits_in - self.data_bits_in;
+                let mut data_bits_out = self.data_bits_out.clone();
+                data_bits_out[n_outputs - 1] += extra;
+                let mut mapping = self.mapping.clone();
+                mapping.extend(vec![n_outputs - 1; extra as usize]);
+                (data_bits_out, mapping)
+            } else {
+                // truncate the mapping; recalculate data_bits_out
+                let mapping = self.mapping[..data_bits_in as usize].to_vec();
+                let mut data_bits_out = vec![0; self.outputs.len()];
+                for &branch in &mapping {
+                    data_bits_out[branch] += 1;
+                }
+                (data_bits_out, mapping)
+            };
+            return Some(Box::new(Self::new(
+                data_bits_in,
+                new_data_bits_out,
+                new_mapping,
+            )));
+        }
         //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
         //         // Number of arms
         //         let mut arms_sel = n_outputs - 1;
@@ -1208,6 +1319,42 @@ impl Draw for Splitter {
         //             new_comp = Some(Box::new(splitter));
         //         }
         //     });
+        let mut new_n_outputs = self.outputs.len();
+        ComboBox::from_label("Number of Arms")
+            .selected_text(format!("{new_n_outputs}"))
+            .show_ui(ui, |ui| {
+                for i in 1..=32 {
+                    ui.selectable_value(&mut new_n_outputs, i, format!("{i}"));
+                }
+            });
+        if new_n_outputs != n_outputs {
+            let (new_data_bits_out, new_mapping) = if new_n_outputs > n_outputs {
+                // make additional arms empty; don't change mapping
+                let extra = new_n_outputs - n_outputs;
+                let mut data_bits_out = self.data_bits_out.clone();
+                data_bits_out.extend(vec![0; extra]);
+                (data_bits_out, self.mapping.clone())
+            } else {
+                // truncate outputs; replace with last existing arm in mapping
+                let mapping = self
+                    .mapping
+                    .iter()
+                    .map(|&branch| {
+                        if branch >= new_n_outputs {
+                            new_n_outputs - 1
+                        } else {
+                            branch
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                (self.data_bits_out[..new_n_outputs].to_vec(), mapping)
+            };
+            return Some(Box::new(Self::new(
+                self.data_bits_in,
+                new_data_bits_out,
+                new_mapping,
+            )));
+        }
         //     // One combobox for each output arm
         //     for i in 0..self.data_bits_in {
         //         let i = i as usize;
@@ -1229,8 +1376,26 @@ impl Draw for Splitter {
         //             }
         //         });
         //     }
+        for bit in 0..self.data_bits_in as usize {
+            let arm = self.mapping[bit];
+            let mut new_arm = arm;
+            ComboBox::from_label(format!("Bit {}", bit))
+                .selected_text(format!("{}", new_arm))
+                .show_ui(ui, |ui| {
+                    for i in 0..n_outputs {
+                        ui.selectable_value(&mut new_arm, i, format!("{i}"));
+                    }
+                });
+
+            if new_arm != arm {
+                let mut splitter = self.clone();
+                splitter.mapping[bit] = new_arm;
+                return Some(Box::new(splitter));
+            }
+        }
         //
         // new_comp
+        None
     }
 }
 
