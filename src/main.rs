@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
+use egui::Ui;
+use egui_macroquad::egui::Align2;
+use egui_macroquad::{egui, macroquad};
 use macroquad::prelude::*;
-use macroquad::ui::widgets::{Button, Group, TreeNode, Window};
-use macroquad::ui::{hash, root_ui, Skin, Ui};
-
+use macroquad::ui::Skin;
 use petgraph::algo::toposort;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
 use petgraph::visit::{EdgeFiltered, EdgeRef};
-use petgraph::Direction::{self, Incoming};
+use petgraph::Direction::Incoming;
 use std::fmt::Debug;
 
 use components::{signal_zeros, Component, PinIndex, Signal};
@@ -263,30 +264,31 @@ impl App {
         if let ActionState::SelectingComponent(cx) = self.action_state {
             let comp = &mut self.graph[cx];
             // Properties UI always starts with name of the component.
-            Group::new(hash!(), vec2(MENU_SIZE.x, 30.))
-                .position(Vec2::ZERO)
-                .ui(ui, |ui| {
-                    ui.label(vec2(0., 0.), "ID");
-                    ui.label(vec2(50., 0.), comp.kind.name());
-                });
-            let new_comp = comp.draw_properties_ui(ui);
-            if let Some(new_comp) = new_comp {
-                self.graph[cx] = Component::new(new_comp, self.graph[cx].position);
-                // remove all wires connected to this component
-                let wxs_to_remove = self
-                    .graph
-                    .edges_directed(cx, Direction::Outgoing)
-                    .map(|e| e.id())
-                    .chain(
-                        self.graph
-                            .edges_directed(cx, Direction::Incoming)
-                            .map(|e| e.id()),
-                    )
-                    .collect::<Vec<_>>();
-                for wx in wxs_to_remove {
-                    self.graph.remove_edge(wx);
-                }
-            }
+            // Group::new(hash!(), vec2(MENU_SIZE.x, 30.))
+            //     .position(Vec2::ZERO)
+            //     .ui(ui, |ui| {
+            //         ui.label(vec2(0., 0.), "ID");
+            //         ui.label(vec2(50., 0.), comp.kind.name());
+            //     });
+            ui.label(comp.kind.name());
+            // let new_comp = comp.draw_properties_ui(ui);
+            // if let Some(new_comp) = new_comp {
+            //     self.graph[cx] = Component::new(new_comp, self.graph[cx].position);
+            //     // remove all wires connected to this component
+            //     let wxs_to_remove = self
+            //         .graph
+            //         .edges_directed(cx, Direction::Outgoing)
+            //         .map(|e| e.id())
+            //         .chain(
+            //             self.graph
+            //                 .edges_directed(cx, Direction::Incoming)
+            //                 .map(|e| e.id()),
+            //         )
+            //         .collect::<Vec<_>>();
+            //     for wx in wxs_to_remove {
+            //         self.graph.remove_edge(wx);
+            //     }
+            // }
         }
     }
 
@@ -432,31 +434,9 @@ impl App {
     }
 }
 
-fn create_skin() -> Skin {
-    let window_style = root_ui()
-        .style_builder()
-        .background(Image {
-            width: 3,
-            height: 3,
-            bytes: vec![
-                68, 68, 68, 255, 68, 68, 68, 255, 68, 68, 68, 255, 68, 68, 68, 255, 238, 238, 238,
-                255, 68, 68, 68, 255, 68, 68, 68, 255, 68, 68, 68, 255, 68, 68, 68, 255,
-            ],
-        })
-        .color_inactive(Color::from_rgba(255, 255, 255, 255))
-        .background_margin(RectOffset::new(1., 1., 1., 1.))
-        .build();
-    Skin {
-        window_style,
-        ..root_ui().default_skin()
-    }
-}
-
 #[macroquad::main("Logisim")]
 async fn main() {
     let mut app = App::new().await;
-    let skin = create_skin();
-    root_ui().push_skin(&skin);
 
     let folder_structure = get_folder_structure();
     let mut selected_menu_comp_name = None;
@@ -465,43 +445,8 @@ async fn main() {
         clear_background(WHITE);
         set_default_camera();
         // Draw Left-Side Menu
-        Window::new(hash!("left-menu"), Vec2::ZERO, MENU_SIZE)
-            .label("Components")
-            .titlebar(true)
-            .movable(false)
-            .ui(&mut root_ui(), |ui| {
-                // Draw Components menu
-                Group::new(hash!("components"), vec2(MENU_SIZE.x, MENU_SIZE.y / 2.))
-                    .position(Vec2::ZERO)
-                    .ui(ui, |ui| {
-                        for (folder, comp_names) in &folder_structure {
-                            TreeNode::new(hash!(*folder), *folder)
-                                .init_unfolded()
-                                .ui(ui, |ui| {
-                                    for &comp_name in comp_names {
-                                        if Button::new(comp_name)
-                                            .selected(selected_menu_comp_name == Some(comp_name))
-                                            .ui(ui)
-                                        {
-                                            // track selection in menu UI
-                                            selected_menu_comp_name = Some(comp_name);
-                                            // create component for App
-                                            let new_comp =
-                                                components::default_comp_from_name(comp_name);
-                                            let new_cx = app.graph.add_node(new_comp);
-                                            app.action_state =
-                                                ActionState::HoldingComponent(new_cx);
-                                        };
-                                    }
-                                });
-                        }
-                    });
-                Group::new(hash!("properties"), vec2(MENU_SIZE.x, MENU_SIZE.y / 2.))
-                    .position(vec2(0., MENU_SIZE.y / 2.))
-                    .ui(ui, |ui| {
-                        app.get_properties_ui(ui);
-                    });
-            });
+        // egui-macroquad ui
+
         // Draw circuit sandbox area
         draw_rectangle(
             SANDBOX_POS.x,
@@ -513,6 +458,35 @@ async fn main() {
         app.draw_grid();
         // Draw in sandbox area
         app.update(&mut selected_menu_comp_name);
+        // egui ui
+        egui_macroquad::ui(|ctx| {
+            egui::Window::new("Components")
+                .movable(false)
+                .collapsible(false)
+                .anchor(Align2::LEFT_TOP, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("hello world");
+                    for (folder, comp_names) in &folder_structure {
+                        ui.collapsing(*folder, |ui| {
+                            for &comp_name in comp_names {
+                                if ui.button(comp_name).clicked() {
+                                    selected_menu_comp_name = Some(comp_name);
+                                    let new_comp = components::default_comp_from_name(comp_name);
+                                    let new_cx = app.graph.add_node(new_comp);
+                                    app.action_state = ActionState::HoldingComponent(new_cx);
+                                }
+                            }
+                        });
+                    }
+                });
+
+            egui::Window::new("Properties")
+                .movable(false)
+                .collapsible(false)
+                .anchor(Align2::LEFT_BOTTOM, egui::Vec2::ZERO)
+                .show(ctx, |ui| app.get_properties_ui(ui));
+        });
+        egui_macroquad::draw();
 
         next_frame().await;
     }

@@ -1,7 +1,12 @@
 use bitvec::prelude::*;
+use egui_macroquad::{
+    egui::{self, ComboBox},
+    macroquad,
+};
 use macroquad::prelude::*;
 use macroquad::ui::widgets::Group;
-use macroquad::ui::{hash, Ui};
+// use macroquad::ui::{hash, Ui};
+use egui::Ui;
 use std::collections::HashMap;
 
 use std::fmt::Debug;
@@ -246,31 +251,59 @@ impl Draw for Gate {
         vec![vec2(tex_info.size.x, tex_info.size.y / 2.)]
     }
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        let mut new_comp: Option<Box<dyn Comp>> = None;
-        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-            // Data bits
-            let mut data_bits_sel = self.data_bits as usize - 1;
-            ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
-            let new_data_bits = data_bits_sel as u8 + 1;
-
-            if new_data_bits != self.data_bits {
-                let gate = Self::new(self.kind, new_data_bits, self.n_inputs);
-                new_comp = Some(Box::new(gate));
-            };
-        });
-        if !matches!(self.kind, GateKind::Not) {
-            // Number of inputs
-            Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-                let mut n_inputs_sel = self.n_inputs - 2;
-                ui.combo_box(hash!(), "Inputs", &COMBO_OPTS[1..11], &mut n_inputs_sel);
-                let new_n_inputs = n_inputs_sel + 2;
-                if new_n_inputs != self.n_inputs {
-                    let gate = Self::new(self.kind, self.data_bits, new_n_inputs);
-                    new_comp = Some(Box::new(gate));
+        // let mut new_comp: Option<Box<dyn Comp>> = None;
+        let mut data_bits = self.data_bits;
+        ComboBox::from_label("Data Bits")
+            .selected_text(format!("{}", data_bits))
+            .show_ui(ui, |ui| {
+                for i in 1..=32 {
+                    ui.selectable_value(&mut data_bits, i, format!("{i}"));
                 }
             });
+
+        if data_bits != self.data_bits {
+            return Some(Box::new(Self::new(self.kind, data_bits, self.n_inputs)));
         }
-        new_comp
+
+        // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+        //     // Data bits
+        //     let mut data_bits_sel = self.data_bits as usize - 1;
+        //     ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
+        //     let new_data_bits = data_bits_sel as u8 + 1;
+        //
+        //     if new_data_bits != self.data_bits {
+        //         let gate = Self::new(self.kind, new_data_bits, self.n_inputs);
+        //         new_comp = Some(Box::new(gate));
+        //     };
+        // });
+        let mut n_inputs = self.n_inputs;
+        if !matches!(self.kind, GateKind::Not) {
+            ComboBox::from_label("Inputs")
+                .selected_text(format!("{}", n_inputs))
+                .show_ui(ui, |ui| {
+                    for i in 1..=10 {
+                        ui.selectable_value(&mut n_inputs, i, format!("{i}"));
+                    }
+                });
+            if n_inputs != self.n_inputs {
+                return Some(Box::new(Self::new(self.kind, self.data_bits, n_inputs)));
+            }
+        }
+
+        // if !matches!(self.kind, GateKind::Not) {
+        //     // Number of inputs
+        //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+        //         let mut n_inputs_sel = self.n_inputs - 2;
+        //         ui.combo_box(hash!(), "Inputs", &COMBO_OPTS[1..11], &mut n_inputs_sel);
+        //         let new_n_inputs = n_inputs_sel + 2;
+        //         if new_n_inputs != self.n_inputs {
+        //             let gate = Self::new(self.kind, self.data_bits, new_n_inputs);
+        //             new_comp = Some(Box::new(gate));
+        //         }
+        //     });
+        // }
+        // new_comp
+        None
     }
 }
 
@@ -414,31 +447,32 @@ impl Draw for Mux {
         input_positions
     }
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        let mut new_comp: Option<Box<dyn Comp>> = None;
-        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-            // Data bits
-            let mut data_bits_sel = self.data_bits as usize - 1;
-            ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
-            let new_data_bits = data_bits_sel as u8 + 1;
-
-            if new_data_bits != self.data_bits {
-                let mux = Self::new(self.sel_bits, new_data_bits);
-                new_comp = Some(Box::new(mux));
-            };
-        });
-
-        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-            // Selection bits
-            let mut sel_bits_sel = self.sel_bits as usize - 1;
-            ui.combo_box(hash!(), "Select Bits", &COMBO_OPTS[..6], &mut sel_bits_sel);
-            let new_sel_bits = sel_bits_sel as u8 + 1;
-            if new_sel_bits != self.sel_bits {
-                let mux = Self::new(new_sel_bits, self.data_bits);
-                new_comp = Some(Box::new(mux));
-            }
-        });
-
-        new_comp
+        todo!();
+        // let mut new_comp: Option<Box<dyn Comp>> = None;
+        // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+        //     // Data bits
+        //     let mut data_bits_sel = self.data_bits as usize - 1;
+        //     ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
+        //     let new_data_bits = data_bits_sel as u8 + 1;
+        //
+        //     if new_data_bits != self.data_bits {
+        //         let mux = Self::new(self.sel_bits, new_data_bits);
+        //         new_comp = Some(Box::new(mux));
+        //     };
+        // });
+        //
+        // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+        //     // Selection bits
+        //     let mut sel_bits_sel = self.sel_bits as usize - 1;
+        //     ui.combo_box(hash!(), "Select Bits", &COMBO_OPTS[..6], &mut sel_bits_sel);
+        //     let new_sel_bits = sel_bits_sel as u8 + 1;
+        //     if new_sel_bits != self.sel_bits {
+        //         let mux = Self::new(new_sel_bits, self.data_bits);
+        //         new_comp = Some(Box::new(mux));
+        //     }
+        // });
+        //
+        // new_comp
     }
 }
 
@@ -568,36 +602,37 @@ impl Draw for Demux {
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        let mut new_comp: Option<Box<dyn Comp>> = None;
-        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-            // Data bits
-            let mut data_bits_sel = self.data_bits as usize - 1;
-            ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
-            let new_data_bits = data_bits_sel as u8 + 1;
-
-            if new_data_bits != self.data_bits {
-                let demux = Self::new(self.sel_bits, new_data_bits);
-                new_comp = Some(Box::new(demux));
-            };
-        });
-
-        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-            // Selection bits
-            let mut sel_bits_sel = self.sel_bits as usize - 1;
-            ui.combo_box(
-                hash!(),
-                "Select Bits",
-                &["1", "2", "3", "4", "5", "6"],
-                &mut sel_bits_sel,
-            );
-            let new_sel_bits = sel_bits_sel as u8 + 1;
-            if new_sel_bits != self.sel_bits {
-                let mux = Self::new(new_sel_bits, self.data_bits);
-                new_comp = Some(Box::new(mux));
-            }
-        });
-
-        new_comp
+        todo!();
+        // let mut new_comp: Option<Box<dyn Comp>> = None;
+        // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+        //     // Data bits
+        //     let mut data_bits_sel = self.data_bits as usize - 1;
+        //     ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
+        //     let new_data_bits = data_bits_sel as u8 + 1;
+        //
+        //     if new_data_bits != self.data_bits {
+        //         let demux = Self::new(self.sel_bits, new_data_bits);
+        //         new_comp = Some(Box::new(demux));
+        //     };
+        // });
+        //
+        // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+        //     // Selection bits
+        //     let mut sel_bits_sel = self.sel_bits as usize - 1;
+        //     ui.combo_box(
+        //         hash!(),
+        //         "Select Bits",
+        //         &["1", "2", "3", "4", "5", "6"],
+        //         &mut sel_bits_sel,
+        //     );
+        //     let new_sel_bits = sel_bits_sel as u8 + 1;
+        //     if new_sel_bits != self.sel_bits {
+        //         let mux = Self::new(new_sel_bits, self.data_bits);
+        //         new_comp = Some(Box::new(mux));
+        //     }
+        // });
+        //
+        // new_comp
     }
 }
 
@@ -718,19 +753,20 @@ impl Draw for Register {
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        let mut new_comp: Option<Box<dyn Comp>> = None;
-        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-            // Data bits
-            let mut data_bits_sel = self.data_bits as usize - 1;
-            ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
-            let new_data_bits = data_bits_sel as u8 + 1;
-
-            if new_data_bits != self.data_bits {
-                let reg = Self::new(new_data_bits);
-                new_comp = Some(Box::new(reg));
-            };
-        });
-        new_comp
+        todo!()
+        //     let mut new_comp: Option<Box<dyn Comp>> = None;
+        //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+        //         // Data bits
+        //         let mut data_bits_sel = self.data_bits as usize - 1;
+        //         ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
+        //         let new_data_bits = data_bits_sel as u8 + 1;
+        //
+        //         if new_data_bits != self.data_bits {
+        //             let reg = Self::new(new_data_bits);
+        //             new_comp = Some(Box::new(reg));
+        //         };
+        //     });
+        //     new_comp
     }
 }
 
@@ -819,20 +855,21 @@ impl Draw for Input {
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        let mut new_comp: Option<Box<dyn Comp>> = None;
-        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-            // Data bits
-            let mut data_bits_sel = self.data_bits as usize - 1;
-            ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
-            let new_data_bits = data_bits_sel as u8 + 1;
-
-            if new_data_bits != self.data_bits {
-                let input = Self::new(new_data_bits);
-                new_comp = Some(Box::new(input));
-            };
-        });
-
-        new_comp
+        todo!();
+        //     let mut new_comp: Option<Box<dyn Comp>> = None;
+        //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+        //         // Data bits
+        //         let mut data_bits_sel = self.data_bits as usize - 1;
+        //         ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
+        //         let new_data_bits = data_bits_sel as u8 + 1;
+        //
+        //         if new_data_bits != self.data_bits {
+        //             let input = Self::new(new_data_bits);
+        //             new_comp = Some(Box::new(input));
+        //         };
+        //     });
+        //
+        //     new_comp
     }
 }
 
@@ -909,20 +946,21 @@ impl Draw for Output {
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        let mut new_comp: Option<Box<dyn Comp>> = None;
-        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-            // Data bits
-            let mut data_bits_sel = self.data_bits as usize - 1;
-            ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
-            let new_data_bits = data_bits_sel as u8 + 1;
-
-            if new_data_bits != self.data_bits {
-                let output = Self::new(new_data_bits);
-                new_comp = Some(Box::new(output));
-            };
-        });
-
-        new_comp
+        todo!();
+        //     let mut new_comp: Option<Box<dyn Comp>> = None;
+        //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+        //         // Data bits
+        //         let mut data_bits_sel = self.data_bits as usize - 1;
+        //         ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
+        //         let new_data_bits = data_bits_sel as u8 + 1;
+        //
+        //         if new_data_bits != self.data_bits {
+        //             let output = Self::new(new_data_bits);
+        //             new_comp = Some(Box::new(output));
+        //         };
+        //     });
+        //
+        //     new_comp
     }
 }
 
@@ -959,7 +997,7 @@ pub(crate) trait Draw: Logic {
     }
     fn draw_from_texture_slice(&self, pos: Vec2, tex: &Texture2D, tex_info: TexInfo) {
         draw_texture_ex(
-            tex,
+            *tex,
             pos.x,
             pos.y,
             WHITE,
@@ -1106,99 +1144,100 @@ impl Draw for Splitter {
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        let mut new_comp: Option<Box<dyn Comp>> = None;
-        let n_outputs = self.outputs.len();
-
-        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-            // Data bits in
-            let mut data_bits_sel = self.data_bits_in as usize - 1;
-            ui.combo_box(hash!(), "Data Bits In", COMBO_OPTS, &mut data_bits_sel);
-            let new_data_bits = data_bits_sel as u8 + 1;
-
-            if new_data_bits != self.data_bits_in {
-                let (new_data_bits_out, new_mapping) = if new_data_bits > self.data_bits_in {
-                    // add extra width to last arm, and map all the extra bits to it.
-                    let extra = new_data_bits - self.data_bits_in;
-                    let mut data_bits_out = self.data_bits_out.clone();
-                    data_bits_out[n_outputs - 1] += extra;
-                    let mut mapping = self.mapping.clone();
-                    mapping.extend(vec![n_outputs - 1; extra as usize]);
-                    (data_bits_out, mapping)
-                } else {
-                    // truncate the mapping; recalculate data_bits_out
-                    let mapping = self.mapping[..new_data_bits as usize].to_vec();
-                    let mut data_bits_out = vec![0; self.outputs.len()];
-                    for &branch in &mapping {
-                        data_bits_out[branch] += 1;
-                    }
-                    (data_bits_out, mapping)
-                };
-                let splitter = Self::new(new_data_bits, new_data_bits_out, new_mapping);
-                new_comp = Some(Box::new(splitter));
-            };
-        });
-        Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-            // Number of arms
-            let mut arms_sel = n_outputs - 1;
-            ui.combo_box(hash!(), "Number of Arms", COMBO_OPTS, &mut arms_sel);
-            let new_n_outputs = arms_sel + 1;
-
-            if new_n_outputs != n_outputs {
-                let (new_data_bits_out, new_mapping) = if new_n_outputs > n_outputs {
-                    // make additional arms empty; don't change mapping
-                    let extra = new_n_outputs - n_outputs;
-                    let mut data_bits_out = self.data_bits_out.clone();
-                    data_bits_out.extend(vec![0; extra]);
-                    (data_bits_out, self.mapping.clone())
-                } else {
-                    // truncate outputs; replace with last existing arm in mapping
-                    let mapping = self
-                        .mapping
-                        .iter()
-                        .map(|&branch| {
-                            if branch >= new_n_outputs {
-                                new_n_outputs - 1
-                            } else {
-                                branch
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    (self.data_bits_out[..new_n_outputs].to_vec(), mapping)
-                };
-                let splitter = Self::new(self.data_bits_in, new_data_bits_out, new_mapping);
-                new_comp = Some(Box::new(splitter));
-            }
-        });
-        // One combobox for each output arm
-        for i in 0..self.data_bits_in {
-            let i = i as usize;
-            Group::new(hash!("arm", i), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-                // FIXME: make the branch_sel 0-indexed (requires reworking COMBO_OPTS to include a
-                // zero)
-                let mut branch_sel = self.mapping[i];
-                ui.combo_box(
-                    hash!("combo", i),
-                    &format!("Bit {}", i),
-                    &COMBO_OPTS[..n_outputs],
-                    &mut branch_sel,
-                );
-                let new_branch = branch_sel;
-                if new_branch != self.mapping[i] {
-                    let mut splitter = self.clone();
-                    splitter.mapping[i] = new_branch;
-                    new_comp = Some(Box::new(splitter));
-                }
-            });
-        }
-
-        new_comp
+        todo!();
+        //     let mut new_comp: Option<Box<dyn Comp>> = None;
+        //     let n_outputs = self.outputs.len();
+        //
+        //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+        //         // Data bits in
+        //         let mut data_bits_sel = self.data_bits_in as usize - 1;
+        //         ui.combo_box(hash!(), "Data Bits In", COMBO_OPTS, &mut data_bits_sel);
+        //         let new_data_bits = data_bits_sel as u8 + 1;
+        //
+        //         if new_data_bits != self.data_bits_in {
+        //             let (new_data_bits_out, new_mapping) = if new_data_bits > self.data_bits_in {
+        //                 // add extra width to last arm, and map all the extra bits to it.
+        //                 let extra = new_data_bits - self.data_bits_in;
+        //                 let mut data_bits_out = self.data_bits_out.clone();
+        //                 data_bits_out[n_outputs - 1] += extra;
+        //                 let mut mapping = self.mapping.clone();
+        //                 mapping.extend(vec![n_outputs - 1; extra as usize]);
+        //                 (data_bits_out, mapping)
+        //             } else {
+        //                 // truncate the mapping; recalculate data_bits_out
+        //                 let mapping = self.mapping[..new_data_bits as usize].to_vec();
+        //                 let mut data_bits_out = vec![0; self.outputs.len()];
+        //                 for &branch in &mapping {
+        //                     data_bits_out[branch] += 1;
+        //                 }
+        //                 (data_bits_out, mapping)
+        //             };
+        //             let splitter = Self::new(new_data_bits, new_data_bits_out, new_mapping);
+        //             new_comp = Some(Box::new(splitter));
+        //         };
+        //     });
+        //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+        //         // Number of arms
+        //         let mut arms_sel = n_outputs - 1;
+        //         ui.combo_box(hash!(), "Number of Arms", COMBO_OPTS, &mut arms_sel);
+        //         let new_n_outputs = arms_sel + 1;
+        //
+        //         if new_n_outputs != n_outputs {
+        //             let (new_data_bits_out, new_mapping) = if new_n_outputs > n_outputs {
+        //                 // make additional arms empty; don't change mapping
+        //                 let extra = new_n_outputs - n_outputs;
+        //                 let mut data_bits_out = self.data_bits_out.clone();
+        //                 data_bits_out.extend(vec![0; extra]);
+        //                 (data_bits_out, self.mapping.clone())
+        //             } else {
+        //                 // truncate outputs; replace with last existing arm in mapping
+        //                 let mapping = self
+        //                     .mapping
+        //                     .iter()
+        //                     .map(|&branch| {
+        //                         if branch >= new_n_outputs {
+        //                             new_n_outputs - 1
+        //                         } else {
+        //                             branch
+        //                         }
+        //                     })
+        //                     .collect::<Vec<_>>();
+        //                 (self.data_bits_out[..new_n_outputs].to_vec(), mapping)
+        //             };
+        //             let splitter = Self::new(self.data_bits_in, new_data_bits_out, new_mapping);
+        //             new_comp = Some(Box::new(splitter));
+        //         }
+        //     });
+        //     // One combobox for each output arm
+        //     for i in 0..self.data_bits_in {
+        //         let i = i as usize;
+        //         Group::new(hash!("arm", i), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
+        //             // FIXME: make the branch_sel 0-indexed (requires reworking COMBO_OPTS to include a
+        //             // zero)
+        //             let mut branch_sel = self.mapping[i];
+        //             ui.combo_box(
+        //                 hash!("combo", i),
+        //                 &format!("Bit {}", i),
+        //                 &COMBO_OPTS[..n_outputs],
+        //                 &mut branch_sel,
+        //             );
+        //             let new_branch = branch_sel;
+        //             if new_branch != self.mapping[i] {
+        //                 let mut splitter = self.clone();
+        //                 splitter.mapping[i] = new_branch;
+        //                 new_comp = Some(Box::new(splitter));
+        //             }
+        //         });
+        //     }
+        //
+        // new_comp
     }
 }
 
 pub(crate) trait Comp: Logic + Draw + Debug {}
 impl<T: Logic + Draw + Debug> Comp for T {}
 
-pub(crate) fn default_comp_from_name(comp_name: &str) -> Component {
+pub fn default_comp_from_name(comp_name: &str) -> Component {
     let kind: Box<dyn Comp> = match comp_name {
         "NOT" => Box::new(Gate::default_of_kind(GateKind::Not)),
         "AND" => Box::new(Gate::default_of_kind(GateKind::And)),
