@@ -465,7 +465,7 @@ async fn main() {
             Window::new("Logisim")
                 .movable(false)
                 .collapsible(false)
-                .fixed_size((SANDBOX_POS.x, SANDBOX_SIZE.y - 50.))
+                .fixed_size((SANDBOX_POS.x - 15., SANDBOX_SIZE.y - 50.))
                 .anchor(Align2::LEFT_TOP, egui::Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.set_min_height(SANDBOX_SIZE.y -  50.);
