@@ -10,7 +10,7 @@ use petgraph::visit::{EdgeFiltered, EdgeRef};
 use petgraph::Direction;
 use std::fmt::Debug;
 
-use components::{signal_zeros, CircuitContext, Component, PinIndex, Signal};
+use components::{signal_zeros, CircuitContext, Component, PinIndex, Signal, SignalRef};
 
 mod components;
 
@@ -29,7 +29,7 @@ struct Wire {
     end_comp: NodeIndex,
     end_pin: usize,
     data_bits: u8,
-    value: Signal,
+    value: Option<Signal>,
 }
 
 impl Wire {
@@ -46,7 +46,18 @@ impl Wire {
             end_comp,
             end_pin,
             data_bits,
-            value: signal_zeros(data_bits),
+            value: None,
+        }
+    }
+    
+    fn set_signal(&mut self, value: Option<SignalRef>) {
+        
+        match value {
+            None => self.value = None,
+            Some(new) => match &mut self.value {
+                Some(old) => old.copy_from_bitslice(new),
+                None => self.value = Some(Signal::from_bitslice(new)),
+            },
         }
     }
 }
@@ -108,7 +119,16 @@ impl App {
         let cx_b = &self.graph[wire.end_comp];
         let pos_a = cx_a.position + cx_a.output_pos[wire.start_pin];
         let pos_b = cx_b.position + cx_b.input_pos[wire.end_pin];
-        let color = if wire.value.any() { GREEN } else { BLUE };
+        let color = match &wire.value {
+            Some(s) => {
+                if s.any() {
+                    GREEN
+                } else {
+                    BLUE
+                }
+            }
+            None => RED,
+        };
         let thickness = if wire.data_bits == 1 { 1. } else { 3. };
         draw_ortho_lines(pos_a, pos_b, color, thickness);
     }
@@ -180,8 +200,8 @@ impl App {
             return false;
         }
         // Check that the two pins have the same number of data_bits
-        let data_bits_a = self.graph[cx_a].kind.get_pin_value(px_a).len();
-        let data_bits_b = self.graph[cx_b].kind.get_pin_value(px_b).len();
+        let data_bits_a = self.graph[cx_a].kind.get_pin_width(px_a);
+        let data_bits_b = self.graph[cx_b].kind.get_pin_width(px_b);
         if data_bits_a != data_bits_b {
             println!("mismatched data bits: {} {}", data_bits_a, data_bits_b);
             return false;
@@ -238,11 +258,14 @@ impl App {
                 let start_pin = PinIndex::Output(self.graph[wx].start_pin);
                 let end_pin = PinIndex::Input(self.graph[wx].end_pin);
                 // use wire to determine relevant output and input pins
-                let signal_to_transmit = self.graph[cx].kind.get_pin_value(start_pin).clone();
+                let signal_to_transmit = self.graph[cx]
+                    .kind
+                    .get_pin_value(start_pin)
+                    .map(Signal::from_bitslice);
                 self.graph[next_node_idx]
                     .kind
-                    .set_pin_value(end_pin, &signal_to_transmit);
-                self.graph[wx].value.copy_from_bitslice(&signal_to_transmit);
+                    .set_pin_value(end_pin, signal_to_transmit.as_deref());
+                self.graph[wx].set_signal(signal_to_transmit.as_deref());
             }
         }
     }

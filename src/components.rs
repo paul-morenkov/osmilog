@@ -133,6 +133,7 @@ pub(crate) trait Logic {
     fn n_out_pins(&self) -> usize;
     fn get_pin_value(&self, px: PinIndex) -> Option<SignalRef>;
     fn set_pin_value(&mut self, px: PinIndex, value: Option<SignalRef>);
+    fn get_pin_width(&self, px: PinIndex) -> u8;
     fn do_logic(&mut self);
     fn is_clocked(&self) -> bool {
         false
@@ -246,6 +247,14 @@ impl Logic for Gate {
                 self.inputs[i].set(value);
             }
             PinIndex::Output(0) => self.output.set(value),
+            _ => panic!(),
+        }
+    }
+
+    fn get_pin_width(&self, px: PinIndex) -> u8 {
+        match px {
+            PinIndex::Input(i) => self.inputs[i].bits,
+            PinIndex::Output(0) => self.output.bits,
             _ => panic!(),
         }
     }
@@ -496,6 +505,21 @@ impl Logic for Mux {
             _ => panic!(),
         }
     }
+
+    fn get_pin_width(&self, px: PinIndex) -> u8 {
+        match px {
+            PinIndex::Input(i) => {
+                // 0 -> selector, then inputs
+                if i == 0 {
+                    self.selector.bits
+                } else {
+                    self.inputs[i - 1].bits
+                }
+            }
+            PinIndex::Output(0) => self.output.bits,
+            _ => panic!(),
+        }
+    }
 }
 
 impl Draw for Mux {
@@ -647,6 +671,17 @@ impl Logic for Demux {
                 _ => panic!(),
             },
             PinIndex::Output(i) => self.outputs[i].set(value),
+        }
+    }
+
+    fn get_pin_width(&self, px: PinIndex) -> u8 {
+        match px {
+            PinIndex::Input(i) => match i {
+                0 => self.selector.bits,
+                1 => self.input.bits,
+                _ => panic!(),
+            },
+            PinIndex::Output(i) => self.outputs[i].bits,
         }
     }
 }
@@ -850,6 +885,18 @@ impl Logic for Register {
             _ => panic!(),
         }
     }
+
+    fn get_pin_width(&self, px: PinIndex) -> u8 {
+        match px {
+            PinIndex::Input(i) => match i {
+                0 => self.write_enable.bits,
+                1 => self.input.bits,
+                _ => panic!(),
+            },
+            PinIndex::Output(0) => self.output.bits,
+            _ => panic!(),
+        }
+    }
 }
 
 impl Draw for Register {
@@ -918,7 +965,10 @@ impl Input {
     fn new(data_bits: u8) -> Self {
         Self {
             data_bits,
-            value: Pin::new(data_bits),
+            value: Pin {
+                bits: data_bits,
+                signal: Some(signal_zeros(data_bits)),
+            },
         }
     }
 }
@@ -952,6 +1002,15 @@ impl Logic for Input {
             _ => panic!(),
         }
     }
+
+    fn get_pin_width(&self, px: PinIndex) -> u8 {
+        match px {
+            PinIndex::Input(_) => panic!(),
+            PinIndex::Output(0) => self.value.bits,
+            _ => panic!(),
+        }
+    }
+
     fn interact(&mut self) -> bool {
         if let Some(s) = self.value.get() {
             let incremented = s.load::<u32>() + 1;
@@ -1046,6 +1105,14 @@ impl Logic for Output {
     fn set_pin_value(&mut self, px: PinIndex, value: Option<SignalRef>) {
         if let PinIndex::Input(0) = px {
             self.value.set(value);
+        } else {
+            panic!()
+        }
+    }
+
+    fn get_pin_width(&self, px: PinIndex) -> u8 {
+        if let PinIndex::Input(0) = px {
+            return self.value.bits;
         } else {
             panic!()
         }
@@ -1148,6 +1215,14 @@ impl Logic for Splitter {
         match px {
             PinIndex::Input(0) => self.input.set(value),
             PinIndex::Output(i) => self.outputs[i].set(value),
+            _ => panic!(),
+        }
+    }
+
+    fn get_pin_width(&self, px: PinIndex) -> u8 {
+        match px {
+            PinIndex::Input(0) => self.input.bits,
+            PinIndex::Output(i) => self.outputs[i].bits,
             _ => panic!(),
         }
     }
@@ -1403,6 +1478,14 @@ impl Logic for Tunnel {
         match (&self.kind, px) {
             (TunnelKind::Sender, PinIndex::Input(0))
             | (TunnelKind::Receiver, PinIndex::Output(0)) => self.value.set(value),
+            _ => panic!(),
+        }
+    }
+
+    fn get_pin_width(&self, px: PinIndex) -> u8 {
+        match (&self.kind, px) {
+            (TunnelKind::Sender, PinIndex::Input(0)) => self.value.bits,
+            (TunnelKind::Receiver, PinIndex::Output(0)) => self.value.bits,
             _ => panic!(),
         }
     }
