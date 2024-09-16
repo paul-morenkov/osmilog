@@ -13,6 +13,40 @@ use crate::TILE_SIZE;
 
 const COMBO_WIDTH: f32 = 50.;
 
+pub type Signal = BitVec<u32, Lsb0>;
+pub type SignalRef<'a> = &'a BitSlice<u32, Lsb0>;
+
+#[derive(Debug, Clone)]
+struct Pin {
+    bits: u8,
+    signal: Option<Signal>,
+}
+
+impl Pin {
+    fn new(bits: u8) -> Self {
+        Self { bits, signal: None }
+    }
+
+    fn get(&self) -> Option<SignalRef> {
+        self.signal.as_deref()
+    }
+    fn set(&mut self, value: Option<SignalRef>) {
+        match value {
+            None => self.signal = None,
+            Some(new) => match &mut self.signal {
+                Some(old) => old.copy_from_bitslice(new),
+                None => self.signal = Some(Signal::from_bitslice(new)),
+            },
+        }
+    }
+}
+
+impl Default for Pin {
+    fn default() -> Self {
+        Self::new(1)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PinIndex {
     Input(usize),
@@ -34,9 +68,9 @@ pub struct CircuitContext {
 pub struct Component {
     pub(crate) kind: Box<dyn Comp>,
     pub(crate) position: Vec2,
-    bboxes: Vec<Rect>,
     pub(crate) input_pos: Vec<Vec2>,
     pub(crate) output_pos: Vec<Vec2>,
+    bboxes: Vec<Rect>,
 }
 
 impl Component {
@@ -64,7 +98,6 @@ impl Component {
         self.kind.draw(self.position, textures)
     }
     pub(crate) fn clock_update(&mut self) {
-        // TODO: make is_clocked part of the type structure
         if self.kind.is_clocked() {
             self.kind.tick_clock();
         }
@@ -90,8 +123,6 @@ impl TexInfo {
     }
 }
 
-pub type Signal = BitVec<u32, Lsb0>;
-
 pub fn signal_zeros(n: u8) -> Signal {
     bitvec![u32, Lsb0; 0; n as usize]
 }
@@ -100,8 +131,8 @@ pub(crate) trait Logic {
     fn name(&self) -> &'static str;
     fn n_in_pins(&self) -> usize;
     fn n_out_pins(&self) -> usize;
-    fn get_pin_value(&self, px: PinIndex) -> &Signal;
-    fn set_pin_value(&mut self, px: PinIndex, value: &Signal);
+    fn get_pin_value(&self, px: PinIndex) -> Option<SignalRef>;
+    fn set_pin_value(&mut self, px: PinIndex, value: Option<SignalRef>);
     fn do_logic(&mut self);
     fn is_clocked(&self) -> bool {
         false
@@ -169,6 +200,7 @@ pub(crate) trait Draw: Logic {
 
 pub(crate) trait Comp: Logic + Draw + Debug {}
 impl<T: Logic + Draw + Debug> Comp for T {}
+
 #[derive(Debug, Clone, Copy)]
 enum GateKind {
     Not,
@@ -181,8 +213,8 @@ struct Gate {
     kind: GateKind,
     data_bits: u8,
     n_inputs: usize,
-    inputs: Vec<Signal>,
-    output: Signal,
+    inputs: Vec<Pin>,
+    output: Pin,
 }
 
 impl Logic for Gate {
@@ -200,46 +232,49 @@ impl Logic for Gate {
         1
     }
 
-    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+    fn get_pin_value(&self, px: PinIndex) -> Option<SignalRef> {
         match px {
-            PinIndex::Input(i) => &self.inputs[i],
-            PinIndex::Output(i) => {
-                if i == 0 {
-                    &self.output
-                } else {
-                    panic!()
-                }
-            }
+            PinIndex::Input(i) => self.inputs[i].get(),
+            PinIndex::Output(0) => self.output.get(),
+            _ => panic!(),
         }
     }
 
-    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+    fn set_pin_value(&mut self, px: PinIndex, value: Option<SignalRef>) {
         match px {
             PinIndex::Input(i) => {
-                if i < self.n_inputs {
-                    self.inputs[i].copy_from_bitslice(value);
-                } else {
-                    panic!()
-                }
+                self.inputs[i].set(value);
             }
-            PinIndex::Output(i) => {
-                if i == 0 {
-                    self.output.copy_from_bitslice(value);
-                } else {
-                    panic!()
-                }
-            }
+            PinIndex::Output(0) => self.output.set(value),
+            _ => panic!(),
         }
     }
 
     fn do_logic(&mut self) {
-        self.output = match self.kind {
-            GateKind::Not => !self.inputs[0].clone(),
-            GateKind::Or => self.inputs.iter().fold(signal_zeros(1), |x, y| x | y),
-            GateKind::And => self
-                .inputs
-                .iter()
-                .fold(self.inputs[0].clone(), |x, y| x & y),
+        self.output.signal = match self.kind {
+            GateKind::Not => self.inputs[0].signal.clone().map(|s| !s),
+            GateKind::Or => 'a: {
+                let mut result = signal_zeros(self.data_bits);
+                for input in &self.inputs {
+                    match &input.signal {
+                        Some(s) => result |= s,
+                        None => {
+                            break 'a None;
+                        }
+                    }
+                }
+                Some(result)
+            }
+            GateKind::And => 'a: {
+                let mut result = !signal_zeros(self.data_bits);
+                for input in &self.inputs {
+                    match &input.signal {
+                        Some(s) => result &= s,
+                        None => break 'a None,
+                    }
+                }
+                Some(result)
+            }
         };
     }
 }
@@ -381,8 +416,8 @@ impl Gate {
             kind,
             data_bits,
             n_inputs,
-            inputs: vec![signal_zeros(data_bits); n_inputs],
-            output: signal_zeros(data_bits),
+            inputs: vec![Pin::new(data_bits); n_inputs],
+            output: Pin::new(data_bits),
         }
     }
     fn default_of_kind(kind: GateKind) -> Self {
@@ -407,9 +442,9 @@ impl Gate {
 struct Mux {
     sel_bits: u8,
     data_bits: u8,
-    inputs: Vec<Signal>,
-    output: Signal,
-    selector: Signal,
+    inputs: Vec<Pin>,
+    output: Pin,
+    selector: Pin,
 }
 
 impl Logic for Mux {
@@ -417,8 +452,11 @@ impl Logic for Mux {
         "Multiplexer"
     }
     fn do_logic(&mut self) {
-        let sel = self.selector.load::<usize>();
-        self.output.copy_from_bitslice(&self.inputs[sel]);
+        let value = self.selector.get().and_then(|s| {
+            let sel = s.load::<usize>();
+            self.inputs[sel].get()
+        });
+        self.output.set(value);
     }
 
     fn n_in_pins(&self) -> usize {
@@ -430,42 +468,32 @@ impl Logic for Mux {
         1
     }
 
-    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+    fn get_pin_value(&self, px: PinIndex) -> Option<SignalRef> {
         match px {
             PinIndex::Input(i) => {
                 // 0 -> selector, then inputs
                 if i == 0 {
-                    &self.selector
+                    self.selector.get()
                 } else {
-                    &self.inputs[i - 1]
+                    self.inputs[i - 1].get()
                 }
             }
-            PinIndex::Output(i) => {
-                if i == 0 {
-                    &self.output
-                } else {
-                    panic!()
-                }
-            }
+            PinIndex::Output(0) => self.output.get(),
+            _ => panic!(),
         }
     }
 
-    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+    fn set_pin_value(&mut self, px: PinIndex, value: Option<SignalRef>) {
         match px {
             PinIndex::Input(i) => {
                 if i == 0 {
-                    self.selector.copy_from_bitslice(value);
+                    self.selector.set(value);
                 } else {
-                    self.inputs[i - 1].copy_from_bitslice(value)
+                    self.inputs[i - 1].set(value)
                 }
             }
-            PinIndex::Output(i) => {
-                if i == 0 {
-                    self.output.copy_from_bitslice(value)
-                } else {
-                    panic!()
-                }
-            }
+            PinIndex::Output(0) => self.output.set(value),
+            _ => panic!(),
         }
     }
 }
@@ -515,19 +543,8 @@ impl Draw for Mux {
         input_positions
     }
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        // let mut new_comp: Option<Box<dyn Comp>> = None;
-        // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-        //     // Data bits
-        //     let mut data_bits_sel = self.data_bits as usize - 1;
-        //     ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
-        //     let new_data_bits = data_bits_sel as u8 + 1;
-        //
-        //     if new_data_bits != self.data_bits {
-        //         let mux = Self::new(self.sel_bits, new_data_bits);
-        //         new_comp = Some(Box::new(mux));
-        //     };
-        // });
         let mut data_bits = self.data_bits;
+
         ComboBox::from_label("Data Bits")
             .width(COMBO_WIDTH)
             .selected_text(format!("{}", data_bits))
@@ -540,16 +557,7 @@ impl Draw for Mux {
         if data_bits != self.data_bits {
             return Some(Box::new(Self::new(self.sel_bits, data_bits)));
         }
-        // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-        //     // Selection bits
-        //     let mut sel_bits_sel = self.sel_bits as usize - 1;
-        //     ui.combo_box(hash!(), "Select Bits", &COMBO_OPTS[..6], &mut sel_bits_sel);
-        //     let new_sel_bits = sel_bits_sel as u8 + 1;
-        //     if new_sel_bits != self.sel_bits {
-        //         let mux = Self::new(new_sel_bits, self.data_bits);
-        //         new_comp = Some(Box::new(mux));
-        //     }
-        // });
+
         let mut select_bits = self.sel_bits;
         ComboBox::from_label("Select Bits")
             .width(COMBO_WIDTH)
@@ -572,9 +580,9 @@ impl Mux {
         Self {
             sel_bits,
             data_bits,
-            inputs: vec![signal_zeros(data_bits); 1 << sel_bits],
-            output: signal_zeros(data_bits),
-            selector: signal_zeros(sel_bits),
+            inputs: vec![Pin::new(data_bits); 1 << sel_bits],
+            output: Pin::new(data_bits),
+            selector: Pin::new(sel_bits),
         }
     }
 }
@@ -588,9 +596,9 @@ impl Default for Mux {
 struct Demux {
     sel_bits: u8,
     data_bits: u8,
-    input: Signal,
-    outputs: Vec<Signal>,
-    selector: Signal,
+    input: Pin,
+    outputs: Vec<Pin>,
+    selector: Pin,
 }
 
 impl Logic for Demux {
@@ -598,11 +606,17 @@ impl Logic for Demux {
         "Demultiplexer"
     }
     fn do_logic(&mut self) {
-        let sel = self.selector.load::<usize>();
-        for output in &mut self.outputs {
-            output.fill(false);
+        let sel = self.selector.get().map(|s| s.load::<usize>());
+
+        if let Some(sel) = sel {
+            for output in &mut self.outputs {
+                if let Some(s) = &mut output.signal {
+                    s.fill(false);
+                }
+            }
+
+            self.outputs[sel].set(self.input.get())
         }
-        self.outputs[sel].copy_from_bitslice(&self.input);
     }
 
     fn n_in_pins(&self) -> usize {
@@ -614,25 +628,25 @@ impl Logic for Demux {
         self.outputs.len()
     }
 
-    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+    fn get_pin_value(&self, px: PinIndex) -> Option<SignalRef> {
         match px {
             PinIndex::Input(i) => match i {
-                0 => &self.selector,
-                1 => &self.input,
+                0 => self.selector.get(),
+                1 => self.input.get(),
                 _ => panic!(),
             },
-            PinIndex::Output(i) => &self.outputs[i],
+            PinIndex::Output(i) => self.outputs[i].get(),
         }
     }
 
-    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+    fn set_pin_value(&mut self, px: PinIndex, value: Option<SignalRef>) {
         match px {
             PinIndex::Input(i) => match i {
-                0 => self.selector.copy_from_bitslice(value),
-                1 => self.input.copy_from_bitslice(value),
+                0 => self.selector.set(value),
+                1 => self.input.set(value),
                 _ => panic!(),
             },
-            PinIndex::Output(i) => self.outputs[i].copy_from_bitslice(value),
+            PinIndex::Output(i) => self.outputs[i].set(value),
         }
     }
 }
@@ -757,9 +771,9 @@ impl Demux {
         Self {
             sel_bits,
             data_bits,
-            input: signal_zeros(data_bits),
-            outputs: vec![signal_zeros(data_bits); 1 << sel_bits],
-            selector: signal_zeros(sel_bits),
+            input: Pin::new(data_bits),
+            outputs: vec![Pin::new(data_bits); 1 << sel_bits],
+            selector: Pin::new(sel_bits),
         }
     }
 }
@@ -773,18 +787,18 @@ impl Default for Demux {
 #[derive(Debug, Clone)]
 struct Register {
     data_bits: u8,
-    write_enable: Signal,
-    input: Signal,
-    output: Signal,
+    write_enable: Pin,
+    input: Pin,
+    output: Pin,
 }
 
 impl Register {
     fn new(data_bits: u8) -> Self {
         Self {
             data_bits,
-            write_enable: signal_zeros(1),
-            input: signal_zeros(data_bits),
-            output: signal_zeros(data_bits),
+            write_enable: Pin::new(1),
+            input: Pin::new(data_bits),
+            output: Pin::new(data_bits),
         }
     }
 }
@@ -798,8 +812,10 @@ impl Logic for Register {
         true
     }
     fn tick_clock(&mut self) {
-        if self.write_enable[0] {
-            self.output.copy_from_bitslice(&self.input);
+        if let Some(s) = self.write_enable.get() {
+            if s.any() {
+                self.output.set(self.input.get());
+            }
         }
     }
 
@@ -811,37 +827,27 @@ impl Logic for Register {
         1
     }
 
-    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+    fn get_pin_value(&self, px: PinIndex) -> Option<SignalRef> {
         match px {
             PinIndex::Input(i) => match i {
-                0 => &self.write_enable,
-                1 => &self.input,
+                0 => self.write_enable.get(),
+                1 => self.input.get(),
                 _ => panic!(),
             },
-            PinIndex::Output(i) => {
-                if i == 0 {
-                    &self.output
-                } else {
-                    panic!()
-                }
-            }
+            PinIndex::Output(0) => self.output.get(),
+            _ => panic!(),
         }
     }
 
-    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+    fn set_pin_value(&mut self, px: PinIndex, value: Option<SignalRef>) {
         match px {
             PinIndex::Input(i) => match i {
-                0 => self.write_enable.copy_from_bitslice(value),
-                1 => self.input.copy_from_bitslice(value),
+                0 => self.write_enable.set(value),
+                1 => self.input.set(value),
                 _ => panic!(),
             },
-            PinIndex::Output(i) => {
-                if i == 0 {
-                    self.output.copy_from_bitslice(value);
-                } else {
-                    panic!()
-                }
-            }
+            PinIndex::Output(0) => self.output.set(value),
+            _ => panic!(),
         }
     }
 }
@@ -853,9 +859,19 @@ impl Draw for Register {
 
     fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
         let (w, h) = self.size().into();
-        let in_color = if self.input.any() { GREEN } else { RED };
+        let get_color = |pin: &Pin| match pin.get() {
+            Some(s) => {
+                if s.any() {
+                    GREEN
+                } else {
+                    GRAY
+                }
+            }
+            None => RED,
+        };
+        let in_color = get_color(&self.input);
         draw_rectangle(pos.x, pos.y, w / 2., h, in_color);
-        let out_color = if self.output.any() { GREEN } else { RED };
+        let out_color = get_color(&self.output);
         draw_rectangle(pos.x + w / 2., pos.y, w / 2., h, out_color);
         draw_text("D", pos.x, pos.y + 25., 20., BLACK);
         draw_text("WE", pos.x, pos.y + 45., 20., BLACK);
@@ -869,18 +885,6 @@ impl Draw for Register {
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        //     let mut new_comp: Option<Box<dyn Comp>> = None;
-        //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-        //         // Data bits
-        //         let mut data_bits_sel = self.data_bits as usize - 1;
-        //         ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
-        //         let new_data_bits = data_bits_sel as u8 + 1;
-        //
-        //         if new_data_bits != self.data_bits {
-        //             let reg = Self::new(new_data_bits);
-        //             new_comp = Some(Box::new(reg));
-        //         };
-        //     });
         let mut data_bits = self.data_bits;
         ComboBox::from_label("Data Bits")
             .width(COMBO_WIDTH)
@@ -895,7 +899,6 @@ impl Draw for Register {
             return Some(Box::new(Self::new(data_bits)));
         }
         None
-        //     new_comp
     }
 }
 
@@ -908,14 +911,14 @@ impl Default for Register {
 #[derive(Debug, Clone)]
 struct Input {
     data_bits: u8,
-    value: Signal,
+    value: Pin,
 }
 
 impl Input {
     fn new(data_bits: u8) -> Self {
         Self {
             data_bits,
-            value: signal_zeros(data_bits),
+            value: Pin::new(data_bits),
         }
     }
 }
@@ -934,40 +937,26 @@ impl Logic for Input {
         1
     }
 
-    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+    fn get_pin_value(&self, px: PinIndex) -> Option<SignalRef> {
         match px {
             PinIndex::Input(_) => panic!(),
-            PinIndex::Output(i) => {
-                if i == 0 {
-                    &self.value
-                } else {
-                    panic!()
-                }
-            }
+            PinIndex::Output(0) => self.value.get(),
+            _ => panic!(),
         }
     }
 
-    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+    fn set_pin_value(&mut self, px: PinIndex, value: Option<SignalRef>) {
         match px {
             PinIndex::Input(_) => panic!(),
-            PinIndex::Output(i) => {
-                if i == 0 {
-                    self.value.copy_from_bitslice(value)
-                } else {
-                    panic!()
-                }
-            }
+            PinIndex::Output(0) => self.value.set(value),
+            _ => panic!(),
         }
     }
     fn interact(&mut self) -> bool {
-        if self.data_bits == 1 {
-            let prev_value = self.value[0];
-            self.value.set(0, !prev_value);
-        } else {
-            let prev_value = self.value.load::<u32>();
-            self.value.copy_from_bitslice(
-                &(prev_value + 1).view_bits::<Lsb0>()[..self.data_bits as usize],
-            );
+        if let Some(s) = self.value.get() {
+            let incremented = s.load::<u32>() + 1;
+            let value = &incremented.view_bits::<Lsb0>()[..self.data_bits as usize];
+            self.value.set(Some(value));
         }
         true
     }
@@ -979,23 +968,20 @@ impl Draw for Input {
     }
 
     fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
-        let color = if self.value.any() { GREEN } else { RED };
+        let color = match self.value.get() {
+            Some(s) => {
+                if s.any() {
+                    GREEN
+                } else {
+                    GRAY
+                }
+            }
+            None => RED,
+        };
         draw_rectangle(pos.x, pos.y, self.size().x, self.size().y, color);
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        //     let mut new_comp: Option<Box<dyn Comp>> = None;
-        //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-        //         // Data bits
-        //         let mut data_bits_sel = self.data_bits as usize - 1;
-        //         ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
-        //         let new_data_bits = data_bits_sel as u8 + 1;
-        //
-        //         if new_data_bits != self.data_bits {
-        //             let input = Self::new(new_data_bits);
-        //             new_comp = Some(Box::new(input));
-        //         };
-        //     });
         let mut data_bits = self.data_bits;
         ComboBox::from_label("Data Bits")
             .width(COMBO_WIDTH)
@@ -1023,14 +1009,14 @@ impl Default for Input {
 #[derive(Debug, Clone)]
 struct Output {
     data_bits: u8,
-    value: Signal,
+    value: Pin,
 }
 
 impl Output {
     fn new(data_bits: u8) -> Self {
         Self {
             data_bits,
-            value: signal_zeros(data_bits),
+            value: Pin::new(data_bits),
         }
     }
 }
@@ -1049,29 +1035,19 @@ impl Logic for Output {
         0
     }
 
-    fn get_pin_value(&self, px: PinIndex) -> &Signal {
-        match px {
-            PinIndex::Input(i) => {
-                if i == 0 {
-                    &self.value
-                } else {
-                    panic!()
-                }
-            }
-            PinIndex::Output(_) => panic!(),
+    fn get_pin_value(&self, px: PinIndex) -> Option<SignalRef> {
+        if let PinIndex::Input(0) = px {
+            return self.value.get();
+        } else {
+            panic!()
         }
     }
 
-    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
-        match px {
-            PinIndex::Input(i) => {
-                if i == 0 {
-                    self.value.copy_from_bitslice(value)
-                } else {
-                    panic!()
-                }
-            }
-            PinIndex::Output(_) => panic!(),
+    fn set_pin_value(&mut self, px: PinIndex, value: Option<SignalRef>) {
+        if let PinIndex::Input(0) = px {
+            self.value.set(value);
+        } else {
+            panic!()
         }
     }
 }
@@ -1082,7 +1058,16 @@ impl Draw for Output {
     }
 
     fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
-        let color = if self.value.any() { GREEN } else { RED };
+        let color = match self.value.get() {
+            Some(s) => {
+                if s.any() {
+                    GREEN
+                } else {
+                    GRAY
+                }
+            }
+            None => RED,
+        };
         draw_rectangle(pos.x, pos.y, self.size().x, self.size().y, color);
     }
 
@@ -1112,8 +1097,8 @@ impl Default for Output {
 
 #[derive(Debug, Clone)]
 struct Splitter {
-    input: Signal,        // input.len = data_bits_in
-    outputs: Vec<Signal>, // outputs[i].len = data_bits_out[i]
+    input: Pin,        // input.len = data_bits_in
+    outputs: Vec<Pin>, // outputs[i].len = data_bits_out[i]
     data_bits_in: u8,
     data_bits_out: Vec<u8>,
     mapping: Vec<usize>, // mapping.len = data_bits_in; mapping[i] = idx of outputs to send input[i]
@@ -1123,8 +1108,8 @@ impl Splitter {
     fn new(data_bits_in: u8, data_bits_out: Vec<u8>, mapping: Vec<usize>) -> Self {
         assert!(mapping.len() == data_bits_in as usize);
         Self {
-            input: signal_zeros(data_bits_in),
-            outputs: data_bits_out.iter().map(|&i| signal_zeros(i)).collect(),
+            input: Pin::new(data_bits_in),
+            outputs: data_bits_out.iter().map(|&i| Pin::new(i)).collect(),
             data_bits_in,
             data_bits_out,
             mapping,
@@ -1151,38 +1136,45 @@ impl Logic for Splitter {
         self.outputs.len()
     }
 
-    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+    fn get_pin_value(&self, px: PinIndex) -> Option<SignalRef> {
         match px {
-            PinIndex::Input(i) => {
-                if i == 0 {
-                    &self.input
-                } else {
-                    panic!()
-                }
-            }
-            PinIndex::Output(i) => &self.outputs[i],
+            PinIndex::Input(0) => self.input.get(),
+            PinIndex::Output(i) => self.outputs[i].get(),
+            _ => panic!(),
         }
     }
 
-    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+    fn set_pin_value(&mut self, px: PinIndex, value: Option<SignalRef>) {
         match px {
-            PinIndex::Input(i) => {
-                if i == 0 {
-                    self.input.copy_from_bitslice(value)
-                } else {
-                    panic!()
-                }
-            }
-            PinIndex::Output(i) => self.outputs[i].copy_from_bitslice(value),
+            PinIndex::Input(0) => self.input.set(value),
+            PinIndex::Output(i) => self.outputs[i].set(value),
+            _ => panic!(),
         }
     }
 
     fn do_logic(&mut self) {
-        for output in &mut self.outputs {
-            output.clear();
-        }
-        for (bit, &branch) in self.mapping.iter().enumerate() {
-            self.outputs[branch].push(self.input[bit]);
+        match self.input.get() {
+            Some(input) => {
+                for output in &mut self.outputs {
+                    match &mut output.signal {
+                        Some(s) => s.clear(),
+                        None => output.signal = Some(Signal::new()),
+                    }
+                }
+                for (bit, &branch) in self.mapping.iter().enumerate() {
+                    // Just instantiated all Some, so unwrap is okay
+                    self.outputs[branch]
+                        .signal
+                        .as_mut()
+                        .unwrap()
+                        .push(input[bit]);
+                }
+            }
+            None => {
+                for output in &mut self.outputs {
+                    output.signal = None
+                }
+            }
         }
     }
 }
@@ -1360,7 +1352,7 @@ struct Tunnel {
     kind: TunnelKind,
     label: String,
     data_bits: u8,
-    value: Signal,
+    value: Pin,
 }
 
 impl Tunnel {
@@ -1369,7 +1361,7 @@ impl Tunnel {
             kind,
             label,
             data_bits,
-            value: signal_zeros(data_bits),
+            value: Pin::new(data_bits),
         }
     }
 }
@@ -1399,18 +1391,18 @@ impl Logic for Tunnel {
         }
     }
 
-    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+    fn get_pin_value(&self, px: PinIndex) -> Option<SignalRef> {
         match (&self.kind, px) {
-            (TunnelKind::Sender, PinIndex::Input(0)) => &self.value,
-            (TunnelKind::Receiver, PinIndex::Output(0)) => &self.value,
+            (TunnelKind::Sender, PinIndex::Input(0)) => self.value.get(),
+            (TunnelKind::Receiver, PinIndex::Output(0)) => self.value.get(),
             _ => panic!(),
         }
     }
 
-    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+    fn set_pin_value(&mut self, px: PinIndex, value: Option<SignalRef>) {
         match (&self.kind, px) {
             (TunnelKind::Sender, PinIndex::Input(0))
-            | (TunnelKind::Receiver, PinIndex::Output(0)) => self.value.copy_from_bitslice(value),
+            | (TunnelKind::Receiver, PinIndex::Output(0)) => self.value.set(value),
             _ => panic!(),
         }
     }
@@ -1516,6 +1508,15 @@ impl Draw for Tunnel {
         None
     }
 }
+
+//
+// impl std::ops::Index<PinIndex> for Box<dyn Comp> {
+//     type Output = Signal;
+//
+//     fn index(&self, px: PinIndex) -> &Self::Output {
+//         self.get_pin_value(px)
+//     }
+// }
 
 pub fn default_comp_from_name(comp_name: &str) -> Component {
     let kind: Box<dyn Comp> = match comp_name {
