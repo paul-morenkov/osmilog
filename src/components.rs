@@ -4,7 +4,8 @@ use egui_macroquad::{
     macroquad,
 };
 use macroquad::prelude::*;
-use std::collections::HashMap;
+use petgraph::stable_graph::NodeIndex;
+use std::{collections::HashMap, fmt::Display};
 
 use std::fmt::Debug;
 
@@ -16,6 +17,17 @@ const COMBO_WIDTH: f32 = 50.;
 pub enum PinIndex {
     Input(usize),
     Output(usize),
+}
+
+#[derive(Debug, Default)]
+struct TunnelMembers {
+    sender: Option<NodeIndex>,
+    receivers: Vec<NodeIndex>,
+}
+
+#[derive(Debug, Default)]
+pub struct CircuitContext {
+    tunnels: HashMap<String, TunnelMembers>,
 }
 
 #[derive(Debug)]
@@ -101,6 +113,62 @@ pub(crate) trait Logic {
     }
 }
 
+pub(crate) trait Draw: Logic {
+    fn size(&self) -> Vec2;
+    fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>);
+    fn bboxes(&self) -> Vec<Rect> {
+        // Return bounding boxes for this component, located relative to its position
+        vec![Rect::new(
+            -TILE_SIZE,
+            -TILE_SIZE,
+            self.size().x + 2. * TILE_SIZE,
+            self.size().y + 2. * TILE_SIZE,
+        )]
+    }
+    fn input_positions(&self) -> Vec<Vec2> {
+        let n_inputs = self.n_in_pins();
+        (0..n_inputs)
+            .map(|i| vec2(0., (i + 1) as f32 * self.size().y / (n_inputs + 1) as f32))
+            .collect()
+    }
+
+    fn output_positions(&self) -> Vec<Vec2> {
+        let n_outputs = self.n_out_pins();
+        (0..n_outputs)
+            .map(|i| {
+                vec2(
+                    self.size().x,
+                    (i + 1) as f32 * self.size().y / (n_outputs + 1) as f32,
+                )
+            })
+            .collect()
+    }
+    fn draw_from_texture_slice(&self, pos: Vec2, tex: &Texture2D, tex_info: TexInfo) {
+        draw_texture_ex(
+            *tex,
+            pos.x,
+            pos.y,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(tex_info.size),
+                source: Some(Rect::new(
+                    tex_info.offset.x,
+                    tex_info.offset.y,
+                    tex_info.tex_size.x,
+                    tex_info.tex_size.y,
+                )),
+                rotation: 0.,
+                flip_x: false,
+                flip_y: false,
+                pivot: None,
+            },
+        );
+    }
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>>;
+}
+
+pub(crate) trait Comp: Logic + Draw + Debug {}
+impl<T: Logic + Draw + Debug> Comp for T {}
 #[derive(Debug, Clone, Copy)]
 enum GateKind {
     Not,
@@ -1019,18 +1087,6 @@ impl Draw for Output {
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        //     let mut new_comp: Option<Box<dyn Comp>> = None;
-        //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-        //         // Data bits
-        //         let mut data_bits_sel = self.data_bits as usize - 1;
-        //         ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
-        //         let new_data_bits = data_bits_sel as u8 + 1;
-        //
-        //         if new_data_bits != self.data_bits {
-        //             let output = Self::new(new_data_bits);
-        //             new_comp = Some(Box::new(output));
-        //         };
-        //     });
         let mut data_bits = self.data_bits;
         ComboBox::from_label("Data Bits")
             .width(COMBO_WIDTH)
@@ -1045,7 +1101,6 @@ impl Draw for Output {
             return Some(Box::new(Self::new(data_bits)));
         }
         None
-        //     new_comp
     }
 }
 
@@ -1053,60 +1108,6 @@ impl Default for Output {
     fn default() -> Self {
         Self::new(1)
     }
-}
-
-pub(crate) trait Draw: Logic {
-    fn size(&self) -> Vec2;
-    fn draw(&self, pos: Vec2, textures: &HashMap<&str, Texture2D>);
-    fn bboxes(&self) -> Vec<Rect> {
-        // Return bounding boxes for this component, located relative to its position
-        vec![Rect::new(
-            -TILE_SIZE,
-            -TILE_SIZE,
-            self.size().x + 2. * TILE_SIZE,
-            self.size().y + 2. * TILE_SIZE,
-        )]
-    }
-    fn input_positions(&self) -> Vec<Vec2> {
-        let n_inputs = self.n_in_pins();
-        (0..n_inputs)
-            .map(|i| vec2(0., (i + 1) as f32 * self.size().y / (n_inputs + 1) as f32))
-            .collect()
-    }
-
-    fn output_positions(&self) -> Vec<Vec2> {
-        let n_outputs = self.n_out_pins();
-        (0..n_outputs)
-            .map(|i| {
-                vec2(
-                    self.size().x,
-                    (i + 1) as f32 * self.size().y / (n_outputs + 1) as f32,
-                )
-            })
-            .collect()
-    }
-    fn draw_from_texture_slice(&self, pos: Vec2, tex: &Texture2D, tex_info: TexInfo) {
-        draw_texture_ex(
-            *tex,
-            pos.x,
-            pos.y,
-            WHITE,
-            DrawTextureParams {
-                dest_size: Some(tex_info.size),
-                source: Some(Rect::new(
-                    tex_info.offset.x,
-                    tex_info.offset.y,
-                    tex_info.tex_size.x,
-                    tex_info.tex_size.y,
-                )),
-                rotation: 0.,
-                flip_x: false,
-                flip_y: false,
-                pivot: None,
-            },
-        );
-    }
-    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>>;
 }
 
 #[derive(Debug, Clone)]
@@ -1334,8 +1335,187 @@ impl Draw for Splitter {
     }
 }
 
-pub(crate) trait Comp: Logic + Draw + Debug {}
-impl<T: Logic + Draw + Debug> Comp for T {}
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum TunnelKind {
+    #[default]
+    Sender,
+    Receiver,
+}
+
+impl Display for TunnelKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                TunnelKind::Sender => "Sender",
+                TunnelKind::Receiver => "Receiver",
+            }
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Tunnel {
+    kind: TunnelKind,
+    label: String,
+    data_bits: u8,
+    value: Signal,
+}
+
+impl Tunnel {
+    fn new(kind: TunnelKind, label: String, data_bits: u8) -> Self {
+        Self {
+            kind,
+            label,
+            data_bits,
+            value: signal_zeros(data_bits),
+        }
+    }
+}
+
+impl Default for Tunnel {
+    fn default() -> Self {
+        Self::new(TunnelKind::default(), String::new(), 1)
+    }
+}
+
+impl Logic for Tunnel {
+    fn name(&self) -> &'static str {
+        "Tunnel"
+    }
+
+    fn n_in_pins(&self) -> usize {
+        match self.kind {
+            TunnelKind::Sender => 1,
+            TunnelKind::Receiver => 0,
+        }
+    }
+
+    fn n_out_pins(&self) -> usize {
+        match self.kind {
+            TunnelKind::Sender => 0,
+            TunnelKind::Receiver => 1,
+        }
+    }
+
+    fn get_pin_value(&self, px: PinIndex) -> &Signal {
+        match (&self.kind, px) {
+            (TunnelKind::Sender, PinIndex::Input(0)) => &self.value,
+            (TunnelKind::Receiver, PinIndex::Output(0)) => &self.value,
+            _ => panic!(),
+        }
+    }
+
+    fn set_pin_value(&mut self, px: PinIndex, value: &Signal) {
+        match (&self.kind, px) {
+            (TunnelKind::Sender, PinIndex::Input(0))
+            | (TunnelKind::Receiver, PinIndex::Output(0)) => self.value.copy_from_bitslice(value),
+            _ => panic!(),
+        }
+    }
+
+    fn do_logic(&mut self) {}
+}
+
+impl Draw for Tunnel {
+    fn size(&self) -> Vec2 {
+        let text_dims = measure_text(&self.label, None, 15, 1.);
+        Vec2::new(
+            f32::max(4. * TILE_SIZE, 2. * TILE_SIZE + text_dims.width.ceil()),
+            2. * TILE_SIZE,
+        )
+    }
+
+    fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
+        let (x, y) = pos.into();
+        let (w, h) = self.size().into();
+
+        draw_text(
+            &self.label,
+            pos.x + TILE_SIZE,
+            pos.y + TILE_SIZE * 1.5,
+            15.,
+            BLACK,
+        );
+        // Draw arrow shape pointing either left or right dependinging on TunnelKind
+        let points = match self.kind {
+            TunnelKind::Sender => [
+                (x, y + TILE_SIZE),
+                (x + TILE_SIZE, y),
+                (x + w, y),
+                (x + w, y + h),
+                (x + TILE_SIZE, y + h),
+            ],
+            TunnelKind::Receiver => [
+                (x, y),
+                (x + w - TILE_SIZE, y),
+                (x + w, y + TILE_SIZE),
+                (x + w - TILE_SIZE, y + h),
+                (x, y + h),
+            ],
+        };
+        for i in 0..points.len() - 1 {
+            draw_line(
+                points[i].0,
+                points[i].1,
+                points[i + 1].0,
+                points[i + 1].1,
+                1.,
+                BLACK,
+            );
+        }
+        draw_line(
+            points[4].0,
+            points[4].1,
+            points[0].0,
+            points[0].1,
+            1.,
+            BLACK,
+        );
+    }
+
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+        let mut data_bits = self.data_bits;
+        ComboBox::from_label("Data Bits")
+            .width(COMBO_WIDTH)
+            .selected_text(format!("{}", data_bits))
+            .show_ui(ui, |ui| {
+                for i in 1..=32 {
+                    ui.selectable_value(&mut data_bits, i, format!("{i}"));
+                }
+            });
+
+        if data_bits != self.data_bits {
+            return Some(Box::new(Self::new(
+                self.kind,
+                self.label.clone(),
+                data_bits,
+            )));
+        }
+
+        let response = ui.text_edit_singleline(&mut self.label);
+        if response.lost_focus() {
+            return Some(Box::new(self.clone()));
+        }
+
+        let mut kind = self.kind;
+
+        ComboBox::from_label("Kind")
+            .width(COMBO_WIDTH)
+            .selected_text(format!("{}", kind))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut kind, TunnelKind::Sender, "Sender");
+                ui.selectable_value(&mut kind, TunnelKind::Receiver, "Receiver");
+            });
+
+        if kind != self.kind {
+            return Some(Box::new(Self::new(kind, self.label.clone(), data_bits)));
+        }
+
+        None
+    }
+}
 
 pub fn default_comp_from_name(comp_name: &str) -> Component {
     let kind: Box<dyn Comp> = match comp_name {
@@ -1348,6 +1528,7 @@ pub fn default_comp_from_name(comp_name: &str) -> Component {
         "Mux" => Box::new(Mux::default()),
         "Demux" => Box::new(Demux::default()),
         "Splitter" => Box::new(Splitter::default()),
+        "Tunnel" => Box::new(Tunnel::default()),
         _ => {
             panic!("Unknown component attempted to be created.")
         }

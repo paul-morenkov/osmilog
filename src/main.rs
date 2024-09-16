@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use egui::{Align2, SidePanel, Ui, Window};
+use egui::{Align2, Ui, Window};
 use egui_macroquad::egui::ScrollArea;
 use egui_macroquad::{egui, macroquad};
 use macroquad::prelude::*;
@@ -10,7 +10,7 @@ use petgraph::visit::{EdgeFiltered, EdgeRef};
 use petgraph::Direction;
 use std::fmt::Debug;
 
-use components::{signal_zeros, Component, PinIndex, Signal};
+use components::{signal_zeros, CircuitContext, Component, PinIndex, Signal};
 
 mod components;
 
@@ -69,6 +69,7 @@ struct App {
     textures: HashMap<&'static str, Texture2D>,
     graph: StableGraph<Component, Wire>,
     action_state: ActionState,
+    context: CircuitContext,
 }
 
 impl App {
@@ -468,7 +469,7 @@ async fn main() {
                 .fixed_size((SANDBOX_POS.x - 15., SANDBOX_SIZE.y - 50.))
                 .anchor(Align2::LEFT_TOP, egui::Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.set_min_height(SANDBOX_SIZE.y -  50.);
+                    ui.set_min_height(SANDBOX_SIZE.y - 50.);
                     ScrollArea::vertical()
                         .id_source("Components")
                         .min_scrolled_height(300.)
@@ -522,7 +523,7 @@ fn get_folder_structure() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         ("Gates", vec!["NOT", "AND", "OR"]),
         ("I/O", vec!["Input", "Output"]),
-        ("Wiring", vec!["Splitter"]),
+        ("Wiring", vec!["Tunnel", "Splitter"]),
         ("Plexers", vec!["Mux", "Demux"]),
         ("Memory", vec!["Register"]),
     ]
