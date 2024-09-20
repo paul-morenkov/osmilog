@@ -6,7 +6,7 @@ use egui_macroquad::{
 use macroquad::prelude::*;
 use std::{collections::HashMap, fmt::Display};
 
-use crate::{CircuitContext, CtxEvent, TunnelUpdate, TunnelUpdateKind};
+use crate::{CtxEvent, TunnelUpdate, TunnelUpdateKind};
 
 use std::fmt::Debug;
 
@@ -54,19 +54,14 @@ pub enum PinIndex {
     Output(usize),
 }
 
-#[derive(Debug)]
-pub enum CompUpdateResponse {
-    ReCreated(Box<dyn Comp>),
-    Updated,
-    RenamedTunnel(Tunnel),
-    FlippedTunnel(Tunnel),
-    Nothing,
-}
+// None -> component didn't change
+// Some(None) -> component changed, but doesn't require context update
+// Some(Some(event)) -> component changed AND requires context update
+pub(crate) type CompUpdateResponse = Option<Option<CtxEvent>>;
 
 #[derive(Debug)]
 pub enum CompEvent {
     Added,
-    Updated,
     Removed,
 }
 
@@ -149,7 +144,7 @@ pub(crate) trait Logic {
     fn interact(&mut self) -> bool {
         false
     }
-    fn get_ctx_event(&self, event: CompEvent) -> Option<CtxEvent> {
+    fn get_ctx_event(&mut self, _: CompEvent) -> Option<CtxEvent> {
         None
     }
 }
@@ -382,11 +377,8 @@ impl Draw for Gate {
             });
 
         if data_bits != self.data_bits {
-            return CompUpdateResponse::ReCreated(Box::new(Self::new(
-                self.kind,
-                data_bits,
-                self.n_inputs,
-            )));
+            *self = Self::new(self.kind, data_bits, self.n_inputs);
+            return Some(None);
         }
 
         if !matches!(self.kind, GateKind::Not) {
@@ -400,15 +392,12 @@ impl Draw for Gate {
                     }
                 });
             if n_inputs != self.n_inputs {
-                return CompUpdateResponse::ReCreated(Box::new(Self::new(
-                    self.kind,
-                    self.data_bits,
-                    n_inputs,
-                )));
+                *self = Self::new(self.kind, self.data_bits, n_inputs);
+                return Some(None);
             }
         }
 
-        CompUpdateResponse::Nothing
+        None
     }
 }
 
@@ -572,7 +561,8 @@ impl Draw for Mux {
             });
 
         if data_bits != self.data_bits {
-            return CompUpdateResponse::ReCreated(Box::new(Self::new(self.sel_bits, data_bits)));
+            *self = Self::new(self.sel_bits, data_bits);
+            return Some(None);
         }
 
         let mut select_bits = self.sel_bits;
@@ -585,10 +575,10 @@ impl Draw for Mux {
                 }
             });
         if select_bits != self.sel_bits {
-            return CompUpdateResponse::ReCreated(Box::new(Self::new(select_bits, self.data_bits)));
+            *self = Self::new(select_bits, self.data_bits);
+            return Some(None);
         }
-        // new_comp
-        CompUpdateResponse::Nothing
+        None
     }
 }
 
@@ -759,23 +749,9 @@ impl Draw for Demux {
             });
 
         if data_bits != self.data_bits {
-            return CompUpdateResponse::ReCreated(Box::new(Self::new(self.sel_bits, data_bits)));
+            *self = Self::new(self.sel_bits, data_bits);
+            return Some(None);
         }
-        // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-        //     // Selection bits
-        //     let mut sel_bits_sel = self.sel_bits as usize - 1;
-        //     ui.combo_box(
-        //         hash!(),
-        //         "Select Bits",
-        //         &["1", "2", "3", "4", "5", "6"],
-        //         &mut sel_bits_sel,
-        //     );
-        //     let new_sel_bits = sel_bits_sel as u8 + 1;
-        //     if new_sel_bits != self.sel_bits {
-        //         let mux = Self::new(new_sel_bits, self.data_bits);
-        //         new_comp = Some(Box::new(mux));
-        //     }
-        // });
 
         let mut select_bits = self.sel_bits;
         ComboBox::from_label("Select Bits")
@@ -787,10 +763,10 @@ impl Draw for Demux {
                 }
             });
         if select_bits != self.sel_bits {
-            return CompUpdateResponse::ReCreated(Box::new(Self::new(select_bits, self.data_bits)));
+            *self = Self::new(select_bits, self.data_bits);
+            return Some(None);
         }
-        CompUpdateResponse::Nothing
-        // new_comp
+        None
     }
 }
 
@@ -936,9 +912,10 @@ impl Draw for Register {
             });
 
         if data_bits != self.data_bits {
-            return CompUpdateResponse::ReCreated(Box::new(Self::new(data_bits)));
+            *self = Self::new(data_bits);
+            return Some(None);
         }
-        CompUpdateResponse::Nothing
+        None
     }
 }
 
@@ -1045,10 +1022,10 @@ impl Draw for Input {
             });
 
         if data_bits != self.data_bits {
-            return CompUpdateResponse::ReCreated(Box::new(Self::new(data_bits)));
+            *self = Self::new(data_bits);
+            return Some(None);
         }
-        CompUpdateResponse::Nothing
-        //     new_comp
+        None
     }
 }
 
@@ -1105,7 +1082,7 @@ impl Logic for Output {
 
     fn get_pin_width(&self, px: PinIndex) -> u8 {
         if let PinIndex::Input(0) = px {
-            return self.value.bits;
+            self.value.bits
         } else {
             panic!()
         }
@@ -1143,9 +1120,10 @@ impl Draw for Output {
             });
 
         if data_bits != self.data_bits {
-            return CompUpdateResponse::ReCreated(Box::new(Self::new(data_bits)));
+            *self = Self::new(data_bits);
+            return Some(None);
         }
-        CompUpdateResponse::Nothing
+        None
     }
 }
 
@@ -1324,11 +1302,8 @@ impl Draw for Splitter {
                 }
                 (data_bits_out, mapping)
             };
-            return CompUpdateResponse::ReCreated(Box::new(Self::new(
-                data_bits_in,
-                new_data_bits_out,
-                new_mapping,
-            )));
+            *self = Self::new(data_bits_in, new_data_bits_out, new_mapping);
+            return Some(None);
         }
 
         let mut new_n_outputs = self.outputs.len();
@@ -1363,11 +1338,8 @@ impl Draw for Splitter {
                     .collect::<Vec<_>>();
                 (self.data_bits_out[..new_n_outputs].to_vec(), mapping)
             };
-            return CompUpdateResponse::ReCreated(Box::new(Self::new(
-                self.data_bits_in,
-                new_data_bits_out,
-                new_mapping,
-            )));
+            *self = Self::new(self.data_bits_in, new_data_bits_out, new_mapping);
+            return Some(None);
         }
         ui.separator();
         for bit in 0..self.data_bits_in as usize {
@@ -1384,14 +1356,11 @@ impl Draw for Splitter {
                 });
 
             if new_arm != arm {
-                let mut splitter = self.clone();
-                splitter.mapping[bit] = new_arm;
-                return CompUpdateResponse::ReCreated(Box::new(splitter));
+                self.mapping[bit] = new_arm;
+                return Some(None);
             }
         }
-        //
-        // new_comp
-        CompUpdateResponse::Nothing
+        None
     }
 }
 
@@ -1487,14 +1456,13 @@ impl Logic for Tunnel {
 
     fn do_logic(&mut self) {}
 
-    fn get_ctx_event(&self, event: CompEvent) -> Option<CtxEvent> {
+    fn get_ctx_event(&mut self, event: CompEvent) -> Option<CtxEvent> {
         match event {
             CompEvent::Added => Some(CtxEvent::TunnelUpdate(TunnelUpdate {
                 label: self.label.clone(),
                 tunnel_kind: self.kind,
                 update_kind: TunnelUpdateKind::Add,
             })),
-            CompEvent::Updated => todo!("Relies on components being able to be updated in place"),
             CompEvent::Removed => Some(CtxEvent::TunnelUpdate(TunnelUpdate {
                 label: self.label.clone(),
                 tunnel_kind: self.kind,
@@ -1573,20 +1541,20 @@ impl Draw for Tunnel {
             });
 
         if data_bits != self.data_bits {
-            return CompUpdateResponse::ReCreated(Box::new(Self::new(
-                self.kind,
-                self.label.clone(),
-                data_bits,
-            )));
+            self.data_bits = data_bits;
+            return Some(None);
         }
 
         let response = ui.text_edit_singleline(&mut self.live_label);
         if response.lost_focus() {
-            return CompUpdateResponse::ReCreated(Box::new(Self::new(
-                self.kind,
-                self.live_label.clone(),
-                data_bits,
-            )));
+            let rename_tunnel_event = CtxEvent::TunnelUpdate(TunnelUpdate {
+                label: self.label.clone(),
+                tunnel_kind: self.kind,
+                update_kind: TunnelUpdateKind::Rename(self.live_label.clone()),
+            });
+            let result = Some(Some(rename_tunnel_event));
+            self.label = self.live_label.clone();
+            return result;
         }
 
         let mut kind = self.kind;
@@ -1600,14 +1568,16 @@ impl Draw for Tunnel {
             });
 
         if kind != self.kind {
-            return CompUpdateResponse::ReCreated(Box::new(Self::new(
-                kind,
-                self.label.clone(),
-                data_bits,
-            )));
+            let flip_tunnel_event = CtxEvent::TunnelUpdate(TunnelUpdate {
+                label: self.label.clone(),
+                tunnel_kind: self.kind,
+                update_kind: TunnelUpdateKind::Flip,
+            });
+            self.kind = kind;
+            return Some(Some(flip_tunnel_event));
         }
 
-        CompUpdateResponse::Nothing
+        None
     }
 }
 

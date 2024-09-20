@@ -6,7 +6,7 @@ use egui_macroquad::{egui, macroquad};
 use macroquad::prelude::*;
 use petgraph::algo::toposort;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
-use petgraph::visit::{EdgeFiltered, EdgeRef, IntoEdgesDirected};
+use petgraph::visit::{EdgeFiltered, EdgeRef};
 use petgraph::Direction;
 use std::fmt::Debug;
 
@@ -17,8 +17,8 @@ mod components;
 const TILE_SIZE: f32 = 10.;
 const SANDBOX_POS: Vec2 = vec2(200., 0.);
 const SANDBOX_SIZE: Vec2 = vec2(900., 700.);
-const WINDOW_SIZE: Vec2 = vec2(1000., 800.);
-const MENU_SIZE: Vec2 = vec2(200., WINDOW_SIZE.y);
+const _WINDOW_SIZE: Vec2 = vec2(1000., 800.);
+const _MENU_SIZE: Vec2 = vec2(200., _WINDOW_SIZE.y);
 const HOVER_RADIUS: f32 = 10.;
 
 #[derive(Debug)]
@@ -327,7 +327,7 @@ impl App {
     }
 
     fn remove_component(&mut self, cx: NodeIndex) -> Option<Component> {
-        let comp = self.graph.remove_node(cx)?;
+        let mut comp = self.graph.remove_node(cx)?;
         if let Some(event) = comp.kind.get_ctx_event(CompEvent::Removed) {
             self.context.update(event, cx);
             dbg!(&self.context.tunnels);
@@ -357,10 +357,6 @@ impl App {
             .collect::<Vec<_>>()
         {
             self.graph.remove_edge(wx);
-        }
-        // Then, check if a context update is necessary
-        if let Some(event) = self.graph[cx].kind.get_ctx_event(CompEvent::Updated) {
-            self.context.update(event, cx);
         }
     }
 
@@ -421,19 +417,15 @@ impl App {
             let comp = &mut self.graph[cx];
             ui.label(comp.kind.name());
             let response = comp.draw_properties_ui(ui);
-            match response {
-                components::CompUpdateResponse::ReCreated(comp) => {
-                    // TODO: extract into own function
-                    let new_comp = Component::new(comp, self.graph[cx].position);
-                    self.remove_component(cx);
-                    self.add_component(new_comp);
+            if let Some(maybe_ctx_event) = response {
+                println!("Updating component");
+                self.update_component(cx);
+                if let Some(ctx_event) = maybe_ctx_event {
+                    println!("context event");
+                    self.context.update(ctx_event, cx);
+            
+                    dbg!(&self.context.tunnels);
                 }
-                components::CompUpdateResponse::Updated => {
-                    // TODO: handle rearranging wires
-                }
-                components::CompUpdateResponse::RenamedTunnel(tunnel) => {}
-                components::CompUpdateResponse::FlippedTunnel(tunnel) => todo!(),
-                components::CompUpdateResponse::Nothing => {}
             }
         }
     }
