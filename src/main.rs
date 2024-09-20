@@ -321,26 +321,40 @@ impl App {
         let cx = self.graph.add_node(comp);
         if let Some(event) = self.graph[cx].kind.get_ctx_event(CompEvent::Added) {
             self.context.update(event, cx);
-            dbg!(&self.context.tunnels);
         }
         cx
     }
 
     fn remove_component(&mut self, cx: NodeIndex) -> Option<Component> {
+        // before removing from the graph, manually set all outgoing edge end pin signals to None
+        let outgoing_wxs = self
+            .graph
+            .edges_directed(cx, Direction::Outgoing)
+            .map(|e| e.id())
+            .collect::<Vec<_>>();
+        for wx in outgoing_wxs {
+            let out_cx = self.graph[wx].end_comp;
+            let out_pin = PinIndex::Input(self.graph[wx].end_pin);
+            self.graph[out_cx].kind.set_pin_value(out_pin, None);
+        }
         let mut comp = self.graph.remove_node(cx)?;
         if let Some(event) = comp.kind.get_ctx_event(CompEvent::Removed) {
             self.context.update(event, cx);
-            dbg!(&self.context.tunnels);
         }
         Some(comp)
     }
 
     fn update_component(&mut self, cx: NodeIndex) {
         // This method is called after a UI interaction causes a component to change state.
+        
+        // Update the component's input and output positions
+        let comp = &mut self.graph[cx];
+        comp.input_pos = comp.kind.input_positions();
+        comp.output_pos = comp.kind.output_positions();
 
-        // First, remove any wires/edges that are made out of bounds
-        let n_inputs = self.graph[cx].kind.n_in_pins();
-        let n_outputs = self.graph[cx].kind.n_out_pins();
+        // Then, remove any wires/edges that are made out of bounds
+        let n_inputs = comp.kind.n_in_pins();
+        let n_outputs = comp.kind.n_out_pins();
 
         let incoming_to_remove = self
             .graph
@@ -433,7 +447,6 @@ impl App {
                     println!("context event");
                     self.context.update(ctx_event, cx);
 
-                    dbg!(&self.context.tunnels);
                 }
             }
         }
