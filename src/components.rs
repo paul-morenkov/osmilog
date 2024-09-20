@@ -1424,7 +1424,6 @@ impl Logic for Tunnel {
     }
 
     fn n_in_pins(&self) -> usize {
-        // FIXME: should this now just always return 1?
         match self.kind {
             TunnelKind::Sender => 1,
             TunnelKind::Receiver => 0,
@@ -1549,7 +1548,7 @@ impl Draw for Tunnel {
             });
 
         if data_bits != self.data_bits {
-            self.data_bits = data_bits;
+            *self = Self::new(self.kind, self.label.clone(), data_bits);
             return Some(None);
         }
 
