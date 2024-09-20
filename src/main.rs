@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use egui::{Align2, Ui, Window};
 use egui_macroquad::egui::ScrollArea;
@@ -10,7 +10,7 @@ use petgraph::visit::{EdgeFiltered, EdgeRef};
 use petgraph::Direction;
 use std::fmt::Debug;
 
-use components::{signal_zeros, CircuitContext, Component, PinIndex, Signal, SignalRef};
+use components::{CompEvent, Component, PinIndex, Signal, SignalRef, TunnelKind};
 
 mod components;
 
@@ -49,9 +49,8 @@ impl Wire {
             value: None,
         }
     }
-    
+
     fn set_signal(&mut self, value: Option<SignalRef>) {
-        
         match value {
             None => self.value = None,
             Some(new) => match &mut self.value {
@@ -73,6 +72,94 @@ enum ActionState {
     // Moving a component that already was in the sandbox area
     MovingComponent(NodeIndex),
     DrawingWire(NodeIndex, PinIndex),
+}
+
+#[derive(Debug, Default)]
+struct TunnelMembers {
+    senders: HashSet<NodeIndex>,
+    receivers: HashSet<NodeIndex>,
+}
+
+impl TunnelMembers {
+    fn valid(&self) -> bool {
+        self.senders.len() == 1
+    }
+}
+
+#[derive(Debug)]
+struct TunnelUpdate {
+    label: String,
+    tunnel_kind: TunnelKind,
+    update_kind: TunnelUpdateKind,
+}
+
+#[derive(Debug)]
+enum TunnelUpdateKind {
+    Add,
+    Remove,
+    Flip,
+    Rename(String),
+}
+
+#[derive(Debug, Default)]
+struct CircuitContext {
+    tunnels: HashMap<String, TunnelMembers>,
+}
+
+impl CircuitContext {
+    fn update(&mut self, event: CtxEvent, cx: NodeIndex) {
+        match event {
+            CtxEvent::TunnelUpdate(update) => {
+                let tunnels = self.tunnels.entry(update.label.clone()).or_default();
+                match update.update_kind {
+                    TunnelUpdateKind::Add => {
+                        match update.tunnel_kind {
+                            TunnelKind::Sender => tunnels.senders.insert(cx),
+                            TunnelKind::Receiver => tunnels.receivers.insert(cx),
+                        };
+                    }
+                    TunnelUpdateKind::Remove => {
+                        match update.tunnel_kind {
+                            TunnelKind::Sender => tunnels.senders.remove(&cx),
+                            TunnelKind::Receiver => tunnels.receivers.remove(&cx),
+                        };
+                        if tunnels.senders.is_empty() && tunnels.receivers.is_empty() {
+                            self.tunnels.remove(&update.label);
+                        }
+                    }
+                    TunnelUpdateKind::Flip => match update.tunnel_kind {
+                        TunnelKind::Sender => {
+                            tunnels.senders.remove(&cx);
+                            tunnels.receivers.insert(cx);
+                        }
+                        TunnelKind::Receiver => {
+                            tunnels.receivers.remove(&cx);
+                            tunnels.senders.insert(cx);
+                        }
+                    },
+                    TunnelUpdateKind::Rename(new_label) => {
+                        let remove_event = CtxEvent::TunnelUpdate(TunnelUpdate {
+                            label: update.label,
+                            tunnel_kind: update.tunnel_kind,
+                            update_kind: TunnelUpdateKind::Remove,
+                        });
+                        let add_event = CtxEvent::TunnelUpdate(TunnelUpdate {
+                            label: new_label,
+                            tunnel_kind: update.tunnel_kind,
+                            update_kind: TunnelUpdateKind::Add,
+                        });
+                        self.update(remove_event, cx);
+                        self.update(add_event, cx);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CtxEvent {
+    TunnelUpdate(TunnelUpdate),
 }
 
 #[derive(Default, Debug)]
@@ -188,6 +275,7 @@ impl App {
         }
         None
     }
+
     fn try_add_wire(
         &mut self,
         cx_a: NodeIndex,
@@ -223,14 +311,26 @@ impl App {
         }
         // We know the pins match in terms of data bits, so arbitrarily set wire data bits to
         // data_bits_a
-        let wire = Wire::new(cx_a, pin_a, cx_b, pin_b, data_bits_a as u8);
+        let wire = Wire::new(cx_a, pin_a, cx_b, pin_b, data_bits_a);
         self.graph.add_edge(cx_a, cx_b, wire);
         self.update_signals();
         true
     }
 
-    fn remove_component(&mut self, cx: NodeIndex) {
-        self.graph.remove_node(cx);
+    fn add_component(&mut self, comp: Component) -> NodeIndex {
+        let cx = self.graph.add_node(comp);
+        if let Some(event) = self.graph[cx].kind.get_ctx_event(CompEvent::Added) {
+            self.context.update(event, cx);
+        }
+        cx
+    }
+
+    fn remove_component(&mut self, cx: NodeIndex) -> Option<Component> {
+        let comp = self.graph.remove_node(cx)?;
+        if let Some(event) = comp.kind.get_ctx_event(CompEvent::Removed) {
+            self.context.update(event, cx);
+        }
+        Some(comp)
     }
 
     fn tick_clock(&mut self) {
@@ -248,6 +348,7 @@ impl App {
             toposort(&de_cycled, None).expect("Cycles should only involve clocked components");
 
         // step through all components in order of evaluation
+        // FIXME: input pins that are not connected to anything should be set to None
         for cx in order {
             // When visiting a component, perform logic to convert inputs to outputs.
             // This also applies to clocked components, whose inputs will still be based on the previous clock cycle.
@@ -288,23 +389,20 @@ impl App {
         {
             let comp = &mut self.graph[cx];
             ui.label(comp.kind.name());
-            let new_comp = comp.draw_properties_ui(ui);
-            if let Some(new_comp) = new_comp {
-                self.graph[cx] = Component::new(new_comp, self.graph[cx].position);
-                // remove all wires connected to this component
-                let wxs_to_remove = self
-                    .graph
-                    .edges_directed(cx, Direction::Outgoing)
-                    .map(|e| e.id())
-                    .chain(
-                        self.graph
-                            .edges_directed(cx, Direction::Incoming)
-                            .map(|e| e.id()),
-                    )
-                    .collect::<Vec<_>>();
-                for wx in wxs_to_remove {
-                    self.graph.remove_edge(wx);
+            let response = comp.draw_properties_ui(ui);
+            match response {
+                components::CompUpdateResponse::ReCreated(comp) => {
+                    // TODO: extract into own function
+                    let new_comp = Component::new(comp, self.graph[cx].position);
+                    self.remove_component(cx);
+                    self.add_component(new_comp);
                 }
+                components::CompUpdateResponse::Updated => {
+                    // TODO: handle rearranging wires
+                }
+                components::CompUpdateResponse::RenamedTunnel(tunnel) => {}
+                components::CompUpdateResponse::FlippedTunnel(tunnel) => todo!(),
+                components::CompUpdateResponse::Nothing => {}
             }
         }
     }
@@ -507,7 +605,7 @@ async fn main() {
                                             selected_menu_comp_name = Some(comp_name);
                                             let new_comp =
                                                 components::default_comp_from_name(comp_name);
-                                            let new_cx = app.graph.add_node(new_comp);
+                                            let new_cx = app.add_component(new_comp);
                                             app.action_state =
                                                 ActionState::HoldingComponent(new_cx);
                                         }

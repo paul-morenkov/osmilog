@@ -4,8 +4,9 @@ use egui_macroquad::{
     macroquad,
 };
 use macroquad::prelude::*;
-use petgraph::stable_graph::NodeIndex;
 use std::{collections::HashMap, fmt::Display};
+
+use crate::{CircuitContext, CtxEvent, TunnelUpdate, TunnelUpdateKind};
 
 use std::fmt::Debug;
 
@@ -53,15 +54,20 @@ pub enum PinIndex {
     Output(usize),
 }
 
-#[derive(Debug, Default)]
-struct TunnelMembers {
-    sender: Option<NodeIndex>,
-    receivers: Vec<NodeIndex>,
+#[derive(Debug)]
+pub enum CompUpdateResponse {
+    ReCreated(Box<dyn Comp>),
+    Updated,
+    RenamedTunnel(Tunnel),
+    FlippedTunnel(Tunnel),
+    Nothing,
 }
 
-#[derive(Debug, Default)]
-pub struct CircuitContext {
-    tunnels: HashMap<String, TunnelMembers>,
+#[derive(Debug)]
+pub enum CompEvent {
+    Added,
+    Updated,
+    Removed,
 }
 
 #[derive(Debug)]
@@ -102,7 +108,7 @@ impl Component {
             self.kind.tick_clock();
         }
     }
-    pub(crate) fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+    pub(crate) fn draw_properties_ui(&mut self, ui: &mut Ui) -> CompUpdateResponse {
         self.kind.draw_properties_ui(ui)
     }
 }
@@ -142,6 +148,9 @@ pub(crate) trait Logic {
     // Any additional changes that happen when you click on the component
     fn interact(&mut self) -> bool {
         false
+    }
+    fn get_ctx_event(&self, event: CompEvent) -> Option<CtxEvent> {
+        None
     }
 }
 
@@ -196,7 +205,7 @@ pub(crate) trait Draw: Logic {
             },
         );
     }
-    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>>;
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> CompUpdateResponse;
 }
 
 pub(crate) trait Comp: Logic + Draw + Debug {}
@@ -361,8 +370,8 @@ impl Draw for Gate {
         let tex_info = self.tex_info();
         vec![vec2(tex_info.size.x, tex_info.size.y / 2.)]
     }
-    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        // let mut new_comp: Option<Box<dyn Comp>> = None;
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> CompUpdateResponse {
+        // let mut new_comp: CompUpdateResponse = None;
         let mut data_bits = self.data_bits;
         ComboBox::from_label("Data Bits")
             .selected_text(format!("{}", data_bits))
@@ -373,20 +382,13 @@ impl Draw for Gate {
             });
 
         if data_bits != self.data_bits {
-            return Some(Box::new(Self::new(self.kind, data_bits, self.n_inputs)));
+            return CompUpdateResponse::ReCreated(Box::new(Self::new(
+                self.kind,
+                data_bits,
+                self.n_inputs,
+            )));
         }
 
-        // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-        //     // Data bits
-        //     let mut data_bits_sel = self.data_bits as usize - 1;
-        //     ui.combo_box(hash!(), "Data Bits", COMBO_OPTS, &mut data_bits_sel);
-        //     let new_data_bits = data_bits_sel as u8 + 1;
-        //
-        //     if new_data_bits != self.data_bits {
-        //         let gate = Self::new(self.kind, new_data_bits, self.n_inputs);
-        //         new_comp = Some(Box::new(gate));
-        //     };
-        // });
         if !matches!(self.kind, GateKind::Not) {
             let mut n_inputs = self.n_inputs;
             ComboBox::from_label("Inputs")
@@ -398,24 +400,15 @@ impl Draw for Gate {
                     }
                 });
             if n_inputs != self.n_inputs {
-                return Some(Box::new(Self::new(self.kind, self.data_bits, n_inputs)));
+                return CompUpdateResponse::ReCreated(Box::new(Self::new(
+                    self.kind,
+                    self.data_bits,
+                    n_inputs,
+                )));
             }
         }
 
-        // if !matches!(self.kind, GateKind::Not) {
-        //     // Number of inputs
-        //     Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
-        //         let mut n_inputs_sel = self.n_inputs - 2;
-        //         ui.combo_box(hash!(), "Inputs", &COMBO_OPTS[1..11], &mut n_inputs_sel);
-        //         let new_n_inputs = n_inputs_sel + 2;
-        //         if new_n_inputs != self.n_inputs {
-        //             let gate = Self::new(self.kind, self.data_bits, new_n_inputs);
-        //             new_comp = Some(Box::new(gate));
-        //         }
-        //     });
-        // }
-        // new_comp
-        None
+        CompUpdateResponse::Nothing
     }
 }
 
@@ -566,7 +559,7 @@ impl Draw for Mux {
         input_positions.extend((1..=n_inputs).map(|i| vec2(0., i as f32 * TILE_SIZE)));
         input_positions
     }
-    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> CompUpdateResponse {
         let mut data_bits = self.data_bits;
 
         ComboBox::from_label("Data Bits")
@@ -579,7 +572,7 @@ impl Draw for Mux {
             });
 
         if data_bits != self.data_bits {
-            return Some(Box::new(Self::new(self.sel_bits, data_bits)));
+            return CompUpdateResponse::ReCreated(Box::new(Self::new(self.sel_bits, data_bits)));
         }
 
         let mut select_bits = self.sel_bits;
@@ -592,10 +585,10 @@ impl Draw for Mux {
                 }
             });
         if select_bits != self.sel_bits {
-            return Some(Box::new(Self::new(select_bits, self.data_bits)));
+            return CompUpdateResponse::ReCreated(Box::new(Self::new(select_bits, self.data_bits)));
         }
         // new_comp
-        None
+        CompUpdateResponse::Nothing
     }
 }
 
@@ -741,8 +734,8 @@ impl Draw for Demux {
             .collect()
     }
 
-    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
-        // let mut new_comp: Option<Box<dyn Comp>> = None;
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> CompUpdateResponse {
+        // let mut new_comp: CompUpdateResponse = None;
         // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
         //     // Data bits
         //     let mut data_bits_sel = self.data_bits as usize - 1;
@@ -766,7 +759,7 @@ impl Draw for Demux {
             });
 
         if data_bits != self.data_bits {
-            return Some(Box::new(Self::new(self.sel_bits, data_bits)));
+            return CompUpdateResponse::ReCreated(Box::new(Self::new(self.sel_bits, data_bits)));
         }
         // Group::new(hash!(), vec2(MENU_SIZE.x, 30.)).ui(ui, |ui| {
         //     // Selection bits
@@ -794,9 +787,9 @@ impl Draw for Demux {
                 }
             });
         if select_bits != self.sel_bits {
-            return Some(Box::new(Self::new(select_bits, self.data_bits)));
+            return CompUpdateResponse::ReCreated(Box::new(Self::new(select_bits, self.data_bits)));
         }
-        None
+        CompUpdateResponse::Nothing
         // new_comp
     }
 }
@@ -931,7 +924,7 @@ impl Draw for Register {
         ]
     }
 
-    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> CompUpdateResponse {
         let mut data_bits = self.data_bits;
         ComboBox::from_label("Data Bits")
             .width(COMBO_WIDTH)
@@ -943,9 +936,9 @@ impl Draw for Register {
             });
 
         if data_bits != self.data_bits {
-            return Some(Box::new(Self::new(data_bits)));
+            return CompUpdateResponse::ReCreated(Box::new(Self::new(data_bits)));
         }
-        None
+        CompUpdateResponse::Nothing
     }
 }
 
@@ -1040,7 +1033,7 @@ impl Draw for Input {
         draw_rectangle(pos.x, pos.y, self.size().x, self.size().y, color);
     }
 
-    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> CompUpdateResponse {
         let mut data_bits = self.data_bits;
         ComboBox::from_label("Data Bits")
             .width(COMBO_WIDTH)
@@ -1052,9 +1045,9 @@ impl Draw for Input {
             });
 
         if data_bits != self.data_bits {
-            return Some(Box::new(Self::new(data_bits)));
+            return CompUpdateResponse::ReCreated(Box::new(Self::new(data_bits)));
         }
-        None
+        CompUpdateResponse::Nothing
         //     new_comp
     }
 }
@@ -1138,7 +1131,7 @@ impl Draw for Output {
         draw_rectangle(pos.x, pos.y, self.size().x, self.size().y, color);
     }
 
-    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> CompUpdateResponse {
         let mut data_bits = self.data_bits;
         ComboBox::from_label("Data Bits")
             .width(COMBO_WIDTH)
@@ -1150,9 +1143,9 @@ impl Draw for Output {
             });
 
         if data_bits != self.data_bits {
-            return Some(Box::new(Self::new(data_bits)));
+            return CompUpdateResponse::ReCreated(Box::new(Self::new(data_bits)));
         }
-        None
+        CompUpdateResponse::Nothing
     }
 }
 
@@ -1301,7 +1294,7 @@ impl Draw for Splitter {
         }
     }
 
-    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> CompUpdateResponse {
         let mut data_bits_in = self.data_bits_in;
         let n_outputs = self.outputs.len();
         ComboBox::from_label("Data Bits In")
@@ -1331,7 +1324,7 @@ impl Draw for Splitter {
                 }
                 (data_bits_out, mapping)
             };
-            return Some(Box::new(Self::new(
+            return CompUpdateResponse::ReCreated(Box::new(Self::new(
                 data_bits_in,
                 new_data_bits_out,
                 new_mapping,
@@ -1370,7 +1363,7 @@ impl Draw for Splitter {
                     .collect::<Vec<_>>();
                 (self.data_bits_out[..new_n_outputs].to_vec(), mapping)
             };
-            return Some(Box::new(Self::new(
+            return CompUpdateResponse::ReCreated(Box::new(Self::new(
                 self.data_bits_in,
                 new_data_bits_out,
                 new_mapping,
@@ -1393,17 +1386,17 @@ impl Draw for Splitter {
             if new_arm != arm {
                 let mut splitter = self.clone();
                 splitter.mapping[bit] = new_arm;
-                return Some(Box::new(splitter));
+                return CompUpdateResponse::ReCreated(Box::new(splitter));
             }
         }
         //
         // new_comp
-        None
+        CompUpdateResponse::Nothing
     }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum TunnelKind {
+pub(crate) enum TunnelKind {
     #[default]
     Sender,
     Receiver,
@@ -1423,9 +1416,10 @@ impl Display for TunnelKind {
 }
 
 #[derive(Debug, Clone)]
-struct Tunnel {
+pub(crate) struct Tunnel {
     kind: TunnelKind,
     label: String,
+    live_label: String,
     data_bits: u8,
     value: Pin,
 }
@@ -1434,6 +1428,7 @@ impl Tunnel {
     fn new(kind: TunnelKind, label: String, data_bits: u8) -> Self {
         Self {
             kind,
+            live_label: label.clone(),
             label,
             data_bits,
             value: Pin::new(data_bits),
@@ -1491,6 +1486,22 @@ impl Logic for Tunnel {
     }
 
     fn do_logic(&mut self) {}
+
+    fn get_ctx_event(&self, event: CompEvent) -> Option<CtxEvent> {
+        match event {
+            CompEvent::Added => Some(CtxEvent::TunnelUpdate(TunnelUpdate {
+                label: self.label.clone(),
+                tunnel_kind: self.kind,
+                update_kind: TunnelUpdateKind::Add,
+            })),
+            CompEvent::Updated => todo!("Relies on components being able to be updated in place"),
+            CompEvent::Removed => Some(CtxEvent::TunnelUpdate(TunnelUpdate {
+                label: self.label.clone(),
+                tunnel_kind: self.kind,
+                update_kind: TunnelUpdateKind::Remove,
+            })),
+        }
+    }
 }
 
 impl Draw for Tunnel {
@@ -1550,7 +1561,7 @@ impl Draw for Tunnel {
         );
     }
 
-    fn draw_properties_ui(&mut self, ui: &mut Ui) -> Option<Box<dyn Comp>> {
+    fn draw_properties_ui(&mut self, ui: &mut Ui) -> CompUpdateResponse {
         let mut data_bits = self.data_bits;
         ComboBox::from_label("Data Bits")
             .width(COMBO_WIDTH)
@@ -1562,16 +1573,20 @@ impl Draw for Tunnel {
             });
 
         if data_bits != self.data_bits {
-            return Some(Box::new(Self::new(
+            return CompUpdateResponse::ReCreated(Box::new(Self::new(
                 self.kind,
                 self.label.clone(),
                 data_bits,
             )));
         }
 
-        let response = ui.text_edit_singleline(&mut self.label);
+        let response = ui.text_edit_singleline(&mut self.live_label);
         if response.lost_focus() {
-            return Some(Box::new(self.clone()));
+            return CompUpdateResponse::ReCreated(Box::new(Self::new(
+                self.kind,
+                self.live_label.clone(),
+                data_bits,
+            )));
         }
 
         let mut kind = self.kind;
@@ -1585,21 +1600,16 @@ impl Draw for Tunnel {
             });
 
         if kind != self.kind {
-            return Some(Box::new(Self::new(kind, self.label.clone(), data_bits)));
+            return CompUpdateResponse::ReCreated(Box::new(Self::new(
+                kind,
+                self.label.clone(),
+                data_bits,
+            )));
         }
 
-        None
+        CompUpdateResponse::Nothing
     }
 }
-
-//
-// impl std::ops::Index<PinIndex> for Box<dyn Comp> {
-//     type Output = Signal;
-//
-//     fn index(&self, px: PinIndex) -> &Self::Output {
-//         self.get_pin_value(px)
-//     }
-// }
 
 pub fn default_comp_from_name(comp_name: &str) -> Component {
     let kind: Box<dyn Comp> = match comp_name {
