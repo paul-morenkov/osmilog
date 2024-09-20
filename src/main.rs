@@ -382,18 +382,27 @@ impl App {
             self.graph[cx].do_logic();
             let mut edges = self.graph.neighbors(cx).detach();
             // step through all connected wires and their corresponding components
-            while let Some((wx, next_node_idx)) = edges.next(&self.graph) {
-                let start_pin = PinIndex::Output(self.graph[wx].start_pin);
-                let end_pin = PinIndex::Input(self.graph[wx].end_pin);
-                // use wire to determine relevant output and input pins
-                let signal_to_transmit = self.graph[cx]
-                    .kind
-                    .get_pin_value(start_pin)
-                    .map(Signal::from_bitslice);
-                self.graph[next_node_idx]
-                    .kind
-                    .set_pin_value(end_pin, signal_to_transmit.as_deref());
-                self.graph[wx].set_signal(signal_to_transmit.as_deref());
+            while let Some((wx, next_cx)) = edges.next(&self.graph) {
+                let wire = &self.graph[wx];
+                let start_pin = PinIndex::Output(wire.start_pin);
+                let end_pin = PinIndex::Input(wire.end_pin);
+                if self.graph[cx].kind.get_pin_width(start_pin)
+                    == self.graph[next_cx].kind.get_pin_width(end_pin)
+                {
+                    // use wire to determine relevant output and input pins
+                    let signal_to_transmit = self.graph[cx]
+                        .kind
+                        .get_pin_value(start_pin)
+                        .map(Signal::from_bitslice);
+                    self.graph[next_cx]
+                        .kind
+                        .set_pin_value(end_pin, signal_to_transmit.as_deref());
+                    self.graph[wx].set_signal(signal_to_transmit.as_deref());
+                } else {
+                    // Pin widths don't match, so set receiving pin and wire to None
+                    self.graph[wx].set_signal(None);
+                    self.graph[next_cx].kind.set_pin_value(end_pin, None);
+                };
             }
         }
     }
@@ -423,7 +432,7 @@ impl App {
                 if let Some(ctx_event) = maybe_ctx_event {
                     println!("context event");
                     self.context.update(ctx_event, cx);
-            
+
                     dbg!(&self.context.tunnels);
                 }
             }
