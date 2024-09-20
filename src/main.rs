@@ -19,7 +19,7 @@ const SANDBOX_POS: Vec2 = vec2(200., 0.);
 const SANDBOX_SIZE: Vec2 = vec2(900., 700.);
 const _WINDOW_SIZE: Vec2 = vec2(1000., 800.);
 const _MENU_SIZE: Vec2 = vec2(200., _WINDOW_SIZE.y);
-const HOVER_RADIUS: f32 = 10.;
+const HOVER_RADIUS: f32 = 6.;
 
 #[derive(Debug)]
 struct Wire {
@@ -72,7 +72,7 @@ enum ActionState {
     // Left-clicked on a component in the sandbox area
     SelectingComponent(NodeIndex),
     // Moving a component that already was in the sandbox area
-    MovingComponent(NodeIndex),
+    MovingComponent(NodeIndex, Vec2),
     DrawingWire(NodeIndex, PinIndex),
 }
 
@@ -474,7 +474,7 @@ impl App {
     }
 
     fn get_properties_ui(&mut self, ui: &mut Ui) {
-        if let ActionState::SelectingComponent(cx) | ActionState::MovingComponent(cx) =
+        if let ActionState::SelectingComponent(cx) | ActionState::MovingComponent(cx, _) =
             self.action_state
         {
             let comp = &mut self.graph[cx];
@@ -578,15 +578,16 @@ impl App {
                     } else if is_mouse_button_down(MouseButton::Left)
                         && mouse_delta_position() != Vec2::ZERO
                     {
-                        ActionState::MovingComponent(cx)
+                        let offset = mouse_pos - self.graph[cx].position;
+                        ActionState::MovingComponent(cx, offset)
                     } else {
                         ActionState::SelectingComponent(cx)
                     }
                 }
-                ActionState::MovingComponent(cx) => {
+                ActionState::MovingComponent(cx, offset) => {
                     // Update component position (and center on mouse)
                     self.graph[cx].position =
-                        snap_to_grid(mouse_pos - self.graph[cx].kind.size() / 2.);
+                        snap_to_grid(mouse_pos - offset);
                     if is_mouse_button_released(MouseButton::Left) {
                         ActionState::SelectingComponent(cx)
                     } else {
