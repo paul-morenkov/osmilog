@@ -6,7 +6,7 @@ use egui_macroquad::{egui, macroquad};
 use macroquad::prelude::*;
 use petgraph::algo::toposort;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
-use petgraph::visit::{EdgeFiltered, EdgeRef};
+use petgraph::visit::{EdgeFiltered, EdgeRef, IntoEdgesDirected};
 use petgraph::Direction;
 use std::fmt::Debug;
 
@@ -321,6 +321,7 @@ impl App {
         let cx = self.graph.add_node(comp);
         if let Some(event) = self.graph[cx].kind.get_ctx_event(CompEvent::Added) {
             self.context.update(event, cx);
+            dbg!(&self.context.tunnels);
         }
         cx
     }
@@ -329,8 +330,38 @@ impl App {
         let comp = self.graph.remove_node(cx)?;
         if let Some(event) = comp.kind.get_ctx_event(CompEvent::Removed) {
             self.context.update(event, cx);
+            dbg!(&self.context.tunnels);
         }
         Some(comp)
+    }
+
+    fn update_component(&mut self, cx: NodeIndex) {
+        // This method is called after a UI interaction causes a component to change state.
+
+        // First, remove any wires/edges that are made out of bounds
+        let n_inputs = self.graph[cx].kind.n_in_pins();
+        let n_outputs = self.graph[cx].kind.n_out_pins();
+
+        let incoming_to_remove = self
+            .graph
+            .edges_directed(cx, Direction::Incoming)
+            .filter(|e| e.weight().end_pin >= n_inputs)
+            .map(|e| e.id());
+        let outgoing_to_remove = self
+            .graph
+            .edges_directed(cx, Direction::Outgoing)
+            .filter(|e| e.weight().start_pin >= n_outputs)
+            .map(|e| e.id());
+        for wx in incoming_to_remove
+            .chain(outgoing_to_remove)
+            .collect::<Vec<_>>()
+        {
+            self.graph.remove_edge(wx);
+        }
+        // Then, check if a context update is necessary
+        if let Some(event) = self.graph[cx].kind.get_ctx_event(CompEvent::Updated) {
+            self.context.update(event, cx);
+        }
     }
 
     fn tick_clock(&mut self) {
