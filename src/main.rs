@@ -357,8 +357,7 @@ impl App {
 
         // Update the component's input and output positions
         let comp = &mut self.graph[cx];
-        comp.input_pos = comp.kind.input_positions();
-        comp.output_pos = comp.kind.output_positions();
+        comp.update_after_prop_change();
 
         // Then, remove any wires/edges that are made out of bounds
         let n_inputs = comp.kind.n_in_pins();

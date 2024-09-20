@@ -89,6 +89,7 @@ impl Component {
             kind,
         }
     }
+
     pub(crate) fn contains(&self, point: Vec2) -> bool {
         for bbox in &self.bboxes {
             if bbox.offset(self.position).contains(point) {
@@ -97,9 +98,11 @@ impl Component {
         }
         false
     }
+
     pub(crate) fn do_logic(&mut self) {
         self.kind.do_logic();
     }
+    
     pub(crate) fn draw(&self, textures: &HashMap<&str, Texture2D>) {
         self.kind.draw(self.position, textures);
         self.draw_pins();
@@ -120,11 +123,18 @@ impl Component {
         }
     }
 
+    pub(crate) fn update_after_prop_change(&mut self) {
+        self.input_pos = self.kind.input_positions();
+        self.output_pos = self.kind.output_positions();
+        self.bboxes = self.kind.bboxes();
+    }
+
     pub(crate) fn clock_update(&mut self) {
         if self.kind.is_clocked() {
             self.kind.tick_clock();
         }
     }
+
     pub(crate) fn draw_properties_ui(&mut self, ui: &mut Ui) -> CompUpdateResponse {
         self.kind.draw_properties_ui(ui)
     }
@@ -1363,7 +1373,15 @@ impl Draw for Splitter {
                 });
 
             if new_arm != arm {
+                // adjust the mapping of the input bit
                 self.mapping[bit] = new_arm;
+                // previous arm width decreases by 1, new arm width increases by 1
+                self.data_bits_out[arm] -= 1;
+                self.data_bits_out[new_arm] += 1;
+                // reset the pins for the old and new arms
+                self.outputs[arm] = Pin::new(self.data_bits_out[arm]);
+                self.outputs[new_arm] = Pin::new(self.data_bits_out[new_arm]);
+                
                 return Some(None);
             }
         }
