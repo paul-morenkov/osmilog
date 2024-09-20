@@ -10,7 +10,9 @@ use petgraph::visit::{EdgeFiltered, EdgeRef};
 use petgraph::Direction;
 use std::fmt::Debug;
 
-use components::{CompEvent, Component, PinIndex, Signal, SignalRef, TunnelKind};
+use components::{
+    color_from_signal, CompEvent, Component, PinIndex, Signal, SignalRef, TunnelKind,
+};
 
 mod components;
 
@@ -199,7 +201,15 @@ impl App {
     fn draw_selected_component_box(&self, cx: NodeIndex) {
         let comp = &self.graph[cx];
         let (w, h) = comp.kind.size().into();
-        draw_rectangle_lines(comp.position.x, comp.position.y, w, h, 2., BLACK);
+        let border = 0.5 * TILE_SIZE;
+        draw_rectangle_lines(
+            comp.position.x - border,
+            comp.position.y - border,
+            w + 2. * border,
+            h + 2. * border,
+            2.,
+            BLACK,
+        );
     }
 
     fn draw_all_wires(&self) {
@@ -214,16 +224,7 @@ impl App {
         let cx_b = &self.graph[wire.end_comp];
         let pos_a = cx_a.position + cx_a.output_pos[wire.start_pin];
         let pos_b = cx_b.position + cx_b.input_pos[wire.end_pin];
-        let color = match &wire.value {
-            Some(s) => {
-                if s.any() {
-                    GREEN
-                } else {
-                    BLUE
-                }
-            }
-            None => RED,
-        };
+        let color = color_from_signal(wire.value.as_deref());
         let thickness = if wire.data_bits == 1 { 1. } else { 3. };
         draw_ortho_lines(pos_a, pos_b, color, thickness);
     }
@@ -586,8 +587,7 @@ impl App {
                 }
                 ActionState::MovingComponent(cx, offset) => {
                     // Update component position (and center on mouse)
-                    self.graph[cx].position =
-                        snap_to_grid(mouse_pos - offset);
+                    self.graph[cx].position = snap_to_grid(mouse_pos - offset);
                     if is_mouse_button_released(MouseButton::Left) {
                         ActionState::SelectingComponent(cx)
                     } else {

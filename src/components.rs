@@ -13,6 +13,7 @@ use std::fmt::Debug;
 use crate::TILE_SIZE;
 
 const COMBO_WIDTH: f32 = 50.;
+const PIN_RADIUS: f32 = 2.;
 
 pub type Signal = BitVec<u32, Lsb0>;
 pub type SignalRef<'a> = &'a BitSlice<u32, Lsb0>;
@@ -39,6 +40,10 @@ impl Pin {
                 None => self.signal = Some(Signal::from_bitslice(new)),
             },
         }
+    }
+
+    fn color(&self) -> Color {
+        color_from_signal(self.signal.as_deref())
     }
 }
 
@@ -96,8 +101,25 @@ impl Component {
         self.kind.do_logic();
     }
     pub(crate) fn draw(&self, textures: &HashMap<&str, Texture2D>) {
-        self.kind.draw(self.position, textures)
+        self.kind.draw(self.position, textures);
+        self.draw_pins();
     }
+
+    fn draw_pins(&self) {
+        let (x, y) = self.position.into();
+        for i in 0..self.kind.n_in_pins() {
+            let color = self.kind.color_from_px(PinIndex::Input(i));
+            let pin_pos = self.input_pos[i];
+            draw_circle(x + pin_pos.x, y + pin_pos.y, PIN_RADIUS, color);
+        }
+
+        for i in 0..self.kind.n_out_pins() {
+            let color = self.kind.color_from_px(PinIndex::Output(i));
+            let pin_pos = self.output_pos[i];
+            draw_circle(x + pin_pos.x, y + pin_pos.y, PIN_RADIUS, color);
+        }
+    }
+
     pub(crate) fn clock_update(&mut self) {
         if self.kind.is_clocked() {
             self.kind.tick_clock();
@@ -200,6 +222,11 @@ pub(crate) trait Draw: Logic {
             },
         );
     }
+
+    fn color_from_px(&self, px: PinIndex) -> Color {
+        color_from_signal(self.get_pin_value(px))
+    }
+
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> CompUpdateResponse;
 }
 
@@ -875,29 +902,27 @@ impl Draw for Register {
 
     fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
         let (w, h) = self.size().into();
-        let get_color = |pin: &Pin| match pin.get() {
-            Some(s) => {
-                if s.any() {
-                    GREEN
-                } else {
-                    GRAY
-                }
-            }
-            None => RED,
-        };
-        let in_color = get_color(&self.input);
-        draw_rectangle(pos.x, pos.y, w / 2., h, in_color);
-        let out_color = get_color(&self.output);
+        let in_color = self.input.color();
+        draw_rectangle(pos.x, pos.y, w / 2., h / 2., in_color);
+        let wen_color = self.write_enable.color();
+        draw_rectangle(pos.x, pos.y + h / 2., w / 2., h / 2., wen_color);
+        let out_color = self.output.color();
         draw_rectangle(pos.x + w / 2., pos.y, w / 2., h, out_color);
-        draw_text("D", pos.x, pos.y + 25., 20., BLACK);
-        draw_text("WE", pos.x, pos.y + 45., 20., BLACK);
-        draw_text("Q", pos.x + 30., pos.y + 25., 20., BLACK);
+        draw_rectangle_lines(pos.x, pos.y, w, h, 2., BLACK);
+
+        draw_text("D", pos.x + 2., pos.y + 25., 20., BLACK);
+        draw_text("WE", pos.x + 2., pos.y + 45., 20., BLACK);
+        draw_text("Q", pos.x + 28., pos.y + 25., 20., BLACK);
     }
     fn input_positions(&self) -> Vec<Vec2> {
         vec![
             Vec2::new(0., 4. * TILE_SIZE), // Write Enable
             Vec2::new(0., 2. * TILE_SIZE),
         ]
+    }
+
+    fn output_positions(&self) -> Vec<Vec2> {
+        vec![Vec2::new(self.size().x, 2. * TILE_SIZE)]
     }
 
     fn draw_properties_ui(&mut self, ui: &mut Ui) -> CompUpdateResponse {
@@ -997,16 +1022,7 @@ impl Draw for Input {
     }
 
     fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
-        let color = match self.value.get() {
-            Some(s) => {
-                if s.any() {
-                    GREEN
-                } else {
-                    GRAY
-                }
-            }
-            None => RED,
-        };
+        let color = self.value.color();
         draw_rectangle(pos.x, pos.y, self.size().x, self.size().y, color);
     }
 
@@ -1095,16 +1111,7 @@ impl Draw for Output {
     }
 
     fn draw(&self, pos: Vec2, _: &HashMap<&str, Texture2D>) {
-        let color = match self.value.get() {
-            Some(s) => {
-                if s.any() {
-                    GREEN
-                } else {
-                    GRAY
-                }
-            }
-            None => RED,
-        };
+        let color = self.value.color();
         draw_rectangle(pos.x, pos.y, self.size().x, self.size().y, color);
     }
 
@@ -1579,6 +1586,19 @@ impl Draw for Tunnel {
         }
 
         None
+    }
+}
+
+pub(crate) fn color_from_signal(sig: Option<SignalRef>) -> Color {
+    match sig {
+        Some(s) => {
+            if s.any() {
+                DARKGREEN
+            } else {
+                BLUE
+            }
+        }
+        None => RED,
     }
 }
 
