@@ -1417,6 +1417,7 @@ impl Logic for Tunnel {
     }
 
     fn n_in_pins(&self) -> usize {
+        // FIXME: should this now just always return 1?
         match self.kind {
             TunnelKind::Sender => 1,
             TunnelKind::Receiver => 0,
@@ -1431,25 +1432,25 @@ impl Logic for Tunnel {
     }
 
     fn get_pin_value(&self, px: PinIndex) -> Option<SignalRef> {
-        match (&self.kind, px) {
-            (TunnelKind::Sender, PinIndex::Input(0)) => self.value.get(),
-            (TunnelKind::Receiver, PinIndex::Output(0)) => self.value.get(),
+        // Tunnels have one pin that is both input and output
+        match px {
+            PinIndex::Input(0) | PinIndex::Output(0) => self.value.get(),
             _ => panic!(),
         }
     }
 
     fn set_pin_value(&mut self, px: PinIndex, value: Option<SignalRef>) {
-        match (&self.kind, px) {
-            (TunnelKind::Sender, PinIndex::Input(0))
-            | (TunnelKind::Receiver, PinIndex::Output(0)) => self.value.set(value),
+        // Tunnels have one pin that is both input and output
+        match px {
+            PinIndex::Input(0) | PinIndex::Output(0) => self.value.set(value),
             _ => panic!(),
         }
     }
 
     fn get_pin_width(&self, px: PinIndex) -> u8 {
-        match (&self.kind, px) {
-            (TunnelKind::Sender, PinIndex::Input(0)) => self.value.bits,
-            (TunnelKind::Receiver, PinIndex::Output(0)) => self.value.bits,
+        // Tunnels have one pin that is both input and output
+        match px {
+            PinIndex::Input(0) | PinIndex::Output(0) => self.value.bits,
             _ => panic!(),
         }
     }

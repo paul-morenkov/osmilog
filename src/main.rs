@@ -23,13 +23,13 @@ const HOVER_RADIUS: f32 = 10.;
 
 #[derive(Debug)]
 struct Wire {
-    // TODO: does Wire even need data_bits? Can just use Signal::len
     start_comp: NodeIndex,
     start_pin: usize,
     end_comp: NodeIndex,
     end_pin: usize,
     data_bits: u8,
     value: Option<Signal>,
+    is_virtual: bool,
 }
 
 impl Wire {
@@ -39,6 +39,7 @@ impl Wire {
         end_comp: NodeIndex,
         end_pin: usize,
         data_bits: u8,
+        is_virtual: bool,
     ) -> Self {
         Self {
             start_comp,
@@ -47,6 +48,7 @@ impl Wire {
             end_pin,
             data_bits,
             value: None,
+            is_virtual,
         }
     }
 
@@ -81,7 +83,7 @@ struct TunnelMembers {
 }
 
 impl TunnelMembers {
-    fn valid(&self) -> bool {
+    fn is_valid(&self) -> bool {
         self.senders.len() == 1
     }
 }
@@ -155,6 +157,10 @@ impl CircuitContext {
             }
         }
     }
+
+    fn _is_valid(&self) -> bool {
+        self.tunnels.values().all(|t| t.is_valid())
+    }
 }
 
 #[derive(Debug)]
@@ -198,7 +204,9 @@ impl App {
 
     fn draw_all_wires(&self) {
         for wire in self.graph.edge_weights() {
-            self.draw_wire(wire);
+            if !wire.is_virtual {
+                self.draw_wire(wire);
+            }
         }
     }
     fn draw_wire(&self, wire: &Wire) {
@@ -291,7 +299,6 @@ impl App {
         let data_bits_a = self.graph[cx_a].kind.get_pin_width(px_a);
         let data_bits_b = self.graph[cx_b].kind.get_pin_width(px_b);
         if data_bits_a != data_bits_b {
-            println!("mismatched data bits: {} {}", data_bits_a, data_bits_b);
             return false;
         }
         // determine which pin is the output (sender) and which is the input (receiver)
@@ -311,7 +318,7 @@ impl App {
         }
         // We know the pins match in terms of data bits, so arbitrarily set wire data bits to
         // data_bits_a
-        let wire = Wire::new(cx_a, pin_a, cx_b, pin_b, data_bits_a);
+        let wire = Wire::new(cx_a, pin_a, cx_b, pin_b, data_bits_a, false);
         self.graph.add_edge(cx_a, cx_b, wire);
         self.update_signals();
         true
@@ -346,7 +353,7 @@ impl App {
 
     fn update_component(&mut self, cx: NodeIndex) {
         // This method is called after a UI interaction causes a component to change state.
-        
+
         // Update the component's input and output positions
         let comp = &mut self.graph[cx];
         comp.input_pos = comp.kind.input_positions();
@@ -381,7 +388,40 @@ impl App {
         self.update_signals();
     }
 
+    fn add_tunnel_connections(&mut self) {
+        // Note: all tunnels have px = 0 for either Input or Output
+        for tunnel_members in self.context.tunnels.values() {
+            if tunnel_members.is_valid() {
+                let &start_comp = tunnel_members
+                    .senders
+                    .iter()
+                    .next()
+                    .expect("Exists if valid");
+                let data_bits = self.graph[start_comp]
+                    .kind
+                    .get_pin_width(PinIndex::Output(0));
+                for &end_comp in &tunnel_members.receivers {
+                    let virtual_wire = Wire::new(start_comp, 0, end_comp, 0, data_bits, true);
+                    self.graph.add_edge(start_comp, end_comp, virtual_wire);
+                }
+            } else {
+                for &end_comp in &tunnel_members.receivers {
+                    self.graph[end_comp]
+                        .kind
+                        .set_pin_value(PinIndex::Output(0), None);
+                }
+            }
+        }
+    }
+
     fn update_signals(&mut self) {
+        // reset then create virtual edges for the tunnels
+        // TODO: make this more efficient by only adding and removing necessary edges
+
+        // Remove virtual edges
+        self.graph.retain_edges(|g, e| !g[e].is_virtual);
+        // Add updated virtual edges
+        self.add_tunnel_connections();
         // Remove (valid) cycles by ignoring edges which lead into a clocked component.
         let de_cycled =
             EdgeFiltered::from_fn(&self.graph, |e| !self.graph[e.target()].kind.is_clocked());
@@ -441,12 +481,9 @@ impl App {
             ui.label(comp.kind.name());
             let response = comp.draw_properties_ui(ui);
             if let Some(maybe_ctx_event) = response {
-                println!("Updating component");
                 self.update_component(cx);
                 if let Some(ctx_event) = maybe_ctx_event {
-                    println!("context event");
                     self.context.update(ctx_event, cx);
-
                 }
             }
         }
