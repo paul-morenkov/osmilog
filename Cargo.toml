@@ -8,3 +8,4 @@ bitvec = "1.0.1"
 egui-macroquad = "0.15.0"
 petgraph = "0.6.5"
 phf = { version = "0.11.2", features = ["macros"] }
+slotmap = "1.0.7"

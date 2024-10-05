@@ -129,6 +129,13 @@ impl Component {
         self.bboxes = self.kind.bboxes();
     }
 
+    pub(crate) fn pin_pos(&self, px: PinIndex) -> Vec2 {
+        self.position + match px {
+            PinIndex::Input(i) => self.input_pos[i],
+            PinIndex::Output(i) => self.output_pos[i],
+        }
+    }
+
     pub(crate) fn clock_update(&mut self) {
         if self.kind.is_clocked() {
             self.kind.tick_clock();

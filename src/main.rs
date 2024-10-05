@@ -5,16 +5,19 @@ use egui_macroquad::egui::ScrollArea;
 use egui_macroquad::{egui, macroquad};
 use macroquad::prelude::*;
 use petgraph::algo::toposort;
-use petgraph::stable_graph::{NodeIndex, StableGraph};
+use petgraph::stable_graph::{EdgeIndex, NodeIndex, StableGraph};
 use petgraph::visit::{EdgeFiltered, EdgeRef};
-use petgraph::Direction;
+use petgraph::{Direction, Graph};
+use slotmap::{DefaultKey, SecondaryMap, SlotMap};
 use std::fmt::Debug;
 
-use components::{
-    color_from_signal, CompEvent, Component, PinIndex, Signal, SignalRef, TunnelKind,
-};
-
 mod components;
+mod utils;
+mod wires;
+
+use components::{color_from_signal, CompEvent, Component, PinIndex, Signal, TunnelKind};
+use utils::{merge_graphs, split_graph_components};
+use wires::{Wire, WireEnd, WireIndex, WireLink, WireSeg};
 
 const TILE_SIZE: f32 = 10.;
 const SANDBOX_POS: Vec2 = vec2(200., 0.);
@@ -22,48 +25,6 @@ const SANDBOX_SIZE: Vec2 = vec2(900., 700.);
 const _WINDOW_SIZE: Vec2 = vec2(1000., 800.);
 const _MENU_SIZE: Vec2 = vec2(200., _WINDOW_SIZE.y);
 const HOVER_RADIUS: f32 = 6.;
-
-#[derive(Debug)]
-struct Wire {
-    start_comp: NodeIndex,
-    start_pin: usize,
-    end_comp: NodeIndex,
-    end_pin: usize,
-    data_bits: u8,
-    value: Option<Signal>,
-    is_virtual: bool,
-}
-
-impl Wire {
-    fn new(
-        start_comp: NodeIndex,
-        start_pin: usize,
-        end_comp: NodeIndex,
-        end_pin: usize,
-        data_bits: u8,
-        is_virtual: bool,
-    ) -> Self {
-        Self {
-            start_comp,
-            start_pin,
-            end_comp,
-            end_pin,
-            data_bits,
-            value: None,
-            is_virtual,
-        }
-    }
-
-    fn set_signal(&mut self, value: Option<SignalRef>) {
-        match value {
-            None => self.value = None,
-            Some(new) => match &mut self.value {
-                Some(old) => old.copy_from_bitslice(new),
-                None => self.value = Some(Signal::from_bitslice(new)),
-            },
-        }
-    }
-}
 
 #[derive(Default, Debug, Clone, Copy)]
 enum ActionState {
@@ -75,7 +36,7 @@ enum ActionState {
     SelectingComponent(NodeIndex),
     // Moving a component that already was in the sandbox area
     MovingComponent(NodeIndex, Vec2),
-    DrawingWire(NodeIndex, PinIndex),
+    DrawingWire(WireTarget),
 }
 
 #[derive(Debug, Default)]
@@ -170,10 +131,314 @@ enum CtxEvent {
     TunnelUpdate(TunnelUpdate),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum HoverItem {
+    Comp(NodeIndex),
+    Pin(NodeIndex, PinIndex),
+    Wire(WireIndex),
+    WireEnd(WireIndex, WireEnd),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireTarget {
+    Pin(NodeIndex, PinIndex),
+    Wire(WireIndex, WireEnd),
+}
+
+#[derive(Debug, Default)]
+struct WiringManager {
+    groups: SlotMap<DefaultKey, StableGraph<WireSeg, ()>>,
+    out_pins: SecondaryMap<DefaultKey, (NodeIndex, usize)>,
+    in_pins: SecondaryMap<DefaultKey, HashSet<(NodeIndex, usize)>>,
+    graph_exs: SecondaryMap<DefaultKey, HashSet<EdgeIndex>>,
+}
+
+impl WiringManager {
+    fn draw_all_wires(&self) {
+        todo!()
+    }
+
+    fn try_add_wire(
+        &mut self,
+        graph: &mut StableGraph<Component, Wire>,
+        start: WireTarget,
+        end: Option<WireTarget>,
+    ) -> bool {
+        if let Some(end) = end {
+            if start == end {
+                return false; // can't create wire to same pin
+            }
+        }
+        match (start, end) {
+            (WireTarget::Pin(nx_a, px_a), None) => self.try_add_wire_pin_to_air(graph, nx_a, px_a),
+            (WireTarget::Pin(nx_a, px_a), Some(end)) => match end {
+                WireTarget::Pin(nx_b, px_b) => {
+                    self.try_add_wire_pin_to_pin(graph, nx_a, px_a, nx_b, px_b)
+                }
+                WireTarget::Wire(wx_b, end_b) => {
+                    self.try_add_wire_pin_to_wire(graph, nx_a, px_a, wx_b, end_b)
+                }
+            },
+            (WireTarget::Wire(wx_a, end_a), None) => {
+                self.try_add_wire_wire_to_air(graph, wx_a, end_a)
+            }
+            (WireTarget::Wire(wx_a, end_a), Some(end)) => match end {
+                WireTarget::Pin(nx_b, px_b) => {
+                    self.try_add_wire_pin_to_wire(graph, nx_b, px_b, wx_a, end_a)
+                }
+                WireTarget::Wire(wx_b, end_b) => {
+                    self.try_add_wire_wire_to_wire(graph, wx_a, end_a, wx_b, end_b)
+                }
+            },
+        }
+    }
+
+    fn try_add_wire_pin_to_air(
+        &mut self,
+        graph: &mut StableGraph<Component, Wire>,
+        cx: NodeIndex,
+        px: PinIndex,
+    ) -> bool {
+        // Need to create new wire group
+        let mut group = StableGraph::new();
+        // Add the new wire segment
+        let start_pos = graph[cx].pin_pos(px);
+        let end_pos = Vec2::from(mouse_position());
+        let start_link = Some(WireLink::Pin(cx, px));
+        let wire = WireSeg::new(start_pos, end_pos, start_link, None);
+        group.add_node(wire);
+        // Get wire group key for SlotMap and populate relevant secondary map
+        let gx = self.groups.insert(group);
+        // Since this is a new wire group, the HashSets will need to be created
+        match px {
+            PinIndex::Input(i) => self.in_pins.insert(gx, HashSet::from([(cx, i)])).is_some(),
+            PinIndex::Output(i) => self.out_pins.insert(gx, (cx, i)).is_some(),
+        };
+
+        true
+    }
+    fn try_add_wire_wire_to_air(
+        &mut self,
+        graph: &mut StableGraph<Component, Wire>,
+        wx: WireIndex,
+        end: WireEnd,
+    ) -> bool {
+        // Get the wire group that must already exist
+        let group = &mut self.groups[wx.group];
+        // Add the new wire segment
+        let start_pos = group[wx.nx].get_pos(end);
+        let end_pos = Vec2::from(mouse_position());
+        let start_link = Some(WireLink::Wire(wx.nx));
+        let wire = WireSeg::new(start_pos, end_pos, start_link, None);
+        let new_nx = group.add_node(wire);
+        // add the edge between the new and old wires within the group
+        group.add_edge(wx.nx, new_nx, ());
+        //Since the new wire doesn't connect to anything else, the secondary maps don't need to be
+        //adjusted
+        true
+    }
+    fn try_add_wire_pin_to_pin(
+        &mut self,
+        graph: &mut StableGraph<Component, Wire>,
+        cx1: NodeIndex,
+        px1: PinIndex,
+        cx2: NodeIndex,
+        px2: PinIndex,
+    ) -> bool {
+        // Can't create a wire between a component and itself
+        if cx1 == cx2 {
+            return false;
+        };
+        // Make sure there is one input and one output pin, and make the output x1 and the input x2
+        let (cx1, i1, cx2, i2) = match (px1, px2) {
+            (PinIndex::Input(_), PinIndex::Input(_))
+            | (PinIndex::Output(_), PinIndex::Output(_)) => return false,
+            (PinIndex::Output(i), PinIndex::Input(j)) => (cx1, i, cx2, j),
+            (PinIndex::Input(i), PinIndex::Output(j)) => (cx2, j, cx1, i),
+        };
+        let (px1, px2) = (PinIndex::Output(i1), PinIndex::Input(i2));
+        // Make sure the input pin is not connected to any other wires
+        if graph
+            .edges_directed(cx2, Direction::Incoming)
+            .any(|e| e.weight().end_pin == i2)
+        {
+            return false;
+        }
+        // All conditions are met, work on adding the wire
+        // Need to create new wire group
+        let mut group = StableGraph::new();
+        // Add the new wire segment
+        let start_pos = graph[cx1].pin_pos(px1);
+        let end_pos = graph[cx2].pin_pos(px2);
+        let start_link = Some(WireLink::Pin(cx1, px1));
+        let end_link = Some(WireLink::Pin(cx2, px2));
+        let wire = WireSeg::new(start_pos, end_pos, start_link, end_link);
+        group.add_node(wire);
+        // Get wire group key for SlotMap and populate both secondary maps
+        let gx = self.groups.insert(group);
+        // Since this is a new wire group, the HashSets will need to be created
+        self.out_pins.insert(gx, (cx1, i1));
+        self.in_pins.insert(gx, HashSet::from([(cx2, i2)]));
+        // Since this immediately creates a complete wire, update the main graph
+        let data_bits = graph[cx1].kind.get_pin_width(px1);
+        // FIXME: change or get rid of the `is_virtual` flag
+        let edge = Wire::new(cx1, i1, cx2, i2, data_bits, gx, false);
+        let ex = graph.add_edge(cx1, cx2, edge);
+        // Track comp graph edge indices in the wiring manager
+        self.graph_exs.insert(gx, HashSet::from([ex]));
+
+        true
+    }
+    fn try_add_wire_pin_to_wire(
+        &mut self,
+        graph: &mut StableGraph<Component, Wire>,
+        cx: NodeIndex,
+        px: PinIndex,
+        wx: WireIndex,
+        end: WireEnd,
+    ) -> bool {
+        // Get the wire group that must already exist
+        let gx = wx.group;
+        let group = &mut self.groups[gx];
+        // Do some pre-checks:
+        match px {
+            // If it's an input, make sure it's not connected to any other wires
+            PinIndex::Input(i) => {
+                if graph
+                    .edges_directed(cx, Direction::Incoming)
+                    .any(|e| e.weight().end_pin == i)
+                {
+                    return false;
+                }
+            }
+            // If it's an output, make sure this group doesn't already have an output
+            PinIndex::Output(_) => {
+                if self.out_pins.contains_key(gx) {
+                    return false;
+                }
+            }
+        };
+        // Any other logical conditions aren't checked ahead. The user will just need to delete the
+        // wire if there is a logical error.
+
+        // Add the new wire segment
+        let start_pos = graph[cx].pin_pos(px);
+        let end_pos = group[wx.nx].get_pos(end);
+        let start_link = Some(WireLink::Pin(cx, px));
+        let end_link = Some(WireLink::Wire(wx.nx));
+        let wire = WireSeg::new(start_pos, end_pos, start_link, end_link);
+        let new_nx = group.add_node(wire);
+        // add the edge between the new and old wires within the group
+        group.add_edge(wx.nx, new_nx, ());
+
+        // Add the new pin to the relevant SecondaryMap HashSet
+        let data_bits = graph[cx].kind.get_pin_width(px);
+        match px {
+            PinIndex::Input(i) => {
+                let is_new = self.in_pins[gx].insert((cx, i));
+                // If the pin isn't already in the group, add an edge between it and every output
+                // pin in the group
+                if is_new {
+                    if let Some(&(cx1, i1)) = self.out_pins.get(gx) {
+                        let edge = Wire::new(cx1, i1, cx, i, data_bits, gx, false);
+                        let ex = graph.add_edge(cx1, cx, edge);
+
+                    }
+                }
+            }
+            PinIndex::Output(i) => {
+                let is_new = self.out_pins.insert(gx, (cx, i)).is_none();
+                // If the pin isn't already in the group, add an edge between it and every input
+                // pin in the group
+                if is_new {
+                    for &(cx2, i2) in &self.in_pins[gx] {
+                        let edge = Wire::new(cx, i, cx2, i2, data_bits, gx, false);
+                        graph.add_edge(cx, cx2, edge);
+                    }
+                }
+            }
+        }
+
+        true
+    }
+    fn try_add_wire_wire_to_wire(
+        &mut self,
+        graph: &mut StableGraph<Component, Wire>,
+        wx1: WireIndex,
+        end1: WireEnd,
+        wx2: WireIndex,
+        end2: WireEnd,
+    ) -> bool {
+        // Make sure the two wire groups are different (no point in double linking a group)
+        if wx1.group == wx2.group {
+            return false;
+        };
+        // Get the two wire groups that must already exist
+        let (gx1, gx2) = (wx1.group, wx2.group);
+        // Make sure the two wire groups have no more than one output pin total
+        if self.in_pins.contains_key(gx1) && self.in_pins.contains_key(gx2) {
+            return false;
+        }
+        // Any other logical conditions aren't checked ahead. The user will just need to delete the
+        // wire if there is a logical error.
+
+        // Remove the two wire groups to prepare to merge them
+        let group1 = self
+            .groups
+            .remove(gx1)
+            .expect("Group must exist if wire exists");
+        let group2 = self
+            .groups
+            .remove(gx2)
+            .expect("Group must exist if wire exists");
+
+        // Create the new group from the original two
+        let (mut joined_group, group2_nx_map) = merge_graphs(&group1, &group2);
+        let nx1 = wx1.nx; // the first group preserves its node indices
+        let nx2 = group2_nx_map[&wx1.nx]; // the second group's node indices are mapped
+
+        // Create the new wire segment and add it to one of the groups
+        let start_pos = joined_group[nx1].get_pos(end1);
+        let end_pos = joined_group[nx2].get_pos(end2);
+        let start_link = Some(WireLink::Wire(nx1));
+        let end_link = Some(WireLink::Wire(nx2));
+        let connecting_wire = WireSeg::new(start_pos, end_pos, start_link, end_link);
+
+        let new_nx = joined_group.add_node(connecting_wire);
+        // add the edges between the new wire and the two wire segments from the two smaller groups
+        joined_group.add_edge(nx1, new_nx, ());
+        joined_group.add_edge(new_nx, nx2, ());
+        // add the merged group
+        let joined_gx = self.groups.insert(joined_group);
+        // Merge the input and output pins
+        let in_pin_1 = self.in_pins.remove(gx1);
+        let in_pin_2 = self.in_pins.remove(gx2);
+
+        let joined_in_pins = in_pin_1
+            .iter()
+            .chain(in_pin_2.iter())
+            .fold(HashSet::new(), |a, b| &a | b);
+        self.in_pins.insert(joined_gx, joined_in_pins);
+
+        let out_pin_1 = self.out_pins.remove(gx1);
+        let out_pin_2 = self.out_pins.remove(gx2);
+        let joined_out_pin = out_pin_1.or(out_pin_2);
+        if let Some(joined_out_pin) = joined_out_pin {
+            self.out_pins.insert(joined_gx, joined_out_pin);
+            // TODO: add necessary edges
+            // FIXME: change existing edges
+            todo!("Add edges between the out pin and every in pin");
+        }
+
+        true
+    }
+}
+
 #[derive(Default, Debug)]
 struct App {
     textures: HashMap<&'static str, Texture2D>,
     graph: StableGraph<Component, Wire>,
+    wiring: WiringManager,
     action_state: ActionState,
     context: CircuitContext,
 }
@@ -212,6 +477,10 @@ impl App {
         );
     }
 
+    fn draw_all_better_wires(&self) {
+        self.wiring.draw_all_wires();
+    }
+
     fn draw_all_wires(&self) {
         for wire in self.graph.edge_weights() {
             if !wire.is_virtual {
@@ -224,7 +493,7 @@ impl App {
         let cx_b = &self.graph[wire.end_comp];
         let pos_a = cx_a.position + cx_a.output_pos[wire.start_pin];
         let pos_b = cx_b.position + cx_b.input_pos[wire.end_pin];
-        let color = color_from_signal(wire.value.as_deref());
+        let color = color_from_signal(wire.get_signal());
         let thickness = if wire.data_bits == 1 { 1. } else { 3. };
         draw_ortho_lines(pos_a, pos_b, color, thickness);
     }
@@ -285,6 +554,47 @@ impl App {
         None
     }
 
+    fn find_hovered_wire(&self) -> Option<(WireIndex, Option<WireEnd>)> {
+        // FIXME: allow the option of hovering a wire without hovering one of the ends.
+        let mouse_pos = Vec2::from(mouse_position());
+        for (group, wire_graph) in &self.wiring.groups {
+            for nx in wire_graph.node_indices() {
+                let wire = &wire_graph[nx];
+                let end = if mouse_pos.distance(wire.start_pos) < HOVER_RADIUS {
+                    Some(WireEnd::Start)
+                } else if mouse_pos.distance(wire.end_pos) < HOVER_RADIUS {
+                    Some(WireEnd::End)
+                } else {
+                    None
+                };
+                if let Some(end) = end {
+                    return Some((WireIndex::new(group, nx), Some(end)));
+                }
+            }
+        }
+        None
+    }
+
+    fn find_hovered_object(&self) -> Option<HoverItem> {
+        if let Some((cx, px)) = self.find_hovered_cx_and_pin() {
+            Some(match px {
+                Some(px) => HoverItem::Pin(cx, px),
+                None => HoverItem::Comp(cx),
+            })
+        } else if let Some((wx, end)) = self.find_hovered_wire() {
+            Some(match end {
+                Some(end) => HoverItem::WireEnd(wx, end),
+                None => HoverItem::Wire(wx),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn try_add_better_wire(&mut self, start: WireTarget, end: Option<WireTarget>) -> bool {
+        self.wiring.try_add_wire(&mut self.graph, start, end)
+    }
+
     fn try_add_wire(
         &mut self,
         cx_a: NodeIndex,
@@ -319,7 +629,16 @@ impl App {
         }
         // We know the pins match in terms of data bits, so arbitrarily set wire data bits to
         // data_bits_a
-        let wire = Wire::new(cx_a, pin_a, cx_b, pin_b, data_bits_a, false);
+        // FIXME: remove the DefaultKey
+        let wire = Wire::new(
+            cx_a,
+            pin_a,
+            cx_b,
+            pin_b,
+            data_bits_a,
+            DefaultKey::default(),
+            false,
+        );
         self.graph.add_edge(cx_a, cx_b, wire);
         self.update_signals();
         true
@@ -401,7 +720,16 @@ impl App {
                     .kind
                     .get_pin_width(PinIndex::Output(0));
                 for &end_comp in &tunnel_members.receivers {
-                    let virtual_wire = Wire::new(start_comp, 0, end_comp, 0, data_bits, true);
+                    // FIXME: remove DefaultKey
+                    let virtual_wire = Wire::new(
+                        start_comp,
+                        0,
+                        end_comp,
+                        0,
+                        data_bits,
+                        DefaultKey::default(),
+                        true,
+                    );
                     self.graph.add_edge(start_comp, end_comp, virtual_wire);
                 }
             } else {
@@ -461,14 +789,22 @@ impl App {
         }
     }
 
-    fn draw_temp_wire(&self, cx: NodeIndex, px: PinIndex) {
-        let comp = &self.graph[cx];
-        let pin_pos = match px {
-            PinIndex::Input(i) => comp.input_pos[i],
-            PinIndex::Output(i) => comp.output_pos[i],
+    fn draw_temp_wire(&self, target: WireTarget) {
+        let start_pos = match target {
+            WireTarget::Pin(cx, px) => {
+                let comp = &self.graph[cx];
+                let pin_pos = match px {
+                    PinIndex::Input(i) => comp.input_pos[i],
+                    PinIndex::Output(i) => comp.output_pos[i],
+                };
+
+                snap_to_grid(comp.position + pin_pos)
+            }
+            WireTarget::Wire(wx, end) => {
+                todo!()
+            }
         };
 
-        let start_pos = snap_to_grid(comp.position + pin_pos);
         let end_pos = snap_to_grid(Vec2::from(mouse_position()));
         draw_ortho_lines(start_pos, end_pos, BLACK, 1.);
     }
@@ -504,7 +840,7 @@ impl App {
     // draw wire so that it only travels orthogonally
     fn update(&mut self, selected_menu_comp_name: &mut Option<&str>) {
         let mouse_pos = Vec2::from(mouse_position());
-        let hover_result = self.find_hovered_cx_and_pin();
+        let hover_result = self.find_hovered_object();
         if in_sandbox_area(mouse_pos) {
             // Alternatively could remove ActionState to use its value without mutating App.
             // let prev_state = std::mem::take(&mut self.action_state);
@@ -513,26 +849,24 @@ impl App {
             let prev_state = self.action_state;
             // Return the new ActionState from the match. This makes it hard to mess up.
             self.action_state = match prev_state {
-                ActionState::Idle => 'idle: {
-                    match hover_result {
-                        // Hovering  on component, but NOT pin
-                        Some((cx, None)) => {
-                            if is_mouse_button_pressed(MouseButton::Left) {
-                                self.select_component(cx);
-                                break 'idle ActionState::SelectingComponent(cx);
-                            }
+                ActionState::Idle => match hover_result {
+                    Some(hover) => match hover {
+                        HoverItem::Comp(cx) if is_mouse_button_pressed(MouseButton::Left) => {
+                            self.select_component(cx);
+                            ActionState::SelectingComponent(cx)
                         }
-                        // Hovering on pin
-                        Some((cx, Some(px))) => {
-                            if is_mouse_button_pressed(MouseButton::Left) {
-                                break 'idle ActionState::DrawingWire(cx, px);
-                            }
+                        HoverItem::Pin(cx, px) if is_mouse_button_pressed(MouseButton::Left) => {
+                            ActionState::DrawingWire(WireTarget::Pin(cx, px))
                         }
-                        // Not hovering anything
-                        None => break 'idle ActionState::Idle,
-                    }
-                    ActionState::Idle
-                }
+                        HoverItem::WireEnd(wx, end)
+                            if is_mouse_button_pressed(MouseButton::Left) =>
+                        {
+                            ActionState::DrawingWire(WireTarget::Wire(wx, end))
+                        }
+                        _ => ActionState::Idle,
+                    },
+                    None => ActionState::Idle,
+                },
                 ActionState::HoldingComponent(cx) => {
                     self.graph[cx].position =
                         snap_to_grid(mouse_pos - self.graph[cx].kind.size() / 2.);
@@ -562,16 +896,19 @@ impl App {
                     // Clicking either de-selects the component, selects a new component, or begins drawing a wire
                     } else if is_mouse_button_pressed(MouseButton::Left) {
                         match hover_result {
-                            // Hovering  on component, but NOT pin
-                            Some((new_cx, None)) => {
-                                self.select_component(new_cx);
-                                ActionState::SelectingComponent(new_cx)
-                            }
-                            // Hovering on pin
-                            Some((new_cx, Some(new_px))) => {
-                                ActionState::DrawingWire(new_cx, new_px)
-                            }
-                            // Not hovering anything
+                            Some(hover) => match hover {
+                                HoverItem::Comp(new_cx) => {
+                                    self.select_component(new_cx);
+                                    ActionState::SelectingComponent(new_cx)
+                                }
+                                HoverItem::Pin(cx, px) => {
+                                    ActionState::DrawingWire(WireTarget::Pin(cx, px))
+                                }
+                                HoverItem::WireEnd(wx, end) => {
+                                    ActionState::DrawingWire(WireTarget::Wire(wx, end))
+                                }
+                                _ => ActionState::Idle,
+                            },
                             None => ActionState::Idle,
                         }
                     // If mouse is dragging, switch from selecting to moving component.
@@ -593,19 +930,40 @@ impl App {
                         prev_state
                     }
                 }
-                ActionState::DrawingWire(start_cx, start_px) => {
+                ActionState::DrawingWire(start_target) => {
                     // Potentially finalizing the wire
                     if is_mouse_button_released(MouseButton::Left) {
-                        // Landed on a pin
-                        if let Some((end_cx, Some(end_px))) = hover_result {
-                            // This function handles all error cases like bad pin match-up, self-connection, and multiple output connections
-                            self.try_add_wire(start_cx, start_px, end_cx, end_px);
-                        }
+                        // FIXME: need to change this after new wiring method works
+                        match hover_result {
+                            Some(end_hover) => match end_hover {
+                                HoverItem::Pin(end_cx, end_px) => {
+                                    println!("Adding wire to pin");
+                                    self.try_add_better_wire(
+                                        start_target,
+                                        Some(WireTarget::Pin(end_cx, end_px)),
+                                    );
+                                    // self.try_add_wire(start_cx, start_px, end_cx, end_px);
+                                }
+                                HoverItem::Comp(end_cx) => (),
+                                HoverItem::WireEnd(wx, end) => {
+                                    self.try_add_better_wire(
+                                        start_target,
+                                        Some(WireTarget::Wire(wx, end)),
+                                    );
+                                }
+                                _ => (),
+                            },
+                            None => {
+                                println!("Adding wire to nothing");
+                                self.try_add_better_wire(start_target, None);
+                            }
+                        };
+
                         ActionState::Idle
                     // In the process of drawing the wire
                     } else if is_mouse_button_down(MouseButton::Left) {
-                        self.draw_temp_wire(start_cx, start_px);
-                        ActionState::DrawingWire(start_cx, start_px)
+                        self.draw_temp_wire(start_target);
+                        ActionState::DrawingWire(start_target)
                     // Let go of wire without completing it
                     } else {
                         ActionState::Idle
@@ -621,6 +979,7 @@ impl App {
         // Do all drawing at the end to make sure everything is updated
         // and so that the z-order is maintained.
         self.draw_all_components();
+        self.draw_all_better_wires();
         self.draw_all_wires();
         if let Some((cx, Some(px))) = self.find_hovered_cx_and_pin() {
             self.draw_pin_highlight(cx, px);
