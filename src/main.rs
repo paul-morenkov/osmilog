@@ -633,7 +633,7 @@ impl App {
 
 fn macroquad_config() -> Conf {
     Conf {
-        window_title: String::from("Logisim"),
+        window_title: String::from("Osmilog"),
         window_width: (SANDBOX_POS.x + SANDBOX_SIZE.x).ceil() as i32,
         window_height: (SANDBOX_POS.y + SANDBOX_SIZE.y).ceil() as i32,
         ..Default::default()
@@ -666,7 +666,7 @@ async fn main() {
         app.update(&mut selected_menu_comp_name);
         // egui ui
         egui_macroquad::ui(|ctx| {
-            Window::new("Logisim")
+            Window::new("Osmilog")
                 .movable(false)
                 .collapsible(false)
                 .fixed_size((SANDBOX_POS.x - 15., SANDBOX_SIZE.y - 50.))
