@@ -7,7 +7,7 @@ use macroquad::prelude::*;
 use petgraph::algo::toposort;
 use petgraph::stable_graph::{EdgeIndex, NodeIndex, StableGraph};
 use petgraph::visit::{EdgeFiltered, EdgeRef};
-use petgraph::{Direction, Graph};
+use petgraph::{data, Direction, Graph};
 use slotmap::{DefaultKey, SecondaryMap, SlotMap};
 use std::fmt::Debug;
 
@@ -15,7 +15,9 @@ mod components;
 mod utils;
 mod wires;
 
-use components::{color_from_signal, CompEvent, Component, PinIndex, Signal, TunnelKind};
+use components::{
+    color_from_signal, signal_zeros, CompEvent, Component, PinIndex, Signal, SignalRef, TunnelKind,
+};
 use utils::{merge_graphs, split_graph_components};
 use wires::{Wire, WireEnd, WireIndex, WireLink, WireSeg};
 
@@ -151,11 +153,43 @@ struct WiringManager {
     out_pins: SecondaryMap<DefaultKey, (NodeIndex, usize)>,
     in_pins: SecondaryMap<DefaultKey, HashSet<(NodeIndex, usize)>>,
     graph_exs: SecondaryMap<DefaultKey, HashSet<EdgeIndex>>,
+    signals: SecondaryMap<DefaultKey, Option<Signal>>,
 }
 
 impl WiringManager {
-    fn draw_all_wires(&self) {
-        todo!()
+    fn draw_all_wires(&self, graph: &StableGraph<Component, Wire>) {
+        for (gx, group) in &self.groups {
+            // TODO: compute signals once instead of every frame
+            // let signal = &self.signals[gx];
+            let (color, thickness) = match self.out_pins.get(gx) {
+                Some(&(cx, i)) => {
+                    let comp = &graph[cx].kind;
+                    let px = PinIndex::Output(i);
+                    let data_bits = comp.get_pin_width(px);
+                    let signal = comp.get_pin_value(px);
+                    let color = color_from_signal(signal);
+                    let thickness = if data_bits == 1 { 1. } else { 3. };
+                    (color, thickness)
+                }
+                None => (RED, 1.),
+            };
+            for wire_seg in group.node_weights() {
+                draw_ortho_lines(wire_seg.start_pos, wire_seg.end_pos, color, thickness);
+            }
+        }
+    }
+
+    fn set_signal(&mut self, gx: DefaultKey, value: Option<SignalRef>) {
+        // TODO: I think this can be improved
+        match value {
+            None => {
+                self.signals.insert(gx, None);
+            }
+            Some(new) => match self.signals.entry(gx).expect("Group exists").or_default() {
+                Some(old) => old.copy_from_bitslice(new),
+                None => self.signals[gx] = Some(Signal::from_bitslice(new)),
+            },
+        }
     }
 
     fn try_add_wire(
@@ -203,7 +237,7 @@ impl WiringManager {
         let mut group = StableGraph::new();
         // Add the new wire segment
         let start_pos = graph[cx].pin_pos(px);
-        let end_pos = Vec2::from(mouse_position());
+        let end_pos = snap_to_grid(Vec2::from(mouse_position()));
         let start_link = Some(WireLink::Pin(cx, px));
         let wire = WireSeg::new(start_pos, end_pos, start_link, None);
         group.add_node(wire);
@@ -214,12 +248,14 @@ impl WiringManager {
             PinIndex::Input(i) => self.in_pins.insert(gx, HashSet::from([(cx, i)])).is_some(),
             PinIndex::Output(i) => self.out_pins.insert(gx, (cx, i)).is_some(),
         };
+        // Also create the signal
+        self.signals.insert(gx, None);
 
         true
     }
     fn try_add_wire_wire_to_air(
         &mut self,
-        graph: &mut StableGraph<Component, Wire>,
+        _: &mut StableGraph<Component, Wire>,
         wx: WireIndex,
         end: WireEnd,
     ) -> bool {
@@ -227,7 +263,7 @@ impl WiringManager {
         let group = &mut self.groups[wx.group];
         // Add the new wire segment
         let start_pos = group[wx.nx].get_pos(end);
-        let end_pos = Vec2::from(mouse_position());
+        let end_pos = snap_to_grid(Vec2::from(mouse_position()));
         let start_link = Some(WireLink::Wire(wx.nx));
         let wire = WireSeg::new(start_pos, end_pos, start_link, None);
         let new_nx = group.add_node(wire);
@@ -282,10 +318,12 @@ impl WiringManager {
         // Since this immediately creates a complete wire, update the main graph
         let data_bits = graph[cx1].kind.get_pin_width(px1);
         // FIXME: change or get rid of the `is_virtual` flag
-        let edge = Wire::new(cx1, i1, cx2, i2, data_bits, gx, false);
+        let edge = Wire::new(cx1, i1, cx2, i2, data_bits, Some(gx), false);
         let ex = graph.add_edge(cx1, cx2, edge);
         // Track comp graph edge indices in the wiring manager
         self.graph_exs.insert(gx, HashSet::from([ex]));
+        // Also add the signal
+        self.signals.insert(gx, Some(signal_zeros(data_bits)));
 
         true
     }
@@ -335,14 +373,23 @@ impl WiringManager {
         let data_bits = graph[cx].kind.get_pin_width(px);
         match px {
             PinIndex::Input(i) => {
-                let is_new = self.in_pins[gx].insert((cx, i));
+                let is_new = self
+                    .in_pins
+                    .entry(gx)
+                    .expect("Group exists")
+                    .or_default()
+                    .insert((cx, i));
                 // If the pin isn't already in the group, add an edge between it and every output
                 // pin in the group
                 if is_new {
                     if let Some(&(cx1, i1)) = self.out_pins.get(gx) {
-                        let edge = Wire::new(cx1, i1, cx, i, data_bits, gx, false);
+                        let edge = Wire::new(cx1, i1, cx, i, data_bits, Some(gx), false);
                         let ex = graph.add_edge(cx1, cx, edge);
-
+                        self.graph_exs
+                            .entry(gx)
+                            .expect("Group exists")
+                            .or_default()
+                            .insert(ex);
                     }
                 }
             }
@@ -352,8 +399,13 @@ impl WiringManager {
                 // pin in the group
                 if is_new {
                     for &(cx2, i2) in &self.in_pins[gx] {
-                        let edge = Wire::new(cx, i, cx2, i2, data_bits, gx, false);
-                        graph.add_edge(cx, cx2, edge);
+                        let edge = Wire::new(cx, i, cx2, i2, data_bits, Some(gx), false);
+                        let ex = graph.add_edge(cx, cx2, edge);
+                        self.graph_exs
+                            .entry(gx)
+                            .expect("Group exists")
+                            .or_default()
+                            .insert(ex);
                     }
                 }
             }
@@ -382,6 +434,15 @@ impl WiringManager {
         // Any other logical conditions aren't checked ahead. The user will just need to delete the
         // wire if there is a logical error.
 
+        // Remove all edges from the App graph that are related to either of the two groups
+        for gx in [gx1, gx2] {
+            if let Some(exs) = self.graph_exs.get(gx) {
+                for ex in exs {
+                    graph.remove_edge(*ex);
+                }
+            }
+        }
+
         // Remove the two wire groups to prepare to merge them
         let group1 = self
             .groups
@@ -391,7 +452,24 @@ impl WiringManager {
             .groups
             .remove(gx2)
             .expect("Group must exist if wire exists");
+        // Remove and combine all SecondaryMap data before it gets overwritten with the
+        // joined_group
+        let in_pin_1 = self.in_pins.remove(gx1);
+        let in_pin_2 = self.in_pins.remove(gx2);
 
+        let joined_in_pins = in_pin_1
+            .iter()
+            .chain(in_pin_2.iter())
+            .fold(HashSet::new(), |a, b| &a | b);
+
+        let out_pin_1 = self.out_pins.remove(gx1);
+        let out_pin_2 = self.out_pins.remove(gx2);
+        let joined_out_pin = out_pin_1.or(out_pin_2);
+
+        let signal_1 = self.signals.remove(gx1);
+        let signal_2 = self.signals.remove(gx2);
+
+        let joined_signal = signal_1.or(signal_2).flatten();
         // Create the new group from the original two
         let (mut joined_group, group2_nx_map) = merge_graphs(&group1, &group2);
         let nx1 = wx1.nx; // the first group preserves its node indices
@@ -411,24 +489,20 @@ impl WiringManager {
         // add the merged group
         let joined_gx = self.groups.insert(joined_group);
         // Merge the input and output pins
-        let in_pin_1 = self.in_pins.remove(gx1);
-        let in_pin_2 = self.in_pins.remove(gx2);
 
-        let joined_in_pins = in_pin_1
-            .iter()
-            .chain(in_pin_2.iter())
-            .fold(HashSet::new(), |a, b| &a | b);
-        self.in_pins.insert(joined_gx, joined_in_pins);
-
-        let out_pin_1 = self.out_pins.remove(gx1);
-        let out_pin_2 = self.out_pins.remove(gx2);
-        let joined_out_pin = out_pin_1.or(out_pin_2);
-        if let Some(joined_out_pin) = joined_out_pin {
-            self.out_pins.insert(joined_gx, joined_out_pin);
-            // TODO: add necessary edges
-            // FIXME: change existing edges
-            todo!("Add edges between the out pin and every in pin");
+        if let Some((cx1, i)) = joined_out_pin {
+            self.out_pins.insert(joined_gx, (cx1, i));
+            let data_bits = graph[cx1].kind.get_pin_width(PinIndex::Output(i));
+            // All existing edges were already removed, so just re-add them with the updated group
+            // info
+            for &(cx2, j) in &joined_in_pins {
+                let wire = Wire::new(cx1, i, cx2, j, data_bits, Some(joined_gx), false);
+                graph.add_edge(cx1, cx2, wire);
+            }
         }
+        self.in_pins.insert(joined_gx, joined_in_pins);
+        // Also add the signal
+        self.signals.insert(joined_gx, joined_signal);
 
         true
     }
@@ -478,7 +552,7 @@ impl App {
     }
 
     fn draw_all_better_wires(&self) {
-        self.wiring.draw_all_wires();
+        self.wiring.draw_all_wires(&self.graph);
     }
 
     fn draw_all_wires(&self) {
@@ -592,56 +666,11 @@ impl App {
     }
 
     fn try_add_better_wire(&mut self, start: WireTarget, end: Option<WireTarget>) -> bool {
-        self.wiring.try_add_wire(&mut self.graph, start, end)
-    }
-
-    fn try_add_wire(
-        &mut self,
-        cx_a: NodeIndex,
-        px_a: PinIndex,
-        cx_b: NodeIndex,
-        px_b: PinIndex,
-    ) -> bool {
-        // Do not allow wires within a single component
-        if cx_a == cx_b {
-            return false;
+        let added_wire = self.wiring.try_add_wire(&mut self.graph, start, end);
+        if added_wire {
+            self.update_signals();
         }
-        // Check that the two pins have the same number of data_bits
-        let data_bits_a = self.graph[cx_a].kind.get_pin_width(px_a);
-        let data_bits_b = self.graph[cx_b].kind.get_pin_width(px_b);
-        if data_bits_a != data_bits_b {
-            return false;
-        }
-        // determine which pin is the output (sender) and which is the input (receiver)
-        let (cx_a, pin_a, cx_b, pin_b) = match (px_a, px_b) {
-            (PinIndex::Output(pin_a), PinIndex::Input(pin_b)) => (cx_a, pin_a, cx_b, pin_b),
-            (PinIndex::Input(pin_a), PinIndex::Output(pin_b)) => (cx_b, pin_b, cx_a, pin_a),
-            // input->input or output->output are invalid connections; don't create the wire.
-            _ => return false,
-        };
-        // Check that the input pin is not already occupied
-        if self
-            .graph
-            .edges_directed(cx_b, Direction::Incoming)
-            .any(|e| e.weight().end_pin == pin_b)
-        {
-            return false;
-        }
-        // We know the pins match in terms of data bits, so arbitrarily set wire data bits to
-        // data_bits_a
-        // FIXME: remove the DefaultKey
-        let wire = Wire::new(
-            cx_a,
-            pin_a,
-            cx_b,
-            pin_b,
-            data_bits_a,
-            DefaultKey::default(),
-            false,
-        );
-        self.graph.add_edge(cx_a, cx_b, wire);
-        self.update_signals();
-        true
+        added_wire
     }
 
     fn add_component(&mut self, comp: Component) -> NodeIndex {
@@ -653,21 +682,46 @@ impl App {
     }
 
     fn remove_component(&mut self, cx: NodeIndex) -> Option<Component> {
-        // before removing from the graph, manually set all outgoing edge end pin signals to None
+        // Get all wires that are outgoing from the comp to be removed
         let outgoing_wxs = self
             .graph
             .edges_directed(cx, Direction::Outgoing)
             .map(|e| e.id())
             .collect::<Vec<_>>();
         for wx in outgoing_wxs {
-            let out_cx = self.graph[wx].end_comp;
-            let out_pin = PinIndex::Input(self.graph[wx].end_pin);
-            self.graph[out_cx].kind.set_pin_value(out_pin, None);
+            let gx = self.graph[wx].wire_group;
+            if let Some(gx) = gx {
+                // Set all corresponding signals in the wiring manager to None
+                self.wiring.signals[gx] = None;
+                // Also remove the out_pin from the wiring manager
+                self.wiring.out_pins.remove(gx);
+            }
+            // TODO: This is eventually not needed
+            let cx2 = self.graph[wx].end_comp;
+            let in_pin = PinIndex::Input(self.graph[wx].end_pin);
+            self.graph[cx2].kind.set_pin_value(in_pin, None);
         }
+
+        // Get all wires incoming to the comp to be removed
+        let incoming_wxs = self
+            .graph
+            .edges_directed(cx, Direction::Incoming)
+            .map(|e| e.id())
+            .collect::<Vec<_>>();
+
+        for wx in incoming_wxs {
+            let gx = self.graph[wx].wire_group;
+            if let Some(gx) = gx {
+                // Remove in_pin from the wire group
+                self.wiring.in_pins[gx].remove(&(cx, self.graph[wx].end_pin));
+            }
+        }
+
         let mut comp = self.graph.remove_node(cx)?;
         if let Some(event) = comp.kind.get_ctx_event(CompEvent::Removed) {
             self.context.update(event, cx);
         }
+        self.update_signals();
         Some(comp)
     }
 
@@ -721,15 +775,7 @@ impl App {
                     .get_pin_width(PinIndex::Output(0));
                 for &end_comp in &tunnel_members.receivers {
                     // FIXME: remove DefaultKey
-                    let virtual_wire = Wire::new(
-                        start_comp,
-                        0,
-                        end_comp,
-                        0,
-                        data_bits,
-                        DefaultKey::default(),
-                        true,
-                    );
+                    let virtual_wire = Wire::new(start_comp, 0, end_comp, 0, data_bits, None, true);
                     self.graph.add_edge(start_comp, end_comp, virtual_wire);
                 }
             } else {
@@ -766,6 +812,7 @@ impl App {
             // step through all connected wires and their corresponding components
             while let Some((wx, next_cx)) = edges.next(&self.graph) {
                 let wire = &self.graph[wx];
+                let wire_group = wire.wire_group;
                 let start_pin = PinIndex::Output(wire.start_pin);
                 let end_pin = PinIndex::Input(wire.end_pin);
                 if self.graph[cx].kind.get_pin_width(start_pin)
@@ -779,10 +826,14 @@ impl App {
                     self.graph[next_cx]
                         .kind
                         .set_pin_value(end_pin, signal_to_transmit.as_deref());
-                    self.graph[wx].set_signal(signal_to_transmit.as_deref());
+                    if let Some(gx) = wire_group {
+                        self.wiring.set_signal(gx, signal_to_transmit.as_deref());
+                    }
                 } else {
                     // Pin widths don't match, so set receiving pin and wire to None
-                    self.graph[wx].set_signal(None);
+                    if let Some(gx) = wire_group {
+                        self.wiring.set_signal(gx, None);
+                    }
                     self.graph[next_cx].kind.set_pin_value(end_pin, None);
                 };
             }
@@ -801,7 +852,7 @@ impl App {
                 snap_to_grid(comp.position + pin_pos)
             }
             WireTarget::Wire(wx, end) => {
-                todo!()
+                snap_to_grid(self.wiring.groups[wx.group][wx.nx].get_pos(end))
             }
         };
 
@@ -980,7 +1031,8 @@ impl App {
         // and so that the z-order is maintained.
         self.draw_all_components();
         self.draw_all_better_wires();
-        self.draw_all_wires();
+        // self.draw_all_wires();
+
         if let Some((cx, Some(px))) = self.find_hovered_cx_and_pin() {
             self.draw_pin_highlight(cx, px);
         }

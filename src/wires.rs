@@ -79,7 +79,7 @@ pub struct Wire {
     pub end_comp: NodeIndex,
     pub end_pin: usize,
     pub data_bits: u8,
-    pub wire_group: DefaultKey,
+    pub wire_group: Option<DefaultKey>,
     value: Option<Signal>,
     pub is_virtual: bool,
 }
@@ -91,7 +91,7 @@ impl Wire {
         end_comp: NodeIndex,
         end_pin: usize,
         data_bits: u8,
-        wire_group: DefaultKey,
+        wire_group: Option<DefaultKey>,
         is_virtual: bool,
     ) -> Self {
         Self {
