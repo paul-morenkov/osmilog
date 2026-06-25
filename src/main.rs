@@ -8,15 +8,16 @@ use petgraph::algo::toposort;
 use petgraph::stable_graph::{EdgeIndex, NodeIndex, StableGraph};
 use petgraph::visit::{EdgeFiltered, EdgeRef};
 use petgraph::{data, Direction, Graph};
-use slotmap::{DefaultKey, SecondaryMap, SlotMap};
+use slotmap::{new_key_type, DefaultKey, SecondaryMap, SlotMap};
 use std::fmt::Debug;
 
 mod components;
 mod utils;
 mod wires;
+mod circuit;
 
 use components::{
-    color_from_signal, signal_zeros, CompEvent, Component, PinIndex, Signal, SignalRef, TunnelKind,
+    color_from_signal, signal_zeros, CompEvent, Component, Net, PinIndex, Signal, TunnelKind,
 };
 use utils::{merge_graphs, split_graph_components};
 use wires::{Wire, WireEnd, WireIndex, WireLink, WireSeg};
@@ -204,6 +205,7 @@ impl WiringManager {
             }
         }
         match (start, end) {
+
             (WireTarget::Pin(nx_a, px_a), None) => self.try_add_wire_pin_to_air(graph, nx_a, px_a),
             (WireTarget::Pin(nx_a, px_a), Some(end)) => match end {
                 WireTarget::Pin(nx_b, px_b) => {
@@ -506,6 +508,11 @@ impl WiringManager {
 
         true
     }
+}
+
+new_key_type! {
+    struct CompKey;
+    struct NetKey;
 }
 
 #[derive(Default, Debug)]

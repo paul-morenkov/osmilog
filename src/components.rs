@@ -15,8 +15,27 @@ use crate::TILE_SIZE;
 const COMBO_WIDTH: f32 = 50.;
 const PIN_RADIUS: f32 = 2.;
 
-pub type Signal = BitVec<u32, Lsb0>;
-pub type SignalRef<'a> = &'a BitSlice<u32, Lsb0>;
+// pub type Signal = BitVec<u32, Lsb0>;
+#[derive(Debug, Clone, Copy)]
+pub struct Signal {
+    bits: u8,
+    value: Option<u32>,
+}
+
+impl Signal {
+    pub fn new(bits: u8, value: Option<u32>) -> Self {
+        Self { bits, value }
+    }
+    pub fn empty(bits: u8) -> Self {
+        Self::new(bits, None)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Net {
+    id: usize,
+    signal: Signal,
+}
 
 #[derive(Debug, Clone)]
 struct Pin {
@@ -102,7 +121,7 @@ impl Component {
     pub(crate) fn do_logic(&mut self) {
         self.kind.do_logic();
     }
-    
+
     pub(crate) fn draw(&self, textures: &HashMap<&str, Texture2D>) {
         self.kind.draw(self.position, textures);
         self.draw_pins();
@@ -130,10 +149,11 @@ impl Component {
     }
 
     pub(crate) fn pin_pos(&self, px: PinIndex) -> Vec2 {
-        self.position + match px {
-            PinIndex::Input(i) => self.input_pos[i],
-            PinIndex::Output(i) => self.output_pos[i],
-        }
+        self.position
+            + match px {
+                PinIndex::Input(i) => self.input_pos[i],
+                PinIndex::Output(i) => self.output_pos[i],
+            }
     }
 
     pub(crate) fn clock_update(&mut self) {
@@ -1388,7 +1408,7 @@ impl Draw for Splitter {
                 // reset the pins for the old and new arms
                 self.outputs[arm] = Pin::new(self.data_bits_out[arm]);
                 self.outputs[new_arm] = Pin::new(self.data_bits_out[new_arm]);
-                
+
                 return Some(None);
             }
         }
