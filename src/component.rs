@@ -1,18 +1,9 @@
 use crate::net::{Net, NetKey};
+use crate::value::Value;
 use slotmap::{new_key_type, SlotMap};
 
 new_key_type! {
     pub struct CompKey;
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum Value {
-    #[default]
-    Floating,
-    Fixed {
-        bits: u32,
-        width: u8,
-    },
 }
 
 pub struct Component {
@@ -29,13 +20,20 @@ impl Component {
                 None => Value::Floating,
             }
         };
+
         match &self.logic {
-            Logic::Gate(gate_op) => todo!(),
+            Logic::Gate(op) => match op {
+                GateOp::And | GateOp::Nand => {}
+                GateOp::Or | GateOp::Nor => {}
+                GateOp::Xor | GateOp::Xnor => {}
+                GateOp::Not => {}
+            },
             Logic::Mux => todo!(),
             Logic::Demux => todo!(),
             Logic::Reg => todo!(),
         }
     }
+
     pub fn net_of(&self, pin: PinId) -> Option<NetKey> {
         match pin {
             // TODO: will panic on out of bounds, fix this
@@ -87,6 +85,7 @@ pub enum GateOp {
     And,
     Or,
     Xor,
+    Xnor,
     Nand,
     Nor,
     Not,

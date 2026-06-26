@@ -1,4 +1,5 @@
-use crate::component::{CompKey, InIdx, OutIdx, Value};
+use crate::component::{CompKey, InIdx, OutIdx};
+use crate::value::Value;
 use slotmap::new_key_type;
 
 new_key_type! {
