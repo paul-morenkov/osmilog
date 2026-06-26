@@ -14,6 +14,13 @@ impl Value {
     pub fn new(bits: u32, width: u8) -> Self {
         Value::Fixed { bits, width }
     }
+    pub fn mask(width: u8) -> u32 {
+        if width >= 32 {
+            u32::MAX
+        } else {
+            (1 << width) - 1
+        }
+    }
 }
 
 impl BitAnd for Value {
@@ -104,7 +111,7 @@ impl Not for Value {
     fn not(self) -> Self::Output {
         match self {
             Self::Fixed { bits, width } => Self::Fixed {
-                bits: !bits & ((1 << width) - 1),
+                bits: !bits & Self::mask(width),
                 width,
             },
             Self::Floating => Self::Floating,
