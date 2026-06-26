@@ -1,153 +1,141 @@
-use petgraph::algo::toposort;
-use petgraph::stable_graph::{EdgeIndex, NodeIndex, StableGraph};
-use petgraph::visit::{EdgeFiltered, EdgeRef};
-use petgraph::{data, Direction, Graph};
-use slotmap::{new_key_type, DefaultKey, SecondaryMap, SlotMap};
-use std::collections::{HashMap, HashSet};
-use std::fmt::Debug;
-use std::iter::{self, Zip};
+use crate::component::{CompKey, Component, PinId};
 
-new_key_type! {
-    struct CompKey;
-    struct NetKey;
-}
+use slotmap::{SecondaryMap, SlotMap};
+use std::collections::VecDeque;
 
-#[derive(Debug, Default)]
-struct Circuit {
-    // components: SlotMap<CompKey, Component>,
+use crate::net::{Net, NetKey};
+
+pub struct Circuit {
     nets: SlotMap<NetKey, Net>,
-    graph: StableGraph<Component, NetKey>,
+    components: SlotMap<CompKey, Component>,
+    dirty: VecDeque<NetKey>,
+    queued: SecondaryMap<NetKey, bool>, // TODO: there might be a nicer way of organizing this
 }
 
 impl Circuit {
-    fn add_component(&mut self, comp: Component) -> NodeIndex {
-        self.graph.add_node(comp)
+    const MAX_ITERATIONS: usize = 100;
+
+    fn add_component(&mut self, comp: Component) -> CompKey {
+        self.components.insert(comp)
     }
 
-    fn remove_component(&mut self, idx: NodeIndex) -> Option<Component> {
-        self.graph.remove_node(idx)
+    fn net_of(&self, comp: CompKey, pin: PinId) -> Option<NetKey> {
+        self.components.get(comp).and_then(|c| c.net_of(pin))
     }
 
-    fn add_net(&mut self, net: Net) -> Option<NetKey> {
-        net.input.map(|input| {
-            self.nets.insert_with_key(|key| {
-                for output in &net.outputs {
-                    self.graph.add_edge(input, *output, key);
-                }
+    fn attach(&mut self, net: NetKey, comp: CompKey, pin: PinId) {
+        // Attaches a Component pin to a net, and back-links
+        match pin {
+            PinId::In(i) => self.nets[net].sinks.push((comp, i)),
+            PinId::Out(i) => self.nets[net].source = Some((comp, i)),
+        }
+    }
+
+    fn link(&mut self, a: CompKey, a_pin: PinId, b: CompKey, b_pin: PinId) -> NetKey {
+        let net_a = self.net_of(a, a_pin);
+        let net_b = self.net_of(b, b_pin);
+
+        match (net_a, net_b) {
+            (None, None) => {
+                // Need to create a new Net
+                let net = self.nets.insert(Net::default());
+                self.attach(net, a, a_pin);
+                self.attach(net, b, b_pin);
                 net
-            })
-        })
-    }
-
-    fn remove_net(&mut self, net_key: NetKey) -> Option<Net> {
-        self.nets.remove(net_key).map(|net| {
-            let edges_to_remove: Vec<_> = self
-                .graph
-                .edge_indices()
-                .filter(|ex| self.graph[*ex] == net_key)
-                .collect();
-            for ex in edges_to_remove {
-                self.graph.remove_edge(ex);
             }
-            net
-        })
+            (Some(net), None) => {
+                self.attach(net, b, b_pin);
+                net
+            }
+            (None, Some(net)) => {
+                self.attach(net, a, a_pin);
+                net
+            }
+            (Some(a_net), Some(b_net)) if a_net == b_net => a_net,
+            (Some(a_net), Some(b_net)) => self.merge(a_net, b_net),
+        }
     }
 
-    fn feed_forward(&mut self) {
-        // ignore clocked components to avoid infinite loops
-        let de_cycled =
-            EdgeFiltered::from_fn(&self.graph, |e| !self.graph[e.target()].kind.is_clocked());
-        // get the directed order to update the rest of the components
-        let order = toposort(&de_cycled, None).expect("No cycles in unclocked components.");
-        self.evaluate_components(order);
+    fn merge(&mut self, a: NetKey, b: NetKey) -> NetKey {
+        if a == b {
+            return a;
+        }
+        // Remove the second net
+        let b_net = self.nets.remove(b).unwrap();
+
+        // Correct backreferences on Net B, then add them into Net A
+        for (comp, i) in b_net.sinks {
+            self.components[comp].set_pin_net(PinId::In(i), a);
+            self.nets[a].sinks.push((comp, i));
+        }
+
+        // Handle source pins
+        match (self.nets[a].source, b_net.source) {
+            (Some(_), Some((comp, i))) => {
+                // TODO: Decide how to handle competing source
+                self.components[comp].set_pin_net(PinId::Out(i), a);
+            }
+            (None, Some((comp, i))) => {
+                // Only Net B was driven, so make that Net A's driver
+                self.components[comp].set_pin_net(PinId::Out(i), a);
+                self.nets[a].source = Some((comp, i));
+            }
+            (_, None) => {}
+        }
+        self.mark_dirty(a);
+        a
     }
 
-    fn tick_clock(&mut self) {
-        let clocked_order: Vec<_> = self
-            .graph
-            .node_indices()
-            .filter(|cx| self.graph[*cx].kind.is_clocked())
-            .collect();
-        self.evaluate_components(clocked_order);
-        self.feed_forward();
+    fn mark_dirty(&mut self, net: NetKey) {
+        if !self.queued.get(net).copied().unwrap_or(false) {
+            self.queued.insert(net, true);
+            self.dirty.push_back(net);
+        }
     }
 
-    fn evaluate_components(&mut self, order: Vec<NodeIndex>) {
-        for cx in order {
-            let comp = &self.graph[cx];
-            let input_signals: Vec<_> = comp
-                .inputs
+    fn settle(&mut self) {
+        let mut iterations = 0;
+
+        while let Some(net) = self.dirty.pop_front() {
+            // Clear visit before eval so that it can be re-evaled in the case of a loop
+            self.queued.insert(net, false);
+
+            let sinks: Vec<_> = self.nets[net]
+                .sinks
                 .iter()
-                .map(|pin| self.nets.get(pin.net).unwrap().signal)
+                .copied()
+                .filter(|(comp, _)| !self.components[*comp].is_sequential())
                 .collect();
-            let output_signals = comp.evaluate(&input_signals);
-            assert_eq!(output_signals.len(), comp.outputs.len());
-            for (output_signal, pin) in std::iter::zip(output_signals, &comp.outputs) {
-                let net = self.nets.get_mut(pin.net).unwrap();
-                net.signal = if output_signal.bits == pin.bits {
-                    output_signal
-                } else {
-                    Signal {
-                        value: None,
-                        ..output_signal
-                    }
-                };
+
+            for (comp, _) in sinks {
+                self.eval_component(comp);
+            }
+
+            iterations += 1;
+            if iterations > Self::MAX_ITERATIONS {
+                // FIXME: Handle error
+                panic!("Exceeded max iterations");
+                break;
             }
         }
     }
-}
 
-#[derive(Debug)]
-struct Component {
-    kind: CompKind,
-    inputs: Vec<Pin>,
-    outputs: Vec<Pin>,
-}
+    fn eval_component(&mut self, comp: CompKey) {
+        let comp = &self.components[comp];
+        let new_values: Vec<_> = comp.evaluate(&self.nets);
+        // filter out values where: a) output pin is disconnected, or b) new value matches previous
+        // value
+        let dirty_values: Vec<_> = new_values
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, new_val)| comp.pins.outputs[i].map(|net| (net, new_val)))
+            .collect();
 
-impl Component {
-    pub fn evaluate(&self, inputs: &[Signal]) -> Vec<Signal> {
-        self.kind.evaluate(inputs)
-    }
-}
-
-#[derive(Debug)]
-enum CompKind {
-    Input(Input),
-    Output(Output),
-    Gate(Gate),
-    Reg(Reg),
-}
-
-impl CompKind {
-    pub fn is_clocked(&self) -> bool {
-        match self {
-            CompKind::Gate(_) => false,
-            CompKind::Reg(_) => true,
-            CompKind::Input(_) => false,
-            CompKind::Output(_) => false,
+        for (net, new_value) in dirty_values {
+            if self.nets[net].value != new_value {
+                self.nets[net].value = new_value;
+                self.mark_dirty(net);
+            }
         }
     }
-    pub fn evaluate(&self, inputs: &[Signal]) -> Vec<Signal> {
-        todo!()
-    }
-}
-
-#[derive(Debug, Default)]
-struct Net {
-    bits: u8,
-    signal: Signal,
-    input: Option<NodeIndex>,
-    outputs: Vec<NodeIndex>,
-}
-
-#[derive(Debug, Default, Copy, Clone)]
-struct Signal {
-    bits: u8,
-    value: Option<u32>,
-}
-
-#[derive(Debug, Default, Copy, Clone)]
-struct Pin {
-    bits: u8,
-    net: NetKey,
 }
