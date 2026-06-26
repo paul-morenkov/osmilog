@@ -10,6 +10,12 @@ pub enum Value {
     },
 }
 
+impl Value {
+    pub fn new(bits: u32, width: u8) -> Self {
+        Value::Fixed { bits, width }
+    }
+}
+
 impl BitAnd for Value {
     type Output = Self;
 
@@ -103,5 +109,33 @@ impl Not for Value {
             },
             Self::Floating => Self::Floating,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_or() {
+        assert_eq!(
+            (Value::new(0b110, 3) | Value::new(0b011, 3)),
+            Value::new(0b111, 3)
+        )
+    }
+
+    #[test]
+    fn test_xor() {
+        assert_eq!(
+            (Value::new(0b110, 3) ^ Value::new(0b011, 3)),
+            Value::new(0b101, 3)
+        )
+    }
+    #[test]
+    fn test_and() {
+        assert_eq!(
+            (Value::new(0b110, 3) & Value::new(0b011, 3)),
+            Value::new(0b010, 3)
+        )
     }
 }
