@@ -171,6 +171,15 @@ impl Component {
             Logic::Reg => true,
         }
     }
+
+    pub(crate) fn clear_pins(&mut self) {
+        for input in &mut self.pins.inputs {
+            *input = None;
+        }
+        for output in &mut self.pins.outputs {
+            *output = None;
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

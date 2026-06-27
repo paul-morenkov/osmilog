@@ -27,9 +27,6 @@ fn main() {
     c.link(and, PinId::output(0), o1, PinId::input(0));
     c.link(or, PinId::output(0), o2, PinId::input(0));
 
-    // c.set_input(i1, Value::new(1, 1));
-    // c.set_input(i2, Value::new(0, 1));
-
     c.settle();
 
     println!("{:?}", c.read_output(o1));

@@ -37,7 +37,6 @@ impl Circuit {
             return;
         }
         self.eval_component(comp);
-        // TODO: determine whether to settle automatically after
     }
 
     pub fn read_output(&self, comp: CompKey) -> Value {
@@ -46,6 +45,15 @@ impl Circuit {
             Some(net) => self.nets[net].value,
             None => Value::Floating,
         }
+    }
+
+    pub fn clear_nets(&mut self) {
+        for comp in self.components.values_mut() {
+            comp.clear_pins();
+        }
+
+        self.nets.clear();
+        self.dirty.clear();
     }
 
     fn net_of(&self, comp: CompKey, pin: PinId) -> Option<NetKey> {
