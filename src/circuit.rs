@@ -24,7 +24,9 @@ impl Circuit {
     }
 
     pub fn add_component(&mut self, comp: Component) -> CompKey {
-        self.components.insert(comp)
+        let key = self.components.insert(comp);
+        self.eval_component(key);
+        key
     }
 
     pub fn set_input(&mut self, comp: CompKey, value: Value) {
@@ -57,6 +59,11 @@ impl Circuit {
             PinId::Out(i) => self.nets[net].source = Some((comp, i)),
         }
         self.components[comp].set_pin_net(pin, net);
+        // If attaching a sink pin, immediately evaluate the component since no Net's have changed
+        // so nothing will call eval_component automatically.
+        if let PinId::In(_) = pin {
+            self.eval_component(comp);
+        }
     }
 
     pub fn link(&mut self, a: CompKey, a_pin: PinId, b: CompKey, b_pin: PinId) -> NetKey {
@@ -130,44 +137,64 @@ impl Circuit {
         while let Some(net) = self.dirty.pop_front() {
             // Clear visit before eval so that it can be re-evaled in the case of a loop
             self.queued.insert(net, false);
+            println!("Visiting {:?}", net);
+            let changed = self.resolve_net(net);
 
-            let sinks: Vec<_> = self.nets[net]
-                .sinks
-                .iter()
-                .copied()
-                .filter(|(comp, _)| !self.components[*comp].is_sequential())
-                .collect();
+            if changed {
+                let sinks: Vec<_> = self.nets[net]
+                    .sinks
+                    .iter()
+                    .copied()
+                    .filter(|(comp, _)| !self.components[*comp].is_sequential())
+                    .collect();
 
-            for (comp, _) in sinks {
-                self.eval_component(comp);
+                for (comp, _) in sinks {
+                    self.eval_component(comp);
+                }
             }
-
             iterations += 1;
             if iterations > Self::MAX_ITERATIONS {
                 // FIXME: Handle error
                 panic!("Exceeded max iterations");
-                break;
             }
         }
     }
 
+    // Recomputes the Net's Value from it's source. Returns whether the value changed.
+    // TODO: Add functionality for multiple sources and conflict detection.
+    fn resolve_net(&mut self, net: NetKey) -> bool {
+        let old = self.nets[net].value;
+        let source = self.nets[net].source;
+
+        let new = match source {
+            // Net takes value from pins.out_cache, which is updated in eval_component
+            Some((comp, i)) => self.components[comp].pins.out_cache[i.0 as usize],
+            None => Value::Floating,
+        };
+        self.nets[net].value = new;
+        new != old
+    }
+
+    // Evaluates component logic, storing the Value in pins.out_cache and marking the net as dirty
+    // if necessary.
     fn eval_component(&mut self, comp: CompKey) {
-        let comp = &self.components[comp];
+        let new_values: Vec<_> = self.components[comp].evaluate(&self.nets);
+        let c = &mut self.components[comp];
 
-        let new_values: Vec<_> = comp.evaluate(&self.nets);
-        // filter out values where: a) output pin is disconnected, or b) new value matches previous
-        // value
-        let dirty_values: Vec<_> = new_values
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, new_val)| comp.pins.outputs[i].map(|net| (net, new_val)))
-            .collect();
+        let mut dirty_nets = Vec::new();
 
-        for (net, new_value) in dirty_values {
-            if self.nets[net].value != new_value {
-                self.nets[net].value = new_value;
-                self.mark_dirty(net);
+        for (i, new_val) in new_values.into_iter().enumerate() {
+            let cache_slot = &mut c.pins.out_cache[i];
+            if *cache_slot != new_val {
+                *cache_slot = new_val;
+                if let Some(net) = c.pins.outputs[i] {
+                    dirty_nets.push(net);
+                }
             }
+        }
+
+        for net in dirty_nets {
+            self.mark_dirty(net);
         }
     }
 }

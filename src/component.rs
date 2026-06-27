@@ -1,5 +1,5 @@
 use crate::net::{Net, NetKey};
-use crate::value::Value;
+use crate::value::Value::{self, Floating};
 use slotmap::{new_key_type, SlotMap};
 
 new_key_type! {
@@ -31,6 +31,17 @@ impl Component {
         Self {
             pins: Pins::new(n, 1),
             logic: Logic::Gate { op, width },
+        }
+    }
+
+    pub fn mux(data_width: u8, sel_width: u8) -> Self {
+        let branches = 1 << sel_width;
+        Self {
+            pins: Pins::new(branches + 1, 1),
+            logic: Logic::Mux {
+                data_width,
+                sel_width,
+            },
         }
     }
 
@@ -96,7 +107,16 @@ impl Component {
                 };
                 vec![val] // Assumes single output
             }
-            Logic::Mux => todo!(),
+            Logic::Mux { sel_width, .. } => match read_pin(0) {
+                Value::Floating => vec![Value::Floating],
+                Value::Fixed { bits, width } => {
+                    if *sel_width == width {
+                        vec![read_pin(bits as usize + 1)]
+                    } else {
+                        vec![Value::Floating]
+                    }
+                }
+            },
             Logic::Demux => todo!(),
             Logic::Reg => todo!(),
         }
@@ -118,9 +138,11 @@ impl Component {
 
     pub fn is_sequential(&self) -> bool {
         match self.logic {
-            Logic::Gate { .. } | Logic::Mux | Logic::Demux | Logic::Input(_) | Logic::Output => {
-                false
-            }
+            Logic::Gate { .. }
+            | Logic::Mux { .. }
+            | Logic::Demux
+            | Logic::Input(_)
+            | Logic::Output => false,
             Logic::Reg => true,
         }
     }
@@ -151,6 +173,8 @@ impl PinId {
 pub struct Pins {
     pub inputs: Vec<Option<NetKey>>,
     pub outputs: Vec<Option<NetKey>>,
+    pub out_cache: Vec<Value>, // TODO: Should this be combined with outputs to enforce the same
+                               // lengths?
 }
 
 impl Pins {
@@ -158,6 +182,7 @@ impl Pins {
         Self {
             inputs: vec![None; inputs],
             outputs: vec![None; outputs],
+            out_cache: vec![Value::default(); outputs],
         }
     }
 }
@@ -166,9 +191,8 @@ impl Pins {
 pub enum Logic {
     Input(Value),
     Output,
-
     Gate { op: GateOp, width: u8 },
-    Mux,
+    Mux { data_width: u8, sel_width: u8 },
     Demux,
     Reg,
 }
