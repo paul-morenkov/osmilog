@@ -1,22 +1,49 @@
-use crate::component::{CompKey, Component, PinId};
+use crate::{
+    component::{CompKey, Component, Logic, PinId},
+    value::Value,
+};
 
 use slotmap::{SecondaryMap, SlotMap};
 use std::collections::VecDeque;
 
 use crate::net::{Net, NetKey};
 
+#[derive(Debug, Default)]
 pub struct Circuit {
-    nets: SlotMap<NetKey, Net>,
+    pub(crate) nets: SlotMap<NetKey, Net>,
     components: SlotMap<CompKey, Component>,
-    dirty: VecDeque<NetKey>,
+    pub(crate) dirty: VecDeque<NetKey>,
     queued: SecondaryMap<NetKey, bool>, // TODO: there might be a nicer way of organizing this
 }
 
 impl Circuit {
     const MAX_ITERATIONS: usize = 100;
 
-    fn add_component(&mut self, comp: Component) -> CompKey {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_component(&mut self, comp: Component) -> CompKey {
         self.components.insert(comp)
+    }
+
+    pub fn set_input(&mut self, comp: CompKey, value: Value) {
+        // TODO: Make this return a result
+        if let Logic::Input(v) = &mut self.components[comp].logic {
+            *v = value
+        } else {
+            return;
+        }
+        self.eval_component(comp);
+        // TODO: determine whether to settle automatically after
+    }
+
+    pub fn read_output(&self, comp: CompKey) -> Value {
+        // TODO: Handle the component not being Logic::Output
+        match self.components[comp].pins.inputs[0] {
+            Some(net) => self.nets[net].value,
+            None => Value::Floating,
+        }
     }
 
     fn net_of(&self, comp: CompKey, pin: PinId) -> Option<NetKey> {
@@ -29,9 +56,10 @@ impl Circuit {
             PinId::In(i) => self.nets[net].sinks.push((comp, i)),
             PinId::Out(i) => self.nets[net].source = Some((comp, i)),
         }
+        self.components[comp].set_pin_net(pin, net);
     }
 
-    fn link(&mut self, a: CompKey, a_pin: PinId, b: CompKey, b_pin: PinId) -> NetKey {
+    pub fn link(&mut self, a: CompKey, a_pin: PinId, b: CompKey, b_pin: PinId) -> NetKey {
         let net_a = self.net_of(a, a_pin);
         let net_b = self.net_of(b, b_pin);
 
@@ -41,14 +69,17 @@ impl Circuit {
                 let net = self.nets.insert(Net::default());
                 self.attach(net, a, a_pin);
                 self.attach(net, b, b_pin);
+                self.mark_dirty(net);
                 net
             }
             (Some(net), None) => {
                 self.attach(net, b, b_pin);
+                self.mark_dirty(net);
                 net
             }
             (None, Some(net)) => {
                 self.attach(net, a, a_pin);
+                self.mark_dirty(net);
                 net
             }
             (Some(a_net), Some(b_net)) if a_net == b_net => a_net,
@@ -93,7 +124,7 @@ impl Circuit {
         }
     }
 
-    fn settle(&mut self) {
+    pub fn settle(&mut self) {
         let mut iterations = 0;
 
         while let Some(net) = self.dirty.pop_front() {
@@ -122,6 +153,7 @@ impl Circuit {
 
     fn eval_component(&mut self, comp: CompKey) {
         let comp = &self.components[comp];
+
         let new_values: Vec<_> = comp.evaluate(&self.nets);
         // filter out values where: a) output pin is disconnected, or b) new value matches previous
         // value

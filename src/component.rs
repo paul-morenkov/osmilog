@@ -6,6 +6,7 @@ new_key_type! {
     pub struct CompKey;
 }
 
+#[derive(Debug)]
 pub struct Component {
     pub pins: Pins,
     pub logic: Logic,
@@ -13,6 +14,26 @@ pub struct Component {
 
 impl Component {
     // TODO: Consider returning pin index information
+    pub fn input(value: Value) -> Self {
+        Self {
+            pins: Pins::new(0, 1),
+            logic: Logic::Input(value),
+        }
+    }
+    pub fn output() -> Self {
+        Self {
+            pins: Pins::new(1, 0),
+            logic: Logic::Output,
+        }
+    }
+
+    pub fn gate(op: GateOp, n: usize, width: u8) -> Self {
+        Self {
+            pins: Pins::new(n, 1),
+            logic: Logic::Gate { op, width },
+        }
+    }
+
     pub fn evaluate(&self, nets: &SlotMap<NetKey, Net>) -> Vec<Value> {
         let read_pin = |i: usize| -> Value {
             match self.pins.inputs[i] {
@@ -21,13 +42,60 @@ impl Component {
             }
         };
 
+        let n_inputs = self.pins.inputs.len();
+
         match &self.logic {
-            Logic::Gate(op) => match op {
-                GateOp::And | GateOp::Nand => {}
-                GateOp::Or | GateOp::Nor => {}
-                GateOp::Xor | GateOp::Xnor => {}
-                GateOp::Not => {}
-            },
+            Logic::Input(val) => vec![*val],
+            Logic::Output => vec![],
+            Logic::Gate { op, width } => {
+                let val = match op {
+                    GateOp::And | GateOp::Nand => {
+                        let mut acc = Value::Fixed {
+                            bits: Value::mask(*width),
+                            width: *width,
+                        };
+                        for i in 0..n_inputs {
+                            let x = read_pin(i);
+                            acc = acc & x;
+                        }
+                        if matches!(op, GateOp::Nand) {
+                            !acc
+                        } else {
+                            acc
+                        }
+                    }
+                    GateOp::Or | GateOp::Nor => {
+                        let mut acc = Value::Fixed {
+                            bits: 0,
+                            width: *width,
+                        };
+                        for i in 0..n_inputs {
+                            acc = acc | read_pin(i)
+                        }
+                        if matches!(op, GateOp::Nor) {
+                            !acc
+                        } else {
+                            acc
+                        }
+                    }
+                    GateOp::Xor | GateOp::Xnor => {
+                        let mut acc = Value::Fixed {
+                            bits: 0,
+                            width: *width,
+                        };
+                        for i in 0..n_inputs {
+                            acc = acc ^ read_pin(i)
+                        }
+                        if matches!(op, GateOp::Xnor) {
+                            !acc
+                        } else {
+                            acc
+                        }
+                    }
+                    GateOp::Not => !read_pin(0),
+                };
+                vec![val] // Assumes single output
+            }
             Logic::Mux => todo!(),
             Logic::Demux => todo!(),
             Logic::Reg => todo!(),
@@ -50,22 +118,33 @@ impl Component {
 
     pub fn is_sequential(&self) -> bool {
         match self.logic {
-            Logic::Gate(_) | Logic::Mux | Logic::Demux => false,
+            Logic::Gate { .. } | Logic::Mux | Logic::Demux | Logic::Input(_) | Logic::Output => {
+                false
+            }
             Logic::Reg => true,
         }
     }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct InIdx(u8);
+pub struct InIdx(pub u8);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct OutIdx(u8);
+pub struct OutIdx(pub u8);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum PinId {
     In(InIdx),
     Out(OutIdx),
+}
+
+impl PinId {
+    pub fn input(i: u8) -> Self {
+        Self::In(InIdx(i))
+    }
+    pub fn output(i: u8) -> Self {
+        Self::Out(OutIdx(i))
+    }
 }
 
 #[derive(Debug)]
@@ -74,13 +153,27 @@ pub struct Pins {
     pub outputs: Vec<Option<NetKey>>,
 }
 
+impl Pins {
+    pub fn new(inputs: usize, outputs: usize) -> Self {
+        Self {
+            inputs: vec![None; inputs],
+            outputs: vec![None; outputs],
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum Logic {
-    Gate(GateOp),
+    Input(Value),
+    Output,
+
+    Gate { op: GateOp, width: u8 },
     Mux,
     Demux,
     Reg,
 }
 
+#[derive(Debug)]
 pub enum GateOp {
     And,
     Or,
