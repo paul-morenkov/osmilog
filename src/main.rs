@@ -96,4 +96,32 @@ mod tests {
         c.settle();
         assert_eq!(c.read_output(o1), Value::new(0, 2));
     }
+
+    #[test]
+    fn test_demux() {
+        let mut c = Circuit::new();
+        let i1 = c.add_component(Component::input(Value::new(1, 1)));
+        let sel = c.add_component(Component::input(Value::new(2, 2)));
+
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+        let o3 = c.add_component(Component::output());
+        let o4 = c.add_component(Component::output());
+
+        let demux = c.add_component(Component::demux(1, 2));
+
+        c.link(i1, PinId::output(0), demux, PinId::input(0));
+        c.link(sel, PinId::output(0), demux, PinId::input(1));
+
+        c.link(demux, PinId::output(0), o1, PinId::input(0));
+        c.link(demux, PinId::output(1), o2, PinId::input(0));
+        c.link(demux, PinId::output(2), o3, PinId::input(0));
+        c.link(demux, PinId::output(3), o4, PinId::input(0));
+
+        c.settle();
+        assert_eq!(c.read_output(o1), Value::new(0, 1));
+        assert_eq!(c.read_output(o2), Value::new(0, 1));
+        assert_eq!(c.read_output(o3), Value::new(1, 1));
+        assert_eq!(c.read_output(o4), Value::new(0, 1));
+    }
 }

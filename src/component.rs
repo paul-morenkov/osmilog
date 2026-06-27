@@ -45,6 +45,16 @@ impl Component {
         }
     }
 
+    pub fn demux(data_width: u8, sel_width: u8) -> Self {
+        Self {
+            pins: Pins::new(2, 1 << sel_width),
+            logic: Logic::Demux {
+                data_width,
+                sel_width,
+            },
+        }
+    }
+
     pub fn evaluate(&self, nets: &SlotMap<NetKey, Net>) -> Vec<Value> {
         let read_pin = |i: usize| -> Value {
             match self.pins.inputs[i] {
@@ -117,7 +127,22 @@ impl Component {
                     }
                 }
             },
-            Logic::Demux => todo!(),
+            // Demux: inputs[0] => data, inputs[1] => selector
+            Logic::Demux {
+                sel_width,
+                data_width,
+            } => {
+                let branches = 1 << sel_width;
+                match read_pin(1) {
+                    Value::Fixed { bits: sel, width } if width == *sel_width => {
+                        let mut values = vec![Value::new(0, *data_width); branches];
+                        // TODO: check data_width?
+                        values[sel as usize] = read_pin(0);
+                        values
+                    }
+                    _ => vec![Value::Floating; branches],
+                }
+            }
             Logic::Reg => todo!(),
         }
     }
@@ -140,7 +165,7 @@ impl Component {
         match self.logic {
             Logic::Gate { .. }
             | Logic::Mux { .. }
-            | Logic::Demux
+            | Logic::Demux { .. }
             | Logic::Input(_)
             | Logic::Output => false,
             Logic::Reg => true,
@@ -193,7 +218,7 @@ pub enum Logic {
     Output,
     Gate { op: GateOp, width: u8 },
     Mux { data_width: u8, sel_width: u8 },
-    Demux,
+    Demux { data_width: u8, sel_width: u8 },
     Reg,
 }
 
