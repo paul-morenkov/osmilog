@@ -1,41 +1,30 @@
-use circuit::Circuit;
-
-use crate::{
-    component::{Component, GateOp, PinId},
-    value::Value,
-};
-
+mod app;
 mod circuit;
 mod component;
 mod net;
 mod value;
 
-fn main() {
-    let mut c = Circuit::new();
-    let i1 = c.add_component(Component::input(Value::new(1, 1)));
-    let i2 = c.add_component(Component::input(Value::new(0, 1)));
-    let o1 = c.add_component(Component::output());
-    let o2 = c.add_component(Component::output());
-
-    let and = c.add_component(Component::gate(GateOp::And, 2, 1));
-    let or = c.add_component(Component::gate(GateOp::Or, 2, 1));
-
-    c.link(i1, PinId::output(0), and, PinId::input(0));
-    c.link(i2, PinId::output(0), and, PinId::input(1));
-    c.link(i1, PinId::output(0), or, PinId::input(0));
-    c.link(i2, PinId::output(0), or, PinId::input(1));
-    c.link(and, PinId::output(0), o1, PinId::input(0));
-    c.link(or, PinId::output(0), o2, PinId::input(0));
-
-    c.settle();
-
-    println!("{:?}", c.read_output(o1));
-    println!("{:?}", c.read_output(o2));
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("osmilog")
+            .with_inner_size([1200.0, 800.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "osmilog",
+        options,
+        Box::new(|cc| Ok(Box::new(app::OsmilogApp::new(cc)))),
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::{
+        circuit::Circuit,
+        component::{Component, GateOp, PinId},
+        value::Value,
+    };
 
     #[test]
     fn test_and_or() {

@@ -11,7 +11,7 @@ use crate::net::{Net, NetKey};
 #[derive(Debug, Default)]
 pub struct Circuit {
     pub(crate) nets: SlotMap<NetKey, Net>,
-    components: SlotMap<CompKey, Component>,
+    pub(crate) components: SlotMap<CompKey, Component>,
     pub(crate) dirty: VecDeque<NetKey>,
     queued: SecondaryMap<NetKey, bool>, // TODO: there might be a nicer way of organizing this
 }
@@ -145,7 +145,6 @@ impl Circuit {
         while let Some(net) = self.dirty.pop_front() {
             // Clear visit before eval so that it can be re-evaled in the case of a loop
             self.queued.insert(net, false);
-            println!("Visiting {:?}", net);
             let changed = self.resolve_net(net);
 
             if changed {

@@ -231,7 +231,7 @@ pub enum Logic {
     Reg,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateOp {
     And,
     Or,
