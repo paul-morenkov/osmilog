@@ -1,0 +1,127 @@
+pub mod app;
+pub mod circuit;
+pub mod component;
+pub mod net;
+pub mod value;
+
+#[cfg(target_arch = "wasm32")]
+mod wasm_entry {
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen(start)]
+    pub fn main_web() {
+        wasm_bindgen_futures::spawn_local(async {
+            let canvas = web_sys::window()
+                .expect("no window")
+                .document()
+                .expect("no document")
+                .get_element_by_id("the_canvas_id")
+                .expect("canvas #the_canvas_id not found")
+                .dyn_into::<web_sys::HtmlCanvasElement>()
+                .expect("element is not a canvas");
+
+            eframe::WebRunner::new()
+                .start(
+                    canvas,
+                    eframe::WebOptions::default(),
+                    Box::new(|cc| Ok(Box::new(crate::app::OsmilogApp::new(cc)))),
+                )
+                .await
+                .expect("failed to start eframe");
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        circuit::Circuit,
+        component::{Component, GateOp, PinId},
+        value::Value,
+    };
+
+    #[test]
+    fn test_and_or() {
+        let mut c = Circuit::new();
+        let i1 = c.add_component(Component::input(Value::new(1, 1)));
+        let i2 = c.add_component(Component::input(Value::new(0, 1)));
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+
+        let and = c.add_component(Component::gate(GateOp::And, 2, 1));
+        let or = c.add_component(Component::gate(GateOp::Or, 2, 1));
+
+        c.link(i1, PinId::output(0), and, PinId::input(0));
+        c.link(i2, PinId::output(0), and, PinId::input(1));
+        c.link(i1, PinId::output(0), or, PinId::input(0));
+        c.link(i2, PinId::output(0), or, PinId::input(1));
+        c.link(and, PinId::output(0), o1, PinId::input(0));
+        c.link(or, PinId::output(0), o2, PinId::input(0));
+
+        c.settle();
+        assert_eq!(c.read_output(o1), Value::new(0, 1));
+        assert_eq!(c.read_output(o2), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_mux() {
+        let mut c = Circuit::new();
+        let i1 = c.add_component(Component::input(Value::new(3, 2)));
+        let i2 = c.add_component(Component::input(Value::new(2, 2)));
+        let i3 = c.add_component(Component::input(Value::new(1, 2)));
+        let i4 = c.add_component(Component::input(Value::new(0, 2)));
+        let sel = c.add_component(Component::input(Value::new(0, 2)));
+
+        let o1 = c.add_component(Component::output());
+
+        let mux = c.add_component(Component::mux(2, 2));
+
+        c.link(i1, PinId::output(0), mux, PinId::input(1));
+        c.link(i2, PinId::output(0), mux, PinId::input(2));
+        c.link(i3, PinId::output(0), mux, PinId::input(3));
+        c.link(i4, PinId::output(0), mux, PinId::input(4));
+        c.link(sel, PinId::output(0), mux, PinId::input(0));
+
+        c.link(mux, PinId::output(0), o1, PinId::input(0));
+
+        c.settle();
+        assert_eq!(c.read_output(o1), Value::new(3, 2));
+        c.set_input(sel, Value::new(1, 2));
+        c.settle();
+        assert_eq!(c.read_output(o1), Value::new(2, 2));
+        c.set_input(sel, Value::new(2, 2));
+        c.settle();
+        assert_eq!(c.read_output(o1), Value::new(1, 2));
+        c.set_input(sel, Value::new(3, 2));
+        c.settle();
+        assert_eq!(c.read_output(o1), Value::new(0, 2));
+    }
+
+    #[test]
+    fn test_demux() {
+        let mut c = Circuit::new();
+        let i1 = c.add_component(Component::input(Value::new(1, 1)));
+        let sel = c.add_component(Component::input(Value::new(2, 2)));
+
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+        let o3 = c.add_component(Component::output());
+        let o4 = c.add_component(Component::output());
+
+        let demux = c.add_component(Component::demux(1, 2));
+
+        c.link(i1, PinId::output(0), demux, PinId::input(0));
+        c.link(sel, PinId::output(0), demux, PinId::input(1));
+
+        c.link(demux, PinId::output(0), o1, PinId::input(0));
+        c.link(demux, PinId::output(1), o2, PinId::input(0));
+        c.link(demux, PinId::output(2), o3, PinId::input(0));
+        c.link(demux, PinId::output(3), o4, PinId::input(0));
+
+        c.settle();
+        assert_eq!(c.read_output(o1), Value::new(0, 1));
+        assert_eq!(c.read_output(o2), Value::new(0, 1));
+        assert_eq!(c.read_output(o3), Value::new(1, 1));
+        assert_eq!(c.read_output(o4), Value::new(0, 1));
+    }
+}

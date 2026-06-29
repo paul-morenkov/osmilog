@@ -1,9 +1,43 @@
-name: WASM build automation
-run-name: ${{ github.actor }} is building to WASM
-on: [push]
+name: Build and deploy WASM
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
 jobs:
-  Build-WASM:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - run: cargo build --release --target wasm32-unknown-unknown
-      - run: cp ./target/
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install trunk
+        run: cargo install trunk --locked
+
+      - name: Build WASM
+        run: trunk build --release
+
+      - name: Deploy to docs/
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/
+          git diff --cached --quiet || git commit -m "chore: update WASM build [skip ci]"
+          git push

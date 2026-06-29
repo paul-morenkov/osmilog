@@ -145,6 +145,7 @@ impl OsmilogApp {
 impl eframe::App for OsmilogApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.viewport().close_requested()) {
+            #[cfg(not(target_arch = "wasm32"))]
             std::process::exit(0);
         }
     }

@@ -5,7 +5,7 @@ components and linking their pins with nets. The simulator propagates signal cha
 the graph until stable (settle). Planned future work: more component types and an egui
 graphical editor targeting both desktop and WASM.
 
-Dependencies: slotmap 1.1.1 (stable generational arena keys), egui 0.35.0 (not yet wired in).
+Dependencies: slotmap 1.1.1 (stable generational arena keys), eframe/egui 0.35.0 (native GUI).
 
 
 ## Module Map
@@ -14,7 +14,8 @@ Dependencies: slotmap 1.1.1 (stable generational arena keys), egui 0.35.0 (not y
     src/net.rs        Net struct - a wire connecting component pins
     src/component.rs  Component, Logic, Pins, PinId, key types
     src/circuit.rs    Circuit - the simulation graph and evaluation engine
-    src/main.rs       entry point and integration tests
+    src/app.rs        OsmilogApp - eframe/egui GUI (ComponentDef, PlacedComponent, Wire, InteractionMode)
+    src/main.rs       entry point (eframe::run_native) and integration tests
 
 
 ## Core Types
@@ -172,6 +173,66 @@ incrementally. settle() is still needed to fully propagate.
 clear_nets() disconnects all pins and removes all nets while keeping components in place.
 
 
+## GUI Architecture
+
+The GUI lives in `src/app.rs` and is driven by `eframe::run_native` in `main.rs`
+(1200 × 800 initial viewport). `OsmilogApp` implements `eframe::App` via two methods:
+`logic` (pre-frame logic) and `ui` (painting).
+
+### OsmilogApp state
+
+    circuit: Circuit          simulation graph — source of truth for signal values
+    components: Vec<PlacedComponent>  visual records: CompKey + ComponentDef + grid_pos + label
+    wires: Vec<Wire>          visual records: NetKey + src/dst CompKey + pin indices
+    mode: InteractionMode     Idle | Placing { def } | WireDrag { src_comp, src_pin, current_end }
+    pan: Vec2                 canvas pan offset in pixels
+
+`PlacedComponent` mirrors the circuit's `Component` but carries display-only data.
+`ComponentDef` re-expresses the `Logic` variants with all parameters needed for both
+display (`label`, `n_inputs`, `n_outputs`) and construction (`make_component()`).
+
+### Rendering pipeline (each frame)
+
+1. Menu bar — "Add" menu populates `mode = Placing { def }` for the chosen component type.
+2. `allocate_painter` fills the remaining area; `Sense::click_and_drag` captures all input.
+3. `draw_grid` — dot grid at GRID_SIZE (20 px) intervals, offset by `pan`.
+4. Wires — L-shaped elbow at the horizontal midpoint; color from `value_color(net.value)`.
+5. Components — rounded rectangles with a label; input pins on the left edge, output pins
+   on the right edge, each a filled circle colored by the current signal value.
+6. Mode overlay — ghost component while placing; rubber-band line while dragging a wire.
+
+### Interaction modes
+
+- **Idle**: drag from an output pin → enters WireDrag; click on an Input component body →
+  toggles its 1-bit value and calls `circuit.set_input` + `circuit.settle`.
+- **Placing**: shows a ghost at the snapped grid cell; click places the component via
+  `place_component`, which calls `circuit.add_component` and appends to `self.components`.
+- **WireDrag**: tracks `current_end` while dragging; on `drag_stopped`, if the cursor is
+  within 2 × PIN_RADIUS of an input pin on a different component, calls `circuit.link` +
+  `circuit.settle` and appends to `self.wires`. Escape returns to Idle.
+
+### Geometry constants
+
+    GRID_SIZE            20 px — canvas grid spacing
+    COMP_WIDTH           80 px — fixed component box width
+    COMP_HEIGHT_PER_PIN  20 px — height contributed by each pin slot
+    COMP_MIN_HEIGHT      40 px — floor on component box height
+    PIN_RADIUS            5 px — drawn radius; hit radius is 2 ×
+
+### Signal color coding
+
+    Floating                 gray
+    Fixed { bits: 0, .. }   dark blue (logic low)
+    Fixed { .. }            green (logic high / non-zero bus)
+
+### Window close (macOS)
+
+`logic()` checks `ctx.input(|i| i.viewport().close_requested())` and calls
+`std::process::exit(0)`. This bypasses eframe's double `save_and_destroy` cleanup sequence
+(a bug in eframe 0.35 on macOS that panics on the second GPU painter destroy) which would
+otherwise trigger Apple's crash reporter.
+
+
 ## Known Limitations / TODOs
 
 - Logic::Reg is a placeholder; clocking semantics not decided
@@ -186,5 +247,6 @@ clear_nets() disconnects all pins and removes all nets while keeping components 
 ## Future Directions
 
 - More component types: sequential elements, arithmetic units, decoders, etc.
-- egui graphical editor for building circuits visually, targeting desktop and WASM
-- Project stays as a single binary crate; egui rendering will be added directly
+- Extend the GUI: delete components/wires, multi-bit input editing, zoom, save/load
+- WASM target: compile egui app to wasm32 for browser use
+- Project stays as a single binary crate
