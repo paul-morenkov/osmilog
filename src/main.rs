@@ -1,3 +1,4 @@
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -11,3 +12,8 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| Ok(Box::new(osmilog::app::OsmilogApp::new(cc)))),
     )
 }
+
+// On wasm32 the entry point is `#[wasm_bindgen(start)]` in lib.rs;
+// a `main` symbol is still required by the toolchain.
+#[cfg(target_arch = "wasm32")]
+fn main() {}
