@@ -50,7 +50,12 @@ impl PinAnchor {
 
 pub struct ComponentShape {
     pub size: Vec2,
+    /// Full outline used for the stroke (may be concave).
     pub outline: Vec<ShapeCmd>,
+    /// Convex-only outline used for the fill. When `None`, `outline` is used for both.
+    /// Required for shapes whose outline is concave, because epaint's fill tessellator
+    /// assumes a convex polygon (triangle fan + feathering with inward normals).
+    pub fill_outline: Option<Vec<ShapeCmd>>,
     pub input_anchors: Vec<PinAnchor>,
     pub output_anchors: Vec<PinAnchor>,
     pub extra_strokes: Vec<Vec<ShapeCmd>>,
@@ -59,6 +64,7 @@ pub struct ComponentShape {
 }
 
 pub fn tessellate_path(cmds: &[ShapeCmd], rect: Rect) -> Vec<Pos2> {
+    // Converts from normalized coordinate to rect coordinate
     let scale = |v: Vec2| {
         pos2(
             rect.left() + v.x * rect.width(),

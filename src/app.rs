@@ -1,6 +1,6 @@
 use eframe;
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, Vec2};
 use egui::epaint::{PathShape, PathStroke};
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, Vec2};
 
 use crate::{
     circuit::Circuit,
@@ -13,10 +13,10 @@ use crate::{
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const GRID_SIZE: f32 = 20.0;
-const COMP_WIDTH: f32 = 80.0;
-const COMP_HEIGHT_PER_PIN: f32 = 20.0;
-const COMP_MIN_HEIGHT: f32 = 40.0;
-const PIN_RADIUS: f32 = 5.0;
+const COMP_WIDTH: f32 = 40.0;
+const COMP_HEIGHT_PER_PIN: f32 = 10.0;
+const COMP_MIN_HEIGHT: f32 = 30.0;
+const PIN_RADIUS: f32 = 3.0;
 const WIRE_THICKNESS: f32 = 2.0;
 
 // ── ComponentDef ──────────────────────────────────────────────────────────────
@@ -108,6 +108,7 @@ impl ComponentDef {
                 ComponentShape {
                     size: egui::vec2(COMP_WIDTH, h),
                     outline: rect_outline(),
+                    fill_outline: None,
                     input_anchors: vec![],
                     output_anchors: vec![PinAnchor::right(0.5)],
                     extra_strokes: vec![],
@@ -120,6 +121,7 @@ impl ComponentDef {
                 ComponentShape {
                     size: egui::vec2(COMP_WIDTH, h),
                     outline: rect_outline(),
+                    fill_outline: None,
                     input_anchors: vec![PinAnchor::left(0.5)],
                     output_anchors: vec![],
                     extra_strokes: vec![],
@@ -258,7 +260,11 @@ impl OsmilogApp {
                 };
                 ui.label(format!("Value: {}", val_str));
             }
-            ComponentDef::Gate { op, mut n_inputs, mut width } => {
+            ComponentDef::Gate {
+                op,
+                mut n_inputs,
+                mut width,
+            } => {
                 let mut changed = false;
                 if op != GateOp::Not {
                     ui.horizontal(|ui| {
@@ -275,10 +281,20 @@ impl OsmilogApp {
                         .changed();
                 });
                 if changed {
-                    self.reconfigure_component(key, ComponentDef::Gate { op, n_inputs, width });
+                    self.reconfigure_component(
+                        key,
+                        ComponentDef::Gate {
+                            op,
+                            n_inputs,
+                            width,
+                        },
+                    );
                 }
             }
-            ComponentDef::Mux { mut data_width, mut sel_width } => {
+            ComponentDef::Mux {
+                mut data_width,
+                mut sel_width,
+            } => {
                 let mut changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Data width:");
@@ -293,10 +309,19 @@ impl OsmilogApp {
                         .changed();
                 });
                 if changed {
-                    self.reconfigure_component(key, ComponentDef::Mux { data_width, sel_width });
+                    self.reconfigure_component(
+                        key,
+                        ComponentDef::Mux {
+                            data_width,
+                            sel_width,
+                        },
+                    );
                 }
             }
-            ComponentDef::Demux { mut data_width, mut sel_width } => {
+            ComponentDef::Demux {
+                mut data_width,
+                mut sel_width,
+            } => {
                 let mut changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Data width:");
@@ -311,7 +336,13 @@ impl OsmilogApp {
                         .changed();
                 });
                 if changed {
-                    self.reconfigure_component(key, ComponentDef::Demux { data_width, sel_width });
+                    self.reconfigure_component(
+                        key,
+                        ComponentDef::Demux {
+                            data_width,
+                            sel_width,
+                        },
+                    );
                 }
             }
         }
@@ -345,10 +376,16 @@ impl OsmilogApp {
             .collect();
 
         self.circuit.remove_component(old_key);
-        self.wires.retain(|w| w.src_comp != old_key && w.dst_comp != old_key);
+        self.wires
+            .retain(|w| w.src_comp != old_key && w.dst_comp != old_key);
 
         let new_key = self.circuit.add_component(new_comp);
-        self.components[pc_idx] = PlacedComponent { key: new_key, def: new_def, grid_pos, label };
+        self.components[pc_idx] = PlacedComponent {
+            key: new_key,
+            def: new_def,
+            grid_pos,
+            label,
+        };
 
         for w in surviving {
             let (src, src_pin, dst, dst_pin) = if w.src_comp == old_key {
@@ -356,13 +393,16 @@ impl OsmilogApp {
             } else {
                 (w.src_comp, w.src_pin, new_key, w.dst_pin)
             };
-            let net_key = self.circuit.link(
-                src,
-                PinId::output(src_pin.0),
-                dst,
-                PinId::input(dst_pin.0),
-            );
-            self.wires.push(Wire { net_key, src_comp: src, src_pin, dst_comp: dst, dst_pin });
+            let net_key =
+                self.circuit
+                    .link(src, PinId::output(src_pin.0), dst, PinId::input(dst_pin.0));
+            self.wires.push(Wire {
+                net_key,
+                src_comp: src,
+                src_pin,
+                dst_comp: dst,
+                dst_pin,
+            });
         }
 
         self.circuit.settle();
@@ -408,23 +448,33 @@ impl eframe::App for OsmilogApp {
                 });
                 if ui.button("Input").clicked() {
                     self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Input { value: Value::new(0, 1) },
+                        def: ComponentDef::Input {
+                            value: Value::new(0, 1),
+                        },
                     };
                     ui.close();
                 }
                 if ui.button("Output").clicked() {
-                    self.mode = InteractionMode::Placing { def: ComponentDef::Output };
+                    self.mode = InteractionMode::Placing {
+                        def: ComponentDef::Output,
+                    };
                     ui.close();
                 }
                 if ui.button("Mux").clicked() {
                     self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Mux { data_width: 1, sel_width: 1 },
+                        def: ComponentDef::Mux {
+                            data_width: 1,
+                            sel_width: 1,
+                        },
                     };
                     ui.close();
                 }
                 if ui.button("Demux").clicked() {
                     self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Demux { data_width: 1, sel_width: 1 },
+                        def: ComponentDef::Demux {
+                            data_width: 1,
+                            sel_width: 1,
+                        },
                     };
                     ui.close();
                 }
@@ -447,7 +497,12 @@ impl eframe::App for OsmilogApp {
             let pan = self.pan;
 
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                if let InteractionMode::ComponentDrag { key, original_grid_pos, .. } = self.mode {
+                if let InteractionMode::ComponentDrag {
+                    key,
+                    original_grid_pos,
+                    ..
+                } = self.mode
+                {
                     if let Some(pc) = self.components.iter_mut().find(|pc| pc.key == key) {
                         pc.grid_pos = original_grid_pos;
                     }
@@ -595,7 +650,11 @@ impl eframe::App for OsmilogApp {
                     }
                 }
 
-                InteractionMode::ComponentDrag { key, drag_origin, original_grid_pos } => {
+                InteractionMode::ComponentDrag {
+                    key,
+                    drag_origin,
+                    original_grid_pos,
+                } => {
                     if let Some(pos) = pointer {
                         let delta_x = ((pos.x - drag_origin.x) / GRID_SIZE).round() as i32;
                         let delta_y = ((pos.y - drag_origin.y) / GRID_SIZE).round() as i32;
@@ -728,6 +787,20 @@ fn or_outline() -> Vec<ShapeCmd> {
     ]
 }
 
+// Convex-only outline for the OR gate fill (no concave left curve).
+// epaint's fill tessellator uses a triangle fan + per-vertex feathering normals,
+// which both assume convexity. The concave left side causes fill to bleed outside
+// the boundary. We fill with this simpler convex shape and stroke with or_outline().
+fn or_fill_outline() -> Vec<ShapeCmd> {
+    use egui::vec2;
+    vec![
+        ShapeCmd::MoveTo(vec2(0.0, 0.0)),
+        ShapeCmd::CubicTo(vec2(0.5, 0.0), vec2(0.9, 0.15), vec2(1.0, 0.5)),
+        ShapeCmd::CubicTo(vec2(0.9, 0.85), vec2(0.5, 1.0), vec2(0.0, 1.0)),
+        // PathShape closes with a straight line from (0,1) back to (0,0)
+    ]
+}
+
 fn not_outline() -> Vec<ShapeCmd> {
     use egui::vec2;
     vec![
@@ -747,18 +820,26 @@ fn xor_extra_arc() -> Vec<ShapeCmd> {
 }
 
 fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
-    let n = if matches!(op, GateOp::Not) { 1 } else { n_inputs };
+    let n = if matches!(op, GateOp::Not) {
+        1
+    } else {
+        n_inputs
+    };
     let h = ((n + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT);
     let bubble = matches!(op, GateOp::Nand | GateOp::Nor | GateOp::Xnor | GateOp::Not);
 
-    let (outline, extra_strokes) = match op {
-        GateOp::And | GateOp::Nand => (and_outline(), vec![]),
-        GateOp::Or | GateOp::Nor => (or_outline(), vec![]),
-        GateOp::Xor | GateOp::Xnor => (or_outline(), vec![xor_extra_arc()]),
-        GateOp::Not => (not_outline(), vec![]),
+    let (outline, fill_outline, extra_strokes) = match op {
+        GateOp::And | GateOp::Nand => (and_outline(), None, vec![]),
+        GateOp::Or | GateOp::Nor => (or_outline(), Some(or_fill_outline()), vec![]),
+        GateOp::Xor | GateOp::Xnor => (or_outline(), Some(or_fill_outline()), vec![xor_extra_arc()]),
+        GateOp::Not => (not_outline(), None, vec![]),
     };
 
-    let out_anchor = if bubble { PinAnchor::right_bubble(0.5) } else { PinAnchor::right(0.5) };
+    let out_anchor = if bubble {
+        PinAnchor::right_bubble(0.5)
+    } else {
+        PinAnchor::right(0.5)
+    };
     let input_anchors = (0..n).map(|i| PinAnchor::left(spaced(i, n))).collect();
     let label_norm = if matches!(op, GateOp::Not) {
         egui::vec2(0.32, 0.5)
@@ -769,6 +850,7 @@ fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
     ComponentShape {
         size: egui::vec2(COMP_WIDTH, h),
         outline,
+        fill_outline,
         input_anchors,
         output_anchors: vec![out_anchor],
         extra_strokes,
@@ -797,6 +879,7 @@ fn mux_shape(sel_width: u8) -> ComponentShape {
     ComponentShape {
         size: egui::vec2(COMP_WIDTH, h),
         outline,
+        fill_outline: None,
         input_anchors,
         output_anchors: vec![PinAnchor::right(0.5)],
         extra_strokes: vec![],
@@ -818,13 +901,20 @@ fn demux_shape(sel_width: u8) -> ComponentShape {
     ];
 
     // input[0] = data → left center; input[1] = selector → bottom center
-    let data_anchor = PinAnchor { norm_pos: egui::vec2(0.0, 0.5), wire_dir: egui::vec2(-1.0, 0.0), pixel_offset: 0.0 };
+    let data_anchor = PinAnchor {
+        norm_pos: egui::vec2(0.0, 0.5),
+        wire_dir: egui::vec2(-1.0, 0.0),
+        pixel_offset: 0.0,
+    };
     let sel_anchor = PinAnchor::bottom_mid(0.5, 1.0 - T / 2.0);
-    let output_anchors = (0..branches).map(|i| PinAnchor::right(spaced(i, branches))).collect();
+    let output_anchors = (0..branches)
+        .map(|i| PinAnchor::right(spaced(i, branches)))
+        .collect();
 
     ComponentShape {
         size: egui::vec2(COMP_WIDTH, h),
         outline,
+        fill_outline: None,
         input_anchors: vec![data_anchor, sel_anchor],
         output_anchors,
         extra_strokes: vec![],
@@ -878,11 +968,25 @@ fn draw_component(
     };
     let outline_stroke = Stroke::new(stroke_w, stroke_col);
 
-    let pts = tessellate_path(&shape.outline, rect);
+    // Fill: use the convex fill_outline if provided (avoids epaint's concave polygon artifact),
+    // otherwise fall back to the regular outline.
+    let fill_pts = tessellate_path(
+        shape.fill_outline.as_deref().unwrap_or(&shape.outline),
+        rect,
+    );
     painter.add(egui::Shape::Path(PathShape {
-        points: pts,
+        points: fill_pts,
         closed: true,
         fill,
+        stroke: Stroke::NONE.into(),
+    }));
+
+    // Stroke: always use the full outline (may include concave curves).
+    let stroke_pts = tessellate_path(&shape.outline, rect);
+    painter.add(egui::Shape::Path(PathShape {
+        points: stroke_pts,
+        closed: true,
+        fill: Color32::TRANSPARENT,
         stroke: PathStroke::new(stroke_w, stroke_col),
     }));
 
@@ -908,7 +1012,13 @@ fn draw_component(
         rect.left() + shape.label_norm.x * rect.width(),
         rect.top() + shape.label_norm.y * rect.height(),
     );
-    painter.text(lp, Align2::CENTER_CENTER, &pc.label, FontId::monospace(11.0), Color32::WHITE);
+    painter.text(
+        lp,
+        Align2::CENTER_CENTER,
+        &pc.label,
+        FontId::monospace(11.0),
+        Color32::WHITE,
+    );
 
     for i in 0..pc.def.n_inputs() {
         let pos = pin_pos(pc, pan, PinId::input(i as u8));
@@ -950,5 +1060,11 @@ fn draw_ghost(painter: &Painter, def: &ComponentDef, grid_pos: [i32; 2], pan: Ve
         rect.left() + shape.label_norm.x * rect.width(),
         rect.top() + shape.label_norm.y * rect.height(),
     );
-    painter.text(lp, Align2::CENTER_CENTER, def.label(), FontId::monospace(11.0), ghost_col);
+    painter.text(
+        lp,
+        Align2::CENTER_CENTER,
+        def.label(),
+        FontId::monospace(11.0),
+        ghost_col,
+    );
 }
