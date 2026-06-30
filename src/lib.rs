@@ -4,34 +4,6 @@ pub mod component;
 pub mod net;
 pub mod value;
 
-#[cfg(target_arch = "wasm32")]
-mod wasm_entry {
-    use wasm_bindgen::prelude::*;
-
-    #[wasm_bindgen(start)]
-    pub fn main_web() {
-        wasm_bindgen_futures::spawn_local(async {
-            let canvas = web_sys::window()
-                .expect("no window")
-                .document()
-                .expect("no document")
-                .get_element_by_id("the_canvas_id")
-                .expect("canvas #the_canvas_id not found")
-                .dyn_into::<web_sys::HtmlCanvasElement>()
-                .expect("element is not a canvas");
-
-            eframe::WebRunner::new()
-                .start(
-                    canvas,
-                    eframe::WebOptions::default(),
-                    Box::new(|cc| Ok(Box::new(crate::app::OsmilogApp::new(cc)))),
-                )
-                .await
-                .expect("failed to start eframe");
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{
