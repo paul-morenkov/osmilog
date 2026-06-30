@@ -14,6 +14,7 @@ Dependencies: slotmap 1.1.1 (stable generational arena keys), eframe/egui 0.35.0
     src/net.rs        Net struct - a wire connecting component pins
     src/component.rs  Component, Logic, Pins, PinId, key types
     src/circuit.rs    Circuit - the simulation graph and evaluation engine
+    src/shape.rs      ComponentShape, ShapeCmd, PinAnchor, tessellate_path - visual shape system
     src/app.rs        OsmilogApp - eframe/egui GUI (ComponentDef, PlacedComponent, Wire, InteractionMode)
     src/main.rs       entry point (eframe::run_native) and integration tests
 
@@ -197,8 +198,8 @@ display (`label`, `n_inputs`, `n_outputs`) and construction (`make_component()`)
 2. `allocate_painter` fills the remaining area; `Sense::click_and_drag` captures all input.
 3. `draw_grid` — dot grid at GRID_SIZE (20 px) intervals, offset by `pan`.
 4. Wires — L-shaped elbow at the horizontal midpoint; color from `value_color(net.value)`.
-5. Components — rounded rectangles with a label; input pins on the left edge, output pins
-   on the right edge, each a filled circle colored by the current signal value.
+5. Components — tessellated bezier shapes with a label; pin circles colored by signal value.
+   Shape and pin positions come from `ComponentDef::shape()` (see Component Shape System below).
 6. Mode overlay — ghost component while placing; rubber-band line while dragging a wire.
 
 ### Interaction modes
@@ -211,6 +212,64 @@ display (`label`, `n_inputs`, `n_outputs`) and construction (`make_component()`)
   within 2 × PIN_RADIUS of an input pin on a different component, calls `circuit.link` +
   `circuit.settle` and appends to `self.wires`. Escape returns to Idle.
 
+### Component Shape System (shape.rs + app.rs)
+
+Every visual component type is described by a `ComponentShape` value returned from
+`ComponentDef::shape()`. Nothing hard-codes "inputs on left, outputs on right" — each shape
+specifies its own geometry.
+
+    pub struct ComponentShape {
+        size: Vec2,                       // bounding box in pixels (W × H)
+        outline: Vec<ShapeCmd>,           // closed path in normalized [0,1]² coords
+        input_anchors: Vec<PinAnchor>,    // one per circuit input pin, in circuit pin order
+        output_anchors: Vec<PinAnchor>,   // one per circuit output pin, in circuit pin order
+        extra_strokes: Vec<Vec<ShapeCmd>>,// open strokes drawn on top (e.g. XOR arc)
+        output_bubbles: Vec<bool>,        // true → draw inversion bubble on that output
+        label_norm: Vec2,                 // label center in normalized coords
+    }
+
+    pub struct PinAnchor {
+        norm_pos: Vec2,     // position in [0,1]² relative to bounding box
+        wire_dir: Vec2,     // unit vector the wire exits toward (away from component)
+        pixel_offset: f32,  // extra pixel shift along wire_dir (non-zero for bubble outputs)
+    }
+
+`ShapeCmd` is `MoveTo(Vec2) | LineTo(Vec2) | CubicTo(Vec2, Vec2, Vec2)`, all in normalized
+coords. `tessellate_path(cmds, rect)` converts a `&[ShapeCmd]` into a `Vec<Pos2>` suitable
+for `egui::epaint::PathShape`, approximating cubic beziers with 16 line segments each.
+
+Normalized coords are scaled to `rect` as: `pos2(rect.left + n.x * rect.width, rect.top + n.y * rect.height)`.
+Values outside [0,1] are valid and draw outside the bounding box (used by the XOR extra arc).
+
+**Pin positions** are computed by `pin_pos(pc, pan, PinId)`:
+
+    base = rect.topleft + anchor.norm_pos * rect.size
+    pin_pos = base + anchor.wire_dir * anchor.pixel_offset
+
+For bubble outputs (`output_bubbles[i] == true`), `draw_component` draws a filled circle
+at `base + wire_dir * BUBBLE_R` and the pin dot (and wire terminus) sits `BUBBLE_R * 2`
+further along `wire_dir`.
+
+**Shape per component type:**
+
+| Variant | Body shape | Inputs | Outputs | Notes |
+|---|---|---|---|---|
+| Input | Rectangle | — | right center | 80 × 40 |
+| Output | Rectangle | left center | — | 80 × 40 |
+| AND / NAND | Flat left + semicircle right | left edge, evenly spaced | right center | NAND adds bubble |
+| OR / NOR | Three-cubic closed curve | left edge (x = 0) | right tip | NOR adds bubble |
+| XOR / XNOR | Same as OR + extra concave arc at x ≈ −0.15 (extra_strokes) | left edge | right tip | XNOR adds bubble |
+| NOT | Triangle (3 vertices) | left center | right tip + bubble | |
+| Mux | Trapezoid, wider left | left edge = data [1..]; bottom center = selector [0] | right center | |
+| Demux | Trapezoid, wider right | left center = data [0]; bottom center = selector [1] | right edge, evenly spaced | |
+
+The selector pin anchor for Mux and Demux sits at the midpoint of the bottom slanted edge
+`(0.5, 1.0 − T/2)` with `wire_dir = (0, 1)` (exits downward), where `T = 0.2` is the taper
+fraction. Component height scales with `(branches + 1) * COMP_HEIGHT_PER_PIN`.
+
+Hit testing for click-to-select uses the bounding rect (`component_bounding_rect`), not the
+actual shape polygon. This is a known approximation.
+
 ### Geometry constants
 
     GRID_SIZE            20 px — canvas grid spacing
@@ -218,6 +277,7 @@ display (`label`, `n_inputs`, `n_outputs`) and construction (`make_component()`)
     COMP_HEIGHT_PER_PIN  20 px — height contributed by each pin slot
     COMP_MIN_HEIGHT      40 px — floor on component box height
     PIN_RADIUS            5 px — drawn radius; hit radius is 2 ×
+    BUBBLE_R              4 px — inversion bubble radius
 
 ### Signal color coding
 
@@ -236,12 +296,12 @@ otherwise trigger Apple's crash reporter.
 ## Known Limitations / TODOs
 
 - Logic::Reg is a placeholder; clocking semantics not decided
-- Mux/Demux pin ordering is provisional and may change
 - No conflict detection when multiple sources end up on the same net (merge() has a TODO)
 - settle() panics after 100 iterations; no graceful error return
 - set_input and read_output do not return errors for wrong component type
 - width is not verified to be nonzero in Value::Fixed
 - Add/Sub may overflow; behavior is unspecified
+- Click-to-select uses the bounding rect, not the actual shape polygon (affects triangles/curves)
 
 
 ## Future Directions
