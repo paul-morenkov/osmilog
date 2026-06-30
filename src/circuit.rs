@@ -204,4 +204,36 @@ impl Circuit {
             self.mark_dirty(net);
         }
     }
+
+    pub fn remove_component(&mut self, key: CompKey) {
+        let Some(comp) = self.components.get(key) else { return };
+        let output_nets: Vec<NetKey> = comp.pins.outputs.iter().filter_map(|&n| n).collect();
+        let input_nets: Vec<NetKey> = comp.pins.inputs.iter().filter_map(|&n| n).collect();
+
+        // Remove nets driven by this component; clear each sink's input pin slot
+        for net_key in output_nets {
+            if let Some(net) = self.nets.get(net_key) {
+                let sinks = net.sinks.clone();
+                for (sink_comp, sink_pin) in sinks {
+                    if let Some(sc) = self.components.get_mut(sink_comp) {
+                        sc.pins.inputs[sink_pin.0 as usize] = None;
+                    }
+                }
+            }
+            self.nets.remove(net_key);
+        }
+
+        // Detach from nets this component receives; remove it from each net's sinks list
+        for net_key in input_nets {
+            if let Some(net) = self.nets.get_mut(net_key) {
+                net.sinks.retain(|&(ck, _)| ck != key);
+            }
+        }
+
+        // Clear propagation state; the caller is expected to call settle() after
+        self.dirty.clear();
+        self.queued.clear();
+
+        self.components.remove(key);
+    }
 }

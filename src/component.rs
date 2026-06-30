@@ -1,5 +1,5 @@
 use crate::net::{Net, NetKey};
-use crate::value::Value::{self, Floating};
+use crate::value::Value;
 use slotmap::{new_key_type, SlotMap};
 
 new_key_type! {

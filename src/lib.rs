@@ -2,6 +2,7 @@ pub mod app;
 pub mod circuit;
 pub mod component;
 pub mod net;
+pub mod shape;
 pub mod value;
 
 #[cfg(test)]

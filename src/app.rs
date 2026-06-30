@@ -1,10 +1,12 @@
 use eframe;
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, Vec2};
+use egui::epaint::{PathShape, PathStroke};
 
 use crate::{
     circuit::Circuit,
     component::{CompKey, Component, GateOp, InIdx, OutIdx, PinId},
     net::NetKey,
+    shape::{tessellate_path, ComponentShape, PinAnchor, ShapeCmd, BUBBLE_R},
     value::Value,
 };
 
@@ -21,11 +23,23 @@ const WIRE_THICKNESS: f32 = 2.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComponentDef {
-    Input { value: Value },
+    Input {
+        value: Value,
+    },
     Output,
-    Gate { op: GateOp, n_inputs: usize, width: u8 },
-    Mux { data_width: u8, sel_width: u8 },
-    Demux { data_width: u8, sel_width: u8 },
+    Gate {
+        op: GateOp,
+        n_inputs: usize,
+        width: u8,
+    },
+    Mux {
+        data_width: u8,
+        sel_width: u8,
+    },
+    Demux {
+        data_width: u8,
+        sel_width: u8,
+    },
 }
 
 impl ComponentDef {
@@ -71,9 +85,51 @@ impl ComponentDef {
         match self {
             Self::Input { value } => Component::input(*value),
             Self::Output => Component::output(),
-            Self::Gate { op, n_inputs, width } => Component::gate(*op, *n_inputs, *width),
-            Self::Mux { data_width, sel_width } => Component::mux(*data_width, *sel_width),
-            Self::Demux { data_width, sel_width } => Component::demux(*data_width, *sel_width),
+            Self::Gate {
+                op,
+                n_inputs,
+                width,
+            } => Component::gate(*op, *n_inputs, *width),
+            Self::Mux {
+                data_width,
+                sel_width,
+            } => Component::mux(*data_width, *sel_width),
+            Self::Demux {
+                data_width,
+                sel_width,
+            } => Component::demux(*data_width, *sel_width),
+        }
+    }
+
+    pub fn shape(&self) -> ComponentShape {
+        match self {
+            Self::Input { .. } => {
+                let h = COMP_MIN_HEIGHT;
+                ComponentShape {
+                    size: egui::vec2(COMP_WIDTH, h),
+                    outline: rect_outline(),
+                    input_anchors: vec![],
+                    output_anchors: vec![PinAnchor::right(0.5)],
+                    extra_strokes: vec![],
+                    output_bubbles: vec![false],
+                    label_norm: egui::vec2(0.5, 0.5),
+                }
+            }
+            Self::Output => {
+                let h = COMP_MIN_HEIGHT;
+                ComponentShape {
+                    size: egui::vec2(COMP_WIDTH, h),
+                    outline: rect_outline(),
+                    input_anchors: vec![PinAnchor::left(0.5)],
+                    output_anchors: vec![],
+                    extra_strokes: vec![],
+                    output_bubbles: vec![],
+                    label_norm: egui::vec2(0.5, 0.5),
+                }
+            }
+            Self::Gate { op, n_inputs, .. } => gate_shape(*op, *n_inputs),
+            Self::Mux { sel_width, .. } => mux_shape(*sel_width),
+            Self::Demux { sel_width, .. } => demux_shape(*sel_width),
         }
     }
 }
@@ -89,6 +145,7 @@ pub struct PlacedComponent {
 
 // ── Wire ──────────────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
 pub struct Wire {
     pub net_key: NetKey,
     pub src_comp: CompKey,
@@ -102,8 +159,19 @@ pub struct Wire {
 #[derive(Clone)]
 pub enum InteractionMode {
     Idle,
-    Placing { def: ComponentDef },
-    WireDrag { src_comp: CompKey, src_pin: OutIdx, current_end: Pos2 },
+    Placing {
+        def: ComponentDef,
+    },
+    WireDrag {
+        src_comp: CompKey,
+        src_pin: OutIdx,
+        current_end: Pos2,
+    },
+    ComponentDrag {
+        key: CompKey,
+        drag_origin: Pos2,
+        original_grid_pos: [i32; 2],
+    },
 }
 
 // ── PinKind ───────────────────────────────────────────────────────────────────
@@ -121,6 +189,7 @@ pub struct OsmilogApp {
     pub wires: Vec<Wire>,
     pub mode: InteractionMode,
     pub pan: Vec2,
+    pub selected: Option<CompKey>,
 }
 
 impl OsmilogApp {
@@ -131,6 +200,7 @@ impl OsmilogApp {
             wires: Vec::new(),
             mode: InteractionMode::Idle,
             pan: Vec2::ZERO,
+            selected: None,
         }
     }
 
@@ -138,7 +208,165 @@ impl OsmilogApp {
         let comp = def.make_component();
         let key = self.circuit.add_component(comp);
         let label = format!("{}{}", def.label(), self.components.len());
-        self.components.push(PlacedComponent { key, def, grid_pos, label });
+        self.components.push(PlacedComponent {
+            key,
+            def,
+            grid_pos,
+            label,
+        });
+    }
+
+    fn show_properties(&mut self, ui: &mut egui::Ui) {
+        let Some(key) = self.selected else {
+            ui.label("Click a component to select it.");
+            return;
+        };
+        let Some(idx) = self.components.iter().position(|pc| pc.key == key) else {
+            self.selected = None;
+            return;
+        };
+
+        ui.heading(self.components[idx].def.label());
+        ui.separator();
+        ui.label("Label:");
+        ui.text_edit_singleline(&mut self.components[idx].label);
+        ui.separator();
+
+        let def = self.components[idx].def.clone();
+        match def {
+            ComponentDef::Input { .. } => {
+                let cur = self.circuit.components[key].pins.out_cache[0];
+                let val_str = match cur {
+                    Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
+                    Value::Floating => "Floating".to_string(),
+                };
+                ui.label(format!("Value: {}", val_str));
+                if ui.button("Toggle").clicked() {
+                    let next = match cur {
+                        Value::Fixed { bits, width } => Value::new(bits ^ 1, width),
+                        Value::Floating => Value::new(1, 1),
+                    };
+                    self.circuit.set_input(key, next);
+                    self.circuit.settle();
+                }
+            }
+            ComponentDef::Output => {
+                let val = self.circuit.read_output(key);
+                let val_str = match val {
+                    Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
+                    Value::Floating => "Floating".to_string(),
+                };
+                ui.label(format!("Value: {}", val_str));
+            }
+            ComponentDef::Gate { op, mut n_inputs, mut width } => {
+                let mut changed = false;
+                if op != GateOp::Not {
+                    ui.horizontal(|ui| {
+                        ui.label("Inputs:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut n_inputs).range(2..=8))
+                            .changed();
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut width).range(1..=32))
+                        .changed();
+                });
+                if changed {
+                    self.reconfigure_component(key, ComponentDef::Gate { op, n_inputs, width });
+                }
+            }
+            ComponentDef::Mux { mut data_width, mut sel_width } => {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Data width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Sel width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut sel_width).range(1..=4))
+                        .changed();
+                });
+                if changed {
+                    self.reconfigure_component(key, ComponentDef::Mux { data_width, sel_width });
+                }
+            }
+            ComponentDef::Demux { mut data_width, mut sel_width } => {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Data width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Sel width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut sel_width).range(1..=4))
+                        .changed();
+                });
+                if changed {
+                    self.reconfigure_component(key, ComponentDef::Demux { data_width, sel_width });
+                }
+            }
+        }
+    }
+
+    fn reconfigure_component(&mut self, old_key: CompKey, new_def: ComponentDef) {
+        let Some(pc_idx) = self.components.iter().position(|pc| pc.key == old_key) else {
+            return;
+        };
+        let grid_pos = self.components[pc_idx].grid_pos;
+        let label = self.components[pc_idx].label.clone();
+
+        let new_comp = new_def.make_component();
+        let new_n_in = new_comp.pins.inputs.len();
+        let new_n_out = new_comp.pins.outputs.len();
+
+        // Wires touching old_key whose pin index is still valid for the new component
+        let surviving: Vec<Wire> = self
+            .wires
+            .iter()
+            .filter(|w| {
+                if w.src_comp == old_key {
+                    (w.src_pin.0 as usize) < new_n_out
+                } else if w.dst_comp == old_key {
+                    (w.dst_pin.0 as usize) < new_n_in
+                } else {
+                    false
+                }
+            })
+            .copied()
+            .collect();
+
+        self.circuit.remove_component(old_key);
+        self.wires.retain(|w| w.src_comp != old_key && w.dst_comp != old_key);
+
+        let new_key = self.circuit.add_component(new_comp);
+        self.components[pc_idx] = PlacedComponent { key: new_key, def: new_def, grid_pos, label };
+
+        for w in surviving {
+            let (src, src_pin, dst, dst_pin) = if w.src_comp == old_key {
+                (new_key, w.src_pin, w.dst_comp, w.dst_pin)
+            } else {
+                (w.src_comp, w.src_pin, new_key, w.dst_pin)
+            };
+            let net_key = self.circuit.link(
+                src,
+                PinId::output(src_pin.0),
+                dst,
+                PinId::input(dst_pin.0),
+            );
+            self.wires.push(Wire { net_key, src_comp: src, src_pin, dst_comp: dst, dst_pin });
+        }
+
+        self.circuit.settle();
+        self.selected = Some(new_key);
     }
 }
 
@@ -154,21 +382,25 @@ impl eframe::App for OsmilogApp {
         let ctx = ui.ctx().clone();
 
         // ── Menu bar ──────────────────────────────────────────────────────
-        ui.horizontal(|ui: &mut egui::Ui| {
-            ui.menu_button("Add", |ui: &mut egui::Ui| {
-                ui.menu_button("Gates", |ui: &mut egui::Ui| {
+        egui::Panel::top("menu_bar").show(ui, |ui| {
+            ui.menu_button("Add", |ui| {
+                ui.menu_button("Gates", |ui| {
                     let gates: [(&str, GateOp, usize); 6] = [
-                        ("AND",  GateOp::And,  2),
-                        ("OR",   GateOp::Or,   2),
-                        ("XOR",  GateOp::Xor,  2),
+                        ("AND", GateOp::And, 2),
+                        ("OR", GateOp::Or, 2),
+                        ("XOR", GateOp::Xor, 2),
                         ("NAND", GateOp::Nand, 2),
-                        ("NOR",  GateOp::Nor,  2),
-                        ("NOT",  GateOp::Not,  1),
+                        ("NOR", GateOp::Nor, 2),
+                        ("NOT", GateOp::Not, 1),
                     ];
                     for (name, op, n) in gates {
                         if ui.button(name).clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentDef::Gate { op, n_inputs: n, width: 1 },
+                                def: ComponentDef::Gate {
+                                    op,
+                                    n_inputs: n,
+                                    width: 1,
+                                },
                             };
                             ui.close();
                         }
@@ -181,9 +413,7 @@ impl eframe::App for OsmilogApp {
                     ui.close();
                 }
                 if ui.button("Output").clicked() {
-                    self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Output,
-                    };
+                    self.mode = InteractionMode::Placing { def: ComponentDef::Output };
                     ui.close();
                 }
                 if ui.button("Mux").clicked() {
@@ -201,7 +431,13 @@ impl eframe::App for OsmilogApp {
             });
         });
 
-        ui.separator();
+        // ── Properties panel ──────────────────────────────────────────────
+        egui::Panel::left("properties")
+            .min_size(200.0)
+            .resizable(true)
+            .show(ui, |ui| {
+                self.show_properties(ui);
+            });
 
         // ── Canvas ────────────────────────────────────────────────────────
         {
@@ -211,6 +447,11 @@ impl eframe::App for OsmilogApp {
             let pan = self.pan;
 
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if let InteractionMode::ComponentDrag { key, original_grid_pos, .. } = self.mode {
+                    if let Some(pc) = self.components.iter_mut().find(|pc| pc.key == key) {
+                        pc.grid_pos = original_grid_pos;
+                    }
+                }
                 self.mode = InteractionMode::Idle;
             }
 
@@ -219,8 +460,16 @@ impl eframe::App for OsmilogApp {
             // Draw wires
             for wire in &self.wires {
                 let (p0, p1) = {
-                    let src = self.components.iter().find(|pc| pc.key == wire.src_comp).unwrap();
-                    let dst = self.components.iter().find(|pc| pc.key == wire.dst_comp).unwrap();
+                    let src = self
+                        .components
+                        .iter()
+                        .find(|pc| pc.key == wire.src_comp)
+                        .unwrap();
+                    let dst = self
+                        .components
+                        .iter()
+                        .find(|pc| pc.key == wire.dst_comp)
+                        .unwrap();
                     (
                         pin_pos(src, pan, PinId::output(wire.src_pin.0)),
                         pin_pos(dst, pan, PinId::input(wire.dst_pin.0)),
@@ -232,10 +481,12 @@ impl eframe::App for OsmilogApp {
 
             // Draw components
             for pc in &self.components {
-                draw_component(&painter, pc, pan, &self.circuit);
+                let is_selected = self.selected == Some(pc.key);
+                draw_component(&painter, pc, pan, &self.circuit, is_selected);
             }
 
-            let pointer = response.interact_pointer_pos()
+            let pointer = response
+                .interact_pointer_pos()
                 .or_else(|| ctx.pointer_hover_pos());
 
             // Mode-specific interaction
@@ -248,31 +499,37 @@ impl eframe::App for OsmilogApp {
                             if let Some((comp_key, PinId::Out(out_idx))) =
                                 pin_at_pos(&self.components, pan, pos, PinKind::Output)
                             {
+                                // Output-pin drag → start wire (highest priority)
                                 self.mode = InteractionMode::WireDrag {
                                     src_comp: comp_key,
                                     src_pin: out_idx,
                                     current_end: pos,
                                 };
+                            } else if let Some(sel_key) = self.selected {
+                                // Selected component body drag → move component
+                                if let Some(pc) =
+                                    self.components.iter().find(|pc| pc.key == sel_key)
+                                {
+                                    if component_bounding_rect(pc, pan).contains(pos) {
+                                        self.mode = InteractionMode::ComponentDrag {
+                                            key: sel_key,
+                                            drag_origin: pos,
+                                            original_grid_pos: pc.grid_pos,
+                                        };
+                                    }
+                                }
                             }
                         }
                     }
 
-                    // Click on Input component body to toggle value
+                    // Click any component body to select it; click empty canvas to deselect
                     if response.clicked() {
                         if let Some(pos) = pointer {
-                            let clicked_key = self.components.iter()
-                                .filter(|pc| matches!(pc.def, ComponentDef::Input { .. }))
-                                .find(|pc| component_rect(pc, pan).contains(pos))
+                            self.selected = self
+                                .components
+                                .iter()
+                                .find(|pc| component_bounding_rect(pc, pan).contains(pos))
                                 .map(|pc| pc.key);
-                            if let Some(key) = clicked_key {
-                                let cur = self.circuit.components[key].pins.out_cache[0];
-                                let next = match cur {
-                                    Value::Fixed { bits, width } => Value::new(bits ^ 1, width),
-                                    Value::Floating => Value::new(1, 1),
-                                };
-                                self.circuit.set_input(key, next);
-                                self.circuit.settle();
-                            }
                         }
                     }
                 }
@@ -291,26 +548,38 @@ impl eframe::App for OsmilogApp {
                     }
                 }
 
-                InteractionMode::WireDrag { src_comp, src_pin, current_end } => {
+                InteractionMode::WireDrag {
+                    src_comp,
+                    src_pin,
+                    current_end,
+                } => {
                     let p0 = {
-                        let src_pc = self.components.iter()
-                            .find(|pc| pc.key == src_comp).unwrap();
+                        let src_pc = self
+                            .components
+                            .iter()
+                            .find(|pc| pc.key == src_comp)
+                            .unwrap();
                         pin_pos(src_pc, pan, PinId::output(src_pin.0))
                     };
 
                     let end = pointer.unwrap_or(current_end);
                     draw_wire(&painter, p0, end, Color32::from_gray(150));
 
-                    // Keep current_end updated while dragging
-                    self.mode = InteractionMode::WireDrag { src_comp, src_pin, current_end: end };
+                    self.mode = InteractionMode::WireDrag {
+                        src_comp,
+                        src_pin,
+                        current_end: end,
+                    };
 
                     if response.drag_stopped() {
                         let target = pin_at_pos(&self.components, pan, end, PinKind::Input);
                         if let Some((dst_comp, PinId::In(in_idx))) = target {
                             if dst_comp != src_comp {
                                 let net = self.circuit.link(
-                                    src_comp, PinId::output(src_pin.0),
-                                    dst_comp,  PinId::input(in_idx.0),
+                                    src_comp,
+                                    PinId::output(src_pin.0),
+                                    dst_comp,
+                                    PinId::input(in_idx.0),
                                 );
                                 self.circuit.settle();
                                 self.wires.push(Wire {
@@ -325,6 +594,23 @@ impl eframe::App for OsmilogApp {
                         self.mode = InteractionMode::Idle;
                     }
                 }
+
+                InteractionMode::ComponentDrag { key, drag_origin, original_grid_pos } => {
+                    if let Some(pos) = pointer {
+                        let delta_x = ((pos.x - drag_origin.x) / GRID_SIZE).round() as i32;
+                        let delta_y = ((pos.y - drag_origin.y) / GRID_SIZE).round() as i32;
+                        let new_grid_pos = [
+                            original_grid_pos[0] + delta_x,
+                            original_grid_pos[1] + delta_y,
+                        ];
+                        if let Some(pc) = self.components.iter_mut().find(|pc| pc.key == key) {
+                            pc.grid_pos = new_grid_pos;
+                        }
+                    }
+                    if response.drag_stopped() {
+                        self.mode = InteractionMode::Idle;
+                    }
+                }
             }
         }
     }
@@ -332,30 +618,30 @@ impl eframe::App for OsmilogApp {
 
 // ── Geometry ─────────────────────────────────────────────────────────────────
 
-fn component_rect(pc: &PlacedComponent, pan: Vec2) -> Rect {
-    let n_slots = pc.def.n_inputs().max(pc.def.n_outputs()).max(1);
-    let h = (n_slots as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT);
+fn component_bounding_rect(pc: &PlacedComponent, pan: Vec2) -> Rect {
+    let size = pc.def.shape().size;
     let tl = egui::pos2(
         pc.grid_pos[0] as f32 * GRID_SIZE + pan.x,
         pc.grid_pos[1] as f32 * GRID_SIZE + pan.y,
     );
-    Rect::from_min_size(tl, egui::vec2(COMP_WIDTH, h))
+    Rect::from_min_size(tl, size)
 }
 
 fn pin_pos(pc: &PlacedComponent, pan: Vec2, pin: PinId) -> Pos2 {
-    let rect = component_rect(pc, pan);
-    match pin {
-        PinId::In(InIdx(i)) => {
-            let n = pc.def.n_inputs();
-            let frac = (i as f32 + 1.0) / (n as f32 + 1.0);
-            egui::pos2(rect.left(), rect.top() + frac * rect.height())
-        }
-        PinId::Out(OutIdx(i)) => {
-            let n = pc.def.n_outputs();
-            let frac = (i as f32 + 1.0) / (n as f32 + 1.0);
-            egui::pos2(rect.right(), rect.top() + frac * rect.height())
-        }
-    }
+    let shape = pc.def.shape();
+    let tl = egui::pos2(
+        pc.grid_pos[0] as f32 * GRID_SIZE + pan.x,
+        pc.grid_pos[1] as f32 * GRID_SIZE + pan.y,
+    );
+    let rect = Rect::from_min_size(tl, shape.size);
+    let anchor = match pin {
+        PinId::In(InIdx(i)) => &shape.input_anchors[i as usize],
+        PinId::Out(OutIdx(i)) => &shape.output_anchors[i as usize],
+    };
+    egui::pos2(
+        rect.left() + anchor.norm_pos.x * rect.width(),
+        rect.top() + anchor.norm_pos.y * rect.height(),
+    ) + anchor.wire_dir * anchor.pixel_offset
 }
 
 fn snap_to_grid(pos: Pos2, pan: Vec2) -> [i32; 2] {
@@ -405,6 +691,148 @@ fn value_color(val: Value) -> Color32 {
     }
 }
 
+// ── Shape helpers ─────────────────────────────────────────────────────────────
+
+fn spaced(i: usize, n: usize) -> f32 {
+    (i as f32 + 1.0) / (n as f32 + 1.0)
+}
+
+fn rect_outline() -> Vec<ShapeCmd> {
+    use egui::vec2;
+    vec![
+        ShapeCmd::MoveTo(vec2(0.0, 0.0)),
+        ShapeCmd::LineTo(vec2(1.0, 0.0)),
+        ShapeCmd::LineTo(vec2(1.0, 1.0)),
+        ShapeCmd::LineTo(vec2(0.0, 1.0)),
+    ]
+}
+
+fn and_outline() -> Vec<ShapeCmd> {
+    use egui::vec2;
+    vec![
+        ShapeCmd::MoveTo(vec2(0.0, 0.0)),
+        ShapeCmd::LineTo(vec2(0.5, 0.0)),
+        ShapeCmd::CubicTo(vec2(0.776, 0.0), vec2(1.0, 0.224), vec2(1.0, 0.5)),
+        ShapeCmd::CubicTo(vec2(1.0, 0.776), vec2(0.776, 1.0), vec2(0.5, 1.0)),
+        ShapeCmd::LineTo(vec2(0.0, 1.0)),
+    ]
+}
+
+fn or_outline() -> Vec<ShapeCmd> {
+    use egui::vec2;
+    vec![
+        ShapeCmd::MoveTo(vec2(0.0, 0.0)),
+        ShapeCmd::CubicTo(vec2(0.5, 0.0), vec2(0.9, 0.15), vec2(1.0, 0.5)),
+        ShapeCmd::CubicTo(vec2(0.9, 0.85), vec2(0.5, 1.0), vec2(0.0, 1.0)),
+        ShapeCmd::CubicTo(vec2(0.15, 0.75), vec2(0.15, 0.25), vec2(0.0, 0.0)),
+    ]
+}
+
+fn not_outline() -> Vec<ShapeCmd> {
+    use egui::vec2;
+    vec![
+        ShapeCmd::MoveTo(vec2(0.0, 0.0)),
+        ShapeCmd::LineTo(vec2(0.0, 1.0)),
+        ShapeCmd::LineTo(vec2(1.0, 0.5)),
+    ]
+}
+
+fn xor_extra_arc() -> Vec<ShapeCmd> {
+    use egui::vec2;
+    // Concave arc drawn just left of the OR body; negative x is outside the bounding box
+    vec![
+        ShapeCmd::MoveTo(vec2(-0.15, 0.05)),
+        ShapeCmd::CubicTo(vec2(0.0, 0.25), vec2(0.0, 0.75), vec2(-0.15, 0.95)),
+    ]
+}
+
+fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
+    let n = if matches!(op, GateOp::Not) { 1 } else { n_inputs };
+    let h = ((n + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT);
+    let bubble = matches!(op, GateOp::Nand | GateOp::Nor | GateOp::Xnor | GateOp::Not);
+
+    let (outline, extra_strokes) = match op {
+        GateOp::And | GateOp::Nand => (and_outline(), vec![]),
+        GateOp::Or | GateOp::Nor => (or_outline(), vec![]),
+        GateOp::Xor | GateOp::Xnor => (or_outline(), vec![xor_extra_arc()]),
+        GateOp::Not => (not_outline(), vec![]),
+    };
+
+    let out_anchor = if bubble { PinAnchor::right_bubble(0.5) } else { PinAnchor::right(0.5) };
+    let input_anchors = (0..n).map(|i| PinAnchor::left(spaced(i, n))).collect();
+    let label_norm = if matches!(op, GateOp::Not) {
+        egui::vec2(0.32, 0.5)
+    } else {
+        egui::vec2(0.38, 0.5)
+    };
+
+    ComponentShape {
+        size: egui::vec2(COMP_WIDTH, h),
+        outline,
+        input_anchors,
+        output_anchors: vec![out_anchor],
+        extra_strokes,
+        output_bubbles: vec![bubble],
+        label_norm,
+    }
+}
+
+fn mux_shape(sel_width: u8) -> ComponentShape {
+    let branches = 1usize << sel_width;
+    let h = ((branches + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT);
+    const T: f32 = 0.2;
+
+    let outline = vec![
+        ShapeCmd::MoveTo(egui::vec2(0.0, 0.0)),
+        ShapeCmd::LineTo(egui::vec2(1.0, T)),
+        ShapeCmd::LineTo(egui::vec2(1.0, 1.0 - T)),
+        ShapeCmd::LineTo(egui::vec2(0.0, 1.0)),
+    ];
+
+    // input[0] = selector → bottom-center of shape; input[1..] = data → left edge
+    let sel_anchor = PinAnchor::bottom_mid(0.5, 1.0 - T / 2.0);
+    let data_anchors = (0..branches).map(|i| PinAnchor::left(spaced(i, branches)));
+    let input_anchors = std::iter::once(sel_anchor).chain(data_anchors).collect();
+
+    ComponentShape {
+        size: egui::vec2(COMP_WIDTH, h),
+        outline,
+        input_anchors,
+        output_anchors: vec![PinAnchor::right(0.5)],
+        extra_strokes: vec![],
+        output_bubbles: vec![false],
+        label_norm: egui::vec2(0.45, 0.45),
+    }
+}
+
+fn demux_shape(sel_width: u8) -> ComponentShape {
+    let branches = 1usize << sel_width;
+    let h = ((branches + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT);
+    const T: f32 = 0.2;
+
+    let outline = vec![
+        ShapeCmd::MoveTo(egui::vec2(0.0, T)),
+        ShapeCmd::LineTo(egui::vec2(1.0, 0.0)),
+        ShapeCmd::LineTo(egui::vec2(1.0, 1.0)),
+        ShapeCmd::LineTo(egui::vec2(0.0, 1.0 - T)),
+    ];
+
+    // input[0] = data → left center; input[1] = selector → bottom center
+    let data_anchor = PinAnchor { norm_pos: egui::vec2(0.0, 0.5), wire_dir: egui::vec2(-1.0, 0.0), pixel_offset: 0.0 };
+    let sel_anchor = PinAnchor::bottom_mid(0.5, 1.0 - T / 2.0);
+    let output_anchors = (0..branches).map(|i| PinAnchor::right(spaced(i, branches))).collect();
+
+    ComponentShape {
+        size: egui::vec2(COMP_WIDTH, h),
+        outline,
+        input_anchors: vec![data_anchor, sel_anchor],
+        output_anchors,
+        extra_strokes: vec![],
+        output_bubbles: vec![false; branches],
+        label_norm: egui::vec2(0.55, 0.45),
+    }
+}
+
 // ── Drawing ───────────────────────────────────────────────────────────────────
 
 fn draw_grid(painter: &Painter, clip_rect: Rect, pan: Vec2) {
@@ -433,18 +861,54 @@ fn draw_wire(painter: &Painter, p0: Pos2, p1: Pos2, color: Color32) {
     painter.line_segment([elbow2, p1], stroke);
 }
 
-fn draw_component(painter: &Painter, pc: &PlacedComponent, pan: Vec2, circuit: &Circuit) {
-    let rect = component_rect(pc, pan);
+fn draw_component(
+    painter: &Painter,
+    pc: &PlacedComponent,
+    pan: Vec2,
+    circuit: &Circuit,
+    is_selected: bool,
+) {
+    let shape = pc.def.shape();
+    let rect = component_bounding_rect(pc, pan);
+    let fill = Color32::from_rgb(45, 45, 65);
+    let (stroke_w, stroke_col) = if is_selected {
+        (2.5_f32, Color32::from_rgb(100, 160, 255))
+    } else {
+        (1.5_f32, Color32::from_gray(160))
+    };
+    let outline_stroke = Stroke::new(stroke_w, stroke_col);
 
-    painter.rect_filled(rect, 4.0, Color32::from_rgb(45, 45, 65));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.5, Color32::from_gray(160)), egui::StrokeKind::Outside);
-    painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        &pc.label,
-        FontId::monospace(11.0),
-        Color32::WHITE,
+    let pts = tessellate_path(&shape.outline, rect);
+    painter.add(egui::Shape::Path(PathShape {
+        points: pts,
+        closed: true,
+        fill,
+        stroke: PathStroke::new(stroke_w, stroke_col),
+    }));
+
+    for stroke_cmds in &shape.extra_strokes {
+        let stroke_pts = tessellate_path(stroke_cmds, rect);
+        painter.add(egui::Shape::line(stroke_pts, outline_stroke));
+    }
+
+    for (i, &has_bubble) in shape.output_bubbles.iter().enumerate() {
+        if has_bubble {
+            let anchor = &shape.output_anchors[i];
+            let boundary = egui::pos2(
+                rect.left() + anchor.norm_pos.x * rect.width(),
+                rect.top() + anchor.norm_pos.y * rect.height(),
+            );
+            let center = boundary + anchor.wire_dir * BUBBLE_R;
+            painter.circle_filled(center, BUBBLE_R, fill);
+            painter.circle_stroke(center, BUBBLE_R, outline_stroke);
+        }
+    }
+
+    let lp = egui::pos2(
+        rect.left() + shape.label_norm.x * rect.width(),
+        rect.top() + shape.label_norm.y * rect.height(),
     );
+    painter.text(lp, Align2::CENTER_CENTER, &pc.label, FontId::monospace(11.0), Color32::WHITE);
 
     for i in 0..pc.def.n_inputs() {
         let pos = pin_pos(pc, pan, PinId::input(i as u8));
@@ -453,7 +917,6 @@ fn draw_component(painter: &Painter, pc: &PlacedComponent, pan: Vec2, circuit: &
             .unwrap_or(Value::Floating);
         painter.circle_filled(pos, PIN_RADIUS, value_color(val));
     }
-
     for i in 0..pc.def.n_outputs() {
         let pos = pin_pos(pc, pan, PinId::output(i as u8));
         let val = circuit.components[pc.key].pins.out_cache[i];
@@ -462,19 +925,30 @@ fn draw_component(painter: &Painter, pc: &PlacedComponent, pan: Vec2, circuit: &
 }
 
 fn draw_ghost(painter: &Painter, def: &ComponentDef, grid_pos: [i32; 2], pan: Vec2) {
-    let n_slots = def.n_inputs().max(def.n_outputs()).max(1);
-    let h = (n_slots as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT);
+    let shape = def.shape();
     let tl = egui::pos2(
         grid_pos[0] as f32 * GRID_SIZE + pan.x,
         grid_pos[1] as f32 * GRID_SIZE + pan.y,
     );
-    let rect = Rect::from_min_size(tl, egui::vec2(COMP_WIDTH, h));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.5, Color32::from_gray(120)), egui::StrokeKind::Outside);
-    painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        def.label(),
-        FontId::monospace(11.0),
-        Color32::from_gray(120),
+    let rect = Rect::from_min_size(tl, shape.size);
+    let ghost_col = Color32::from_gray(120);
+
+    let pts = tessellate_path(&shape.outline, rect);
+    painter.add(egui::Shape::Path(PathShape {
+        points: pts,
+        closed: true,
+        fill: Color32::TRANSPARENT,
+        stroke: PathStroke::new(1.5, ghost_col),
+    }));
+
+    for stroke_cmds in &shape.extra_strokes {
+        let stroke_pts = tessellate_path(stroke_cmds, rect);
+        painter.add(egui::Shape::line(stroke_pts, Stroke::new(1.5, ghost_col)));
+    }
+
+    let lp = egui::pos2(
+        rect.left() + shape.label_norm.x * rect.width(),
+        rect.top() + shape.label_norm.y * rect.height(),
     );
+    painter.text(lp, Align2::CENTER_CENTER, def.label(), FontId::monospace(11.0), ghost_col);
 }
