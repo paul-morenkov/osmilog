@@ -83,7 +83,7 @@ fn xor_extra_arc() -> Vec<ShapeCmd> {
 // rather than recomputing the formula, so callers that only need a
 // bounding box (e.g. component_bounding_rect) don't have to build and
 // immediately discard a full ComponentShape (outline/anchors/bubbles Vecs).
-pub fn gate_size(op: GateOp, n_inputs: usize) -> Vec2 {
+pub const fn gate_size(op: GateOp, n_inputs: usize) -> Vec2 {
     let n = if matches!(op, GateOp::Not) {
         1
     } else {
@@ -95,7 +95,7 @@ pub fn gate_size(op: GateOp, n_inputs: usize) -> Vec2 {
     )
 }
 
-pub fn mux_size(sel_width: u8) -> Vec2 {
+pub const fn mux_size(sel_width: u8) -> Vec2 {
     let branches = 1usize << sel_width;
     vec2(
         COMP_WIDTH,
@@ -103,14 +103,14 @@ pub fn mux_size(sel_width: u8) -> Vec2 {
     )
 }
 
-pub fn demux_size(sel_width: u8) -> Vec2 {
+pub const fn demux_size(sel_width: u8) -> Vec2 {
     mux_size(sel_width) // same branches+1 formula
 }
 
-pub fn reg_size() -> Vec2 {
+pub const fn reg_size() -> Vec2 {
     vec2(
         COMP_WIDTH,
-        ((2 + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT),
+        ((2 + 3) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT),
     )
 }
 
@@ -189,7 +189,7 @@ pub fn reg_shape() -> ComponentShape {
     let h = reg_size().y;
 
     // input[0] = data, input[1] = write_enable, both on the left edge; output[0] on the right
-    let input_anchors = vec![PinAnchor::left(spaced(0, 2)), PinAnchor::left(spaced(1, 2))];
+    let input_anchors = vec![PinAnchor::left(spaced(0, 3)), PinAnchor::left(spaced(2, 3))];
 
     ComponentShape {
         size: vec2(COMP_WIDTH, h),
