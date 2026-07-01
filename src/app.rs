@@ -137,7 +137,8 @@ impl ComponentDef {
                     output_anchors: vec![PinAnchor::right(0.5)],
                     extra_strokes: vec![],
                     output_bubbles: vec![false],
-                    label_norm: egui::vec2(0.5, 0.5),
+                    labels: vec![],
+                    dynamic_label_pos: Vec2::ZERO,
                 }
             }
             Self::Output => {
@@ -150,7 +151,8 @@ impl ComponentDef {
                     output_anchors: vec![],
                     extra_strokes: vec![],
                     output_bubbles: vec![],
-                    label_norm: egui::vec2(0.5, 0.5),
+                    labels: vec![],
+                    dynamic_label_pos: Vec2::ZERO,
                 }
             }
             Self::Gate { op, n_inputs, .. } => gate_shape(*op, *n_inputs),
@@ -167,7 +169,6 @@ pub struct PlacedComponent {
     pub key: CompKey,
     pub def: ComponentDef,
     pub grid_pos: [i32; 2],
-    pub label: String,
 }
 
 // ── PlacedTunnel ──────────────────────────────────────────────────────────────
@@ -176,8 +177,10 @@ pub struct PlacedComponent {
 // not a PlacedComponent/ComponentDef variant — Tunnel lives at the Circuit
 // level as its own SlotMap, tied to a net directly rather than via Component
 // pins. `label` mirrors circuit::Tunnel.label directly (editing it both
-// updates the displayed text and calls circuit.rename_tunnel), unlike
-// PlacedComponent's separate def.label()/pc.label split.
+// updates the displayed text and calls circuit.rename_tunnel). Components,
+// by contrast, show only hardcoded, non-editable per-type/pin labels (see
+// ComponentShape::labels) - Tunnels are the only entity with a user-editable
+// label.
 pub struct PlacedTunnel {
     pub key: TunnelKey,
     pub label: String,
@@ -294,13 +297,7 @@ impl OsmilogApp {
     fn place_component(&mut self, def: ComponentDef, grid_pos: [i32; 2]) {
         let comp = def.make_component();
         let key = self.circuit.add_component(comp);
-        let label = format!("{}{}", def.label(), self.components.len());
-        self.components.push(PlacedComponent {
-            key,
-            def,
-            grid_pos,
-            label,
-        });
+        self.components.push(PlacedComponent { key, def, grid_pos });
     }
 
     fn place_tunnel(&mut self, role: TunnelRole, grid_pos: [i32; 2]) {
@@ -361,9 +358,6 @@ impl OsmilogApp {
         };
 
         ui.heading(self.components[idx].def.label());
-        ui.separator();
-        ui.label("Label:");
-        ui.text_edit_singleline(&mut self.components[idx].label);
         ui.separator();
 
         let def = self.components[idx].def.clone();
@@ -522,7 +516,6 @@ impl OsmilogApp {
             return;
         };
         let grid_pos = self.components[pc_idx].grid_pos;
-        let label = self.components[pc_idx].label.clone();
 
         let new_comp = new_def.make_component();
         let new_n_in = new_comp.pins.inputs.len();
@@ -571,7 +564,6 @@ impl OsmilogApp {
             key: new_key,
             def: new_def,
             grid_pos,
-            label,
         };
 
         for w in surviving {
@@ -1251,17 +1243,19 @@ fn draw_component(
         }
     }
 
-    let label_pos = egui::pos2(
-        rect.left() + shape.label_norm.x * rect.width(),
-        rect.top() + shape.label_norm.y * rect.height(),
-    );
-    painter.text(
-        label_pos,
-        Align2::CENTER_CENTER,
-        &pc.label,
-        FontId::monospace(LABEL_FONT_SIZE),
-        Color32::WHITE,
-    );
+    for label in &shape.labels {
+        let label_pos = egui::pos2(
+            rect.left() + label.pos.x * rect.width(),
+            rect.top() + label.pos.y * rect.height(),
+        );
+        painter.text(
+            label_pos,
+            Align2::CENTER_CENTER,
+            label.text,
+            FontId::monospace(LABEL_FONT_SIZE),
+            Color32::WHITE,
+        );
+    }
 
     for i in 0..pc.def.n_inputs() {
         let pos = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::input(i as u8));
@@ -1311,8 +1305,8 @@ fn draw_tunnel(
     }));
 
     let label_pos = egui::pos2(
-        rect.left() + shape.label_norm.x * rect.width(),
-        rect.top() + shape.label_norm.y * rect.height(),
+        rect.left() + shape.dynamic_label_pos.x * rect.width(),
+        rect.top() + shape.dynamic_label_pos.y * rect.height(),
     );
     painter.text(
         label_pos,
@@ -1356,17 +1350,19 @@ fn draw_ghost(painter: &Painter, def: &ComponentDef, grid_pos: [i32; 2], pan: Ve
         ));
     }
 
-    let label_pos = egui::pos2(
-        rect.left() + shape.label_norm.x * rect.width(),
-        rect.top() + shape.label_norm.y * rect.height(),
-    );
-    painter.text(
-        label_pos,
-        Align2::CENTER_CENTER,
-        def.label(),
-        FontId::monospace(LABEL_FONT_SIZE),
-        ghost_col,
-    );
+    for label in &shape.labels {
+        let label_pos = egui::pos2(
+            rect.left() + label.pos.x * rect.width(),
+            rect.top() + label.pos.y * rect.height(),
+        );
+        painter.text(
+            label_pos,
+            Align2::CENTER_CENTER,
+            label.text,
+            FontId::monospace(LABEL_FONT_SIZE),
+            ghost_col,
+        );
+    }
 }
 
 fn draw_tunnel_ghost(painter: &Painter, role: TunnelRole, grid_pos: [i32; 2], pan: Vec2) {
@@ -1387,8 +1383,8 @@ fn draw_tunnel_ghost(painter: &Painter, role: TunnelRole, grid_pos: [i32; 2], pa
     }));
 
     let label_pos = egui::pos2(
-        rect.left() + shape.label_norm.x * rect.width(),
-        rect.top() + shape.label_norm.y * rect.height(),
+        rect.left() + shape.dynamic_label_pos.x * rect.width(),
+        rect.top() + shape.dynamic_label_pos.y * rect.height(),
     );
     let label = match role {
         TunnelRole::Feed => "TUN(F)",

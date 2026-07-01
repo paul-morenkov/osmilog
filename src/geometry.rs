@@ -3,7 +3,7 @@ use egui::{Pos2, Vec2};
 
 use crate::circuit::TunnelRole;
 use crate::component::GateOp;
-use crate::shape::{ComponentShape, PinAnchor, ShapeCmd};
+use crate::shape::{ComponentLabel, ComponentShape, PinAnchor, ShapeCmd};
 
 pub const GRID_SIZE: f32 = 20.0;
 pub const COMP_WIDTH: f32 = 40.0;
@@ -138,11 +138,6 @@ pub fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
         PinAnchor::right(0.5)
     };
     let input_anchors = (0..n).map(|i| PinAnchor::left(spaced(i, n))).collect();
-    let label_norm = if matches!(op, GateOp::Not) {
-        vec2(0.32, 0.5)
-    } else {
-        vec2(0.38, 0.5)
-    };
 
     ComponentShape {
         size: vec2(COMP_WIDTH, h),
@@ -152,7 +147,8 @@ pub fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
         output_anchors: vec![out_anchor],
         extra_strokes,
         output_bubbles: vec![bubble],
-        label_norm,
+        labels: vec![],
+        dynamic_label_pos: Vec2::ZERO,
     }
 }
 
@@ -181,7 +177,8 @@ pub fn mux_shape(sel_width: u8) -> ComponentShape {
         output_anchors: vec![PinAnchor::right(0.5)],
         extra_strokes: vec![],
         output_bubbles: vec![false],
-        label_norm: vec2(0.45, 0.45),
+        labels: vec![],
+        dynamic_label_pos: Vec2::ZERO,
     }
 }
 
@@ -191,6 +188,19 @@ pub fn reg_shape() -> ComponentShape {
     // input[0] = data, input[1] = write_enable, both on the left edge; output[0] on the right
     let input_anchors = vec![PinAnchor::left(spaced(0, 3)), PinAnchor::left(spaced(2, 3))];
 
+    // "D"/"WE" sit level with their pins (same y as the anchors above), offset
+    // right of the left-edge pin dot with room to spare in the 40px-wide box.
+    let labels = vec![
+        ComponentLabel {
+            text: "D",
+            pos: vec2(0.28, spaced(0, 3)),
+        },
+        ComponentLabel {
+            text: "WE",
+            pos: vec2(0.28, spaced(2, 3)),
+        },
+    ];
+
     ComponentShape {
         size: vec2(COMP_WIDTH, h),
         outline: rect_outline(),
@@ -199,7 +209,8 @@ pub fn reg_shape() -> ComponentShape {
         output_anchors: vec![PinAnchor::right(0.5)],
         extra_strokes: vec![],
         output_bubbles: vec![false],
-        label_norm: vec2(0.5, 0.5),
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
     }
 }
 
@@ -234,7 +245,8 @@ pub fn demux_shape(sel_width: u8) -> ComponentShape {
         output_anchors,
         extra_strokes: vec![],
         output_bubbles: vec![false; branches],
-        label_norm: vec2(0.55, 0.45),
+        labels: vec![],
+        dynamic_label_pos: Vec2::ZERO,
     }
 }
 
@@ -273,6 +285,7 @@ pub fn tunnel_shape(role: TunnelRole) -> ComponentShape {
         output_anchors,
         extra_strokes: vec![],
         output_bubbles: vec![false],
-        label_norm: vec2(0.45, 0.45),
+        labels: vec![],
+        dynamic_label_pos: vec2(0.45, 0.45),
     }
 }

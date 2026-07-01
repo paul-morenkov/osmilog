@@ -183,7 +183,7 @@ The GUI lives in `src/app.rs` and is driven by `eframe::run_native` in `main.rs`
 ### OsmilogApp state
 
     circuit: Circuit          simulation graph — source of truth for signal values
-    components: Vec<PlacedComponent>  visual records: CompKey + ComponentDef + grid_pos + label
+    components: Vec<PlacedComponent>  visual records: CompKey + ComponentDef + grid_pos
     wires: Vec<Wire>          visual records: NetKey + src/dst CompKey + pin indices
     mode: InteractionMode     Idle | Placing { def } | WireDrag { src_comp, src_pin, current_end }
     pan: Vec2                 canvas pan offset in pixels
@@ -221,11 +221,13 @@ specifies its own geometry.
     pub struct ComponentShape {
         size: Vec2,                       // bounding box in pixels (W × H)
         outline: Vec<ShapeCmd>,           // closed path in normalized [0,1]² coords
+        fill_outline: Option<Vec<ShapeCmd>>, // convex-only fallback for filling concave outlines
         input_anchors: Vec<PinAnchor>,    // one per circuit input pin, in circuit pin order
         output_anchors: Vec<PinAnchor>,   // one per circuit output pin, in circuit pin order
         extra_strokes: Vec<Vec<ShapeCmd>>,// open strokes drawn on top (e.g. XOR arc)
         output_bubbles: Vec<bool>,        // true → draw inversion bubble on that output
-        label_norm: Vec2,                 // label center in normalized coords
+        labels: Vec<ComponentLabel>,      // hardcoded, non-editable pin/section labels
+        dynamic_label_pos: Vec2,          // position for a single externally-supplied editable label
     }
 
     pub struct PinAnchor {
@@ -233,6 +235,21 @@ specifies its own geometry.
         wire_dir: Vec2,     // unit vector the wire exits toward (away from component)
         pixel_offset: f32,  // extra pixel shift along wire_dir (non-zero for bubble outputs)
     }
+
+    pub struct ComponentLabel {
+        text: &'static str, // hardcoded label text
+        pos: Vec2,           // position in [0,1]², same convention as PinAnchor.norm_pos
+    }
+
+**Labels: Components vs. Tunnels.** `ComponentDef::shape()` bakes zero or more hardcoded,
+non-editable `ComponentLabel`s into `labels` — most component types have none; `Reg` labels its
+two input pins `"D"` and `"WE"` next to their anchors. There is no per-instance component label
+anymore (the old free-form `PlacedComponent.label: String` and its properties-panel "Label:"
+field were removed — components don't need unique names). `PlacedTunnel` is the one exception:
+it keeps a single user-editable `label: String` (edited in the properties panel, committed to
+`circuit.rename_tunnel` on Enter), drawn at `shape.dynamic_label_pos` — this is why
+`ComponentShape` still carries one dynamic position field alongside the new hardcoded `labels`
+list: `dynamic_label_pos` is meaningful only for Tunnels, `labels` only for Components.
 
 `ShapeCmd` is `MoveTo(Vec2) | LineTo(Vec2) | CubicTo(Vec2, Vec2, Vec2)`, all in normalized
 coords. `tessellate_path(cmds, rect)` converts a `&[ShapeCmd]` into a `Vec<Pos2>` suitable
@@ -252,16 +269,17 @@ further along `wire_dir`.
 
 **Shape per component type:**
 
-| Variant | Body shape | Inputs | Outputs | Notes |
-|---|---|---|---|---|
-| Input | Rectangle | — | right center | 80 × 40 |
-| Output | Rectangle | left center | — | 80 × 40 |
-| AND / NAND | Flat left + semicircle right | left edge, evenly spaced | right center | NAND adds bubble |
-| OR / NOR | Three-cubic closed curve | left edge (x = 0) | right tip | NOR adds bubble |
-| XOR / XNOR | Same as OR + extra concave arc at x ≈ −0.15 (extra_strokes) | left edge | right tip | XNOR adds bubble |
-| NOT | Triangle (3 vertices) | left center | right tip + bubble | |
-| Mux | Trapezoid, wider left | left edge = data [1..]; bottom center = selector [0] | right center | |
-| Demux | Trapezoid, wider right | left center = data [0]; bottom center = selector [1] | right edge, evenly spaced | |
+| Variant | Body shape | Inputs | Outputs | Labels | Notes |
+|---|---|---|---|---|---|
+| Input | Rectangle | — | right center | — | 40 × 30 |
+| Output | Rectangle | left center | — | — | 40 × 30 |
+| AND / NAND | Flat left + semicircle right | left edge, evenly spaced | right center | — | NAND adds bubble |
+| OR / NOR | Three-cubic closed curve | left edge (x = 0) | right tip | — | NOR adds bubble |
+| XOR / XNOR | Same as OR + extra concave arc at x ≈ −0.15 (extra_strokes) | left edge | right tip | — | XNOR adds bubble |
+| NOT | Triangle (3 vertices) | left center | right tip + bubble | — | |
+| Mux | Trapezoid, wider left | left edge = data [1..]; bottom center = selector [0] | right center | — | |
+| Demux | Trapezoid, wider right | left center = data [0]; bottom center = selector [1] | right edge, evenly spaced | — | |
+| Reg | Rectangle | left edge: [0] data (y=0.25), [1] write_enable (y=0.75) | right center | `"D"` next to input[0], `"WE"` next to input[1] | height uses a fixed `(2+3) * COMP_HEIGHT_PER_PIN`, not the branches-based formula below |
 
 The selector pin anchor for Mux and Demux sits at the midpoint of the bottom slanted edge
 `(0.5, 1.0 − T/2)` with `wire_dir = (0, 1)` (exits downward), where `T = 0.2` is the taper
@@ -273,10 +291,10 @@ actual shape polygon. This is a known approximation.
 ### Geometry constants
 
     GRID_SIZE            20 px — canvas grid spacing
-    COMP_WIDTH           80 px — fixed component box width
-    COMP_HEIGHT_PER_PIN  20 px — height contributed by each pin slot
-    COMP_MIN_HEIGHT      40 px — floor on component box height
-    PIN_RADIUS            5 px — drawn radius; hit radius is 2 ×
+    COMP_WIDTH           40 px — fixed component box width
+    COMP_HEIGHT_PER_PIN  10 px — height contributed by each pin slot
+    COMP_MIN_HEIGHT      30 px — floor on component box height
+    PIN_RADIUS             3 px — drawn radius; hit radius is 2 ×
     BUBBLE_R              4 px — inversion bubble radius
 
 ### Signal color coding
