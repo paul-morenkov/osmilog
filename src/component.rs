@@ -17,20 +17,20 @@ impl Component {
     pub fn input(value: Value) -> Self {
         Self {
             pins: Pins::new(0, 1),
-            logic: Logic::Input(value),
+            logic: Logic::Comb(LogicComb::Input(value)),
         }
     }
     pub fn output() -> Self {
         Self {
             pins: Pins::new(1, 0),
-            logic: Logic::Output,
+            logic: Logic::Comb(LogicComb::Output),
         }
     }
 
     pub fn gate(op: GateOp, n: usize, width: u8) -> Self {
         Self {
             pins: Pins::new(n, 1),
-            logic: Logic::Gate { op, width },
+            logic: Logic::Comb(LogicComb::Gate { op, width }),
         }
     }
 
@@ -38,112 +38,158 @@ impl Component {
         let branches = 1 << sel_width;
         Self {
             pins: Pins::new(branches + 1, 1),
-            logic: Logic::Mux {
+            logic: Logic::Comb(LogicComb::Mux {
                 data_width,
                 sel_width,
-            },
+            }),
         }
     }
 
     pub fn demux(data_width: u8, sel_width: u8) -> Self {
         Self {
             pins: Pins::new(2, 1 << sel_width),
-            logic: Logic::Demux {
+            logic: Logic::Comb(LogicComb::Demux {
                 data_width,
                 sel_width,
+            }),
+        }
+    }
+
+    pub fn reg(data_width: u8) -> Self {
+        Self {
+            pins: Pins::new(2, 1), // [0] data, [1] write_enable -> [0] value
+            logic: Logic::Seq(LogicSeq::Reg {
+                value: Value::new(0, data_width),
+                data_width,
+            }),
+        }
+    }
+
+    // Reads the current Value of every input pin from net state, without mutating
+    // anything. Used by evaluate() and by Circuit::tick_clock()'s input-collection stage.
+    pub fn read_inputs(&self, nets: &SlotMap<NetKey, Net>) -> Vec<Value> {
+        self.pins
+            .inputs
+            .iter()
+            .map(|slot| match slot {
+                Some(net) => nets[*net].value,
+                None => Value::Floating,
+            })
+            .collect()
+    }
+
+    pub fn evaluate(&self, nets: &SlotMap<NetKey, Net>) -> Vec<Value> {
+        let inputs = self.read_inputs(nets);
+        let read_pin = |i: usize| -> Value { inputs[i] };
+
+        let n_inputs = inputs.len();
+
+        match &self.logic {
+            Logic::Comb(comb) => match comb {
+                LogicComb::Input(val) => vec![*val],
+                LogicComb::Output => vec![],
+                LogicComb::Gate { op, width } => {
+                    let val = match op {
+                        GateOp::And | GateOp::Nand => {
+                            let mut acc = Value::Fixed {
+                                bits: Value::mask(*width),
+                                width: *width,
+                            };
+                            for i in 0..n_inputs {
+                                let x = read_pin(i);
+                                acc = acc & x;
+                            }
+                            if matches!(op, GateOp::Nand) {
+                                !acc
+                            } else {
+                                acc
+                            }
+                        }
+                        GateOp::Or | GateOp::Nor => {
+                            let mut acc = Value::Fixed {
+                                bits: 0,
+                                width: *width,
+                            };
+                            for i in 0..n_inputs {
+                                acc = acc | read_pin(i)
+                            }
+                            if matches!(op, GateOp::Nor) {
+                                !acc
+                            } else {
+                                acc
+                            }
+                        }
+                        GateOp::Xor | GateOp::Xnor => {
+                            let mut acc = Value::Fixed {
+                                bits: 0,
+                                width: *width,
+                            };
+                            for i in 0..n_inputs {
+                                acc = acc ^ read_pin(i)
+                            }
+                            if matches!(op, GateOp::Xnor) {
+                                !acc
+                            } else {
+                                acc
+                            }
+                        }
+                        GateOp::Not => !read_pin(0),
+                    };
+                    vec![val] // Assumes single output
+                }
+                LogicComb::Mux { sel_width, .. } => match read_pin(0) {
+                    Value::Floating => vec![Value::Floating],
+                    Value::Fixed { bits, width } => {
+                        if *sel_width == width {
+                            vec![read_pin(bits as usize + 1)]
+                        } else {
+                            vec![Value::Floating]
+                        }
+                    }
+                },
+                // Demux: inputs[0] => data, inputs[1] => selector
+                LogicComb::Demux {
+                    sel_width,
+                    data_width,
+                } => {
+                    let branches = 1 << sel_width;
+                    match read_pin(1) {
+                        Value::Fixed { bits: sel, width } if width == *sel_width => {
+                            let mut values = vec![Value::new(0, *data_width); branches];
+                            // TODO: check data_width?
+                            values[sel as usize] = read_pin(0);
+                            values
+                        }
+                        _ => vec![Value::Floating; branches],
+                    }
+                }
+            },
+            // Sequential components never mutate state or recompute outputs via the
+            // combinational path (add_component / attach / neighboring net changes) -
+            // they just report their currently latched value(s). State only changes
+            // via tick().
+            Logic::Seq(seq) => match seq {
+                LogicSeq::Reg { value, .. } => vec![*value],
             },
         }
     }
 
-    pub fn evaluate(&self, nets: &SlotMap<NetKey, Net>) -> Vec<Value> {
-        let read_pin = |i: usize| -> Value {
-            match self.pins.inputs[i] {
-                Some(net) => nets[net].value,
-                None => Value::Floating,
-            }
-        };
-
-        let n_inputs = self.pins.inputs.len();
-
-        match &self.logic {
-            Logic::Input(val) => vec![*val],
-            Logic::Output => vec![],
-            Logic::Gate { op, width } => {
-                let val = match op {
-                    GateOp::And | GateOp::Nand => {
-                        let mut acc = Value::Fixed {
-                            bits: Value::mask(*width),
-                            width: *width,
-                        };
-                        for i in 0..n_inputs {
-                            let x = read_pin(i);
-                            acc = acc & x;
-                        }
-                        if matches!(op, GateOp::Nand) {
-                            !acc
-                        } else {
-                            acc
-                        }
+    // Advances one clock tick given pre-collected input values (see read_inputs).
+    // Mutates persisted state and returns new out_cache values. Only valid on
+    // Logic::Seq components - callers must filter with is_sequential() first.
+    pub fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
+        match &mut self.logic {
+            Logic::Comb(_) => unreachable!("tick() called on a combinational component"),
+            Logic::Seq(seq) => match seq {
+                LogicSeq::Reg { value, .. } => {
+                    let data = inputs[0];
+                    let write_enable = inputs[1];
+                    if matches!(write_enable, Value::Fixed { bits: 1, width: 1 }) {
+                        *value = data;
                     }
-                    GateOp::Or | GateOp::Nor => {
-                        let mut acc = Value::Fixed {
-                            bits: 0,
-                            width: *width,
-                        };
-                        for i in 0..n_inputs {
-                            acc = acc | read_pin(i)
-                        }
-                        if matches!(op, GateOp::Nor) {
-                            !acc
-                        } else {
-                            acc
-                        }
-                    }
-                    GateOp::Xor | GateOp::Xnor => {
-                        let mut acc = Value::Fixed {
-                            bits: 0,
-                            width: *width,
-                        };
-                        for i in 0..n_inputs {
-                            acc = acc ^ read_pin(i)
-                        }
-                        if matches!(op, GateOp::Xnor) {
-                            !acc
-                        } else {
-                            acc
-                        }
-                    }
-                    GateOp::Not => !read_pin(0),
-                };
-                vec![val] // Assumes single output
-            }
-            Logic::Mux { sel_width, .. } => match read_pin(0) {
-                Value::Floating => vec![Value::Floating],
-                Value::Fixed { bits, width } => {
-                    if *sel_width == width {
-                        vec![read_pin(bits as usize + 1)]
-                    } else {
-                        vec![Value::Floating]
-                    }
+                    vec![*value]
                 }
             },
-            // Demux: inputs[0] => data, inputs[1] => selector
-            Logic::Demux {
-                sel_width,
-                data_width,
-            } => {
-                let branches = 1 << sel_width;
-                match read_pin(1) {
-                    Value::Fixed { bits: sel, width } if width == *sel_width => {
-                        let mut values = vec![Value::new(0, *data_width); branches];
-                        // TODO: check data_width?
-                        values[sel as usize] = read_pin(0);
-                        values
-                    }
-                    _ => vec![Value::Floating; branches],
-                }
-            }
-            Logic::Reg => todo!(),
         }
     }
 
@@ -162,14 +208,7 @@ impl Component {
     }
 
     pub fn is_sequential(&self) -> bool {
-        match self.logic {
-            Logic::Gate { .. }
-            | Logic::Mux { .. }
-            | Logic::Demux { .. }
-            | Logic::Input(_)
-            | Logic::Output => false,
-            Logic::Reg => true,
-        }
+        matches!(self.logic, Logic::Seq(_))
     }
 
     pub(crate) fn clear_pins(&mut self) {
@@ -223,12 +262,22 @@ impl Pins {
 
 #[derive(Debug)]
 pub enum Logic {
+    Comb(LogicComb),
+    Seq(LogicSeq),
+}
+
+#[derive(Debug)]
+pub enum LogicComb {
     Input(Value),
     Output,
     Gate { op: GateOp, width: u8 },
     Mux { data_width: u8, sel_width: u8 },
     Demux { data_width: u8, sel_width: u8 },
-    Reg,
+}
+
+#[derive(Debug)]
+pub enum LogicSeq {
+    Reg { value: Value, data_width: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
