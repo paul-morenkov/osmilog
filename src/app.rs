@@ -5,17 +5,17 @@ use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, Vec2};
 use crate::{
     circuit::Circuit,
     component::{CompKey, Component, GateOp, InIdx, OutIdx, PinId},
+    geometry::{
+        demux_shape, gate_shape, mux_shape, reg_shape, rect_outline, snap_to_grid,
+        COMP_MIN_HEIGHT, COMP_WIDTH, GRID_SIZE,
+    },
     net::NetKey,
-    shape::{tessellate_path, ComponentShape, PinAnchor, ShapeCmd, BUBBLE_R},
+    shape::{tessellate_path, ComponentShape, PinAnchor, BUBBLE_R},
     value::Value,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const GRID_SIZE: f32 = 20.0;
-const COMP_WIDTH: f32 = 40.0;
-const COMP_HEIGHT_PER_PIN: f32 = 10.0;
-const COMP_MIN_HEIGHT: f32 = 30.0;
 const PIN_RADIUS: f32 = 3.0;
 const WIRE_THICKNESS: f32 = 2.0;
 
@@ -40,6 +40,9 @@ pub enum ComponentDef {
         data_width: u8,
         sel_width: u8,
     },
+    Reg {
+        data_width: u8,
+    },
 }
 
 impl ComponentDef {
@@ -50,6 +53,7 @@ impl ComponentDef {
             Self::Gate { n_inputs, .. } => *n_inputs,
             Self::Mux { sel_width, .. } => (1usize << sel_width) + 1,
             Self::Demux { .. } => 2,
+            Self::Reg { .. } => 2,
         }
     }
 
@@ -60,6 +64,7 @@ impl ComponentDef {
             Self::Gate { .. } => 1,
             Self::Mux { .. } => 1,
             Self::Demux { sel_width, .. } => 1usize << sel_width,
+            Self::Reg { .. } => 1,
         }
     }
 
@@ -78,6 +83,7 @@ impl ComponentDef {
             },
             Self::Mux { .. } => "MUX",
             Self::Demux { .. } => "DEMUX",
+            Self::Reg { .. } => "REG",
         }
     }
 
@@ -98,6 +104,7 @@ impl ComponentDef {
                 data_width,
                 sel_width,
             } => Component::demux(*data_width, *sel_width),
+            Self::Reg { data_width } => Component::reg(*data_width),
         }
     }
 
@@ -132,6 +139,7 @@ impl ComponentDef {
             Self::Gate { op, n_inputs, .. } => gate_shape(*op, *n_inputs),
             Self::Mux { sel_width, .. } => mux_shape(*sel_width),
             Self::Demux { sel_width, .. } => demux_shape(*sel_width),
+            Self::Reg { .. } => reg_shape(),
         }
     }
 }
@@ -345,6 +353,25 @@ impl OsmilogApp {
                     );
                 }
             }
+            ComponentDef::Reg { mut data_width } => {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Data width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                        .changed();
+                });
+                if changed {
+                    self.reconfigure_component(key, ComponentDef::Reg { data_width });
+                }
+
+                let cur = self.circuit.components[key].pins.out_cache[0];
+                let val_str = match cur {
+                    Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
+                    Value::Floating => "Floating".to_string(),
+                };
+                ui.label(format!("Value: {}", val_str));
+            }
         }
     }
 
@@ -478,7 +505,18 @@ impl eframe::App for OsmilogApp {
                     };
                     ui.close();
                 }
+                ui.menu_button("Memory", |ui| {
+                    if ui.button("Register").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Reg { data_width: 1 },
+                        };
+                        ui.close();
+                    }
+                });
             });
+            if ui.button("Tick Clock").clicked() {
+                self.circuit.tick_clock();
+            }
         });
 
         // ── Properties panel ──────────────────────────────────────────────
@@ -703,13 +741,6 @@ fn pin_pos(pc: &PlacedComponent, pan: Vec2, pin: PinId) -> Pos2 {
     ) + anchor.wire_dir * anchor.pixel_offset
 }
 
-fn snap_to_grid(pos: Pos2, pan: Vec2) -> [i32; 2] {
-    [
-        ((pos.x - pan.x) / GRID_SIZE).round() as i32,
-        ((pos.y - pan.y) / GRID_SIZE).round() as i32,
-    ]
-}
-
 fn pin_at_pos(
     components: &[PlacedComponent],
     pan: Vec2,
@@ -747,179 +778,6 @@ fn value_color(val: Value) -> Color32 {
         Value::Floating => Color32::GRAY,
         Value::Fixed { bits: 0, .. } => Color32::from_rgb(40, 40, 80),
         Value::Fixed { .. } => Color32::from_rgb(50, 200, 80),
-    }
-}
-
-// ── Shape helpers ─────────────────────────────────────────────────────────────
-
-fn spaced(i: usize, n: usize) -> f32 {
-    (i as f32 + 1.0) / (n as f32 + 1.0)
-}
-
-fn rect_outline() -> Vec<ShapeCmd> {
-    use egui::vec2;
-    vec![
-        ShapeCmd::MoveTo(vec2(0.0, 0.0)),
-        ShapeCmd::LineTo(vec2(1.0, 0.0)),
-        ShapeCmd::LineTo(vec2(1.0, 1.0)),
-        ShapeCmd::LineTo(vec2(0.0, 1.0)),
-    ]
-}
-
-fn and_outline() -> Vec<ShapeCmd> {
-    use egui::vec2;
-    vec![
-        ShapeCmd::MoveTo(vec2(0.0, 0.0)),
-        ShapeCmd::LineTo(vec2(0.5, 0.0)),
-        ShapeCmd::CubicTo(vec2(0.776, 0.0), vec2(1.0, 0.224), vec2(1.0, 0.5)),
-        ShapeCmd::CubicTo(vec2(1.0, 0.776), vec2(0.776, 1.0), vec2(0.5, 1.0)),
-        ShapeCmd::LineTo(vec2(0.0, 1.0)),
-    ]
-}
-
-fn or_outline() -> Vec<ShapeCmd> {
-    use egui::vec2;
-    vec![
-        ShapeCmd::MoveTo(vec2(0.0, 0.0)),
-        ShapeCmd::CubicTo(vec2(0.5, 0.0), vec2(0.9, 0.15), vec2(1.0, 0.5)),
-        ShapeCmd::CubicTo(vec2(0.9, 0.85), vec2(0.5, 1.0), vec2(0.0, 1.0)),
-        ShapeCmd::CubicTo(vec2(0.15, 0.75), vec2(0.15, 0.25), vec2(0.0, 0.0)),
-    ]
-}
-
-// Convex-only outline for the OR gate fill (no concave left curve).
-// epaint's fill tessellator uses a triangle fan + per-vertex feathering normals,
-// which both assume convexity. The concave left side causes fill to bleed outside
-// the boundary. We fill with this simpler convex shape and stroke with or_outline().
-fn or_fill_outline() -> Vec<ShapeCmd> {
-    use egui::vec2;
-    vec![
-        ShapeCmd::MoveTo(vec2(0.0, 0.0)),
-        ShapeCmd::CubicTo(vec2(0.5, 0.0), vec2(0.9, 0.15), vec2(1.0, 0.5)),
-        ShapeCmd::CubicTo(vec2(0.9, 0.85), vec2(0.5, 1.0), vec2(0.0, 1.0)),
-        // PathShape closes with a straight line from (0,1) back to (0,0)
-    ]
-}
-
-fn not_outline() -> Vec<ShapeCmd> {
-    use egui::vec2;
-    vec![
-        ShapeCmd::MoveTo(vec2(0.0, 0.0)),
-        ShapeCmd::LineTo(vec2(0.0, 1.0)),
-        ShapeCmd::LineTo(vec2(1.0, 0.5)),
-    ]
-}
-
-fn xor_extra_arc() -> Vec<ShapeCmd> {
-    use egui::vec2;
-    // Concave arc drawn just left of the OR body; negative x is outside the bounding box
-    vec![
-        ShapeCmd::MoveTo(vec2(-0.15, 0.05)),
-        ShapeCmd::CubicTo(vec2(0.0, 0.25), vec2(0.0, 0.75), vec2(-0.15, 0.95)),
-    ]
-}
-
-fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
-    let n = if matches!(op, GateOp::Not) {
-        1
-    } else {
-        n_inputs
-    };
-    let h = ((n + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT);
-    let bubble = matches!(op, GateOp::Nand | GateOp::Nor | GateOp::Xnor | GateOp::Not);
-
-    let (outline, fill_outline, extra_strokes) = match op {
-        GateOp::And | GateOp::Nand => (and_outline(), None, vec![]),
-        GateOp::Or | GateOp::Nor => (or_outline(), Some(or_fill_outline()), vec![]),
-        GateOp::Xor | GateOp::Xnor => (or_outline(), Some(or_fill_outline()), vec![xor_extra_arc()]),
-        GateOp::Not => (not_outline(), None, vec![]),
-    };
-
-    let out_anchor = if bubble {
-        PinAnchor::right_bubble(0.5)
-    } else {
-        PinAnchor::right(0.5)
-    };
-    let input_anchors = (0..n).map(|i| PinAnchor::left(spaced(i, n))).collect();
-    let label_norm = if matches!(op, GateOp::Not) {
-        egui::vec2(0.32, 0.5)
-    } else {
-        egui::vec2(0.38, 0.5)
-    };
-
-    ComponentShape {
-        size: egui::vec2(COMP_WIDTH, h),
-        outline,
-        fill_outline,
-        input_anchors,
-        output_anchors: vec![out_anchor],
-        extra_strokes,
-        output_bubbles: vec![bubble],
-        label_norm,
-    }
-}
-
-fn mux_shape(sel_width: u8) -> ComponentShape {
-    let branches = 1usize << sel_width;
-    let h = ((branches + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT);
-    const T: f32 = 0.2;
-
-    let outline = vec![
-        ShapeCmd::MoveTo(egui::vec2(0.0, 0.0)),
-        ShapeCmd::LineTo(egui::vec2(1.0, T)),
-        ShapeCmd::LineTo(egui::vec2(1.0, 1.0 - T)),
-        ShapeCmd::LineTo(egui::vec2(0.0, 1.0)),
-    ];
-
-    // input[0] = selector → bottom-center of shape; input[1..] = data → left edge
-    let sel_anchor = PinAnchor::bottom_mid(0.5, 1.0 - T / 2.0);
-    let data_anchors = (0..branches).map(|i| PinAnchor::left(spaced(i, branches)));
-    let input_anchors = std::iter::once(sel_anchor).chain(data_anchors).collect();
-
-    ComponentShape {
-        size: egui::vec2(COMP_WIDTH, h),
-        outline,
-        fill_outline: None,
-        input_anchors,
-        output_anchors: vec![PinAnchor::right(0.5)],
-        extra_strokes: vec![],
-        output_bubbles: vec![false],
-        label_norm: egui::vec2(0.45, 0.45),
-    }
-}
-
-fn demux_shape(sel_width: u8) -> ComponentShape {
-    let branches = 1usize << sel_width;
-    let h = ((branches + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT);
-    const T: f32 = 0.2;
-
-    let outline = vec![
-        ShapeCmd::MoveTo(egui::vec2(0.0, T)),
-        ShapeCmd::LineTo(egui::vec2(1.0, 0.0)),
-        ShapeCmd::LineTo(egui::vec2(1.0, 1.0)),
-        ShapeCmd::LineTo(egui::vec2(0.0, 1.0 - T)),
-    ];
-
-    // input[0] = data → left center; input[1] = selector → bottom center
-    let data_anchor = PinAnchor {
-        norm_pos: egui::vec2(0.0, 0.5),
-        wire_dir: egui::vec2(-1.0, 0.0),
-        pixel_offset: 0.0,
-    };
-    let sel_anchor = PinAnchor::bottom_mid(0.5, 1.0 - T / 2.0);
-    let output_anchors = (0..branches)
-        .map(|i| PinAnchor::right(spaced(i, branches)))
-        .collect();
-
-    ComponentShape {
-        size: egui::vec2(COMP_WIDTH, h),
-        outline,
-        fill_outline: None,
-        input_anchors: vec![data_anchor, sel_anchor],
-        output_anchors,
-        extra_strokes: vec![],
-        output_bubbles: vec![false; branches],
-        label_norm: egui::vec2(0.55, 0.45),
     }
 }
 

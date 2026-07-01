@@ -1,6 +1,7 @@
 pub mod app;
 pub mod circuit;
 pub mod component;
+pub mod geometry;
 pub mod net;
 pub mod shape;
 pub mod value;
@@ -96,5 +97,36 @@ mod tests {
         assert_eq!(c.read_output(o2), Value::new(0, 1));
         assert_eq!(c.read_output(o3), Value::new(1, 1));
         assert_eq!(c.read_output(o4), Value::new(0, 1));
+    }
+
+    #[test]
+    fn test_reg() {
+        let mut c = Circuit::new();
+
+        let data = c.add_component(Component::input(Value::new(5, 4)));
+        let we = c.add_component(Component::input(Value::new(0, 1)));
+        let reg = c.add_component(Component::reg(4));
+        let out = c.add_component(Component::output());
+
+        c.link(data, PinId::output(0), reg, PinId::input(0));
+        c.link(we, PinId::output(0), reg, PinId::input(1));
+        c.link(reg, PinId::output(0), out, PinId::input(0));
+
+        c.settle();
+        // Zero-initialized, unaffected by data already driving 5 pre-tick.
+        assert_eq!(c.read_output(out), Value::new(0, 4));
+
+        // write_enable=1, tick: latches data.
+        c.set_input(we, Value::new(1, 1));
+        c.settle();
+        c.tick_clock();
+        assert_eq!(c.read_output(out), Value::new(5, 4));
+
+        // write_enable=0, change data, tick: holds previous value.
+        c.set_input(we, Value::new(0, 1));
+        c.set_input(data, Value::new(9, 4));
+        c.settle();
+        c.tick_clock();
+        assert_eq!(c.read_output(out), Value::new(5, 4));
     }
 }

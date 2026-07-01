@@ -1,5 +1,5 @@
 use crate::{
-    component::{CompKey, Component, Logic, PinId},
+    component::{CompKey, Component, Logic, LogicComb, PinId},
     value::Value,
 };
 
@@ -31,7 +31,7 @@ impl Circuit {
 
     pub fn set_input(&mut self, comp: CompKey, value: Value) {
         // TODO: Make this return a result
-        if let Logic::Input(v) = &mut self.components[comp].logic {
+        if let Logic::Comb(LogicComb::Input(v)) = &mut self.components[comp].logic {
             *v = value
         } else {
             return;
@@ -185,9 +185,15 @@ impl Circuit {
     // Evaluates component logic, storing the Value in pins.out_cache and marking the net as dirty
     // if necessary.
     fn eval_component(&mut self, comp: CompKey) {
-        let new_values: Vec<_> = self.components[comp].evaluate(&self.nets);
-        let c = &mut self.components[comp];
+        let new_values = self.components[comp].evaluate(&self.nets);
+        self.apply_output_values(comp, new_values);
+    }
 
+    // Diffs new_values against a component's current out_cache, updates out_cache in place,
+    // and marks any changed output net dirty. Shared by eval_component (combinational path)
+    // and tick_clock (sequential path).
+    fn apply_output_values(&mut self, comp: CompKey, new_values: Vec<Value>) {
+        let c = &mut self.components[comp];
         let mut dirty_nets = Vec::new();
 
         for (i, new_val) in new_values.into_iter().enumerate() {
@@ -203,6 +209,38 @@ impl Circuit {
         for net in dirty_nets {
             self.mark_dirty(net);
         }
+    }
+
+    // Advances the clock by one tick for all sequential components:
+    //   1. Collect every sequential component's current input Values from net state
+    //      (a snapshot, taken before any state mutation).
+    //   2. Compute each sequential component's next state via Component::tick, updating
+    //      out_cache and persisted state, and marking changed output nets dirty.
+    //   3. Call settle() to propagate the changes through the combinational circuit.
+    // Generic over LogicSeq variants: adding a new sequential component type only needs
+    // new match arms in Component::evaluate/Component::tick, not changes here.
+    pub fn tick_clock(&mut self) {
+        let seq_comps: Vec<CompKey> = self
+            .components
+            .iter()
+            .filter(|(_, c)| c.is_sequential())
+            .map(|(key, _)| key)
+            .collect();
+
+        let collected_inputs: Vec<(CompKey, Vec<Value>)> = seq_comps
+            .into_iter()
+            .map(|key| {
+                let inputs = self.components[key].read_inputs(&self.nets);
+                (key, inputs)
+            })
+            .collect();
+
+        for (key, inputs) in collected_inputs {
+            let new_values = self.components[key].tick(&inputs);
+            self.apply_output_values(key, new_values);
+        }
+
+        self.settle();
     }
 
     pub fn remove_component(&mut self, key: CompKey) {
