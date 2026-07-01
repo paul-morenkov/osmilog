@@ -48,6 +48,16 @@ impl PinAnchor {
     }
 }
 
+// A hardcoded, non-editable label (e.g. a Register's "D"/"WE" pin
+// annotations) at a fixed position within the component's normalized
+// [0,1]^2 box. Only meaningful for Components - Tunnels use
+// `ComponentShape::dynamic_label_pos` instead, since their single label's
+// *text* is user-editable at runtime rather than known at shape() time.
+pub struct ComponentLabel {
+    pub text: &'static str,
+    pub pos: Vec2,
+}
+
 pub struct ComponentShape {
     pub size: Vec2,
     /// Full outline used for the stroke (may be concave).
@@ -60,7 +70,12 @@ pub struct ComponentShape {
     pub output_anchors: Vec<PinAnchor>,
     pub extra_strokes: Vec<Vec<ShapeCmd>>,
     pub output_bubbles: Vec<bool>,
-    pub label_norm: Vec2,
+    /// Hardcoded pin/section labels, positioned per component type/parameters. Empty for
+    /// component types with nothing non-obvious to annotate.
+    pub labels: Vec<ComponentLabel>,
+    /// Position for a single externally-supplied, editable label string. Only meaningful for
+    /// Tunnels (see PlacedTunnel.label) - unused (left at the type's default) by Components.
+    pub dynamic_label_pos: Vec2,
 }
 
 pub fn tessellate_path(cmds: &[ShapeCmd], rect: Rect) -> Vec<Pos2> {

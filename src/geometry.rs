@@ -3,7 +3,7 @@ use egui::{Pos2, Vec2};
 
 use crate::circuit::TunnelRole;
 use crate::component::GateOp;
-use crate::shape::{ComponentShape, PinAnchor, ShapeCmd};
+use crate::shape::{ComponentLabel, ComponentShape, PinAnchor, ShapeCmd};
 
 pub const GRID_SIZE: f32 = 20.0;
 pub const COMP_WIDTH: f32 = 40.0;
@@ -83,7 +83,7 @@ fn xor_extra_arc() -> Vec<ShapeCmd> {
 // rather than recomputing the formula, so callers that only need a
 // bounding box (e.g. component_bounding_rect) don't have to build and
 // immediately discard a full ComponentShape (outline/anchors/bubbles Vecs).
-pub fn gate_size(op: GateOp, n_inputs: usize) -> Vec2 {
+pub const fn gate_size(op: GateOp, n_inputs: usize) -> Vec2 {
     let n = if matches!(op, GateOp::Not) {
         1
     } else {
@@ -95,7 +95,7 @@ pub fn gate_size(op: GateOp, n_inputs: usize) -> Vec2 {
     )
 }
 
-pub fn mux_size(sel_width: u8) -> Vec2 {
+pub const fn mux_size(sel_width: u8) -> Vec2 {
     let branches = 1usize << sel_width;
     vec2(
         COMP_WIDTH,
@@ -103,14 +103,14 @@ pub fn mux_size(sel_width: u8) -> Vec2 {
     )
 }
 
-pub fn demux_size(sel_width: u8) -> Vec2 {
+pub const fn demux_size(sel_width: u8) -> Vec2 {
     mux_size(sel_width) // same branches+1 formula
 }
 
-pub fn reg_size() -> Vec2 {
+pub const fn reg_size() -> Vec2 {
     vec2(
         COMP_WIDTH,
-        ((2 + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT),
+        ((2 + 3) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT),
     )
 }
 
@@ -138,11 +138,6 @@ pub fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
         PinAnchor::right(0.5)
     };
     let input_anchors = (0..n).map(|i| PinAnchor::left(spaced(i, n))).collect();
-    let label_norm = if matches!(op, GateOp::Not) {
-        vec2(0.32, 0.5)
-    } else {
-        vec2(0.38, 0.5)
-    };
 
     ComponentShape {
         size: vec2(COMP_WIDTH, h),
@@ -152,7 +147,8 @@ pub fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
         output_anchors: vec![out_anchor],
         extra_strokes,
         output_bubbles: vec![bubble],
-        label_norm,
+        labels: vec![],
+        dynamic_label_pos: Vec2::ZERO,
     }
 }
 
@@ -181,7 +177,8 @@ pub fn mux_shape(sel_width: u8) -> ComponentShape {
         output_anchors: vec![PinAnchor::right(0.5)],
         extra_strokes: vec![],
         output_bubbles: vec![false],
-        label_norm: vec2(0.45, 0.45),
+        labels: vec![],
+        dynamic_label_pos: Vec2::ZERO,
     }
 }
 
@@ -189,7 +186,20 @@ pub fn reg_shape() -> ComponentShape {
     let h = reg_size().y;
 
     // input[0] = data, input[1] = write_enable, both on the left edge; output[0] on the right
-    let input_anchors = vec![PinAnchor::left(spaced(0, 2)), PinAnchor::left(spaced(1, 2))];
+    let input_anchors = vec![PinAnchor::left(spaced(0, 3)), PinAnchor::left(spaced(2, 3))];
+
+    // "D"/"WE" sit level with their pins (same y as the anchors above), offset
+    // right of the left-edge pin dot with room to spare in the 40px-wide box.
+    let labels = vec![
+        ComponentLabel {
+            text: "D",
+            pos: vec2(0.28, spaced(0, 3)),
+        },
+        ComponentLabel {
+            text: "WE",
+            pos: vec2(0.28, spaced(2, 3)),
+        },
+    ];
 
     ComponentShape {
         size: vec2(COMP_WIDTH, h),
@@ -199,7 +209,8 @@ pub fn reg_shape() -> ComponentShape {
         output_anchors: vec![PinAnchor::right(0.5)],
         extra_strokes: vec![],
         output_bubbles: vec![false],
-        label_norm: vec2(0.5, 0.5),
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
     }
 }
 
@@ -234,7 +245,8 @@ pub fn demux_shape(sel_width: u8) -> ComponentShape {
         output_anchors,
         extra_strokes: vec![],
         output_bubbles: vec![false; branches],
-        label_norm: vec2(0.55, 0.45),
+        labels: vec![],
+        dynamic_label_pos: Vec2::ZERO,
     }
 }
 
@@ -273,6 +285,7 @@ pub fn tunnel_shape(role: TunnelRole) -> ComponentShape {
         output_anchors,
         extra_strokes: vec![],
         output_bubbles: vec![false],
-        label_norm: vec2(0.45, 0.45),
+        labels: vec![],
+        dynamic_label_pos: vec2(0.45, 0.45),
     }
 }
