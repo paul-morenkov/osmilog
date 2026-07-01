@@ -6,8 +6,8 @@ use crate::{
     circuit::Circuit,
     component::{CompKey, Component, GateOp, InIdx, OutIdx, PinId},
     geometry::{
-        demux_shape, gate_shape, mux_shape, reg_shape, rect_outline, snap_to_grid,
-        COMP_MIN_HEIGHT, COMP_WIDTH, GRID_SIZE,
+        demux_shape, gate_shape, mux_shape, rect_outline, reg_shape, snap_to_grid, COMP_MIN_HEIGHT,
+        COMP_WIDTH, GRID_SIZE,
     },
     net::NetKey,
     shape::{tessellate_path, ComponentShape, PinAnchor, BUBBLE_R},
@@ -24,7 +24,8 @@ const WIRE_THICKNESS: f32 = 2.0;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComponentDef {
     Input {
-        value: Value,
+        bits: u32,
+        width: u8,
     },
     Output,
     Gate {
@@ -89,7 +90,7 @@ impl ComponentDef {
 
     fn make_component(&self) -> Component {
         match self {
-            Self::Input { value } => Component::input(*value),
+            Self::Input { bits, width } => Component::input(*bits, *width),
             Self::Output => Component::output(),
             Self::Gate {
                 op,
@@ -226,7 +227,10 @@ impl OsmilogApp {
         });
     }
 
+    /// Shows property menu for the currently selected component. ComponentDef for the UI element is
+    /// cloned. If the user edits a property, call `self.reconfigure_component()` with an updated ComponentDef
     fn show_properties(&mut self, ui: &mut egui::Ui) {
+        // TODO: can't this be an index for a PlacedComponent instead?
         let Some(key) = self.selected else {
             ui.label("Click a component to select it.");
             return;
@@ -242,22 +246,33 @@ impl OsmilogApp {
         ui.text_edit_singleline(&mut self.components[idx].label);
         ui.separator();
 
+        // TODO: what's up with this clone
         let def = self.components[idx].def.clone();
         match def {
-            ComponentDef::Input { .. } => {
-                let cur = self.circuit.components[key].pins.out_cache[0];
-                let val_str = match cur {
-                    Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
-                    Value::Floating => "Floating".to_string(),
-                };
+            ComponentDef::Input {
+                mut bits,
+                mut width,
+            } => {
+                // FIXME: This needs to update ComponentDef
+                let mut changed = false;
+                let val_str = format!("0x{:X} ({}b)", bits, width);
                 ui.label(format!("Value: {}", val_str));
+
+                // TODO: Checkbox if width == 1 else input field
                 if ui.button("Toggle").clicked() {
-                    let next = match cur {
-                        Value::Fixed { bits, width } => Value::new(bits ^ 1, width),
-                        Value::Floating => Value::new(1, 1),
-                    };
-                    self.circuit.set_input(key, next);
-                    self.circuit.settle();
+                    bits = (bits + 1) & Value::mask(width);
+                    changed = true;
+                    // self.circuit.set_input(key, bits, width);
+                    // self.circuit.settle();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut width).range(1..=32))
+                        .changed();
+                });
+                if changed {
+                    self.reconfigure_component(key, ComponentDef::Input { bits, width });
                 }
             }
             ComponentDef::Output => {
@@ -375,6 +390,7 @@ impl OsmilogApp {
         }
     }
 
+    // TODO: write docs, return result
     fn reconfigure_component(&mut self, old_key: CompKey, new_def: ComponentDef) {
         let Some(pc_idx) = self.components.iter().position(|pc| pc.key == old_key) else {
             return;
@@ -452,7 +468,7 @@ impl eframe::App for OsmilogApp {
         egui::Panel::top("menu_bar").show(ui, |ui| {
             ui.menu_button("Add", |ui| {
                 ui.menu_button("Gates", |ui| {
-                    let gates: [(&str, GateOp, usize); 6] = [
+                    let gates = [
                         ("AND", GateOp::And, 2),
                         ("OR", GateOp::Or, 2),
                         ("XOR", GateOp::Xor, 2),
@@ -475,9 +491,7 @@ impl eframe::App for OsmilogApp {
                 });
                 if ui.button("Input").clicked() {
                     self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Input {
-                            value: Value::new(0, 1),
-                        },
+                        def: ComponentDef::Input { bits: 0, width: 1 },
                     };
                     ui.close();
                 }

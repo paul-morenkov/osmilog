@@ -29,14 +29,16 @@ impl Circuit {
         key
     }
 
-    pub fn set_input(&mut self, comp: CompKey, value: Value) {
+    pub fn set_input(&mut self, comp: CompKey, bits: u32, width: u8) {
+        // TODO: Should you be able to change width via this function?
         // TODO: Make this return a result
-        if let Logic::Comb(LogicComb::Input(v)) = &mut self.components[comp].logic {
-            *v = value
-        } else {
-            return;
+        if let Logic::Comb(LogicComb::Input { bits: b, width: w }) =
+            &mut self.components[comp].logic
+        {
+            *b = bits;
+            *w = width;
+            self.eval_component(comp);
         }
-        self.eval_component(comp);
     }
 
     pub fn read_output(&self, comp: CompKey) -> Value {
@@ -244,7 +246,9 @@ impl Circuit {
     }
 
     pub fn remove_component(&mut self, key: CompKey) {
-        let Some(comp) = self.components.get(key) else { return };
+        let Some(comp) = self.components.get(key) else {
+            return;
+        };
         let output_nets: Vec<NetKey> = comp.pins.outputs.iter().filter_map(|&n| n).collect();
         let input_nets: Vec<NetKey> = comp.pins.inputs.iter().filter_map(|&n| n).collect();
 

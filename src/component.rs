@@ -13,11 +13,10 @@ pub struct Component {
 }
 
 impl Component {
-    // TODO: Consider returning pin index information
-    pub fn input(value: Value) -> Self {
+    pub fn input(bits: u32, width: u8) -> Self {
         Self {
             pins: Pins::new(0, 1),
-            logic: Logic::Comb(LogicComb::Input(value)),
+            logic: Logic::Comb(LogicComb::Input { bits, width }),
         }
     }
     pub fn output() -> Self {
@@ -86,7 +85,10 @@ impl Component {
 
         match &self.logic {
             Logic::Comb(comb) => match comb {
-                LogicComb::Input(val) => vec![*val],
+                LogicComb::Input { bits, width } => vec![Value::Fixed {
+                    bits: *bits,
+                    width: *width,
+                }],
                 LogicComb::Output => vec![],
                 LogicComb::Gate { op, width } => {
                     let val = match op {
@@ -268,7 +270,7 @@ pub enum Logic {
 
 #[derive(Debug)]
 pub enum LogicComb {
-    Input(Value),
+    Input { bits: u32, width: u8 }, // Matches Value::Fixed
     Output,
     Gate { op: GateOp, width: u8 },
     Mux { data_width: u8, sel_width: u8 },

@@ -17,8 +17,8 @@ mod tests {
     #[test]
     fn test_and_or() {
         let mut c = Circuit::new();
-        let i1 = c.add_component(Component::input(Value::new(1, 1)));
-        let i2 = c.add_component(Component::input(Value::new(0, 1)));
+        let i1 = c.add_component(Component::input(1, 1));
+        let i2 = c.add_component(Component::input(0, 1));
         let o1 = c.add_component(Component::output());
         let o2 = c.add_component(Component::output());
 
@@ -40,11 +40,11 @@ mod tests {
     #[test]
     fn test_mux() {
         let mut c = Circuit::new();
-        let i1 = c.add_component(Component::input(Value::new(3, 2)));
-        let i2 = c.add_component(Component::input(Value::new(2, 2)));
-        let i3 = c.add_component(Component::input(Value::new(1, 2)));
-        let i4 = c.add_component(Component::input(Value::new(0, 2)));
-        let sel = c.add_component(Component::input(Value::new(0, 2)));
+        let i1 = c.add_component(Component::input(3, 2));
+        let i2 = c.add_component(Component::input(2, 2));
+        let i3 = c.add_component(Component::input(1, 2));
+        let i4 = c.add_component(Component::input(0, 2));
+        let sel = c.add_component(Component::input(0, 2));
 
         let o1 = c.add_component(Component::output());
 
@@ -60,13 +60,13 @@ mod tests {
 
         c.settle();
         assert_eq!(c.read_output(o1), Value::new(3, 2));
-        c.set_input(sel, Value::new(1, 2));
+        c.set_input(sel, 1, 2);
         c.settle();
         assert_eq!(c.read_output(o1), Value::new(2, 2));
-        c.set_input(sel, Value::new(2, 2));
+        c.set_input(sel, 2, 2);
         c.settle();
         assert_eq!(c.read_output(o1), Value::new(1, 2));
-        c.set_input(sel, Value::new(3, 2));
+        c.set_input(sel, 3, 2);
         c.settle();
         assert_eq!(c.read_output(o1), Value::new(0, 2));
     }
@@ -74,8 +74,8 @@ mod tests {
     #[test]
     fn test_demux() {
         let mut c = Circuit::new();
-        let i1 = c.add_component(Component::input(Value::new(1, 1)));
-        let sel = c.add_component(Component::input(Value::new(2, 2)));
+        let i1 = c.add_component(Component::input(1, 1));
+        let sel = c.add_component(Component::input(2, 2));
 
         let o1 = c.add_component(Component::output());
         let o2 = c.add_component(Component::output());
@@ -101,10 +101,11 @@ mod tests {
 
     #[test]
     fn test_reg() {
+        // TODO: Verify this test
         let mut c = Circuit::new();
 
-        let data = c.add_component(Component::input(Value::new(5, 4)));
-        let we = c.add_component(Component::input(Value::new(0, 1)));
+        let data = c.add_component(Component::input(5, 4));
+        let we = c.add_component(Component::input(0, 1));
         let reg = c.add_component(Component::reg(4));
         let out = c.add_component(Component::output());
 
@@ -117,14 +118,14 @@ mod tests {
         assert_eq!(c.read_output(out), Value::new(0, 4));
 
         // write_enable=1, tick: latches data.
-        c.set_input(we, Value::new(1, 1));
+        c.set_input(we, 1, 1);
         c.settle();
         c.tick_clock();
         assert_eq!(c.read_output(out), Value::new(5, 4));
 
         // write_enable=0, change data, tick: holds previous value.
-        c.set_input(we, Value::new(0, 1));
-        c.set_input(data, Value::new(9, 4));
+        c.set_input(we, 0, 1);
+        c.set_input(data, 9, 4);
         c.settle();
         c.tick_clock();
         assert_eq!(c.read_output(out), Value::new(5, 4));
