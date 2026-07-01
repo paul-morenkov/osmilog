@@ -17,7 +17,10 @@ use crate::{
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const PIN_RADIUS: f32 = 3.0;
-const WIRE_THICKNESS: f32 = 2.0;
+const WIRE_THICKNESS_THIN: f32 = 2.0;
+const WIRE_THICKNESS_THICK: f32 = 4.0;
+const LABEL_FONT_SIZE: f32 = 8.0;
+const COMP_STROKE: f32 = 1.5;
 
 // ── ComponentDef ──────────────────────────────────────────────────────────────
 
@@ -156,7 +159,7 @@ pub struct PlacedComponent {
 
 // ── Wire ──────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Wire {
     pub net_key: NetKey,
     pub src_comp: CompKey,
@@ -201,6 +204,7 @@ pub struct OsmilogApp {
     pub mode: InteractionMode,
     pub pan: Vec2,
     pub selected: Option<CompKey>,
+    pub last_settle_error: Option<String>,
 }
 
 impl OsmilogApp {
@@ -212,6 +216,14 @@ impl OsmilogApp {
             mode: InteractionMode::Idle,
             pan: Vec2::ZERO,
             selected: None,
+            last_settle_error: None,
+        }
+    }
+
+    fn record_settle_result<T>(&mut self, result: Result<T, crate::circuit::SettleError>) {
+        match result {
+            Ok(_) => self.last_settle_error = None,
+            Err(e) => self.last_settle_error = Some(e.to_string()),
         }
     }
 
@@ -246,24 +258,29 @@ impl OsmilogApp {
         ui.text_edit_singleline(&mut self.components[idx].label);
         ui.separator();
 
-        // TODO: what's up with this clone
         let def = self.components[idx].def.clone();
         match def {
             ComponentDef::Input {
                 mut bits,
                 mut width,
             } => {
-                // FIXME: This needs to update ComponentDef
                 let mut changed = false;
-                let val_str = format!("0x{:X} ({}b)", bits, width);
-                ui.label(format!("Value: {}", val_str));
+                ui.label(format!("Value: 0x{:X}", bits));
 
-                // TODO: Checkbox if width == 1 else input field
-                if ui.button("Toggle").clicked() {
-                    bits = (bits + 1) & Value::mask(width);
-                    changed = true;
-                    // self.circuit.set_input(key, bits, width);
-                    // self.circuit.settle();
+                // `bits` controlled by checkbox or textfield depending on `width`
+                if width == 1 {
+                    let mut high = bits != 0;
+                    if ui.checkbox(&mut high, "Toggle").clicked() {
+                        bits = high as u32;
+                        changed = true;
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Bits:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut bits).range(1..=Value::mask(width)))
+                            .changed();
+                    });
                 }
                 ui.horizontal(|ui| {
                     ui.label("Width:");
@@ -272,6 +289,7 @@ impl OsmilogApp {
                         .changed();
                 });
                 if changed {
+                    bits &= Value::mask(width); // In case width was changed below max `bits` value
                     self.reconfigure_component(key, ComponentDef::Input { bits, width });
                 }
             }
@@ -415,7 +433,7 @@ impl OsmilogApp {
                     false
                 }
             })
-            .copied()
+            .cloned()
             .collect();
 
         self.circuit.remove_component(old_key);
@@ -448,7 +466,8 @@ impl OsmilogApp {
             });
         }
 
-        self.circuit.settle();
+        let result = self.circuit.settle();
+        self.record_settle_result(result);
         self.selected = Some(new_key);
     }
 }
@@ -529,7 +548,11 @@ impl eframe::App for OsmilogApp {
                 });
             });
             if ui.button("Tick Clock").clicked() {
-                self.circuit.tick_clock();
+                let result = self.circuit.tick_clock();
+                self.record_settle_result(result);
+            }
+            if let Some(err) = &self.last_settle_error {
+                ui.colored_label(Color32::RED, err);
             }
         });
 
@@ -582,7 +605,7 @@ impl eframe::App for OsmilogApp {
                         pin_pos(dst, pan, PinId::input(wire.dst_pin.0)),
                     )
                 };
-                let color = value_color(self.circuit.nets[wire.net_key].value);
+                let color = value_stroke(self.circuit.nets[wire.net_key].value);
                 draw_wire(&painter, p0, p1, color);
             }
 
@@ -670,7 +693,8 @@ impl eframe::App for OsmilogApp {
                     };
 
                     let end = pointer.unwrap_or(current_end);
-                    draw_wire(&painter, p0, end, Color32::from_gray(150));
+                    let stroke = Stroke::new(WIRE_THICKNESS_THIN, Color32::from_gray(150));
+                    draw_wire(&painter, p0, end, stroke);
 
                     self.mode = InteractionMode::WireDrag {
                         src_comp,
@@ -688,7 +712,8 @@ impl eframe::App for OsmilogApp {
                                     dst_comp,
                                     PinId::input(in_idx.0),
                                 );
-                                self.circuit.settle();
+                                let result = self.circuit.settle();
+                                self.record_settle_result(result);
                                 self.wires.push(Wire {
                                     net_key: net,
                                     src_comp,
@@ -787,12 +812,23 @@ fn pin_at_pos(
 
 // ── Color ─────────────────────────────────────────────────────────────────────
 
-fn value_color(val: Value) -> Color32 {
-    match val {
-        Value::Floating => Color32::GRAY,
-        Value::Fixed { bits: 0, .. } => Color32::from_rgb(40, 40, 80),
-        Value::Fixed { .. } => Color32::from_rgb(50, 200, 80),
-    }
+fn value_stroke(val: Value) -> Stroke {
+    let (color, weight) = match val {
+        Value::Floating => (Color32::GRAY, WIRE_THICKNESS_THIN),
+        Value::Fixed { bits, width } => (
+            if bits == 0 {
+                Color32::from_rgb(40, 40, 80)
+            } else {
+                Color32::from_rgb(50, 200, 80)
+            },
+            if width == 1 {
+                WIRE_THICKNESS_THIN
+            } else {
+                WIRE_THICKNESS_THICK
+            },
+        ),
+    };
+    Stroke::new(weight, color)
 }
 
 // ── Drawing ───────────────────────────────────────────────────────────────────
@@ -813,8 +849,7 @@ fn draw_grid(painter: &Painter, clip_rect: Rect, pan: Vec2) {
     }
 }
 
-fn draw_wire(painter: &Painter, p0: Pos2, p1: Pos2, color: Color32) {
-    let stroke = Stroke::new(WIRE_THICKNESS, color);
+fn draw_wire(painter: &Painter, p0: Pos2, p1: Pos2, stroke: Stroke) {
     let mid_x = (p0.x + p1.x) / 2.0;
     let elbow1 = egui::pos2(mid_x, p0.y);
     let elbow2 = egui::pos2(mid_x, p1.y);
@@ -834,9 +869,9 @@ fn draw_component(
     let rect = component_bounding_rect(pc, pan);
     let fill = Color32::from_rgb(45, 45, 65);
     let (stroke_w, stroke_col) = if is_selected {
-        (2.5_f32, Color32::from_rgb(100, 160, 255))
+        (COMP_STROKE + 1.0, Color32::from_rgb(100, 160, 255))
     } else {
-        (1.5_f32, Color32::from_gray(160))
+        (COMP_STROKE, Color32::from_gray(160))
     };
     let outline_stroke = Stroke::new(stroke_w, stroke_col);
 
@@ -880,15 +915,15 @@ fn draw_component(
         }
     }
 
-    let lp = egui::pos2(
+    let label_pos = egui::pos2(
         rect.left() + shape.label_norm.x * rect.width(),
         rect.top() + shape.label_norm.y * rect.height(),
     );
     painter.text(
-        lp,
+        label_pos,
         Align2::CENTER_CENTER,
         &pc.label,
-        FontId::monospace(11.0),
+        FontId::monospace(LABEL_FONT_SIZE),
         Color32::WHITE,
     );
 
@@ -897,12 +932,12 @@ fn draw_component(
         let val = circuit.components[pc.key].pins.inputs[i]
             .map(|nk| circuit.nets[nk].value)
             .unwrap_or(Value::Floating);
-        painter.circle_filled(pos, PIN_RADIUS, value_color(val));
+        painter.circle_filled(pos, PIN_RADIUS, value_stroke(val).color);
     }
     for i in 0..pc.def.n_outputs() {
         let pos = pin_pos(pc, pan, PinId::output(i as u8));
         let val = circuit.components[pc.key].pins.out_cache[i];
-        painter.circle_filled(pos, PIN_RADIUS, value_color(val));
+        painter.circle_filled(pos, PIN_RADIUS, value_stroke(val).color);
     }
 }
 
@@ -920,23 +955,26 @@ fn draw_ghost(painter: &Painter, def: &ComponentDef, grid_pos: [i32; 2], pan: Ve
         points: pts,
         closed: true,
         fill: Color32::TRANSPARENT,
-        stroke: PathStroke::new(1.5, ghost_col),
+        stroke: PathStroke::new(COMP_STROKE, ghost_col),
     }));
 
     for stroke_cmds in &shape.extra_strokes {
         let stroke_pts = tessellate_path(stroke_cmds, rect);
-        painter.add(egui::Shape::line(stroke_pts, Stroke::new(1.5, ghost_col)));
+        painter.add(egui::Shape::line(
+            stroke_pts,
+            Stroke::new(COMP_STROKE, ghost_col),
+        ));
     }
 
-    let lp = egui::pos2(
+    let label_pos = egui::pos2(
         rect.left() + shape.label_norm.x * rect.width(),
         rect.top() + shape.label_norm.y * rect.height(),
     );
     painter.text(
-        lp,
+        label_pos,
         Align2::CENTER_CENTER,
         def.label(),
-        FontId::monospace(11.0),
+        FontId::monospace(LABEL_FONT_SIZE),
         ghost_col,
     );
 }
