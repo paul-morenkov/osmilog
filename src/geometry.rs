@@ -1,6 +1,7 @@
 use egui::vec2;
 use egui::{Pos2, Vec2};
 
+use crate::circuit::TunnelRole;
 use crate::component::GateOp;
 use crate::shape::{ComponentShape, PinAnchor, ShapeCmd};
 
@@ -77,13 +78,49 @@ fn xor_extra_arc() -> Vec<ShapeCmd> {
     ]
 }
 
+// Zero-allocation size queries, kept as the single source of truth for the
+// height formulas below - the corresponding *_shape() functions call these
+// rather than recomputing the formula, so callers that only need a
+// bounding box (e.g. component_bounding_rect) don't have to build and
+// immediately discard a full ComponentShape (outline/anchors/bubbles Vecs).
+pub fn gate_size(op: GateOp, n_inputs: usize) -> Vec2 {
+    let n = if matches!(op, GateOp::Not) {
+        1
+    } else {
+        n_inputs
+    };
+    vec2(
+        COMP_WIDTH,
+        ((n + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT),
+    )
+}
+
+pub fn mux_size(sel_width: u8) -> Vec2 {
+    let branches = 1usize << sel_width;
+    vec2(
+        COMP_WIDTH,
+        ((branches + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT),
+    )
+}
+
+pub fn demux_size(sel_width: u8) -> Vec2 {
+    mux_size(sel_width) // same branches+1 formula
+}
+
+pub fn reg_size() -> Vec2 {
+    vec2(
+        COMP_WIDTH,
+        ((2 + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT),
+    )
+}
+
 pub fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
     let n = if matches!(op, GateOp::Not) {
         1
     } else {
         n_inputs
     };
-    let h = ((n + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT);
+    let h = gate_size(op, n_inputs).y;
     let bubble = matches!(op, GateOp::Nand | GateOp::Nor | GateOp::Xnor | GateOp::Not);
 
     let (outline, fill_outline, extra_strokes) = match op {
@@ -121,7 +158,7 @@ pub fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
 
 pub fn mux_shape(sel_width: u8) -> ComponentShape {
     let branches = 1usize << sel_width;
-    let h = ((branches + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT);
+    let h = mux_size(sel_width).y;
     const T: f32 = 0.2;
 
     let outline = vec![
@@ -149,7 +186,7 @@ pub fn mux_shape(sel_width: u8) -> ComponentShape {
 }
 
 pub fn reg_shape() -> ComponentShape {
-    let h = ((2 + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT);
+    let h = reg_size().y;
 
     // input[0] = data, input[1] = write_enable, both on the left edge; output[0] on the right
     let input_anchors = vec![PinAnchor::left(spaced(0, 2)), PinAnchor::left(spaced(1, 2))];
@@ -168,7 +205,7 @@ pub fn reg_shape() -> ComponentShape {
 
 pub fn demux_shape(sel_width: u8) -> ComponentShape {
     let branches = 1usize << sel_width;
-    let h = ((branches + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT);
+    let h = demux_size(sel_width).y;
     const T: f32 = 0.2;
 
     let outline = vec![
@@ -198,5 +235,44 @@ pub fn demux_shape(sel_width: u8) -> ComponentShape {
         extra_strokes: vec![],
         output_bubbles: vec![false; branches],
         label_norm: vec2(0.55, 0.45),
+    }
+}
+
+pub fn tunnel_shape(role: TunnelRole) -> ComponentShape {
+    let outline = match role {
+        TunnelRole::Feed => vec![
+            ShapeCmd::MoveTo(vec2(0.0, 0.0)),
+            ShapeCmd::LineTo(vec2(0.7, 0.0)),
+            ShapeCmd::LineTo(vec2(1.0, 0.5)),
+            ShapeCmd::LineTo(vec2(0.7, 1.0)),
+            ShapeCmd::LineTo(vec2(0.0, 1.0)),
+        ],
+        TunnelRole::Pull => vec![
+            ShapeCmd::MoveTo(vec2(0.0, 0.5)),
+            ShapeCmd::LineTo(vec2(0.3, 0.0)),
+            ShapeCmd::LineTo(vec2(1.0, 0.0)),
+            ShapeCmd::LineTo(vec2(1.0, 1.0)),
+            ShapeCmd::LineTo(vec2(0.3, 1.0)),
+        ],
+    };
+
+    let input_anchors = match role {
+        TunnelRole::Feed => vec![],
+        TunnelRole::Pull => vec![PinAnchor::left(0.5)],
+    };
+    let output_anchors = match role {
+        TunnelRole::Feed => vec![PinAnchor::right(0.5)],
+        TunnelRole::Pull => vec![],
+    };
+
+    ComponentShape {
+        size: vec2(COMP_WIDTH, COMP_MIN_HEIGHT),
+        outline,
+        fill_outline: None,
+        input_anchors,
+        output_anchors,
+        extra_strokes: vec![],
+        output_bubbles: vec![false],
+        label_norm: vec2(0.45, 0.45),
     }
 }

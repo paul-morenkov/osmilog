@@ -3,24 +3,53 @@ use crate::{
     value::Value,
 };
 
-use slotmap::{SecondaryMap, SlotMap};
-use std::collections::VecDeque;
+use slotmap::{new_key_type, SecondaryMap, SlotMap};
+use std::collections::{HashMap, VecDeque};
 
 use crate::net::{Net, NetKey};
 
+new_key_type! {
+    pub struct TunnelKey;
+}
+
+// A Tunnel ties together all Tunnels sharing the same Label into one virtual
+// net, without a drawn wire between them (a schematic "net label" / off-page
+// connector). Feed tunnels drive their attached net FROM the shared label
+// group's resolved value; Pull tunnels read their attached net's value and
+// contribute it TO the group. See Circuit::settle()/resolve_net().
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SettleError {
-    pub net: NetKey,
-    pub revisits: usize,
+pub enum TunnelRole {
+    Feed,
+    Pull,
+}
+
+#[derive(Debug, Clone)]
+pub struct Tunnel {
+    pub label: String,
+    pub role: TunnelRole,
+    pub net: Option<NetKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettleError {
+    Oscillation { net: NetKey, revisits: usize },
+    TunnelConflict { label: String },
 }
 
 impl std::fmt::Display for SettleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "net {:?} did not converge after {} revisits (possible combinational oscillation)",
-            self.net, self.revisits
-        )
+        match self {
+            SettleError::Oscillation { net, revisits } => write!(
+                f,
+                "net {:?} did not converge after {} revisits (possible combinational oscillation)",
+                net, revisits
+            ),
+            SettleError::TunnelConflict { label } => write!(
+                f,
+                "tunnel label {:?} has conflicting driven values from multiple Pull tunnels",
+                label
+            ),
+        }
     }
 }
 
@@ -32,6 +61,8 @@ pub struct Circuit {
     pub(crate) components: SlotMap<CompKey, Component>,
     pub(crate) dirty: VecDeque<NetKey>,
     queued: SecondaryMap<NetKey, bool>, // TODO: there might be a nicer way of organizing this
+    pub(crate) tunnels: SlotMap<TunnelKey, Tunnel>,
+    tunnel_labels: HashMap<String, Vec<TunnelKey>>,
 }
 
 impl Circuit {
@@ -82,12 +113,32 @@ impl Circuit {
             comp.clear_pins();
         }
 
+        // Every NetKey is about to become invalid; tunnels must not keep
+        // pointing at one, or they'd hold a dangling key.
+        for t in self.tunnels.values_mut() {
+            t.net = None;
+        }
+
         self.nets.clear();
         self.dirty.clear();
     }
 
     fn net_of(&self, comp: CompKey, pin: PinId) -> Option<NetKey> {
         self.components.get(comp).and_then(|c| c.net_of(pin))
+    }
+
+    // Returns the net already attached to (comp, pin), or creates and
+    // attaches a fresh one. Shared by link()'s (None, None) case and
+    // link_tunnel().
+    fn net_or_create(&mut self, comp: CompKey, pin: PinId) -> NetKey {
+        match self.net_of(comp, pin) {
+            Some(net) => net,
+            None => {
+                let net = self.nets.insert(Net::default());
+                self.attach(net, comp, pin);
+                net
+            }
+        }
     }
 
     fn attach(&mut self, net: NetKey, comp: CompKey, pin: PinId) {
@@ -111,8 +162,7 @@ impl Circuit {
         match (net_a, net_b) {
             (None, None) => {
                 // Need to create a new Net
-                let net = self.nets.insert(Net::default());
-                self.attach(net, a, a_pin);
+                let net = self.net_or_create(a, a_pin);
                 self.attach(net, b, b_pin);
                 self.mark_dirty(net);
                 net
@@ -158,8 +208,178 @@ impl Circuit {
             }
             (_, None) => {}
         }
+
+        // Repoint any tunnels attached to the removed net. Same net, new
+        // key, so no extra dirtying beyond mark_dirty(a) below is needed.
+        for t in self.tunnels.values_mut() {
+            if t.net == Some(b) {
+                t.net = Some(a);
+            }
+        }
+
         self.mark_dirty(a);
         a
+    }
+
+    pub fn add_tunnel(&mut self, label: String, role: TunnelRole) -> TunnelKey {
+        let key = self.tunnels.insert(Tunnel {
+            label: label.clone(),
+            role,
+            net: None,
+        });
+        self.tunnel_labels.entry(label).or_default().push(key);
+        key
+    }
+
+    // Finds or creates the net at (comp, pin) and attaches the tunnel to it.
+    pub fn link_tunnel(&mut self, tunnel: TunnelKey, comp: CompKey, pin: PinId) -> NetKey {
+        let net = self.net_or_create(comp, pin);
+        self.attach_tunnel(tunnel, net);
+        net
+    }
+
+    fn attach_tunnel(&mut self, tunnel: TunnelKey, net: NetKey) {
+        let old_net = self.tunnels[tunnel].net;
+        let label = self.tunnels[tunnel].label.clone();
+        self.tunnels[tunnel].net = Some(net);
+        // Rewiring away from a previous net: that net must be re-resolved
+        // too, or it keeps showing a stale tunnel-contributed value forever.
+        if let Some(old) = old_net {
+            if old != net {
+                self.mark_dirty(old);
+            }
+        }
+        self.mark_dirty(net);
+        // Group membership changed (a new net now contributes to/reads from
+        // this label), independent of whether this net's own value happens
+        // to change - settle()'s "if changed" cross-dirty step alone can't
+        // catch that, so dirty Feed siblings explicitly.
+        self.dirty_label_feed_nets(&label);
+    }
+
+    pub fn detach_tunnel(&mut self, tunnel: TunnelKey) {
+        let label = self.tunnels[tunnel].label.clone();
+        if let Some(old) = self.tunnels[tunnel].net.take() {
+            self.mark_dirty(old);
+        }
+        self.dirty_label_feed_nets(&label);
+    }
+
+    pub fn remove_tunnel(&mut self, tunnel: TunnelKey) {
+        let Some(t) = self.tunnels.remove(tunnel) else {
+            return;
+        };
+        if let Some(keys) = self.tunnel_labels.get_mut(&t.label) {
+            keys.retain(|&k| k != tunnel);
+            if keys.is_empty() {
+                self.tunnel_labels.remove(&t.label);
+            }
+        }
+        if let Some(net) = t.net {
+            self.mark_dirty(net);
+        }
+        self.dirty_label_feed_nets(&t.label);
+    }
+
+    pub fn rename_tunnel(&mut self, tunnel: TunnelKey, new_label: String) {
+        println!("Renaming tunnel {:?} to {}", tunnel, new_label);
+        let Some(t) = self.tunnels.get_mut(tunnel) else {
+            return;
+        };
+        let old_label = std::mem::replace(&mut t.label, new_label.clone());
+        let net = t.net;
+
+        if let Some(keys) = self.tunnel_labels.get_mut(&old_label) {
+            keys.retain(|&k| k != tunnel);
+            if keys.is_empty() {
+                self.tunnel_labels.remove(&old_label);
+            }
+        }
+        self.tunnel_labels
+            .entry(new_label.clone())
+            .or_default()
+            .push(tunnel);
+
+        if let Some(net) = net {
+            self.mark_dirty(net);
+        }
+        // Both the old group (lost a member) and the new group (gained one)
+        // may need their Feed nets re-resolved, even though this tunnel's
+        // own net value is unaffected by a relabel.
+        self.dirty_label_feed_nets(&old_label);
+        self.dirty_label_feed_nets(&new_label);
+    }
+
+    fn tunnels_on_net(&self, net: NetKey) -> impl Iterator<Item = &Tunnel> {
+        self.tunnels.values().filter(move |t| t.net == Some(net))
+    }
+
+    // Marks the net of every Feed-role tunnel in `label`'s group dirty, so
+    // they re-resolve against the group's (possibly just-changed) value or
+    // membership.
+    fn dirty_label_feed_nets(&mut self, label: &str) {
+        let Some(keys) = self.tunnel_labels.get(label) else {
+            return;
+        };
+        let nets: Vec<NetKey> = keys
+            .iter()
+            .filter_map(|&tk| {
+                let t = &self.tunnels[tk];
+                (t.role == TunnelRole::Feed).then_some(t.net).flatten()
+            })
+            .collect();
+        for n in nets {
+            self.mark_dirty(n);
+        }
+    }
+
+    // Aggregates a label group's value from its Pull-role tunnels' net
+    // values. `strict` controls what happens when two Pull tunnels disagree
+    // (non-Floating, differing values): lenient (false) deterministically
+    // takes the last such value in tunnel_labels order and never errors,
+    // safe to call mid-convergence in resolve_net(); strict (true) returns
+    // TunnelConflict, meant to be called exactly once after settle()'s
+    // dirty-queue loop has fully drained, when disagreement is genuine
+    // rather than an evaluation-order artifact.
+    fn tunnel_group_value(&self, label: &str, strict: bool) -> Result<Value, SettleError> {
+        let Some(keys) = self.tunnel_labels.get(label) else {
+            return Ok(Value::Floating);
+        };
+        let mut result = Value::Floating;
+        for &tk in keys {
+            let t = &self.tunnels[tk];
+            if t.role != TunnelRole::Pull {
+                continue;
+            }
+            let Some(net) = t.net else { continue };
+            let v = self.nets[net].value;
+            if matches!(v, Value::Floating) {
+                continue;
+            }
+            match result {
+                Value::Floating => result = v,
+                _ if result == v => {}
+                _ if strict => {
+                    return Err(SettleError::TunnelConflict {
+                        label: label.to_string(),
+                    })
+                }
+                _ => result = v,
+            }
+        }
+        Ok(result)
+    }
+
+    fn tunnel_feed_value(&self, net: NetKey) -> Value {
+        let Some(t) = self
+            .tunnels_on_net(net)
+            .find(|t| t.role == TunnelRole::Feed)
+        else {
+            return Value::Floating;
+        };
+        // strict=false never returns Err.
+        self.tunnel_group_value(&t.label, false)
+            .unwrap_or(Value::Floating)
     }
 
     fn mark_dirty(&mut self, net: NetKey) {
@@ -192,7 +412,7 @@ impl Circuit {
                 let revisit_count = revisits.get(net).copied().unwrap_or(0) + 1;
                 revisits.insert(net, revisit_count);
                 if revisit_count > Self::REVISIT_THRESHOLD {
-                    return Err(SettleError {
+                    return Err(SettleError::Oscillation {
                         net,
                         revisits: revisit_count,
                     });
@@ -208,17 +428,36 @@ impl Circuit {
                 for (comp, _) in sinks {
                     self.eval_component(comp);
                 }
+
+                // If a Pull tunnel reads this net, the label group's value
+                // may have changed; re-dirty sibling Feed nets so they pick
+                // it up on a later pass of this same settle() call.
+                let pull_label: Option<String> = self
+                    .tunnels_on_net(net)
+                    .find(|t| t.role == TunnelRole::Pull)
+                    .map(|t| t.label.clone());
+                if let Some(label) = pull_label {
+                    self.dirty_label_feed_nets(&label);
+                }
             }
             total_iterations += 1;
             if total_iterations > iteration_budget {
                 // Extremely defensive backstop (e.g. many nets oscillating
                 // simultaneously); should be unreachable if the per-net
                 // revisit check above is doing its job.
-                return Err(SettleError {
+                return Err(SettleError::Oscillation {
                     net,
                     revisits: revisits.get(net).copied().unwrap_or(0),
                 });
             }
+        }
+
+        // All nets have fully converged at this point (the loop only exits
+        // when dirty is empty). Any tunnel-group disagreement found now is
+        // genuine, not a mid-convergence evaluation-order artifact.
+        let labels: Vec<String> = self.tunnel_labels.keys().cloned().collect();
+        for label in &labels {
+            self.tunnel_group_value(label, true)?;
         }
         Ok(())
     }
@@ -232,7 +471,9 @@ impl Circuit {
         let new = match source {
             // Net takes value from pins.out_cache, which is updated in eval_component
             Some((comp, i)) => self.components[comp].pins.out_cache[i.0 as usize],
-            None => Value::Floating,
+            // A component driver always takes priority; only fall back to a
+            // Feed tunnel's group value when this net has no real driver.
+            None => self.tunnel_feed_value(net),
         };
         self.nets[net].value = new;
         new != old
@@ -306,6 +547,12 @@ impl Circuit {
         let output_nets: Vec<NetKey> = comp.pins.outputs.iter().filter_map(|&n| n).collect();
         let input_nets: Vec<NetKey> = comp.pins.inputs.iter().filter_map(|&n| n).collect();
 
+        // Tunnels attached to nets that are about to be deleted must be
+        // detached (their NetKey would otherwise dangle). Their sibling
+        // nets need re-dirtying too, but only after the trailing
+        // dirty/queued clear below, or the marks would be wiped.
+        let mut affected_labels: Vec<String> = Vec::new();
+
         // Remove nets driven by this component; clear each sink's input pin slot
         for net_key in output_nets {
             if let Some(net) = self.nets.get(net_key) {
@@ -314,6 +561,12 @@ impl Circuit {
                     if let Some(sc) = self.components.get_mut(sink_comp) {
                         sc.pins.inputs[sink_pin.0 as usize] = None;
                     }
+                }
+            }
+            for t in self.tunnels.values_mut() {
+                if t.net == Some(net_key) {
+                    t.net = None;
+                    affected_labels.push(t.label.clone());
                 }
             }
             self.nets.remove(net_key);
@@ -331,6 +584,12 @@ impl Circuit {
         self.queued.clear();
 
         self.components.remove(key);
+
+        // Re-dirty sibling Feed-tunnel nets now that propagation state has
+        // already been reset above.
+        for label in affected_labels {
+            self.dirty_label_feed_nets(&label);
+        }
     }
 }
 
@@ -1232,5 +1491,130 @@ mod tests {
         c.set_input(g, 99, 4); // g is a Gate, not an Input; silently no-ops
         c.settle().unwrap();
         assert_eq!(c.read_output(o), Value::new(1, 1)); // unaffected
+    }
+
+    // ---- Group 8: tunnels ----
+
+    #[test]
+    fn test_tunnel_feed_pull_propagates_without_wire() {
+        let mut c = Circuit::new();
+        let driver = c.add_component(Component::input(1, 1));
+        let pull = c.add_tunnel("CLK".to_string(), TunnelRole::Pull);
+        c.link_tunnel(pull, driver, PinId::output(0));
+
+        let feed = c.add_tunnel("CLK".to_string(), TunnelRole::Feed);
+        let out = c.add_component(Component::output());
+        c.link_tunnel(feed, out, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_tunnel_conflict_detected_after_convergence() {
+        let mut c = Circuit::new();
+        let driver1 = c.add_component(Component::input(1, 1));
+        let driver2 = c.add_component(Component::input(0, 1));
+        let pull1 = c.add_tunnel("BUS".to_string(), TunnelRole::Pull);
+        c.link_tunnel(pull1, driver1, PinId::output(0));
+        let pull2 = c.add_tunnel("BUS".to_string(), TunnelRole::Pull);
+        c.link_tunnel(pull2, driver2, PinId::output(0));
+
+        let result = c.settle();
+        assert_eq!(
+            result,
+            Err(SettleError::TunnelConflict {
+                label: "BUS".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_tunnel_net_repointed_on_merge() {
+        let mut c = Circuit::new();
+        let driver1 = c.add_component(Component::input(1, 1));
+        let driver2 = c.add_component(Component::input(1, 1));
+        let sink1 = c.add_component(Component::output());
+        let sink2 = c.add_component(Component::output());
+        c.link(driver1, PinId::output(0), sink1, PinId::input(0));
+        c.link(driver2, PinId::output(0), sink2, PinId::input(0));
+
+        let pull = c.add_tunnel("X".to_string(), TunnelRole::Pull);
+        c.link_tunnel(pull, sink2, PinId::input(0)); // attaches to sink2's net
+
+        // sink1's net and sink2's net both already exist; linking their
+        // already-attached input pins together forces a merge().
+        c.link(sink1, PinId::input(0), sink2, PinId::input(0));
+        c.settle().unwrap();
+
+        // The tunnel must have followed the merge (repointed from the
+        // removed net to the surviving one), not been left dangling.
+        let feed = c.add_tunnel("X".to_string(), TunnelRole::Feed);
+        let out = c.add_component(Component::output());
+        c.link_tunnel(feed, out, PinId::input(0));
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_tunnel_detached_when_driving_component_removed() {
+        let mut c = Circuit::new();
+        let driver = c.add_component(Component::input(1, 1));
+        let pull = c.add_tunnel("Y".to_string(), TunnelRole::Pull);
+        c.link_tunnel(pull, driver, PinId::output(0));
+        c.settle().unwrap();
+
+        c.remove_component(driver);
+        // Must not panic (no dangling NetKey held by the tunnel), and a
+        // subsequent settle() must succeed.
+        c.settle().unwrap();
+    }
+
+    #[test]
+    fn test_tunnel_detached_on_clear_nets() {
+        let mut c = Circuit::new();
+        let driver = c.add_component(Component::input(1, 1));
+        let pull = c.add_tunnel("Z".to_string(), TunnelRole::Pull);
+        c.link_tunnel(pull, driver, PinId::output(0));
+        c.settle().unwrap();
+
+        c.clear_nets();
+        // Must not panic; the tunnel's net should have been reset to None.
+        c.settle().unwrap();
+
+        // Re-linking the same components/tunnel afterward must still work.
+        let feed = c.add_tunnel("Z".to_string(), TunnelRole::Feed);
+        let out = c.add_component(Component::output());
+        c.link_tunnel(pull, driver, PinId::output(0));
+        c.link_tunnel(feed, out, PinId::input(0));
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_tunnel_rename_moves_label_group() {
+        let mut c = Circuit::new();
+        let driver = c.add_component(Component::input(1, 1));
+        let pull = c.add_tunnel("OLD".to_string(), TunnelRole::Pull);
+        c.link_tunnel(pull, driver, PinId::output(0));
+
+        let feed_old = c.add_tunnel("OLD".to_string(), TunnelRole::Feed);
+        let out_old = c.add_component(Component::output());
+        c.link_tunnel(feed_old, out_old, PinId::input(0));
+
+        let feed_new = c.add_tunnel("NEW".to_string(), TunnelRole::Feed);
+        let out_new = c.add_component(Component::output());
+        c.link_tunnel(feed_new, out_new, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out_old), Value::new(1, 1)); // still "OLD" group
+        assert_eq!(c.read_output(out_new), Value::Floating); // "NEW" has no Pull yet
+
+        // Rename the Pull tunnel from "OLD" to "NEW".
+        c.rename_tunnel(pull, "NEW".to_string());
+        c.settle().unwrap();
+
+        assert_eq!(c.read_output(out_new), Value::new(1, 1)); // now follows "NEW"
+        assert_eq!(c.read_output(out_old), Value::Floating); // "OLD" lost its only Pull
     }
 }
