@@ -246,24 +246,29 @@ impl OsmilogApp {
         ui.text_edit_singleline(&mut self.components[idx].label);
         ui.separator();
 
-        // TODO: what's up with this clone
         let def = self.components[idx].def.clone();
         match def {
             ComponentDef::Input {
                 mut bits,
                 mut width,
             } => {
-                // FIXME: This needs to update ComponentDef
                 let mut changed = false;
-                let val_str = format!("0x{:X} ({}b)", bits, width);
-                ui.label(format!("Value: {}", val_str));
+                ui.label(format!("Value: 0x{:X}", bits));
 
-                // TODO: Checkbox if width == 1 else input field
-                if ui.button("Toggle").clicked() {
-                    bits = (bits + 1) & Value::mask(width);
-                    changed = true;
-                    // self.circuit.set_input(key, bits, width);
-                    // self.circuit.settle();
+                // `bits` controlled by checkbox or textfield depending on `width`
+                if width == 1 {
+                    let mut high = bits != 0;
+                    if ui.checkbox(&mut high, "Toggle").clicked() {
+                        bits = high as u32;
+                        changed = true;
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Bits:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut bits).range(1..=Value::mask(width)))
+                            .changed();
+                    });
                 }
                 ui.horizontal(|ui| {
                     ui.label("Width:");
@@ -272,6 +277,7 @@ impl OsmilogApp {
                         .changed();
                 });
                 if changed {
+                    bits &= Value::mask(width); // In case width was changed below max `bits` value
                     self.reconfigure_component(key, ComponentDef::Input { bits, width });
                 }
             }
