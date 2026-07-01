@@ -8,6 +8,24 @@ use std::collections::VecDeque;
 
 use crate::net::{Net, NetKey};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettleError {
+    pub net: NetKey,
+    pub revisits: usize,
+}
+
+impl std::fmt::Display for SettleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "net {:?} did not converge after {} revisits (possible combinational oscillation)",
+            self.net, self.revisits
+        )
+    }
+}
+
+impl std::error::Error for SettleError {}
+
 #[derive(Debug, Default)]
 pub struct Circuit {
     pub(crate) nets: SlotMap<NetKey, Net>,
@@ -17,7 +35,17 @@ pub struct Circuit {
 }
 
 impl Circuit {
-    const MAX_ITERATIONS: usize = 100;
+    // How many times a single net may change value within one settle() call
+    // before it's considered a combinational oscillation. Bounded by
+    // reconvergent fan-in depth in legitimate circuits (small, independent
+    // of circuit size), not by circuit size itself.
+    const REVISIT_THRESHOLD: usize = 16;
+    // Defensive backstop on total net-pops across the whole call, in case
+    // many different nets are oscillating simultaneously. Scaled to circuit
+    // size so it doesn't false-positive on large-but-legitimate circuits;
+    // should essentially never trigger if the per-net check above is doing
+    // its job.
+    const ITERATION_BUDGET_PER_NET: usize = 64;
 
     pub fn new() -> Self {
         Self::default()
@@ -141,15 +169,35 @@ impl Circuit {
         }
     }
 
-    pub fn settle(&mut self) {
-        let mut iterations = 0;
+    pub fn settle(&mut self) -> Result<(), SettleError> {
+        let mut revisits: SecondaryMap<NetKey, usize> = SecondaryMap::new();
+        let iteration_budget = self
+            .nets
+            .len()
+            .saturating_mul(Self::ITERATION_BUDGET_PER_NET)
+            .max(1024);
+        let mut total_iterations = 0;
 
         while let Some(net) = self.dirty.pop_front() {
+            // Check if net key is valid (could have been merged away and now be stale)
+            if !self.nets.contains_key(net) {
+                continue;
+            }
+
             // Clear visit before eval so that it can be re-evaled in the case of a loop
             self.queued.insert(net, false);
             let changed = self.resolve_net(net);
 
             if changed {
+                let revisit_count = revisits.get(net).copied().unwrap_or(0) + 1;
+                revisits.insert(net, revisit_count);
+                if revisit_count > Self::REVISIT_THRESHOLD {
+                    return Err(SettleError {
+                        net,
+                        revisits: revisit_count,
+                    });
+                }
+
                 let sinks: Vec<_> = self.nets[net]
                     .sinks
                     .iter()
@@ -161,12 +209,18 @@ impl Circuit {
                     self.eval_component(comp);
                 }
             }
-            iterations += 1;
-            if iterations > Self::MAX_ITERATIONS {
-                // FIXME: Handle error
-                panic!("Exceeded max iterations");
+            total_iterations += 1;
+            if total_iterations > iteration_budget {
+                // Extremely defensive backstop (e.g. many nets oscillating
+                // simultaneously); should be unreachable if the per-net
+                // revisit check above is doing its job.
+                return Err(SettleError {
+                    net,
+                    revisits: revisits.get(net).copied().unwrap_or(0),
+                });
             }
         }
+        Ok(())
     }
 
     // Recomputes the Net's Value from it's source. Returns whether the value changed.
@@ -221,7 +275,7 @@ impl Circuit {
     //   3. Call settle() to propagate the changes through the combinational circuit.
     // Generic over LogicSeq variants: adding a new sequential component type only needs
     // new match arms in Component::evaluate/Component::tick, not changes here.
-    pub fn tick_clock(&mut self) {
+    pub fn tick_clock(&mut self) -> Result<(), SettleError> {
         let seq_comps: Vec<CompKey> = self
             .components
             .iter()
@@ -242,7 +296,7 @@ impl Circuit {
             self.apply_output_values(key, new_values);
         }
 
-        self.settle();
+        self.settle()
     }
 
     pub fn remove_component(&mut self, key: CompKey) {
@@ -277,5 +331,906 @@ impl Circuit {
         self.queued.clear();
 
         self.components.remove(key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::GateOp;
+    use test_case::test_case;
+
+    // ---- Group 1: construction / basic wiring ----
+
+    #[test]
+    fn test_and_or() {
+        let mut c = Circuit::new();
+        let i1 = c.add_component(Component::input(1, 1));
+        let i2 = c.add_component(Component::input(0, 1));
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+
+        let and = c.add_component(Component::gate(GateOp::And, 2, 1));
+        let or = c.add_component(Component::gate(GateOp::Or, 2, 1));
+
+        c.link(i1, PinId::output(0), and, PinId::input(0));
+        c.link(i2, PinId::output(0), and, PinId::input(1));
+        c.link(i1, PinId::output(0), or, PinId::input(0));
+        c.link(i2, PinId::output(0), or, PinId::input(1));
+        c.link(and, PinId::output(0), o1, PinId::input(0));
+        c.link(or, PinId::output(0), o2, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0, 1));
+        assert_eq!(c.read_output(o2), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_mux() {
+        let mut c = Circuit::new();
+        let i1 = c.add_component(Component::input(3, 2));
+        let i2 = c.add_component(Component::input(2, 2));
+        let i3 = c.add_component(Component::input(1, 2));
+        let i4 = c.add_component(Component::input(0, 2));
+        let sel = c.add_component(Component::input(0, 2));
+
+        let o1 = c.add_component(Component::output());
+
+        let mux = c.add_component(Component::mux(2, 2));
+
+        c.link(i1, PinId::output(0), mux, PinId::input(1));
+        c.link(i2, PinId::output(0), mux, PinId::input(2));
+        c.link(i3, PinId::output(0), mux, PinId::input(3));
+        c.link(i4, PinId::output(0), mux, PinId::input(4));
+        c.link(sel, PinId::output(0), mux, PinId::input(0));
+
+        c.link(mux, PinId::output(0), o1, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(3, 2));
+        c.set_input(sel, 1, 2);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(2, 2));
+        c.set_input(sel, 2, 2);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(1, 2));
+        c.set_input(sel, 3, 2);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0, 2));
+    }
+
+    #[test]
+    fn test_demux() {
+        let mut c = Circuit::new();
+        let i1 = c.add_component(Component::input(1, 1));
+        let sel = c.add_component(Component::input(2, 2));
+
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+        let o3 = c.add_component(Component::output());
+        let o4 = c.add_component(Component::output());
+
+        let demux = c.add_component(Component::demux(1, 2));
+
+        c.link(i1, PinId::output(0), demux, PinId::input(0));
+        c.link(sel, PinId::output(0), demux, PinId::input(1));
+
+        c.link(demux, PinId::output(0), o1, PinId::input(0));
+        c.link(demux, PinId::output(1), o2, PinId::input(0));
+        c.link(demux, PinId::output(2), o3, PinId::input(0));
+        c.link(demux, PinId::output(3), o4, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0, 1));
+        assert_eq!(c.read_output(o2), Value::new(0, 1));
+        assert_eq!(c.read_output(o3), Value::new(1, 1));
+        assert_eq!(c.read_output(o4), Value::new(0, 1));
+    }
+
+    #[test]
+    fn test_reg() {
+        let mut c = Circuit::new();
+
+        let data = c.add_component(Component::input(5, 4));
+        let we = c.add_component(Component::input(0, 1));
+        let reg = c.add_component(Component::reg(4));
+        let out = c.add_component(Component::output());
+
+        c.link(data, PinId::output(0), reg, PinId::input(0));
+        c.link(we, PinId::output(0), reg, PinId::input(1));
+        c.link(reg, PinId::output(0), out, PinId::input(0));
+
+        c.settle().unwrap();
+        // Zero-initialized, unaffected by data already driving 5 pre-tick.
+        assert_eq!(c.read_output(out), Value::new(0, 4));
+
+        // write_enable=1, tick: latches data.
+        c.set_input(we, 1, 1);
+        c.settle().unwrap();
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out), Value::new(5, 4));
+
+        // write_enable=0, change data, tick: holds previous value.
+        c.set_input(we, 0, 1);
+        c.set_input(data, 9, 4);
+        c.settle().unwrap();
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out), Value::new(5, 4));
+    }
+
+    #[test]
+    fn test_add_component_input_out_cache_populated_immediately() {
+        let mut c = Circuit::new();
+        let i = c.add_component(Component::input(5, 3));
+        // add_component eagerly evaluates, before any link() or settle().
+        assert_eq!(c.components[i].pins.out_cache[0], Value::new(5, 3));
+    }
+
+    #[test]
+    fn test_link_before_settle_net_value_still_floating() {
+        let mut c = Circuit::new();
+        let i = c.add_component(Component::input(5, 3));
+        let o = c.add_component(Component::output());
+        c.link(i, PinId::output(0), o, PinId::input(0));
+        // out_cache is populated, but the net's own value isn't resolved
+        // until settle() runs resolve_net.
+        assert_eq!(c.read_output(o), Value::Floating);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(5, 3));
+    }
+
+    #[test]
+    fn test_link_extends_existing_net_fan_out() {
+        let mut c = Circuit::new();
+        let i = c.add_component(Component::input(1, 1));
+        let g1 = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let g2 = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+
+        c.link(i, PinId::output(0), g1, PinId::input(0));
+        c.link(i, PinId::output(0), g2, PinId::input(0));
+        c.link(g1, PinId::output(0), o1, PinId::input(0));
+        c.link(g2, PinId::output(0), o2, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0, 1));
+        assert_eq!(c.read_output(o2), Value::new(0, 1));
+    }
+
+    #[test]
+    fn test_link_second_source_overwrites_first() {
+        let mut c = Circuit::new();
+        let i1 = c.add_component(Component::input(1, 1));
+        let i2 = c.add_component(Component::input(0, 1));
+        let g1 = c.add_component(Component::gate(GateOp::Not, 1, 1)); // NOT(1) = 0
+        let g2 = c.add_component(Component::gate(GateOp::Not, 1, 1)); // NOT(0) = 1
+        let o = c.add_component(Component::output());
+
+        c.link(i1, PinId::output(0), g1, PinId::input(0));
+        c.link(i2, PinId::output(0), g2, PinId::input(0));
+
+        c.link(g1, PinId::output(0), o, PinId::input(0));
+        // o's input pin already has a net; this attaches g2 as its source,
+        // silently overwriting g1.
+        c.link(g2, PinId::output(0), o, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_link_idempotent_returns_same_net() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(1, 1));
+        let b = c.add_component(Component::output());
+        let net1 = c.link(a, PinId::output(0), b, PinId::input(0));
+        let net2 = c.link(a, PinId::output(0), b, PinId::input(0));
+        assert_eq!(net1, net2);
+    }
+
+    #[test]
+    fn test_link_merge_keeps_original_source_documents_bug() {
+        // Documents current (unfinished) merge() behavior: when two
+        // already-driven nets are merged, the ORIGINAL net's source silently
+        // wins; the second driver's component is repointed at the merged net
+        // but its value is never read. See merge()'s "TODO: Decide how to
+        // handle competing source". Not necessarily correct, just current.
+        let mut c = Circuit::new();
+        let driver1 = c.add_component(Component::input(1, 1));
+        let driver2 = c.add_component(Component::input(0, 1));
+        let sink1 = c.add_component(Component::output());
+        let sink2 = c.add_component(Component::output());
+
+        c.link(driver1, PinId::output(0), sink1, PinId::input(0)); // net1, source = driver1
+        c.link(driver2, PinId::output(0), sink2, PinId::input(0)); // net2, source = driver2
+                                                                   // Resolve both nets before merging: see
+                                                                   // test_link_merge_of_still_dirty_nets_panics_documents_bug for what
+                                                                   // happens if a merged-away net is still pending in the dirty queue.
+        c.settle().unwrap();
+        assert_eq!(c.read_output(sink1), Value::new(1, 1));
+        assert_eq!(c.read_output(sink2), Value::new(0, 1));
+
+        // Merge net1 and net2 by linking their already-attached input pins.
+        c.link(sink1, PinId::input(0), sink2, PinId::input(0));
+
+        c.settle().unwrap();
+        // Both sinks now share one net; merge() keeps net1's original source
+        // (driver1), even though driver2's output pin was repointed at it.
+        assert_eq!(c.read_output(sink1), Value::new(1, 1));
+        assert_eq!(c.read_output(sink2), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_link_merge_of_still_dirty_nets_removes_stale_key() {
+        let mut c = Circuit::new();
+        let driver1 = c.add_component(Component::input(1, 1));
+        let driver2 = c.add_component(Component::input(0, 1));
+        let sink1 = c.add_component(Component::output());
+        let sink2 = c.add_component(Component::output());
+
+        c.link(driver1, PinId::output(0), sink1, PinId::input(0)); // net1, still dirty
+        c.link(driver2, PinId::output(0), sink2, PinId::input(0)); // net2, still dirty
+                                                                   // Merging while both nets are still unresolved/dirty removes net2
+                                                                   // from the slotmap while it's still queued.
+        c.link(sink1, PinId::input(0), sink2, PinId::input(0));
+
+        c.settle().unwrap(); // stale NetKey should get removed
+    }
+
+    // ---- Group 2: gate truth tables ----
+
+    #[test_case(GateOp::And,  0, 0, 0 ; "and 0 0")]
+    #[test_case(GateOp::And,  0, 1, 0 ; "and 0 1")]
+    #[test_case(GateOp::And,  1, 0, 0 ; "and 1 0")]
+    #[test_case(GateOp::And,  1, 1, 1 ; "and 1 1")]
+    #[test_case(GateOp::Or,   0, 0, 0 ; "or 0 0")]
+    #[test_case(GateOp::Or,   0, 1, 1 ; "or 0 1")]
+    #[test_case(GateOp::Or,   1, 0, 1 ; "or 1 0")]
+    #[test_case(GateOp::Or,   1, 1, 1 ; "or 1 1")]
+    #[test_case(GateOp::Xor,  0, 0, 0 ; "xor 0 0")]
+    #[test_case(GateOp::Xor,  0, 1, 1 ; "xor 0 1")]
+    #[test_case(GateOp::Xor,  1, 0, 1 ; "xor 1 0")]
+    #[test_case(GateOp::Xor,  1, 1, 0 ; "xor 1 1")]
+    #[test_case(GateOp::Xnor, 0, 0, 1 ; "xnor 0 0")]
+    #[test_case(GateOp::Xnor, 0, 1, 0 ; "xnor 0 1")]
+    #[test_case(GateOp::Xnor, 1, 0, 0 ; "xnor 1 0")]
+    #[test_case(GateOp::Xnor, 1, 1, 1 ; "xnor 1 1")]
+    #[test_case(GateOp::Nand, 0, 0, 1 ; "nand 0 0")]
+    #[test_case(GateOp::Nand, 0, 1, 1 ; "nand 0 1")]
+    #[test_case(GateOp::Nand, 1, 0, 1 ; "nand 1 0")]
+    #[test_case(GateOp::Nand, 1, 1, 0 ; "nand 1 1")]
+    #[test_case(GateOp::Nor,  0, 0, 1 ; "nor 0 0")]
+    #[test_case(GateOp::Nor,  0, 1, 0 ; "nor 0 1")]
+    #[test_case(GateOp::Nor,  1, 0, 0 ; "nor 1 0")]
+    #[test_case(GateOp::Nor,  1, 1, 0 ; "nor 1 1")]
+    fn test_gate_binary_truth_table(op: GateOp, av: u32, bv: u32, expected: u32) {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(av, 1));
+        let b = c.add_component(Component::input(bv, 1));
+        let g = c.add_component(Component::gate(op, 2, 1));
+        let o = c.add_component(Component::output());
+        c.link(a, PinId::output(0), g, PinId::input(0));
+        c.link(b, PinId::output(0), g, PinId::input(1));
+        c.link(g, PinId::output(0), o, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(expected, 1));
+    }
+
+    #[test_case(0, 1 ; "not 0")]
+    #[test_case(1, 0 ; "not 1")]
+    fn test_gate_not_truth_table(av: u32, expected: u32) {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(av, 1));
+        let g = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let o = c.add_component(Component::output());
+        c.link(a, PinId::output(0), g, PinId::input(0));
+        c.link(g, PinId::output(0), o, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(expected, 1));
+    }
+
+    #[test]
+    fn test_gate_and_multi_input_fold() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(1, 1));
+        let b = c.add_component(Component::input(1, 1));
+        let d = c.add_component(Component::input(1, 1));
+        let g = c.add_component(Component::gate(GateOp::And, 3, 1));
+        let o = c.add_component(Component::output());
+        c.link(a, PinId::output(0), g, PinId::input(0));
+        c.link(b, PinId::output(0), g, PinId::input(1));
+        c.link(d, PinId::output(0), g, PinId::input(2));
+        c.link(g, PinId::output(0), o, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(1, 1));
+
+        c.set_input(d, 0, 1);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(0, 1));
+    }
+
+    #[test]
+    fn test_gate_or_multi_input_fold() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(0, 1));
+        let b = c.add_component(Component::input(0, 1));
+        let d = c.add_component(Component::input(0, 1));
+        let g = c.add_component(Component::gate(GateOp::Or, 3, 1));
+        let o = c.add_component(Component::output());
+        c.link(a, PinId::output(0), g, PinId::input(0));
+        c.link(b, PinId::output(0), g, PinId::input(1));
+        c.link(d, PinId::output(0), g, PinId::input(2));
+        c.link(g, PinId::output(0), o, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(0, 1));
+
+        c.set_input(d, 1, 1);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_gate_multibit_width() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(0b1100, 4));
+        let b = c.add_component(Component::input(0b1010, 4));
+        let and_g = c.add_component(Component::gate(GateOp::And, 2, 4));
+        let xor_g = c.add_component(Component::gate(GateOp::Xor, 2, 4));
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+        c.link(a, PinId::output(0), and_g, PinId::input(0));
+        c.link(b, PinId::output(0), and_g, PinId::input(1));
+        c.link(a, PinId::output(0), xor_g, PinId::input(0));
+        c.link(b, PinId::output(0), xor_g, PinId::input(1));
+        c.link(and_g, PinId::output(0), o1, PinId::input(0));
+        c.link(xor_g, PinId::output(0), o2, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0b1000, 4));
+        assert_eq!(c.read_output(o2), Value::new(0b0110, 4));
+    }
+
+    #[test]
+    fn test_gate_floating_input_yields_floating_output() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(1, 1));
+        let g = c.add_component(Component::gate(GateOp::And, 2, 1));
+        let o = c.add_component(Component::output());
+        c.link(a, PinId::output(0), g, PinId::input(0));
+        // g's second input pin is left unconnected.
+        c.link(g, PinId::output(0), o, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::Floating);
+    }
+
+    // ---- Group 3: mux / demux edge cases ----
+
+    #[test]
+    fn test_mux_floating_selector_yields_floating_output() {
+        let mut c = Circuit::new();
+        let d0 = c.add_component(Component::input(1, 1));
+        let d1 = c.add_component(Component::input(0, 1));
+        let mux = c.add_component(Component::mux(1, 1));
+        let o = c.add_component(Component::output());
+        // selector (input 0) left unconnected.
+        c.link(d0, PinId::output(0), mux, PinId::input(1));
+        c.link(d1, PinId::output(0), mux, PinId::input(2));
+        c.link(mux, PinId::output(0), o, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::Floating);
+    }
+
+    #[test]
+    fn test_mux_selector_width_mismatch_yields_floating() {
+        let mut c = Circuit::new();
+        let sel = c.add_component(Component::input(0, 1)); // width 1, mux expects sel_width=2
+        let d0 = c.add_component(Component::input(5, 2));
+        let mux = c.add_component(Component::mux(2, 2));
+        let o = c.add_component(Component::output());
+        c.link(sel, PinId::output(0), mux, PinId::input(0));
+        c.link(d0, PinId::output(0), mux, PinId::input(1));
+        c.link(mux, PinId::output(0), o, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::Floating);
+    }
+
+    #[test]
+    fn test_mux_unconnected_data_branch_is_floating() {
+        let mut c = Circuit::new();
+        let sel = c.add_component(Component::input(0, 1)); // selects branch 0
+        let mux = c.add_component(Component::mux(1, 1));
+        let o = c.add_component(Component::output());
+        c.link(sel, PinId::output(0), mux, PinId::input(0));
+        // data branch 0 (input 1) left unconnected.
+        c.link(mux, PinId::output(0), o, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::Floating);
+    }
+
+    #[test]
+    fn test_demux_floating_selector_all_outputs_floating() {
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(1, 1));
+        let demux = c.add_component(Component::demux(1, 2));
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+        let o3 = c.add_component(Component::output());
+        let o4 = c.add_component(Component::output());
+        c.link(data, PinId::output(0), demux, PinId::input(0));
+        // selector (input 1) left unconnected.
+        c.link(demux, PinId::output(0), o1, PinId::input(0));
+        c.link(demux, PinId::output(1), o2, PinId::input(0));
+        c.link(demux, PinId::output(2), o3, PinId::input(0));
+        c.link(demux, PinId::output(3), o4, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::Floating);
+        assert_eq!(c.read_output(o2), Value::Floating);
+        assert_eq!(c.read_output(o3), Value::Floating);
+        assert_eq!(c.read_output(o4), Value::Floating);
+    }
+
+    #[test]
+    fn test_demux_selector_width_mismatch_all_outputs_floating() {
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(1, 1));
+        let sel = c.add_component(Component::input(0, 1)); // width 1, demux expects sel_width=2
+        let demux = c.add_component(Component::demux(1, 2));
+        let o1 = c.add_component(Component::output());
+        c.link(data, PinId::output(0), demux, PinId::input(0));
+        c.link(sel, PinId::output(0), demux, PinId::input(1));
+        c.link(demux, PinId::output(0), o1, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::Floating);
+    }
+
+    #[test]
+    fn test_demux_unselected_branches_are_zero_not_floating() {
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(0b1111, 4));
+        let sel = c.add_component(Component::input(1, 2));
+        let demux = c.add_component(Component::demux(4, 2));
+        let o0 = c.add_component(Component::output());
+        let o1 = c.add_component(Component::output());
+        c.link(data, PinId::output(0), demux, PinId::input(0));
+        c.link(sel, PinId::output(0), demux, PinId::input(1));
+        c.link(demux, PinId::output(0), o0, PinId::input(0));
+        c.link(demux, PinId::output(1), o1, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o0), Value::new(0, 4)); // unselected: zero, not Floating
+        assert_eq!(c.read_output(o1), Value::new(0b1111, 4)); // selected: data verbatim
+    }
+
+    #[test]
+    fn test_demux_data_width_mismatch_passes_through_verbatim() {
+        // Documents current lenient/unvalidated behavior: demux does not
+        // check that the data input's width matches data_width (see the
+        // "TODO: check data_width?" in Component::evaluate).
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(3, 2)); // width 2, demux built with data_width=1
+        let sel = c.add_component(Component::input(0, 1));
+        let demux = c.add_component(Component::demux(1, 1));
+        let o0 = c.add_component(Component::output());
+        c.link(data, PinId::output(0), demux, PinId::input(0));
+        c.link(sel, PinId::output(0), demux, PinId::input(1));
+        c.link(demux, PinId::output(0), o0, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o0), Value::new(3, 2));
+    }
+
+    // ---- Group 4: propagation / settle behavior ----
+
+    #[test]
+    fn test_settle_layered_propagation() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(1, 1));
+        let b = c.add_component(Component::input(1, 1));
+        let and_g = c.add_component(Component::gate(GateOp::And, 2, 1));
+        let not_g = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let o = c.add_component(Component::output());
+        c.link(a, PinId::output(0), and_g, PinId::input(0));
+        c.link(b, PinId::output(0), and_g, PinId::input(1));
+        c.link(and_g, PinId::output(0), not_g, PinId::input(0));
+        c.link(not_g, PinId::output(0), o, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(0, 1)); // NOT(1 AND 1) = 0
+    }
+
+    #[test]
+    fn test_settle_idempotent_when_no_dirty_nets() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(1, 1));
+        let o = c.add_component(Component::output());
+        c.link(a, PinId::output(0), o, PinId::input(0));
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(1, 1));
+        c.settle().unwrap(); // nothing dirty; must be a no-op
+        assert_eq!(c.read_output(o), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_settle_self_loop_stabilizes_to_floating() {
+        let mut c = Circuit::new();
+        let g = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let o = c.add_component(Component::output());
+        c.link(g, PinId::output(0), g, PinId::input(0)); // self-feedback
+        c.link(g, PinId::output(0), o, PinId::input(0));
+
+        c.settle().unwrap(); // must not panic
+        assert_eq!(c.read_output(o), Value::Floating);
+    }
+
+    #[test]
+    fn test_settle_long_acyclic_chain_settles_successfully() {
+        // Regression test: settle() used to count total net-pops within one
+        // call rather than per-net revisits, so a sufficiently deep but
+        // fully acyclic chain would falsely trip the old MAX_ITERATIONS
+        // panic. With per-net revisit tracking, no net here is ever
+        // revisited (each resolves exactly once), so this succeeds
+        // regardless of chain length.
+        let mut c = Circuit::new();
+        let input = c.add_component(Component::input(1, 1));
+        let mut prev = input;
+        for _ in 0..105 {
+            let g = c.add_component(Component::gate(GateOp::Not, 1, 1));
+            c.link(prev, PinId::output(0), g, PinId::input(0));
+            prev = g;
+        }
+        assert!(c.settle().is_ok());
+    }
+
+    #[test]
+    fn test_settle_ring_oscillator_reports_non_convergence() {
+        let mut c = Circuit::new();
+        let seed = c.add_component(Component::input(0, 1));
+        let n1 = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let n2 = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let n3 = c.add_component(Component::gate(GateOp::Not, 1, 1));
+
+        c.link(seed, PinId::output(0), n1, PinId::input(0));
+        c.link(n1, PinId::output(0), n2, PinId::input(0));
+        c.link(n2, PinId::output(0), n3, PinId::input(0));
+        c.settle().unwrap(); // seeds n1/n2/n3 with concrete alternating values, no loop yet
+
+        // Close the loop: n3's output overwrites n1's input net's source
+        // (last-link-wins, see test_link_second_source_overwrites_first),
+        // injecting a stale concrete value into what is now a genuine
+        // feedback cycle.
+        c.link(n3, PinId::output(0), n1, PinId::input(0));
+        // Toggles forever: the same net keeps crossing REVISIT_THRESHOLD,
+        // reported as a clean Err instead of a panic.
+        assert!(c.settle().is_err());
+    }
+
+    // ---- Group 5: register / clock behavior ----
+
+    #[test]
+    fn test_reg_initial_value_before_any_tick() {
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(9, 4));
+        let we = c.add_component(Component::input(1, 1));
+        let reg = c.add_component(Component::reg(4));
+        let out = c.add_component(Component::output());
+        c.link(data, PinId::output(0), reg, PinId::input(0));
+        c.link(we, PinId::output(0), reg, PinId::input(1));
+        c.link(reg, PinId::output(0), out, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(0, 4));
+    }
+
+    #[test]
+    fn test_reg_settle_never_latches_only_tick_does() {
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(0, 4));
+        let we = c.add_component(Component::input(1, 1));
+        let reg = c.add_component(Component::reg(4));
+        let out = c.add_component(Component::output());
+        c.link(data, PinId::output(0), reg, PinId::input(0));
+        c.link(we, PinId::output(0), reg, PinId::input(1));
+        c.link(reg, PinId::output(0), out, PinId::input(0));
+        c.settle().unwrap();
+
+        for v in [1, 2, 3, 4] {
+            c.set_input(data, v, 4);
+            c.settle().unwrap();
+            assert_eq!(c.read_output(out), Value::new(0, 4)); // settle() never ticks
+        }
+    }
+
+    #[test_case(None ; "write_enable floating (unconnected)")]
+    #[test_case(Some((1, 2)) ; "write_enable wrong width (bits=1, width=2)")]
+    #[test_case(Some((0, 1)) ; "write_enable exactly zero")]
+    fn test_reg_write_enable_non_latching_cases(we_input: Option<(u32, u8)>) {
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(7, 4));
+        let reg = c.add_component(Component::reg(4));
+        let out = c.add_component(Component::output());
+        c.link(data, PinId::output(0), reg, PinId::input(0));
+        if let Some((bits, width)) = we_input {
+            let we = c.add_component(Component::input(bits, width));
+            c.link(we, PinId::output(0), reg, PinId::input(1));
+        }
+        // Otherwise write_enable (input 1) is left unconnected -> Floating.
+        c.link(reg, PinId::output(0), out, PinId::input(0));
+
+        c.settle().unwrap();
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out), Value::new(0, 4));
+    }
+
+    #[test]
+    fn test_reg_multi_tick_sequence() {
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(0, 4));
+        let we = c.add_component(Component::input(0, 1));
+        let reg = c.add_component(Component::reg(4));
+        let out = c.add_component(Component::output());
+        c.link(data, PinId::output(0), reg, PinId::input(0));
+        c.link(we, PinId::output(0), reg, PinId::input(1));
+        c.link(reg, PinId::output(0), out, PinId::input(0));
+        c.settle().unwrap();
+
+        // tick 1: we=1, data=3 -> latches 3.
+        c.set_input(we, 1, 1);
+        c.set_input(data, 3, 4);
+        c.settle().unwrap();
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out), Value::new(3, 4));
+
+        // tick 2: we=0, data=9 -> holds 3.
+        c.set_input(we, 0, 1);
+        c.set_input(data, 9, 4);
+        c.settle().unwrap();
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out), Value::new(3, 4));
+
+        // tick 3: we=1, data=9 -> latches 9.
+        c.set_input(we, 1, 1);
+        c.settle().unwrap();
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out), Value::new(9, 4));
+    }
+
+    #[test]
+    fn test_reg_output_feeds_combinational_logic_after_tick() {
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(0, 1));
+        let we = c.add_component(Component::input(1, 1));
+        let reg = c.add_component(Component::reg(1));
+        let not_g = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let out = c.add_component(Component::output());
+        c.link(data, PinId::output(0), reg, PinId::input(0));
+        c.link(we, PinId::output(0), reg, PinId::input(1));
+        c.link(reg, PinId::output(0), not_g, PinId::input(0));
+        c.link(not_g, PinId::output(0), out, PinId::input(0));
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(1, 1)); // NOT(0) = 1
+
+        c.set_input(data, 1, 1);
+        c.settle().unwrap();
+        c.tick_clock().unwrap(); // latches 1; trailing settle() propagates through not_g
+        assert_eq!(c.read_output(out), Value::new(0, 1)); // NOT(1) = 0
+    }
+
+    #[test]
+    fn test_tick_clock_multiple_independent_regs() {
+        let mut c = Circuit::new();
+        let data1 = c.add_component(Component::input(5, 4));
+        let we1 = c.add_component(Component::input(1, 1));
+        let reg1 = c.add_component(Component::reg(4));
+        let out1 = c.add_component(Component::output());
+
+        let data2 = c.add_component(Component::input(9, 4));
+        let we2 = c.add_component(Component::input(0, 1));
+        let reg2 = c.add_component(Component::reg(4));
+        let out2 = c.add_component(Component::output());
+
+        c.link(data1, PinId::output(0), reg1, PinId::input(0));
+        c.link(we1, PinId::output(0), reg1, PinId::input(1));
+        c.link(reg1, PinId::output(0), out1, PinId::input(0));
+
+        c.link(data2, PinId::output(0), reg2, PinId::input(0));
+        c.link(we2, PinId::output(0), reg2, PinId::input(1));
+        c.link(reg2, PinId::output(0), out2, PinId::input(0));
+
+        c.settle().unwrap();
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out1), Value::new(5, 4)); // we1=1, latches
+        assert_eq!(c.read_output(out2), Value::new(0, 4)); // we2=0, holds initial
+    }
+
+    #[test]
+    fn test_tick_clock_snapshot_semantics_chained_registers() {
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(5, 4));
+        let we1 = c.add_component(Component::input(1, 1));
+        let we2 = c.add_component(Component::input(1, 1));
+        let reg1 = c.add_component(Component::reg(4));
+        let reg2 = c.add_component(Component::reg(4));
+        let out2 = c.add_component(Component::output());
+
+        c.link(data, PinId::output(0), reg1, PinId::input(0));
+        c.link(we1, PinId::output(0), reg1, PinId::input(1));
+        c.link(reg1, PinId::output(0), reg2, PinId::input(0));
+        c.link(we2, PinId::output(0), reg2, PinId::input(1));
+        c.link(reg2, PinId::output(0), out2, PinId::input(0));
+        c.settle().unwrap();
+
+        // tick 1: reg1 latches 5, but reg2 sees reg1's OLD value (0), since
+        // tick_clock snapshots all sequential inputs before mutating.
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out2), Value::new(0, 4));
+
+        // tick 2: reg2 now latches what reg1 captured during tick 1.
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out2), Value::new(5, 4));
+    }
+
+    #[test]
+    fn test_tick_clock_noop_with_no_sequential_components() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(1, 1));
+        let b = c.add_component(Component::input(0, 1));
+        let g = c.add_component(Component::gate(GateOp::Or, 2, 1));
+        let o = c.add_component(Component::output());
+        c.link(a, PinId::output(0), g, PinId::input(0));
+        c.link(b, PinId::output(0), g, PinId::input(1));
+        c.link(g, PinId::output(0), o, PinId::input(0));
+
+        c.settle().unwrap();
+        c.tick_clock().unwrap(); // no sequential components; behaves like settle()
+        assert_eq!(c.read_output(o), Value::new(1, 1));
+    }
+
+    // ---- Group 6: structural operations ----
+
+    #[test]
+    fn test_clear_nets_resets_all_wiring() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(1, 1));
+        let b = c.add_component(Component::input(0, 1));
+        let and_g = c.add_component(Component::gate(GateOp::And, 2, 1));
+        let or_g = c.add_component(Component::gate(GateOp::Or, 2, 1));
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+        c.link(a, PinId::output(0), and_g, PinId::input(0));
+        c.link(b, PinId::output(0), and_g, PinId::input(1));
+        c.link(a, PinId::output(0), or_g, PinId::input(0));
+        c.link(b, PinId::output(0), or_g, PinId::input(1));
+        c.link(and_g, PinId::output(0), o1, PinId::input(0));
+        c.link(or_g, PinId::output(0), o2, PinId::input(0));
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0, 1));
+        assert_eq!(c.read_output(o2), Value::new(1, 1));
+
+        c.clear_nets();
+        assert_eq!(c.read_output(o1), Value::Floating);
+        assert_eq!(c.read_output(o2), Value::Floating);
+    }
+
+    #[test]
+    fn test_clear_nets_then_relink_same_components_works() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(1, 1));
+        let b = c.add_component(Component::input(1, 1));
+        let g = c.add_component(Component::gate(GateOp::And, 2, 1));
+        let o = c.add_component(Component::output());
+        c.link(a, PinId::output(0), g, PinId::input(0));
+        c.link(b, PinId::output(0), g, PinId::input(1));
+        c.link(g, PinId::output(0), o, PinId::input(0));
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(1, 1));
+
+        c.clear_nets();
+        c.set_input(a, 0, 1);
+        c.link(a, PinId::output(0), g, PinId::input(0));
+        c.link(b, PinId::output(0), g, PinId::input(1));
+        c.link(g, PinId::output(0), o, PinId::input(0));
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(0, 1));
+    }
+
+    #[test]
+    fn test_remove_component_nulls_direct_sink_input_pins() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(1, 1));
+        let g = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let o = c.add_component(Component::output());
+        c.link(a, PinId::output(0), g, PinId::input(0));
+        c.link(g, PinId::output(0), o, PinId::input(0));
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(0, 1));
+
+        c.remove_component(g);
+        assert_eq!(c.read_output(o), Value::Floating);
+    }
+
+    #[test]
+    fn test_remove_component_preserves_net_for_other_sinks() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(1, 1));
+        let g1 = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let g2 = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let o2 = c.add_component(Component::output());
+        c.link(a, PinId::output(0), g1, PinId::input(0));
+        c.link(a, PinId::output(0), g2, PinId::input(0));
+        c.link(g2, PinId::output(0), o2, PinId::input(0));
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o2), Value::new(0, 1));
+
+        c.remove_component(g1); // g1 only reads from a's net
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o2), Value::new(0, 1));
+    }
+
+    #[test]
+    fn test_remove_component_leaves_downstream_out_cache_stale() {
+        // Documents a gap between remove_component's doc comment ("the
+        // caller is expected to call settle() after") and actual behavior:
+        // only the directly-adjacent sink's input pin is nulled
+        // synchronously; nothing is marked dirty, and dirty/queued are
+        // unconditionally cleared. A subsequent settle() call is therefore a
+        // no-op and cannot refresh out_cache/output values more than one hop
+        // downstream of the removal.
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(1, 1));
+        let g1 = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let g2 = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let o = c.add_component(Component::output());
+        c.link(a, PinId::output(0), g1, PinId::input(0));
+        c.link(g1, PinId::output(0), g2, PinId::input(0));
+        c.link(g2, PinId::output(0), o, PinId::input(0));
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(1, 1)); // NOT(NOT(1)) = 1
+
+        c.remove_component(g1);
+        c.settle().unwrap(); // documented as sufficient, but is actually a no-op here
+
+        // g2's input pin was nulled (would read Floating if re-evaluated),
+        // but g2's out_cache still holds its stale pre-removal value, and
+        // settle() never re-dirtied anything to refresh it.
+        assert_eq!(c.read_output(o), Value::new(1, 1)); // stale: unchanged
+    }
+
+    // ---- Group 7: error / edge-case behavior ----
+
+    #[test]
+    #[should_panic]
+    fn test_read_output_on_input_component_panics() {
+        let mut c = Circuit::new();
+        let i = c.add_component(Component::input(1, 1));
+        let _ = c.read_output(i); // Input has 0 input pins; indexes out of bounds
+    }
+
+    #[test]
+    fn test_set_input_on_gate_is_silent_noop() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(1, 1));
+        let b = c.add_component(Component::input(1, 1));
+        let g = c.add_component(Component::gate(GateOp::And, 2, 1));
+        let o = c.add_component(Component::output());
+        c.link(a, PinId::output(0), g, PinId::input(0));
+        c.link(b, PinId::output(0), g, PinId::input(1));
+        c.link(g, PinId::output(0), o, PinId::input(0));
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(1, 1));
+
+        c.set_input(g, 99, 4); // g is a Gate, not an Input; silently no-ops
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::new(1, 1)); // unaffected
     }
 }

@@ -204,6 +204,7 @@ pub struct OsmilogApp {
     pub mode: InteractionMode,
     pub pan: Vec2,
     pub selected: Option<CompKey>,
+    pub last_settle_error: Option<String>,
 }
 
 impl OsmilogApp {
@@ -215,6 +216,14 @@ impl OsmilogApp {
             mode: InteractionMode::Idle,
             pan: Vec2::ZERO,
             selected: None,
+            last_settle_error: None,
+        }
+    }
+
+    fn record_settle_result<T>(&mut self, result: Result<T, crate::circuit::SettleError>) {
+        match result {
+            Ok(_) => self.last_settle_error = None,
+            Err(e) => self.last_settle_error = Some(e.to_string()),
         }
     }
 
@@ -457,7 +466,8 @@ impl OsmilogApp {
             });
         }
 
-        self.circuit.settle();
+        let result = self.circuit.settle();
+        self.record_settle_result(result);
         self.selected = Some(new_key);
     }
 }
@@ -538,7 +548,11 @@ impl eframe::App for OsmilogApp {
                 });
             });
             if ui.button("Tick Clock").clicked() {
-                self.circuit.tick_clock();
+                let result = self.circuit.tick_clock();
+                self.record_settle_result(result);
+            }
+            if let Some(err) = &self.last_settle_error {
+                ui.colored_label(Color32::RED, err);
             }
         });
 
@@ -698,7 +712,8 @@ impl eframe::App for OsmilogApp {
                                     dst_comp,
                                     PinId::input(in_idx.0),
                                 );
-                                self.circuit.settle();
+                                let result = self.circuit.settle();
+                                self.record_settle_result(result);
                                 self.wires.push(Wire {
                                     net_key: net,
                                     src_comp,
