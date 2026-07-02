@@ -687,6 +687,214 @@ mod tests {
     }
 
     #[test]
+    fn test_splitter_contiguous_halves() {
+        // 4-bit bus split into two 2-bit arms: bits [0,1] -> arm0, bits [2,3] -> arm1.
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(0, 4));
+        let splitter = c.add_component(Component::splitter(vec![vec![0, 1], vec![2, 3]]));
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+
+        c.link(data, PinId::output(0), splitter, PinId::input(0));
+        c.link(splitter, PinId::output(0), o1, PinId::input(0));
+        c.link(splitter, PinId::output(1), o2, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0, 2));
+        assert_eq!(c.read_output(o2), Value::new(0, 2));
+
+        c.set_input(data, 0b0001, 4);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(1, 2));
+        assert_eq!(c.read_output(o2), Value::new(0, 2));
+
+        c.set_input(data, 0b0100, 4);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0, 2));
+        assert_eq!(c.read_output(o2), Value::new(1, 2));
+
+        c.set_input(data, 0b1111, 4);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(3, 2));
+        assert_eq!(c.read_output(o2), Value::new(3, 2));
+    }
+
+    #[test]
+    fn test_splitter_interleaved() {
+        // 4-bit bus, even bits (0,2) -> arm0, odd bits (1,3) -> arm1.
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(0, 4));
+        let splitter = c.add_component(Component::splitter(vec![vec![0, 2], vec![1, 3]]));
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+
+        c.link(data, PinId::output(0), splitter, PinId::input(0));
+        c.link(splitter, PinId::output(0), o1, PinId::input(0));
+        c.link(splitter, PinId::output(1), o2, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0, 2));
+        assert_eq!(c.read_output(o2), Value::new(0, 2));
+
+        c.set_input(data, 0b0100, 4); // bit2 (even) -> arm0 pos1
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(2, 2));
+        assert_eq!(c.read_output(o2), Value::new(0, 2));
+
+        c.set_input(data, 0b1000, 4); // bit3 (odd) -> arm1 pos1
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0, 2));
+        assert_eq!(c.read_output(o2), Value::new(2, 2));
+
+        c.set_input(data, 0b1010, 4); // bits 1,3 -> arm1 full
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0, 2));
+        assert_eq!(c.read_output(o2), Value::new(3, 2));
+
+        c.set_input(data, 0b1111, 4);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(3, 2));
+        assert_eq!(c.read_output(o2), Value::new(3, 2));
+    }
+
+    #[test]
+    fn test_splitter_full_spread() {
+        // Each of the 4 bits fans out to its own dedicated 1-bit arm.
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(0, 4));
+        let splitter = c.add_component(Component::splitter(vec![
+            vec![0],
+            vec![1],
+            vec![2],
+            vec![3],
+        ]));
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+        let o3 = c.add_component(Component::output());
+        let o4 = c.add_component(Component::output());
+
+        c.link(data, PinId::output(0), splitter, PinId::input(0));
+        c.link(splitter, PinId::output(0), o1, PinId::input(0));
+        c.link(splitter, PinId::output(1), o2, PinId::input(0));
+        c.link(splitter, PinId::output(2), o3, PinId::input(0));
+        c.link(splitter, PinId::output(3), o4, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0, 1));
+        assert_eq!(c.read_output(o2), Value::new(0, 1));
+        assert_eq!(c.read_output(o3), Value::new(0, 1));
+        assert_eq!(c.read_output(o4), Value::new(0, 1));
+
+        c.set_input(data, 0b0100, 4);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0, 1));
+        assert_eq!(c.read_output(o2), Value::new(0, 1));
+        assert_eq!(c.read_output(o3), Value::new(1, 1));
+        assert_eq!(c.read_output(o4), Value::new(0, 1));
+
+        c.set_input(data, 0b1111, 4);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(1, 1));
+        assert_eq!(c.read_output(o2), Value::new(1, 1));
+        assert_eq!(c.read_output(o3), Value::new(1, 1));
+        assert_eq!(c.read_output(o4), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_splitter_floating_input_propagates_to_all_arms() {
+        let mut c = Circuit::new();
+        // Splitter's input pin is left unconnected, so it reads as Floating.
+        let splitter = c.add_component(Component::splitter(vec![vec![0], vec![1], vec![2]]));
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+        let o3 = c.add_component(Component::output());
+
+        c.link(splitter, PinId::output(0), o1, PinId::input(0));
+        c.link(splitter, PinId::output(1), o2, PinId::input(0));
+        c.link(splitter, PinId::output(2), o3, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::Floating);
+        assert_eq!(c.read_output(o2), Value::Floating);
+        assert_eq!(c.read_output(o3), Value::Floating);
+    }
+
+    #[test]
+    fn test_splitter_zero_arms_produces_empty_output() {
+        let mut c = Circuit::new();
+        let splitter = c.add_component(Component::splitter(vec![]));
+        assert!(c.components[splitter].pins.out_cache.is_empty());
+    }
+
+    #[test]
+    fn test_splitter_arm_with_no_mapped_bits_is_zero_width() {
+        // arm 2 is listed with no bits, so it should receive nothing.
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(0b11, 2));
+        let splitter = c.add_component(Component::splitter(vec![vec![0], vec![1], vec![]]));
+        let o3 = c.add_component(Component::output());
+
+        c.link(data, PinId::output(0), splitter, PinId::input(0));
+        c.link(splitter, PinId::output(2), o3, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o3), Value::new(0, 0));
+    }
+
+    #[test]
+    fn test_splitter_unrouted_high_bits_of_wider_input_are_ignored() {
+        // arm_bits only covers the low 2 bits of a 4-bit input value; the
+        // upper bits (2,3) are unrouted and should have no effect on any arm.
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(0b1101, 4));
+        let splitter = c.add_component(Component::splitter(vec![vec![0], vec![1]]));
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+
+        c.link(data, PinId::output(0), splitter, PinId::input(0));
+        c.link(splitter, PinId::output(0), o1, PinId::input(0));
+        c.link(splitter, PinId::output(1), o2, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(1, 1));
+        assert_eq!(c.read_output(o2), Value::new(0, 1));
+    }
+
+    #[test]
+    fn test_splitter_bit_claimed_by_multiple_arms_last_arm_wins() {
+        // bit1 is listed under both arm0 and arm1; arm_bits is processed in
+        // order, so the later arm (arm1) should end up owning it, not arm0.
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(0, 2));
+        let splitter = c.add_component(Component::splitter(vec![vec![0, 1], vec![1]]));
+        let o1 = c.add_component(Component::output());
+        let o2 = c.add_component(Component::output());
+
+        c.link(data, PinId::output(0), splitter, PinId::input(0));
+        c.link(splitter, PinId::output(0), o1, PinId::input(0));
+        c.link(splitter, PinId::output(1), o2, PinId::input(0));
+
+        c.set_input(data, 0b01, 2); // bit0 set, bit1 clear
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(1, 1));
+        assert_eq!(c.read_output(o2), Value::new(0, 1));
+
+        c.set_input(data, 0b10, 2); // bit0 clear, bit1 set
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o1), Value::new(0, 1));
+        assert_eq!(c.read_output(o2), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_splitter_data_width_derived_from_arm_bits() {
+        let comp = Component::splitter(vec![vec![0, 2], vec![1]]);
+        match &comp.logic {
+            Logic::Comb(LogicComb::Splitter(s)) => assert_eq!(s.data_width(), 3),
+            _ => panic!("expected Splitter logic"),
+        }
+    }
+
+    #[test]
     fn test_reg() {
         let mut c = Circuit::new();
 

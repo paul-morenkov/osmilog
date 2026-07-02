@@ -9,6 +9,18 @@ pub const GRID_SIZE: f32 = 20.0;
 pub const COMP_WIDTH: f32 = 40.0;
 pub const COMP_MIN_HEIGHT: f32 = 30.0;
 const COMP_HEIGHT_PER_PIN: f32 = 10.0;
+// Splitter doesn't compute anything - it just re-routes bits - so it's drawn
+// much narrower than other components to read as a connector rather than a
+// processing block. See splitter_shape() for the comb-shaped body this pairs
+// with.
+const SPLITTER_WIDTH: f32 = 20.0;
+// Normalized x-band (relative to SPLITTER_WIDTH) of the splitter's thin
+// "spine" rectangle; the comb's trunk/teeth strokes extend from here out to
+// x=0.0/x=1.0 to reach the pins. Kept narrow (a thin rod, not a block) so
+// most of SPLITTER_WIDTH is free for trunk/tooth length - each side needs to
+// clear the ~3px pin dot radius drawn at its far end, plus some margin, or
+// the teeth end up fully hidden under the pin dots.
+const SPLITTER_BODY_X: (f32, f32) = (0.25, 0.60);
 
 pub fn snap_to_grid(pos: Pos2, pan: Vec2) -> [i32; 2] {
     [
@@ -105,6 +117,13 @@ pub const fn mux_size(sel_width: u8) -> Vec2 {
 
 pub const fn demux_size(sel_width: u8) -> Vec2 {
     mux_size(sel_width) // same branches+1 formula
+}
+
+pub const fn splitter_size(arms: u8) -> Vec2 {
+    vec2(
+        SPLITTER_WIDTH,
+        ((arms as usize + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT),
+    )
 }
 
 pub const fn reg_size() -> Vec2 {
@@ -245,6 +264,58 @@ pub fn demux_shape(sel_width: u8) -> ComponentShape {
         output_anchors,
         extra_strokes: vec![],
         output_bubbles: vec![false; branches],
+        labels: vec![],
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+pub fn splitter_shape(arms: u8) -> ComponentShape {
+    let n = arms as usize;
+    let h = splitter_size(arms).y;
+    let (x0, x1) = SPLITTER_BODY_X;
+
+    // Thin rectangular "spine" - kept convex so it needs no separate
+    // fill_outline, unlike the comb shape a full concave outline would need.
+    let outline = vec![
+        ShapeCmd::MoveTo(vec2(x0, 0.0)),
+        ShapeCmd::LineTo(vec2(x1, 0.0)),
+        ShapeCmd::LineTo(vec2(x1, 1.0)),
+        ShapeCmd::LineTo(vec2(x0, 1.0)),
+    ];
+
+    // arm 0's tooth sits at the smallest y (spaced() grows with i), i.e. the
+    // top. The data pin lines up with it rather than sitting at mid-height,
+    // so the shape itself communicates "arm 0 is the near/top one, arm N-1
+    // is the far/bottom one" instead of leaving that ambiguous.
+    let data_y = spaced(0, n.max(1));
+
+    // One trunk line from the data pin into the spine, then one tooth line
+    // per arm fanning out from the spine to that arm's pin - drawn past the
+    // spine's own edges to form the comb, rather than baking the fan into
+    // the (concave) outline itself.
+    let trunk = vec![
+        ShapeCmd::MoveTo(vec2(0.0, data_y)),
+        ShapeCmd::LineTo(vec2(x0, data_y)),
+    ];
+    let teeth = (0..n).map(|i| {
+        let y = spaced(i, n);
+        vec![
+            ShapeCmd::MoveTo(vec2(x1, y)),
+            ShapeCmd::LineTo(vec2(1.0, y)),
+        ]
+    });
+    let extra_strokes = std::iter::once(trunk).chain(teeth).collect();
+
+    let output_anchors = (0..n).map(|i| PinAnchor::right(spaced(i, n))).collect();
+
+    ComponentShape {
+        size: vec2(SPLITTER_WIDTH, h),
+        outline,
+        fill_outline: None,
+        input_anchors: vec![PinAnchor::left(data_y)],
+        output_anchors,
+        extra_strokes,
+        output_bubbles: vec![false; n],
         labels: vec![],
         dynamic_label_pos: Vec2::ZERO,
     }

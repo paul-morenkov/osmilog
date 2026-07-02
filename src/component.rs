@@ -64,15 +64,28 @@ impl Component {
         }
     }
 
-    pub fn splitter(data_width: u8, arms: u8, in_out_map: Vec<u8>) -> Self {
-        // FIXME: Decide how to pass `in_out_map` in to maximize correctness.
+    // arm_bits[j] lists the data-bit indices routed to arm j, e.g.
+    // arm_bits = [[0, 2], [1, 3]] sends bits 0,2 to arm0 and bits 1,3 to arm1.
+    // Arm indices are just positions in `arm_bits`, so an out-of-range arm
+    // reference isn't representable. If a bit index is listed in more than one
+    // arm, the later arm (by position in `arm_bits`) wins.
+    pub fn splitter(arm_bits: Vec<Vec<u8>>) -> Self {
+        let arms = arm_bits.len() as u8;
+        let width = arm_bits
+            .iter()
+            .flatten()
+            .map(|&bit| bit + 1)
+            .max()
+            .unwrap_or(0);
+        let mut in_out_map = vec![None; width as usize];
+        for (arm, bits) in arm_bits.into_iter().enumerate() {
+            for bit in bits {
+                in_out_map[bit as usize] = Some(arm as u8);
+            }
+        }
         Self {
             pins: Pins::new(1, arms as usize),
-            logic: Logic::Comb(LogicComb::Splitter(Splitter {
-                data_width,
-                arms,
-                in_out_map,
-            })),
+            logic: Logic::Comb(LogicComb::Splitter(Splitter { arms, in_out_map })),
         }
     }
 
@@ -185,7 +198,7 @@ impl Component {
                             let mut out_bits = 0;
                             let mut out_width = 0;
                             for (data_i, &arm) in s.in_out_map.iter().enumerate() {
-                                if arm == out_arm {
+                                if arm == Some(out_arm) {
                                     let is_set = bits & (1 << data_i) > 0;
                                     if is_set {
                                         out_bits |= 1 << out_width;
@@ -332,124 +345,15 @@ pub enum GateOp {
 
 #[derive(Debug)]
 pub struct Splitter {
-    pub data_width: u8,
-    pub arms: u8,
-    pub in_out_map: Vec<u8>, // in_out_map[i] = j => The i'th bit of data goes to arm j
+    arms: u8,
+    // in_out_map[i] = Some(j) => the i'th bit of data goes to arm j; None => unrouted.
+    // Only constructible via Component::splitter(), which builds this from an
+    // arm-major Vec<Vec<u8>> so every arm index here is guaranteed valid.
+    in_out_map: Vec<Option<u8>>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use test_case::test_case;
-
-    // Directly drives Component::evaluate() with a single input net, bypassing
-    // Circuit/settle(). Splitter is purely combinational and only reads input[0],
-    // so this is enough to exercise the logic in isolation.
-    fn splitter_outputs(input: Value, arms: u8, in_out_map: Vec<u8>) -> Vec<Value> {
-        let mut nets: SlotMap<NetKey, Net> = SlotMap::with_key();
-        let net = nets.insert(Net {
-            value: input,
-            ..Default::default()
-        });
-        let data_width = in_out_map.len() as u8;
-        let mut splitter = Component::splitter(data_width, arms, in_out_map);
-        splitter.set_pin_net(PinId::input(0), net);
-        splitter.evaluate(&nets)
-    }
-
-    // ---- Group 1: contiguous split (low half / high half of a 4-bit bus) ----
-
-    #[test_case(0b0000, vec![0, 0] ; "0000")]
-    #[test_case(0b0001, vec![1, 0] ; "0001 -> low bit0")]
-    #[test_case(0b0010, vec![2, 0] ; "0010 -> low bit1")]
-    #[test_case(0b0011, vec![3, 0] ; "0011 -> low half full")]
-    #[test_case(0b0100, vec![0, 1] ; "0100 -> high bit0")]
-    #[test_case(0b1000, vec![0, 2] ; "1000 -> high bit1")]
-    #[test_case(0b1100, vec![0, 3] ; "1100 -> high half full")]
-    #[test_case(0b1111, vec![3, 3] ; "1111 -> both halves full")]
-    fn test_splitter_contiguous_halves(data: u32, expected: Vec<u32>) {
-        // 4-bit bus split into two 2-bit arms: bits [0,1] -> arm0, bits [2,3] -> arm1.
-        let out = splitter_outputs(Value::new(data, 4), 2, vec![0, 0, 1, 1]);
-        assert_eq!(
-            out,
-            vec![Value::new(expected[0], 2), Value::new(expected[1], 2)]
-        );
-    }
-
-    // ---- Group 2: interleaved split (even bits -> arm0, odd bits -> arm1) ----
-
-    #[test_case(0b0000, vec![0, 0] ; "0000")]
-    #[test_case(0b0001, vec![1, 0] ; "bit0 (even) -> arm0 pos0")]
-    #[test_case(0b0100, vec![2, 0] ; "bit2 (even) -> arm0 pos1")]
-    #[test_case(0b0010, vec![0, 1] ; "bit1 (odd) -> arm1 pos0")]
-    #[test_case(0b1000, vec![0, 2] ; "bit3 (odd) -> arm1 pos1")]
-    #[test_case(0b1010, vec![0, 3] ; "bits1,3 -> arm1 full")]
-    #[test_case(0b1111, vec![3, 3] ; "all bits set")]
-    fn test_splitter_interleaved(data: u32, expected: Vec<u32>) {
-        // 4-bit bus, even bits (0,2) -> arm0, odd bits (1,3) -> arm1.
-        let out = splitter_outputs(Value::new(data, 4), 2, vec![0, 1, 0, 1]);
-        assert_eq!(
-            out,
-            vec![Value::new(expected[0], 2), Value::new(expected[1], 2)]
-        );
-    }
-
-    // ---- Group 3: full spread (every bit routed to its own single-bit arm) ----
-
-    #[test_case(0b0000, vec![0, 0, 0, 0] ; "all zero")]
-    #[test_case(0b0001, vec![1, 0, 0, 0] ; "bit0 set")]
-    #[test_case(0b0010, vec![0, 1, 0, 0] ; "bit1 set")]
-    #[test_case(0b0100, vec![0, 0, 1, 0] ; "bit2 set")]
-    #[test_case(0b1000, vec![0, 0, 0, 1] ; "bit3 set")]
-    #[test_case(0b1111, vec![1, 1, 1, 1] ; "all bits set")]
-    fn test_splitter_full_spread(data: u32, expected: Vec<u32>) {
-        // Each of the 4 bits fans out to its own dedicated 1-bit arm.
-        let out = splitter_outputs(Value::new(data, 4), 4, vec![0, 1, 2, 3]);
-        assert_eq!(
-            out,
-            expected
-                .into_iter()
-                .map(|b| Value::new(b, 1))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    // ---- Group 4: edge cases ----
-
-    #[test]
-    fn test_splitter_floating_input_propagates_to_all_arms() {
-        let out = splitter_outputs(Value::Floating, 3, vec![0, 1, 2]);
-        assert_eq!(out, vec![Value::Floating; 3]);
-    }
-
-    #[test]
-    fn test_splitter_zero_arms_produces_empty_output() {
-        let out = splitter_outputs(Value::new(0, 2), 0, vec![]);
-        assert_eq!(out, Vec::<Value>::new());
-    }
-
-    #[test]
-    fn test_splitter_arm_with_no_mapped_bits_is_zero_width() {
-        // arm 2 never appears in in_out_map, so it should receive nothing.
-        let out = splitter_outputs(Value::new(0b11, 2), 3, vec![0, 1]);
-        assert_eq!(out[2], Value::new(0, 0));
-    }
-
-    #[test]
-    fn test_splitter_in_out_map_shorter_than_data_ignores_extra_bits() {
-        // in_out_map only covers the low 2 bits of a nominally-4-bit value;
-        // the upper bits (2,3) are unmapped and should have no effect on any arm.
-        let out = splitter_outputs(Value::new(0b1101, 4), 2, vec![0, 1]);
-        assert_eq!(out, vec![Value::new(1, 1), Value::new(0, 1)]);
-    }
-
-    #[test]
-    fn test_splitter_out_of_range_arm_index_is_dropped_silently() {
-        // in_out_map routes bit1 to arm index 5, but the component only has 2 arms
-        // (0..2), so that bit is never picked up by any out_arm and is dropped
-        // rather than panicking on an out-of-bounds output.
-        let out = splitter_outputs(Value::new(0b11, 2), 2, vec![0, 5]);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0], Value::new(1, 1));
+impl Splitter {
+    pub fn data_width(&self) -> u8 {
+        self.in_out_map.len() as u8
     }
 }
