@@ -123,7 +123,16 @@ pub struct OsmilogApp {
     pub mode: InteractionMode,
     pub pan: Vec2,
     pub selected: Option<Selected>,
+    // Also surfaces File > Save/Load I/O errors, not just settle() errors -
+    // both are transient "something went wrong" status shown in the same
+    // red label in the menu bar (see the "Menu bar" section of `ui`).
     pub last_settle_error: Option<String>,
+    // WASM has no synchronous file dialogs (picking/reading a file is
+    // Promise-based), so a load kicked off from the File menu delivers its
+    // result here on some later frame instead of returning directly to the
+    // click handler that started it - see `apply_pending_load`.
+    #[cfg(target_arch = "wasm32")]
+    pending_load: crate::io::wasm::PendingLoad,
 }
 
 impl OsmilogApp {
@@ -141,6 +150,8 @@ impl OsmilogApp {
             pan: Vec2::ZERO,
             selected: None,
             last_settle_error: None,
+            #[cfg(target_arch = "wasm32")]
+            pending_load: crate::io::wasm::new_pending_load(),
         }
     }
 
@@ -690,10 +701,30 @@ impl OsmilogApp {
         // Now that Selected holds a PlacedCompKey, it doesn't need to be updated on reconfigure
         self.selected = Some(Selected::Component(old_pc_key));
     }
+
+    // Applies a File > Load result that a spawned WASM load task has
+    // delivered into `pending_load`, if any is waiting. No-op most frames.
+    #[cfg(target_arch = "wasm32")]
+    fn apply_pending_load(&mut self) {
+        let Some(outcome) = self.pending_load.borrow_mut().take() else {
+            return;
+        };
+        match outcome {
+            Ok(file) => {
+                if let Err(e) = self.load_circuit_file(&file) {
+                    self.last_settle_error = Some(format!("load failed: {e}"));
+                }
+            }
+            Err(e) => self.last_settle_error = Some(format!("load failed: {e}")),
+        }
+    }
 }
 
 impl eframe::App for OsmilogApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_arch = "wasm32")]
+        self.apply_pending_load();
+
         if ctx.input(|i| i.viewport().close_requested()) {
             #[cfg(not(target_arch = "wasm32"))]
             std::process::exit(0);
@@ -705,6 +736,41 @@ impl eframe::App for OsmilogApp {
 
         // ── Menu bar ──────────────────────────────────────────────────────
         egui::Panel::top("menu_bar").show(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("Save").clicked() {
+                    match self.to_circuit_file().to_json() {
+                        Ok(json) => {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if let Some(Err(e)) = crate::io::native::save_dialog(&json) {
+                                self.last_settle_error = Some(format!("save failed: {e}"));
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            crate::io::wasm::trigger_download("circuit.json", &json);
+                        }
+                        Err(e) => self.last_settle_error = Some(format!("save failed: {e}")),
+                    }
+                    ui.close();
+                }
+                if ui.button("Load").clicked() {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(outcome) = crate::io::native::load_dialog() {
+                        match outcome {
+                            Ok(file) => {
+                                if let Err(e) = self.load_circuit_file(&file) {
+                                    self.last_settle_error = Some(format!("load failed: {e}"));
+                                }
+                            }
+                            Err(e) => self.last_settle_error = Some(format!("load failed: {e}")),
+                        }
+                    }
+                    // WASM's file pick + read is async - this just kicks the
+                    // task off; the result lands in pending_load and is
+                    // applied by apply_pending_load on a later frame.
+                    #[cfg(target_arch = "wasm32")]
+                    crate::io::wasm::spawn_load_dialog(self.pending_load.clone());
+                    ui.close();
+                }
+            });
             ui.menu_button("Add", |ui| {
                 ui.menu_button("Gates", |ui| {
                     let gates = [
