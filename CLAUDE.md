@@ -16,7 +16,8 @@ Dependencies: slotmap 1.1.1 (stable generational arena keys), eframe/egui 0.35.0
     src/sim/circuit.rs    Circuit - the simulation graph and evaluation engine
     src/gui/shape.rs      ComponentShape, ShapeCmd, PinAnchor, tessellate_path - visual shape system
     src/gui/geometry.rs   ComponentDef shape builders (gate_shape, mux_shape, ...) and geometry constants (GRID_SIZE, COMP_WIDTH, ...)
-    src/gui/app.rs        OsmilogApp - eframe/egui GUI (ComponentDef, PlacedComponent, Wire, InteractionMode)
+    src/gui/placed_component.rs  PlacedComponent, ComponentDef - visual/construction record for a placed component
+    src/gui/app.rs        OsmilogApp - eframe/egui GUI (PlacedTunnel, Wire, TunnelWire, Selected, InteractionMode)
     src/main.rs           entry point (eframe::run_native) and integration tests
 
 
@@ -183,15 +184,30 @@ The GUI lives in `src/gui/app.rs` and is driven by `eframe::run_native` in `main
 
 ### OsmilogApp state
 
-    circuit: Circuit          simulation graph — source of truth for signal values
-    components: Vec<PlacedComponent>  visual records: CompKey + ComponentDef + grid_pos
-    wires: Vec<Wire>          visual records: NetKey + src/dst CompKey + pin indices
-    mode: InteractionMode     Idle | Placing { def } | WireDrag { src_comp, src_pin, current_end }
-    pan: Vec2                 canvas pan offset in pixels
+    circuit: Circuit                                       simulation graph — source of truth for signal values
+    components: SlotMap<PlacedCompKey, PlacedComponent>     visual records: CompKey + ComponentDef + grid_pos
+    tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel>          visual records: TunnelKey + label + role + grid_pos
+    wires: Vec<Wire>                                        visual records: src/dst CompKey + pin indices
+    tunnel_wires: Vec<TunnelWire>                           visual records: TunnelKey + CompKey + PinId
+    mode: InteractionMode                                   Idle | Placing | PlacingTunnel | WireDrag | ComponentDrag
+    pan: Vec2                                               canvas pan offset in pixels
+    selected: Option<Selected>                              currently selected component or tunnel
+    last_settle_error: Option<String>                       error from the last circuit.settle()/tick_clock()
 
 `PlacedComponent` mirrors the circuit's `Component` but carries display-only data.
 `ComponentDef` re-expresses the `Logic` variants with all parameters needed for both
 display (`label`, `n_inputs`, `n_outputs`) and construction (`make_component()`).
+
+`components` and `tunnels` are `SlotMap`s keyed by their own generational key types
+(`PlacedCompKey`, `PlacedTunnelKey` — distinct from the circuit's own `CompKey`/
+`TunnelKey`), not a `Vec`. This lets `Selected`, `DragSource`, and
+`InteractionMode::ComponentDrag` hold a stable key directly — `Selected` is
+`Component(PlacedCompKey) | Tunnel(PlacedTunnelKey)` — instead of a `Vec` index
+(which would shift on removal) or a raw `CompKey`/`TunnelKey` that then has to be
+linearly searched for in a `Vec` to find its visual record. The hit-testing
+functions `pin_at_pos`/`tunnel_pin_at_pos` (see Pin positions below) return these
+same `PlacedCompKey`/`PlacedTunnelKey` values, so callers can index straight into
+`self.components`/`self.tunnels` without an extra search.
 
 ### Rendering pipeline (each frame)
 
@@ -259,10 +275,17 @@ for `egui::epaint::PathShape`, approximating cubic beziers with 16 line segments
 Normalized coords are scaled to `rect` as: `pos2(rect.left + n.x * rect.width, rect.top + n.y * rect.height)`.
 Values outside [0,1] are valid and draw outside the bounding box (used by the XOR extra arc).
 
-**Pin positions** are computed by `pin_pos(pc, pan, PinId)`:
+**Pin positions** are computed by `comp_pin_pos(shape: &ComponentShape, grid_pos, pan,
+PinId)` for components and `tunnel_pin_pos(pt: &PlacedTunnel, pan)` for tunnels:
 
     base = rect.topleft + anchor.norm_pos * rect.size
     pin_pos = base + anchor.wire_dir * anchor.pixel_offset
+
+The reverse lookup — "which pin, if any, sits under this screen position" — is done
+by `pin_at_pos` and `tunnel_pin_at_pos`, which return the owning `PlacedCompKey`/
+`PlacedTunnelKey` (paired with a `PinId` for `pin_at_pos`) rather than a raw
+`CompKey`/`TunnelKey`, so callers can index straight into `self.components`/
+`self.tunnels`.
 
 For bubble outputs (`output_bubbles[i] == true`), `draw_component` draws a filled circle
 at `base + wire_dir * BUBBLE_R` and the pin dot (and wire terminus) sits `BUBBLE_R * 2`
@@ -321,6 +344,9 @@ otherwise trigger Apple's crash reporter.
 - width is not verified to be nonzero in Value::Fixed
 - Add/Sub may overflow; behavior is unspecified
 - Click-to-select uses the bounding rect, not the actual shape polygon (affects triangles/curves)
+- `Wire`/`TunnelWire` still store raw `CompKey`/`TunnelKey` rather than
+  `PlacedCompKey`/`PlacedTunnelKey`, so drawing a wire still does a linear
+  `.values().find(...)` over `components`/`tunnels` (see FIXME comments in the draw loop)
 
 
 ## Future Directions

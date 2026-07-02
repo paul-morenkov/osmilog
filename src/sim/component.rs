@@ -68,8 +68,11 @@ impl Component {
     // arm_bits = [[0, 2], [1, 3]] sends bits 0,2 to arm0 and bits 1,3 to arm1.
     // Arm indices are just positions in `arm_bits`, so an out-of-range arm
     // reference isn't representable. If a bit index is listed in more than one
-    // arm, the later arm (by position in `arm_bits`) wins.
-    pub fn splitter(arm_bits: Vec<Vec<u8>>) -> Self {
+    // arm, the later arm (by position in `arm_bits`) wins. `direction` picks
+    // which side of this bit-to-arm mapping is the input: Right keeps the
+    // classic splitter shape (1 input bus -> arms outputs); Left inverts it
+    // into a combiner (arms inputs -> 1 output bus), using the same mapping.
+    pub fn splitter(arm_bits: Vec<Vec<u8>>, direction: FanDirection) -> Self {
         let arms = arm_bits.len() as u8;
         let width = arm_bits
             .iter()
@@ -77,15 +80,40 @@ impl Component {
             .map(|&bit| bit + 1)
             .max()
             .unwrap_or(0);
-        let mut in_out_map = vec![None; width as usize];
+        let mut owner = vec![None; width as usize];
         for (arm, bits) in arm_bits.into_iter().enumerate() {
             for bit in bits {
-                in_out_map[bit as usize] = Some(arm as u8);
+                owner[bit as usize] = Some(arm as u8);
             }
         }
+        // routing[i] = Some((arm, slot)) => data bit i is arm `arm`'s `slot`-th
+        // bit (0 = LSB of that arm's Value), in ascending data-bit order per
+        // arm. Precomputed once here (rather than recounted on every
+        // evaluate() call) since it depends only on arm_bits' structure.
+        let mut arm_width = vec![0u8; arms as usize];
+        let routing: Vec<Option<(u8, u8)>> = owner
+            .into_iter()
+            .map(|maybe_arm| {
+                maybe_arm.map(|arm| {
+                    let slot = arm_width[arm as usize];
+                    arm_width[arm as usize] += 1;
+                    (arm, slot)
+                })
+            })
+            .collect();
+
+        let (n_in, n_out) = match direction {
+            FanDirection::Right => (1, arms as usize),
+            FanDirection::Left => (arms as usize, 1),
+        };
         Self {
-            pins: Pins::new(1, arms as usize),
-            logic: Logic::Comb(LogicComb::Splitter(Splitter { arms, in_out_map })),
+            pins: Pins::new(n_in, n_out),
+            logic: Logic::Comb(LogicComb::Splitter(Splitter {
+                arms,
+                direction,
+                routing,
+                arm_width,
+            })),
         }
     }
 
@@ -190,28 +218,49 @@ impl Component {
                         _ => vec![Value::Floating; branches],
                     }
                 }
-                LogicComb::Splitter(s) => match read_pin(0) {
-                    // TODO: Use `width` to validate total width in arms
-                    Value::Fixed { bits, .. } => {
-                        let mut out = Vec::new();
-                        for out_arm in 0..s.arms {
-                            let mut out_bits = 0;
-                            let mut out_width = 0;
-                            for (data_i, &arm) in s.in_out_map.iter().enumerate() {
-                                if arm == Some(out_arm) {
-                                    let is_set = bits & (1 << data_i) > 0;
-                                    if is_set {
-                                        out_bits |= 1 << out_width;
+                LogicComb::Splitter(s) => match s.direction {
+                    FanDirection::Right => match read_pin(0) {
+                        Value::Fixed { bits, .. } => {
+                            let mut arm_bits_out = vec![0u32; s.arms as usize];
+                            for (data_i, route) in s.routing.iter().enumerate() {
+                                if let Some((arm, slot)) = *route {
+                                    if bits & (1 << data_i) != 0 {
+                                        arm_bits_out[arm as usize] |= 1 << slot;
                                     }
-                                    out_width += 1;
                                 }
                             }
-                            out.push(Value::new(out_bits, out_width));
+                            (0..s.arms as usize)
+                                .map(|arm| Value::new(arm_bits_out[arm], s.arm_width[arm]))
+                                .collect()
                         }
-                        out
-                    }
-                    Value::Floating => {
-                        vec![Value::Floating; s.arms as usize]
+                        Value::Floating => vec![Value::Floating; s.arms as usize],
+                    },
+                    FanDirection::Left => {
+                        let arm_vals: Vec<Value> = (0..s.arms as usize).map(read_pin).collect();
+                        // Every arm that owns >=1 bit must be driven at exactly the
+                        // width it owns; Floating or a width mismatch poisons the
+                        // whole merged output, mirroring Value's own bitwise-op
+                        // width-mismatch convention rather than silently
+                        // truncating/zero-extending.
+                        let widths_ok = (0..s.arms as usize).all(|arm| {
+                            s.arm_width[arm] == 0
+                                || matches!(arm_vals[arm], Value::Fixed { width, .. } if width == s.arm_width[arm])
+                        });
+                        if !widths_ok {
+                            vec![Value::Floating]
+                        } else {
+                            let mut out_bits = 0u32;
+                            for (data_i, route) in s.routing.iter().enumerate() {
+                                if let Some((arm, slot)) = *route {
+                                    if let Value::Fixed { bits, .. } = arm_vals[arm as usize] {
+                                        if bits & (1 << slot) != 0 {
+                                            out_bits |= 1 << data_i;
+                                        }
+                                    }
+                                }
+                            }
+                            vec![Value::new(out_bits, s.data_width())]
+                        }
                     }
                 },
             },
@@ -343,17 +392,33 @@ pub enum GateOp {
     Not,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanDirection {
+    Right,
+    Left,
+}
+
 #[derive(Debug)]
 pub struct Splitter {
     arms: u8,
-    // in_out_map[i] = Some(j) => the i'th bit of data goes to arm j; None => unrouted.
-    // Only constructible via Component::splitter(), which builds this from an
-    // arm-major Vec<Vec<u8>> so every arm index here is guaranteed valid.
-    in_out_map: Vec<Option<u8>>,
+    direction: FanDirection,
+    // routing[i] = Some((arm, slot)) => the i'th data bit is arm `arm`'s
+    // `slot`-th bit; None => unrouted (dropped in Right mode, always 0 in
+    // the merged Left-mode trunk). Only constructible via
+    // Component::splitter(), which builds this from an arm-major
+    // Vec<Vec<u8>> so every arm index here is guaranteed valid.
+    routing: Vec<Option<(u8, u8)>>,
+    // arm_width[j] = number of data bits owned by arm j. In Right mode this
+    // is the width evaluate() gives that arm's output; in Left mode it's
+    // the width evaluate() requires on that arm's input.
+    arm_width: Vec<u8>,
 }
 
 impl Splitter {
     pub fn data_width(&self) -> u8 {
-        self.in_out_map.len() as u8
+        self.routing.len() as u8
+    }
+    pub fn direction(&self) -> FanDirection {
+        self.direction
     }
 }

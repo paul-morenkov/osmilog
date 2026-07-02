@@ -2,7 +2,7 @@ use egui::Vec2;
 
 use crate::gui::geometry::*;
 use crate::gui::shape::{ComponentShape, PinAnchor};
-use crate::sim::component::{CompKey, Component, GateOp};
+use crate::sim::component::{CompKey, Component, FanDirection, GateOp};
 
 // ── PlacedComponent ───────────────────────────────────────────────────────────
 
@@ -40,6 +40,7 @@ pub enum ComponentDef {
     Splitter {
         width: u8,
         arm_bits: Vec<Vec<u8>>,
+        direction: FanDirection,
     },
 }
 
@@ -52,7 +53,14 @@ impl ComponentDef {
             Self::Mux { sel_width, .. } => (1usize << sel_width) + 1,
             Self::Demux { .. } => 2,
             Self::Reg { .. } => 2,
-            Self::Splitter { .. } => 1,
+            Self::Splitter {
+                arm_bits,
+                direction,
+                ..
+            } => match direction {
+                FanDirection::Right => 1,
+                FanDirection::Left => arm_bits.len(),
+            },
         }
     }
 
@@ -64,7 +72,14 @@ impl ComponentDef {
             Self::Mux { .. } => 1,
             Self::Demux { sel_width, .. } => 1usize << sel_width,
             Self::Reg { .. } => 1,
-            Self::Splitter { arm_bits, .. } => arm_bits.len(),
+            Self::Splitter {
+                arm_bits,
+                direction,
+                ..
+            } => match direction {
+                FanDirection::Right => arm_bits.len(),
+                FanDirection::Left => 1,
+            },
         }
     }
 
@@ -99,7 +114,10 @@ impl ComponentDef {
             Self::Mux { .. } => "MUX",
             Self::Demux { .. } => "DEMUX",
             Self::Reg { .. } => "REG",
-            Self::Splitter { .. } => "SPLIT",
+            Self::Splitter { direction, .. } => match direction {
+                FanDirection::Right => "SPLIT",
+                FanDirection::Left => "COMBINE",
+            },
         }
     }
 
@@ -121,7 +139,11 @@ impl ComponentDef {
                 sel_width,
             } => Component::demux(*data_width, *sel_width),
             Self::Reg { data_width } => Component::reg(*data_width),
-            Self::Splitter { arm_bits, .. } => Component::splitter(arm_bits.clone()),
+            Self::Splitter {
+                arm_bits,
+                direction,
+                ..
+            } => Component::splitter(arm_bits.clone(), *direction),
         }
     }
 
@@ -159,7 +181,11 @@ impl ComponentDef {
             Self::Mux { sel_width, .. } => mux_shape(*sel_width),
             Self::Demux { sel_width, .. } => demux_shape(*sel_width),
             Self::Reg { .. } => reg_shape(),
-            Self::Splitter { arm_bits, .. } => splitter_shape(arm_bits.len() as u8),
+            Self::Splitter {
+                arm_bits,
+                direction,
+                ..
+            } => splitter_shape(arm_bits.len() as u8, *direction),
         }
     }
 }

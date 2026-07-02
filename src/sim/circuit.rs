@@ -592,7 +592,7 @@ impl Circuit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::component::GateOp;
+    use crate::sim::component::{FanDirection, GateOp};
     use test_case::test_case;
 
     // ---- Group 1: construction / basic wiring ----
@@ -687,7 +687,10 @@ mod tests {
         // 4-bit bus split into two 2-bit arms: bits [0,1] -> arm0, bits [2,3] -> arm1.
         let mut c = Circuit::new();
         let data = c.add_component(Component::input(0, 4));
-        let splitter = c.add_component(Component::splitter(vec![vec![0, 1], vec![2, 3]]));
+        let splitter = c.add_component(Component::splitter(
+            vec![vec![0, 1], vec![2, 3]],
+            FanDirection::Right,
+        ));
         let o1 = c.add_component(Component::output());
         let o2 = c.add_component(Component::output());
 
@@ -720,7 +723,10 @@ mod tests {
         // 4-bit bus, even bits (0,2) -> arm0, odd bits (1,3) -> arm1.
         let mut c = Circuit::new();
         let data = c.add_component(Component::input(0, 4));
-        let splitter = c.add_component(Component::splitter(vec![vec![0, 2], vec![1, 3]]));
+        let splitter = c.add_component(Component::splitter(
+            vec![vec![0, 2], vec![1, 3]],
+            FanDirection::Right,
+        ));
         let o1 = c.add_component(Component::output());
         let o2 = c.add_component(Component::output());
 
@@ -758,12 +764,10 @@ mod tests {
         // Each of the 4 bits fans out to its own dedicated 1-bit arm.
         let mut c = Circuit::new();
         let data = c.add_component(Component::input(0, 4));
-        let splitter = c.add_component(Component::splitter(vec![
-            vec![0],
-            vec![1],
-            vec![2],
-            vec![3],
-        ]));
+        let splitter = c.add_component(Component::splitter(
+            vec![vec![0], vec![1], vec![2], vec![3]],
+            FanDirection::Right,
+        ));
         let o1 = c.add_component(Component::output());
         let o2 = c.add_component(Component::output());
         let o3 = c.add_component(Component::output());
@@ -800,7 +804,10 @@ mod tests {
     fn test_splitter_floating_input_propagates_to_all_arms() {
         let mut c = Circuit::new();
         // Splitter's input pin is left unconnected, so it reads as Floating.
-        let splitter = c.add_component(Component::splitter(vec![vec![0], vec![1], vec![2]]));
+        let splitter = c.add_component(Component::splitter(
+            vec![vec![0], vec![1], vec![2]],
+            FanDirection::Right,
+        ));
         let o1 = c.add_component(Component::output());
         let o2 = c.add_component(Component::output());
         let o3 = c.add_component(Component::output());
@@ -818,7 +825,7 @@ mod tests {
     #[test]
     fn test_splitter_zero_arms_produces_empty_output() {
         let mut c = Circuit::new();
-        let splitter = c.add_component(Component::splitter(vec![]));
+        let splitter = c.add_component(Component::splitter(vec![], FanDirection::Right));
         assert!(c.components[splitter].pins.out_cache.is_empty());
     }
 
@@ -827,7 +834,10 @@ mod tests {
         // arm 2 is listed with no bits, so it should receive nothing.
         let mut c = Circuit::new();
         let data = c.add_component(Component::input(0b11, 2));
-        let splitter = c.add_component(Component::splitter(vec![vec![0], vec![1], vec![]]));
+        let splitter = c.add_component(Component::splitter(
+            vec![vec![0], vec![1], vec![]],
+            FanDirection::Right,
+        ));
         let o3 = c.add_component(Component::output());
 
         c.link(data, PinId::output(0), splitter, PinId::input(0));
@@ -843,7 +853,10 @@ mod tests {
         // upper bits (2,3) are unrouted and should have no effect on any arm.
         let mut c = Circuit::new();
         let data = c.add_component(Component::input(0b1101, 4));
-        let splitter = c.add_component(Component::splitter(vec![vec![0], vec![1]]));
+        let splitter = c.add_component(Component::splitter(
+            vec![vec![0], vec![1]],
+            FanDirection::Right,
+        ));
         let o1 = c.add_component(Component::output());
         let o2 = c.add_component(Component::output());
 
@@ -862,7 +875,10 @@ mod tests {
         // order, so the later arm (arm1) should end up owning it, not arm0.
         let mut c = Circuit::new();
         let data = c.add_component(Component::input(0, 2));
-        let splitter = c.add_component(Component::splitter(vec![vec![0, 1], vec![1]]));
+        let splitter = c.add_component(Component::splitter(
+            vec![vec![0, 1], vec![1]],
+            FanDirection::Right,
+        ));
         let o1 = c.add_component(Component::output());
         let o2 = c.add_component(Component::output());
 
@@ -883,11 +899,120 @@ mod tests {
 
     #[test]
     fn test_splitter_data_width_derived_from_arm_bits() {
-        let comp = Component::splitter(vec![vec![0, 2], vec![1]]);
+        let comp = Component::splitter(vec![vec![0, 2], vec![1]], FanDirection::Right);
         match &comp.logic {
-            Logic::Comb(LogicComb::Splitter(s)) => assert_eq!(s.data_width(), 3),
+            Logic::Comb(LogicComb::Splitter(s)) => {
+                assert_eq!(s.data_width(), 3);
+                assert_eq!(s.direction(), FanDirection::Right);
+            }
             _ => panic!("expected Splitter logic"),
         }
+        let comp = Component::splitter(vec![vec![0, 2], vec![1]], FanDirection::Left);
+        match &comp.logic {
+            Logic::Comb(LogicComb::Splitter(s)) => assert_eq!(s.direction(), FanDirection::Left),
+            _ => panic!("expected Splitter logic"),
+        }
+    }
+
+    #[test]
+    fn test_splitter_combine_contiguous_halves() {
+        // Inverse of test_splitter_contiguous_halves: two 2-bit arms merge into
+        // a single 4-bit output, bits [0,1] from arm0, bits [2,3] from arm1.
+        let mut c = Circuit::new();
+        let a0 = c.add_component(Component::input(0, 2));
+        let a1 = c.add_component(Component::input(0, 2));
+        let splitter = c.add_component(Component::splitter(
+            vec![vec![0, 1], vec![2, 3]],
+            FanDirection::Left,
+        ));
+        let out = c.add_component(Component::output());
+
+        c.link(a0, PinId::output(0), splitter, PinId::input(0));
+        c.link(a1, PinId::output(0), splitter, PinId::input(1));
+        c.link(splitter, PinId::output(0), out, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(0, 4));
+
+        c.set_input(a0, 0b01, 2);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(0b0001, 4));
+
+        c.set_input(a1, 0b10, 2);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(0b1001, 4));
+    }
+
+    #[test]
+    fn test_splitter_combine_floating_arm_propagates() {
+        // One owning arm left unconnected (Floating) poisons the whole merged
+        // output, regardless of the other arm's value.
+        let mut c = Circuit::new();
+        let a0 = c.add_component(Component::input(0b1, 1));
+        let splitter = c.add_component(Component::splitter(
+            vec![vec![0], vec![1]],
+            FanDirection::Left,
+        ));
+        let out = c.add_component(Component::output());
+
+        c.link(a0, PinId::output(0), splitter, PinId::input(0));
+        // input(1) (arm1) intentionally left unconnected -> reads Floating.
+        c.link(splitter, PinId::output(0), out, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::Floating);
+    }
+
+    #[test]
+    fn test_splitter_combine_width_mismatch_yields_floating() {
+        // arm0 owns 2 bits but is driven by a 3-bit source -> Floating.
+        let mut c = Circuit::new();
+        let a0 = c.add_component(Component::input(0, 3));
+        let a1 = c.add_component(Component::input(0, 1));
+        let splitter = c.add_component(Component::splitter(
+            vec![vec![0, 1], vec![2]],
+            FanDirection::Left,
+        ));
+        let out = c.add_component(Component::output());
+
+        c.link(a0, PinId::output(0), splitter, PinId::input(0));
+        c.link(a1, PinId::output(0), splitter, PinId::input(1));
+        c.link(splitter, PinId::output(0), out, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::Floating);
+    }
+
+    #[test]
+    fn test_splitter_combine_unrouted_bit_defaults_zero() {
+        // arm_bits only covers bits 0 and 2 of a 3-bit merged output; bit 1 has
+        // no owning arm and should always read as 0, regardless of other arms.
+        let mut c = Circuit::new();
+        let a0 = c.add_component(Component::input(0b1, 1));
+        let a1 = c.add_component(Component::input(0b1, 1));
+        let splitter = c.add_component(Component::splitter(
+            vec![vec![0], vec![2]],
+            FanDirection::Left,
+        ));
+        let out = c.add_component(Component::output());
+
+        c.link(a0, PinId::output(0), splitter, PinId::input(0));
+        c.link(a1, PinId::output(0), splitter, PinId::input(1));
+        c.link(splitter, PinId::output(0), out, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(0b101, 3));
+    }
+
+    #[test]
+    fn test_splitter_combine_zero_arms_produces_single_zero_output() {
+        // Deliberately asymmetric with test_splitter_zero_arms_produces_empty_output:
+        // Left mode always has exactly one trunk output pin, even with zero arms,
+        // whereas Right mode with zero arms has zero output pins.
+        let mut c = Circuit::new();
+        let splitter = c.add_component(Component::splitter(vec![], FanDirection::Left));
+        assert!(c.components[splitter].pins.inputs.is_empty());
+        assert_eq!(c.components[splitter].pins.out_cache, vec![Value::new(0, 0)]);
     }
 
     #[test]

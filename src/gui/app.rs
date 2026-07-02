@@ -7,7 +7,7 @@ use crate::gui::geometry::{snap_to_grid, tunnel_shape, GRID_SIZE};
 use crate::gui::placed_component::{ComponentDef, PlacedComponent};
 use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
-use crate::sim::component::{CompKey, GateOp, InIdx, OutIdx, PinId};
+use crate::sim::component::{CompKey, FanDirection, GateOp, InIdx, OutIdx, PinId};
 use crate::sim::value::Value;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -359,8 +359,17 @@ impl OsmilogApp {
             ComponentDef::Splitter {
                 mut width,
                 mut arm_bits,
+                mut direction,
             } => {
                 let mut changed = false;
+
+                let before_dir = direction;
+                ui.horizontal(|ui| {
+                    ui.label("Fan Direction:");
+                    ui.selectable_value(&mut direction, FanDirection::Right, "Split");
+                    ui.selectable_value(&mut direction, FanDirection::Left, "Combine");
+                });
+                changed |= direction != before_dir;
 
                 ui.horizontal(|ui| {
                     ui.label("Data width:");
@@ -422,7 +431,14 @@ impl OsmilogApp {
                 }
 
                 if changed {
-                    self.reconfigure_component(key, ComponentDef::Splitter { width, arm_bits });
+                    self.reconfigure_component(
+                        key,
+                        ComponentDef::Splitter {
+                            width,
+                            arm_bits,
+                            direction,
+                        },
+                    );
                 }
             }
         }
@@ -587,6 +603,7 @@ impl eframe::App for OsmilogApp {
                         def: ComponentDef::Splitter {
                             width: 2,
                             arm_bits: vec![vec![0], vec![1]],
+                            direction: FanDirection::Right,
                         },
                     };
                     ui.close();
