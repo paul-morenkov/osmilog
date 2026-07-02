@@ -1,15 +1,13 @@
 use eframe;
 use egui::epaint::{PathShape, PathStroke};
 use egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Sense, Stroke, Vec2};
+use slotmap::{new_key_type, SlotMap};
 
-use crate::gui::geometry::{
-    demux_shape, demux_size, gate_shape, gate_size, mux_shape, mux_size, rect_outline, reg_shape,
-    reg_size, snap_to_grid, splitter_shape, splitter_size, tunnel_shape, COMP_MIN_HEIGHT,
-    COMP_WIDTH, GRID_SIZE,
-};
-use crate::gui::shape::{tessellate_path, ComponentShape, PinAnchor, BUBBLE_R};
+use crate::gui::geometry::{snap_to_grid, tunnel_shape, GRID_SIZE};
+use crate::gui::placed_component::{ComponentDef, PlacedComponent};
+use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
-use crate::sim::component::{CompKey, Component, GateOp, InIdx, OutIdx, PinId};
+use crate::sim::component::{CompKey, FanDirection, GateOp, InIdx, OutIdx, PinId};
 use crate::sim::value::Value;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -19,166 +17,6 @@ const WIRE_THICKNESS_THIN: f32 = 2.0;
 const WIRE_THICKNESS_THICK: f32 = 4.0;
 const LABEL_FONT_SIZE: f32 = 8.0;
 const COMP_STROKE: f32 = 1.5;
-
-// ── ComponentDef ──────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ComponentDef {
-    Input {
-        bits: u32,
-        width: u8,
-    },
-    Output,
-    Gate {
-        op: GateOp,
-        n_inputs: usize,
-        width: u8,
-    },
-    Mux {
-        data_width: u8,
-        sel_width: u8,
-    },
-    Demux {
-        data_width: u8,
-        sel_width: u8,
-    },
-    Reg {
-        data_width: u8,
-    },
-    Splitter {
-        width: u8,
-        arm_bits: Vec<Vec<u8>>,
-    },
-}
-
-impl ComponentDef {
-    fn n_inputs(&self) -> usize {
-        match self {
-            Self::Input { .. } => 0,
-            Self::Output => 1,
-            Self::Gate { n_inputs, .. } => *n_inputs,
-            Self::Mux { sel_width, .. } => (1usize << sel_width) + 1,
-            Self::Demux { .. } => 2,
-            Self::Reg { .. } => 2,
-            Self::Splitter { .. } => 1,
-        }
-    }
-
-    fn n_outputs(&self) -> usize {
-        match self {
-            Self::Input { .. } => 1,
-            Self::Output => 0,
-            Self::Gate { .. } => 1,
-            Self::Mux { .. } => 1,
-            Self::Demux { sel_width, .. } => 1usize << sel_width,
-            Self::Reg { .. } => 1,
-            Self::Splitter { arm_bits, .. } => arm_bits.len(),
-        }
-    }
-
-    // Zero-allocation bounding-box size, matching shape().size but without
-    // building the full ComponentShape (outline/anchors/bubbles Vecs) just
-    // to read one field - used by component_bounding_rect, which is called
-    // every frame for hit-testing/selection.
-    fn size(&self) -> Vec2 {
-        match self {
-            Self::Input { .. } | Self::Output => egui::vec2(COMP_WIDTH, COMP_MIN_HEIGHT),
-            Self::Gate { op, n_inputs, .. } => gate_size(*op, *n_inputs),
-            Self::Mux { sel_width, .. } => mux_size(*sel_width),
-            Self::Demux { sel_width, .. } => demux_size(*sel_width),
-            Self::Reg { .. } => reg_size(),
-            Self::Splitter { arm_bits, .. } => splitter_size(arm_bits.len() as u8),
-        }
-    }
-
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Input { .. } => "IN",
-            Self::Output => "OUT",
-            Self::Gate { op, .. } => match op {
-                GateOp::And => "AND",
-                GateOp::Or => "OR",
-                GateOp::Xor => "XOR",
-                GateOp::Nand => "NAND",
-                GateOp::Nor => "NOR",
-                GateOp::Xnor => "XNOR",
-                GateOp::Not => "NOT",
-            },
-            Self::Mux { .. } => "MUX",
-            Self::Demux { .. } => "DEMUX",
-            Self::Reg { .. } => "REG",
-            Self::Splitter { .. } => "SPLIT",
-        }
-    }
-
-    fn make_component(&self) -> Component {
-        match self {
-            Self::Input { bits, width } => Component::input(*bits, *width),
-            Self::Output => Component::output(),
-            Self::Gate {
-                op,
-                n_inputs,
-                width,
-            } => Component::gate(*op, *n_inputs, *width),
-            Self::Mux {
-                data_width,
-                sel_width,
-            } => Component::mux(*data_width, *sel_width),
-            Self::Demux {
-                data_width,
-                sel_width,
-            } => Component::demux(*data_width, *sel_width),
-            Self::Reg { data_width } => Component::reg(*data_width),
-            Self::Splitter { arm_bits, .. } => Component::splitter(arm_bits.clone()),
-        }
-    }
-
-    pub fn shape(&self) -> ComponentShape {
-        match self {
-            Self::Input { .. } => {
-                let h = COMP_MIN_HEIGHT;
-                ComponentShape {
-                    size: egui::vec2(COMP_WIDTH, h),
-                    outline: rect_outline(),
-                    fill_outline: None,
-                    input_anchors: vec![],
-                    output_anchors: vec![PinAnchor::right(0.5)],
-                    extra_strokes: vec![],
-                    output_bubbles: vec![false],
-                    labels: vec![],
-                    dynamic_label_pos: Vec2::ZERO,
-                }
-            }
-            Self::Output => {
-                let h = COMP_MIN_HEIGHT;
-                ComponentShape {
-                    size: egui::vec2(COMP_WIDTH, h),
-                    outline: rect_outline(),
-                    fill_outline: None,
-                    input_anchors: vec![PinAnchor::left(0.5)],
-                    output_anchors: vec![],
-                    extra_strokes: vec![],
-                    output_bubbles: vec![],
-                    labels: vec![],
-                    dynamic_label_pos: Vec2::ZERO,
-                }
-            }
-            Self::Gate { op, n_inputs, .. } => gate_shape(*op, *n_inputs),
-            Self::Mux { sel_width, .. } => mux_shape(*sel_width),
-            Self::Demux { sel_width, .. } => demux_shape(*sel_width),
-            Self::Reg { .. } => reg_shape(),
-            Self::Splitter { arm_bits, .. } => splitter_shape(arm_bits.len() as u8),
-        }
-    }
-}
-
-// ── PlacedComponent ───────────────────────────────────────────────────────────
-
-pub struct PlacedComponent {
-    pub key: CompKey,
-    pub def: ComponentDef,
-    pub grid_pos: [i32; 2],
-}
 
 // ── PlacedTunnel ──────────────────────────────────────────────────────────────
 
@@ -224,8 +62,8 @@ pub struct TunnelWire {
 // fields) avoids a "can both be Some, who wins" desync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selected {
-    Component(CompKey),
-    Tunnel(TunnelKey),
+    Component(PlacedCompKey),
+    Tunnel(PlacedTunnelKey),
 }
 
 // The origin of an in-progress wire drag: either a component's output pin
@@ -234,8 +72,8 @@ pub enum Selected {
 // valid drop-target only, checked separately at drag_stopped()).
 #[derive(Debug, Clone, Copy)]
 pub enum DragSource {
-    Component(CompKey, OutIdx),
-    Tunnel(TunnelKey),
+    Component(PlacedCompKey, OutIdx),
+    Tunnel(PlacedTunnelKey),
 }
 
 // ── InteractionMode ───────────────────────────────────────────────────────────
@@ -269,10 +107,15 @@ enum PinKind {
 
 // ── OsmilogApp ────────────────────────────────────────────────────────────────
 
+new_key_type! {
+    pub struct PlacedCompKey;
+    pub struct PlacedTunnelKey;
+}
+
 pub struct OsmilogApp {
     pub circuit: Circuit,
-    pub components: Vec<PlacedComponent>,
-    pub tunnels: Vec<PlacedTunnel>,
+    pub components: SlotMap<PlacedCompKey, PlacedComponent>,
+    pub tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel>,
     pub wires: Vec<Wire>,
     pub tunnel_wires: Vec<TunnelWire>,
     pub mode: InteractionMode,
@@ -285,8 +128,8 @@ impl OsmilogApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             circuit: Circuit::new(),
-            components: Vec::new(),
-            tunnels: Vec::new(),
+            components: SlotMap::default(),
+            tunnels: SlotMap::default(),
             wires: Vec::new(),
             tunnel_wires: Vec::new(),
             mode: InteractionMode::Idle,
@@ -303,21 +146,23 @@ impl OsmilogApp {
         }
     }
 
-    fn place_component(&mut self, def: ComponentDef, grid_pos: [i32; 2]) {
+    fn place_component(&mut self, def: ComponentDef, grid_pos: [i32; 2]) -> PlacedCompKey {
         let comp = def.make_component();
         let key = self.circuit.add_component(comp);
-        self.components.push(PlacedComponent { key, def, grid_pos });
+        let pc = PlacedComponent { key, def, grid_pos };
+        self.components.insert(pc)
     }
 
-    fn place_tunnel(&mut self, role: TunnelRole, grid_pos: [i32; 2]) {
+    fn place_tunnel(&mut self, role: TunnelRole, grid_pos: [i32; 2]) -> PlacedTunnelKey {
         let label = format!("Tunnel{}", self.tunnels.len());
         let key = self.circuit.add_tunnel(label.clone(), role);
-        self.tunnels.push(PlacedTunnel {
+        let pt = PlacedTunnel {
             key,
             label,
             role,
             grid_pos,
-        });
+        };
+        self.tunnels.insert(pt)
     }
 
     /// Shows property menu for the currently selected item. ComponentDef for the UI element is
@@ -333,43 +178,38 @@ impl OsmilogApp {
         }
     }
 
-    fn show_tunnel_properties(&mut self, key: TunnelKey, ui: &mut egui::Ui) {
-        let Some(idx) = self.tunnels.iter().position(|pt| pt.key == key) else {
-            self.selected = None;
-            return;
-        };
+    fn show_tunnel_properties(&mut self, key: PlacedTunnelKey, ui: &mut egui::Ui) {
+        let pt = &mut self.tunnels[key];
 
-        ui.heading(match self.tunnels[idx].role {
+        ui.heading(match pt.role {
             TunnelRole::Feed => "TUNNEL (FEED)",
             TunnelRole::Pull => "TUNNEL (PULL)",
         });
         ui.separator();
         ui.label("Label:");
-        let mut label = self.tunnels[idx].label.clone();
+        let mut label = pt.label.clone();
         let response = ui.text_edit_singleline(&mut label);
         if response.changed() {
-            self.tunnels[idx].label = label.clone();
+            pt.label = label.clone();
         }
 
         if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-            self.circuit.rename_tunnel(key, label.clone());
-            self.tunnels[idx].label = label;
+            self.circuit.rename_tunnel(pt.key, label.clone());
+            pt.label = label;
             let result = self.circuit.settle();
             self.record_settle_result(result);
         }
     }
 
     // TODO: can't this be an index for a PlacedComponent instead?
-    fn show_component_properties(&mut self, key: CompKey, ui: &mut egui::Ui) {
-        let Some(idx) = self.components.iter().position(|pc| pc.key == key) else {
-            self.selected = None;
-            return;
-        };
+    fn show_component_properties(&mut self, key: PlacedCompKey, ui: &mut egui::Ui) {
+        let pc = &self.components[key];
+        let comp_key = pc.key;
 
-        ui.heading(self.components[idx].def.label());
+        ui.heading(pc.def.label());
         ui.separator();
 
-        let def = self.components[idx].def.clone();
+        let def = pc.def.clone();
         match def {
             ComponentDef::Input {
                 mut bits,
@@ -405,7 +245,7 @@ impl OsmilogApp {
                 }
             }
             ComponentDef::Output => {
-                let val = self.circuit.read_output(key);
+                let val = self.circuit.read_output(comp_key);
                 let val_str = match val {
                     Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
                     Value::Floating => "Floating".to_string(),
@@ -509,7 +349,7 @@ impl OsmilogApp {
                     self.reconfigure_component(key, ComponentDef::Reg { data_width });
                 }
 
-                let cur = self.circuit.components[key].pins.out_cache[0];
+                let cur = self.circuit.components[comp_key].pins.out_cache[0];
                 let val_str = match cur {
                     Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
                     Value::Floating => "Floating".to_string(),
@@ -519,8 +359,17 @@ impl OsmilogApp {
             ComponentDef::Splitter {
                 mut width,
                 mut arm_bits,
+                mut direction,
             } => {
                 let mut changed = false;
+
+                let before_dir = direction;
+                ui.horizontal(|ui| {
+                    ui.label("Fan Direction:");
+                    ui.selectable_value(&mut direction, FanDirection::Right, "Split");
+                    ui.selectable_value(&mut direction, FanDirection::Left, "Combine");
+                });
+                changed |= direction != before_dir;
 
                 ui.horizontal(|ui| {
                     ui.label("Data width:");
@@ -582,18 +431,24 @@ impl OsmilogApp {
                 }
 
                 if changed {
-                    self.reconfigure_component(key, ComponentDef::Splitter { width, arm_bits });
+                    self.reconfigure_component(
+                        key,
+                        ComponentDef::Splitter {
+                            width,
+                            arm_bits,
+                            direction,
+                        },
+                    );
                 }
             }
         }
     }
 
     // TODO: write docs, return result
-    fn reconfigure_component(&mut self, old_key: CompKey, new_def: ComponentDef) {
-        let Some(pc_idx) = self.components.iter().position(|pc| pc.key == old_key) else {
-            return;
-        };
-        let grid_pos = self.components[pc_idx].grid_pos;
+    fn reconfigure_component(&mut self, old_pc_key: PlacedCompKey, new_def: ComponentDef) {
+        let old_pc = &self.components[old_pc_key];
+        let old_key = old_pc.key;
+        let grid_pos = old_pc.grid_pos;
 
         let new_comp = new_def.make_component();
         let new_n_in = new_comp.pins.inputs.len();
@@ -638,7 +493,8 @@ impl OsmilogApp {
         self.tunnel_wires.retain(|tw| tw.comp != old_key);
 
         let new_key = self.circuit.add_component(new_comp);
-        self.components[pc_idx] = PlacedComponent {
+
+        self.components[old_pc_key] = PlacedComponent {
             key: new_key,
             def: new_def,
             grid_pos,
@@ -671,7 +527,8 @@ impl OsmilogApp {
 
         let result = self.circuit.settle();
         self.record_settle_result(result);
-        self.selected = Some(Selected::Component(new_key));
+        // Now that Selected holds a PlacedCompKey, it doesn't need to be updated on reconfigure
+        self.selected = Some(Selected::Component(old_pc_key));
     }
 }
 
@@ -746,6 +603,7 @@ impl eframe::App for OsmilogApp {
                         def: ComponentDef::Splitter {
                             width: 2,
                             arm_bits: vec![vec![0], vec![1]],
+                            direction: FanDirection::Right,
                         },
                     };
                     ui.close();
@@ -805,16 +663,8 @@ impl eframe::App for OsmilogApp {
                 } = self.mode
                 {
                     match key {
-                        Selected::Component(k) => {
-                            if let Some(pc) = self.components.iter_mut().find(|pc| pc.key == k) {
-                                pc.grid_pos = original_grid_pos;
-                            }
-                        }
-                        Selected::Tunnel(k) => {
-                            if let Some(pt) = self.tunnels.iter_mut().find(|pt| pt.key == k) {
-                                pt.grid_pos = original_grid_pos;
-                            }
-                        }
+                        Selected::Component(k) => self.components[k].grid_pos = original_grid_pos,
+                        Selected::Tunnel(k) => self.tunnels[k].grid_pos = original_grid_pos,
                     }
                 }
                 self.mode = InteractionMode::Idle;
@@ -829,14 +679,15 @@ impl eframe::App for OsmilogApp {
             // the very next frame.
             for wire in &self.wires {
                 let (p0, p1) = {
+                    // FIXME: Wire should probably hold a PlacedCompKey
                     let src = self
                         .components
-                        .iter()
+                        .values()
                         .find(|pc| pc.key == wire.src_comp)
                         .unwrap();
                     let dst = self
                         .components
-                        .iter()
+                        .values()
                         .find(|pc| pc.key == wire.dst_comp)
                         .unwrap();
                     (
@@ -866,8 +717,9 @@ impl eframe::App for OsmilogApp {
             // approach as above - no cached NetKey.
             for tw in &self.tunnel_wires {
                 let (Some(pt), Some(pc)) = (
-                    self.tunnels.iter().find(|pt| pt.key == tw.tunnel),
-                    self.components.iter().find(|pc| pc.key == tw.comp),
+                    // FIXME: TunnelWire should probably hold a PlacedTunnelKey
+                    self.tunnels.values().find(|pt| pt.key == tw.tunnel),
+                    self.components.values().find(|pc| pc.key == tw.comp),
                 ) else {
                     continue;
                 };
@@ -881,14 +733,14 @@ impl eframe::App for OsmilogApp {
             }
 
             // Draw components
-            for pc in &self.components {
-                let is_selected = self.selected == Some(Selected::Component(pc.key));
+            for (pc_key, pc) in &self.components {
+                let is_selected = self.selected == Some(Selected::Component(pc_key));
                 draw_component(&painter, pc, pan, &self.circuit, is_selected);
             }
 
             // Draw tunnels
-            for pt in &self.tunnels {
-                let is_selected = self.selected == Some(Selected::Tunnel(pt.key));
+            for (pt_key, pt) in &self.tunnels {
+                let is_selected = self.selected == Some(Selected::Tunnel(pt_key));
                 draw_tunnel(&painter, pt, pan, &self.circuit, is_selected);
             }
 
@@ -904,7 +756,7 @@ impl eframe::App for OsmilogApp {
                         let origin = ctx.input(|i| i.pointer.press_origin());
                         if let Some(pos) = origin {
                             if let Some((comp_key, PinId::Out(out_idx))) =
-                                pin_at_pos(&self.components, pan, pos, PinKind::Output)
+                                pin_at_pos(self.components.iter(), pan, pos, PinKind::Output)
                             {
                                 // Output-pin drag → start wire (highest priority)
                                 self.mode = InteractionMode::WireDrag {
@@ -912,7 +764,7 @@ impl eframe::App for OsmilogApp {
                                     current_end: pos,
                                 };
                             } else if let Some(tunnel_key) =
-                                tunnel_pin_at_pos(&self.tunnels, pan, pos)
+                                tunnel_pin_at_pos(self.tunnels.iter(), pan, pos)
                             {
                                 // Feed-tunnel pin drag → start wire
                                 self.mode = InteractionMode::WireDrag {
@@ -921,26 +773,22 @@ impl eframe::App for OsmilogApp {
                                 };
                             } else if let Some(sel) = self.selected {
                                 // Selected component/tunnel body drag → move it
-                                let hit_pos = match sel {
+                                let (rect, grid_pos) = match sel {
                                     Selected::Component(key) => {
-                                        self.components.iter().find(|pc| pc.key == key).map(|pc| {
-                                            (component_bounding_rect(pc, pan), pc.grid_pos)
-                                        })
+                                        let pc = &self.components[key];
+                                        (component_bounding_rect(pc, pan), pc.grid_pos)
                                     }
-                                    Selected::Tunnel(key) => self
-                                        .tunnels
-                                        .iter()
-                                        .find(|pt| pt.key == key)
-                                        .map(|pt| (tunnel_bounding_rect(pt, pan), pt.grid_pos)),
+                                    Selected::Tunnel(key) => {
+                                        let pt = &self.tunnels[key];
+                                        (tunnel_bounding_rect(pt, pan), pt.grid_pos)
+                                    }
                                 };
-                                if let Some((rect, grid_pos)) = hit_pos {
-                                    if rect.contains(pos) {
-                                        self.mode = InteractionMode::ComponentDrag {
-                                            key: sel,
-                                            drag_origin: pos,
-                                            original_grid_pos: grid_pos,
-                                        };
-                                    }
+                                if rect.contains(pos) {
+                                    self.mode = InteractionMode::ComponentDrag {
+                                        key: sel,
+                                        drag_origin: pos,
+                                        original_grid_pos: grid_pos,
+                                    };
                                 }
                             }
                         }
@@ -951,17 +799,17 @@ impl eframe::App for OsmilogApp {
                     // canvas to deselect.
                     if response.clicked() {
                         if let Some(pos) = pointer {
-                            self.selected = self
+                            let maybe_comp = self
                                 .components
                                 .iter()
-                                .find(|pc| component_bounding_rect(pc, pan).contains(pos))
-                                .map(|pc| Selected::Component(pc.key))
-                                .or_else(|| {
-                                    self.tunnels
-                                        .iter()
-                                        .find(|pt| tunnel_bounding_rect(pt, pan).contains(pos))
-                                        .map(|pt| Selected::Tunnel(pt.key))
-                                });
+                                .find(|(_key, pc)| component_bounding_rect(pc, pan).contains(pos))
+                                .map(|(key, _pc)| Selected::Component(key));
+                            let maybe_tunnel = self
+                                .tunnels
+                                .iter()
+                                .find(|(_key, pt)| tunnel_bounding_rect(pt, pan).contains(pos))
+                                .map(|(key, _pt)| Selected::Tunnel(key));
+                            self.selected = maybe_comp.or(maybe_tunnel);
                         }
                     }
                 }
@@ -996,12 +844,8 @@ impl eframe::App for OsmilogApp {
 
                 InteractionMode::WireDrag { src, current_end } => {
                     let p0 = match src {
-                        DragSource::Component(comp_key, out_idx) => {
-                            let src_pc = self
-                                .components
-                                .iter()
-                                .find(|pc| pc.key == comp_key)
-                                .unwrap();
+                        DragSource::Component(pc_key, out_idx) => {
+                            let src_pc = &self.components[pc_key];
                             comp_pin_pos(
                                 &src_pc.def.shape(),
                                 src_pc.grid_pos,
@@ -1009,9 +853,8 @@ impl eframe::App for OsmilogApp {
                                 PinId::output(out_idx.0),
                             )
                         }
-                        DragSource::Tunnel(tunnel_key) => {
-                            let src_pt =
-                                self.tunnels.iter().find(|pt| pt.key == tunnel_key).unwrap();
+                        DragSource::Tunnel(pt_key) => {
+                            let src_pt = &self.tunnels[pt_key];
                             tunnel_pin_pos(src_pt, pan)
                         }
                     };
@@ -1026,12 +869,14 @@ impl eframe::App for OsmilogApp {
                     };
 
                     if response.drag_stopped() {
-                        let target = pin_at_pos(&self.components, pan, end, PinKind::Input);
+                        let target = pin_at_pos(self.components.iter(), pan, end, PinKind::Input);
                         match (src, target) {
                             (
-                                DragSource::Component(src_comp, src_pin),
-                                Some((dst_comp, PinId::In(in_idx))),
+                                DragSource::Component(src_pc, src_pin),
+                                Some((dst_pc, PinId::In(in_idx))),
                             ) => {
+                                let src_comp = self.components[src_pc].key;
+                                let dst_comp = self.components[dst_pc].key;
                                 if dst_comp != src_comp {
                                     self.circuit.link(
                                         src_comp,
@@ -1049,19 +894,21 @@ impl eframe::App for OsmilogApp {
                                     });
                                 }
                             }
-                            (DragSource::Component(src_comp, src_pin), None) => {
+                            (DragSource::Component(src_pc_key, src_pin), None) => {
                                 // Didn't land on a component input pin; check
                                 // whether it landed on a Pull tunnel instead.
                                 let tunnel_key = self
                                     .tunnels
-                                    .iter()
+                                    .values()
                                     .find(|pt| {
                                         pt.role == TunnelRole::Pull
                                             && tunnel_bounding_rect(pt, pan).contains(end)
                                     })
                                     .map(|pt| pt.key);
                                 if let Some(tunnel_key) = tunnel_key {
+                                    let src_comp = self.components[src_pc_key].key;
                                     let pin = PinId::output(src_pin.0);
+
                                     self.circuit.link_tunnel(tunnel_key, src_comp, pin);
                                     let result = self.circuit.settle();
                                     self.record_settle_result(result);
@@ -1072,11 +919,11 @@ impl eframe::App for OsmilogApp {
                                     });
                                 }
                             }
-                            (
-                                DragSource::Tunnel(tunnel_key),
-                                Some((dst_comp, PinId::In(in_idx))),
-                            ) => {
+                            (DragSource::Tunnel(src_pt), Some((dst_pc, PinId::In(in_idx)))) => {
+                                let tunnel_key = self.tunnels[src_pt].key;
+                                let dst_comp = self.components[dst_pc].key;
                                 let pin = PinId::input(in_idx.0);
+
                                 self.circuit.link_tunnel(tunnel_key, dst_comp, pin);
                                 let result = self.circuit.settle();
                                 self.record_settle_result(result);
@@ -1105,17 +952,8 @@ impl eframe::App for OsmilogApp {
                             original_grid_pos[1] + delta_y,
                         ];
                         match key {
-                            Selected::Component(k) => {
-                                if let Some(pc) = self.components.iter_mut().find(|pc| pc.key == k)
-                                {
-                                    pc.grid_pos = new_grid_pos;
-                                }
-                            }
-                            Selected::Tunnel(k) => {
-                                if let Some(pt) = self.tunnels.iter_mut().find(|pt| pt.key == k) {
-                                    pt.grid_pos = new_grid_pos;
-                                }
-                            }
+                            Selected::Component(k) => self.components[k].grid_pos = new_grid_pos,
+                            Selected::Tunnel(k) => self.tunnels[k].grid_pos = new_grid_pos,
                         }
                     }
                     if response.drag_stopped() {
@@ -1185,21 +1023,21 @@ fn tunnel_pin_pos(pt: &PlacedTunnel, pan: Vec2) -> Pos2 {
     ) + anchor.wire_dir * anchor.pixel_offset
 }
 
-fn pin_at_pos(
-    components: &[PlacedComponent],
+fn pin_at_pos<'a>(
+    components: impl Iterator<Item = (PlacedCompKey, &'a PlacedComponent)>,
     pan: Vec2,
     pos: Pos2,
     kind: PinKind,
-) -> Option<(CompKey, PinId)> {
+) -> Option<(PlacedCompKey, PinId)> {
     let hit_r = PIN_RADIUS * 2.0;
-    for pc in components {
+    for (key, pc) in components {
         let shape = pc.def.shape();
         match kind {
             PinKind::Output => {
                 for i in 0..pc.def.n_outputs() {
                     let pp = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::output(i as u8));
                     if pos.distance(pp) <= hit_r {
-                        return Some((pc.key, PinId::output(i as u8)));
+                        return Some((key, PinId::output(i as u8)));
                     }
                 }
             }
@@ -1207,7 +1045,7 @@ fn pin_at_pos(
                 for i in 0..pc.def.n_inputs() {
                     let pp = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::input(i as u8));
                     if pos.distance(pp) <= hit_r {
-                        return Some((pc.key, PinId::input(i as u8)));
+                        return Some((key, PinId::input(i as u8)));
                     }
                 }
             }
@@ -1215,11 +1053,15 @@ fn pin_at_pos(
     }
     None
 }
-fn tunnel_pin_at_pos(tunnels: &[PlacedTunnel], pan: Vec2, pos: Pos2) -> Option<TunnelKey> {
+fn tunnel_pin_at_pos<'a>(
+    tunnels: impl Iterator<Item = (PlacedTunnelKey, &'a PlacedTunnel)>,
+    pan: Vec2,
+    pos: Pos2,
+) -> Option<PlacedTunnelKey> {
     let hit_r = PIN_RADIUS * 2.0;
-    for tunnel in tunnels {
+    for (key, tunnel) in tunnels {
         if tunnel.role == TunnelRole::Feed && tunnel_pin_pos(tunnel, pan).distance(pos) <= hit_r {
-            return Some(tunnel.key);
+            return Some(key);
         }
     }
     None

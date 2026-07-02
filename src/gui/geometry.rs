@@ -3,7 +3,7 @@ use egui::{Pos2, Vec2};
 
 use crate::gui::shape::{ComponentLabel, ComponentShape, PinAnchor, ShapeCmd};
 use crate::sim::circuit::TunnelRole;
-use crate::sim::component::GateOp;
+use crate::sim::component::{FanDirection, GateOp};
 
 pub const GRID_SIZE: f32 = 20.0;
 pub const COMP_WIDTH: f32 = 40.0;
@@ -269,18 +269,31 @@ pub fn demux_shape(sel_width: u8) -> ComponentShape {
     }
 }
 
-pub fn splitter_shape(arms: u8) -> ComponentShape {
+// direction == Right draws the classic splitter: a single trunk pin on the
+// left (input), teeth fanning out to arm pins on the right (outputs). Left
+// mirrors the whole shape horizontally (x -> 1-x) via `mx` and swaps which
+// anchor list holds the trunk vs. the arms, turning it into a combiner: arm
+// pins on the left (inputs), single trunk pin on the right (output) - this
+// must match Component::splitter's Left-mode pin order (arm index ==
+// input pin index, ascending).
+pub fn splitter_shape(arms: u8, direction: FanDirection) -> ComponentShape {
     let n = arms as usize;
     let h = splitter_size(arms).y;
+    let flip = matches!(direction, FanDirection::Left);
+    let mx = |x: f32| if flip { 1.0 - x } else { x };
+
     let (x0, x1) = SPLITTER_BODY_X;
+    // Mirroring reverses x0 < x1 into mx(x1) < mx(x0), so re-sort into
+    // (lo, hi) for a well-formed spine rect either way.
+    let (bx0, bx1) = if flip { (mx(x1), mx(x0)) } else { (x0, x1) };
 
     // Thin rectangular "spine" - kept convex so it needs no separate
     // fill_outline, unlike the comb shape a full concave outline would need.
     let outline = vec![
-        ShapeCmd::MoveTo(vec2(x0, 0.0)),
-        ShapeCmd::LineTo(vec2(x1, 0.0)),
-        ShapeCmd::LineTo(vec2(x1, 1.0)),
-        ShapeCmd::LineTo(vec2(x0, 1.0)),
+        ShapeCmd::MoveTo(vec2(bx0, 0.0)),
+        ShapeCmd::LineTo(vec2(bx1, 0.0)),
+        ShapeCmd::LineTo(vec2(bx1, 1.0)),
+        ShapeCmd::LineTo(vec2(bx0, 1.0)),
     ];
 
     // arm 0's tooth sits at the smallest y (spaced() grows with i), i.e. the
@@ -294,28 +307,47 @@ pub fn splitter_shape(arms: u8) -> ComponentShape {
     // spine's own edges to form the comb, rather than baking the fan into
     // the (concave) outline itself.
     let trunk = vec![
-        ShapeCmd::MoveTo(vec2(0.0, data_y)),
-        ShapeCmd::LineTo(vec2(x0, data_y)),
+        ShapeCmd::MoveTo(vec2(mx(0.0), data_y)),
+        ShapeCmd::LineTo(vec2(mx(x0), data_y)),
     ];
     let teeth = (0..n).map(|i| {
         let y = spaced(i, n);
         vec![
-            ShapeCmd::MoveTo(vec2(x1, y)),
-            ShapeCmd::LineTo(vec2(1.0, y)),
+            ShapeCmd::MoveTo(vec2(mx(x1), y)),
+            ShapeCmd::LineTo(vec2(mx(1.0), y)),
         ]
     });
     let extra_strokes = std::iter::once(trunk).chain(teeth).collect();
 
-    let output_anchors = (0..n).map(|i| PinAnchor::right(spaced(i, n))).collect();
+    let arm_anchor = |i: usize| {
+        if flip {
+            PinAnchor::left(spaced(i, n))
+        } else {
+            PinAnchor::right(spaced(i, n))
+        }
+    };
+    let trunk_anchor = if flip {
+        PinAnchor::right(data_y)
+    } else {
+        PinAnchor::left(data_y)
+    };
+
+    let (input_anchors, output_anchors): (Vec<PinAnchor>, Vec<PinAnchor>) = if flip {
+        ((0..n).map(arm_anchor).collect(), vec![trunk_anchor])
+    } else {
+        (vec![trunk_anchor], (0..n).map(arm_anchor).collect())
+    };
+    // Sized off output_anchors.len(), not `n` - they only coincide in Right mode.
+    let output_bubbles = vec![false; output_anchors.len()];
 
     ComponentShape {
         size: vec2(SPLITTER_WIDTH, h),
         outline,
         fill_outline: None,
-        input_anchors: vec![PinAnchor::left(data_y)],
+        input_anchors,
         output_anchors,
         extra_strokes,
-        output_bubbles: vec![false; n],
+        output_bubbles,
         labels: vec![],
         dynamic_label_pos: Vec2::ZERO,
     }
