@@ -1,9 +1,9 @@
 use egui::vec2;
 use egui::{Pos2, Vec2};
 
-use crate::circuit::TunnelRole;
-use crate::component::GateOp;
-use crate::shape::{ComponentLabel, ComponentShape, PinAnchor, ShapeCmd};
+use crate::gui::shape::{ComponentLabel, ComponentShape, PinAnchor, ShapeCmd};
+use crate::sim::circuit::TunnelRole;
+use crate::sim::component::GateOp;
 
 pub const GRID_SIZE: f32 = 20.0;
 pub const COMP_WIDTH: f32 = 40.0;

@@ -10,13 +10,14 @@ Dependencies: slotmap 1.1.1 (stable generational arena keys), eframe/egui 0.35.0
 
 ## Module Map
 
-    src/value.rs      Value enum - signal representation
-    src/net.rs        Net struct - a wire connecting component pins
-    src/component.rs  Component, Logic, Pins, PinId, key types
-    src/circuit.rs    Circuit - the simulation graph and evaluation engine
-    src/shape.rs      ComponentShape, ShapeCmd, PinAnchor, tessellate_path - visual shape system
-    src/app.rs        OsmilogApp - eframe/egui GUI (ComponentDef, PlacedComponent, Wire, InteractionMode)
-    src/main.rs       entry point (eframe::run_native) and integration tests
+    src/sim/value.rs      Value enum - signal representation
+    src/sim/net.rs        Net struct - a wire connecting component pins
+    src/sim/component.rs  Component, Logic, Pins, PinId, key types
+    src/sim/circuit.rs    Circuit - the simulation graph and evaluation engine
+    src/gui/shape.rs      ComponentShape, ShapeCmd, PinAnchor, tessellate_path - visual shape system
+    src/gui/geometry.rs   ComponentDef shape builders (gate_shape, mux_shape, ...) and geometry constants (GRID_SIZE, COMP_WIDTH, ...)
+    src/gui/app.rs        OsmilogApp - eframe/egui GUI (ComponentDef, PlacedComponent, Wire, InteractionMode)
+    src/main.rs           entry point (eframe::run_native) and integration tests
 
 
 ## Core Types
@@ -176,7 +177,7 @@ clear_nets() disconnects all pins and removes all nets while keeping components 
 
 ## GUI Architecture
 
-The GUI lives in `src/app.rs` and is driven by `eframe::run_native` in `main.rs`
+The GUI lives in `src/gui/app.rs` and is driven by `eframe::run_native` in `main.rs`
 (1200 × 800 initial viewport). `OsmilogApp` implements `eframe::App` via two methods:
 `logic` (pre-frame logic) and `ui` (painting).
 

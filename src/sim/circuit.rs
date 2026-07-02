@@ -1,4 +1,4 @@
-use crate::{
+use crate::sim::{
     component::{CompKey, Component, Logic, LogicComb, PinId},
     value::Value,
 };
@@ -6,7 +6,7 @@ use crate::{
 use slotmap::{new_key_type, SecondaryMap, SlotMap};
 use std::collections::{HashMap, VecDeque};
 
-use crate::net::{Net, NetKey};
+use crate::sim::net::{Net, NetKey};
 
 new_key_type! {
     pub struct TunnelKey;
@@ -596,7 +596,7 @@ impl Circuit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::GateOp;
+    use crate::sim::component::GateOp;
     use test_case::test_case;
 
     // ---- Group 1: construction / basic wiring ----

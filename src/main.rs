@@ -1,3 +1,5 @@
+use osmilog::gui::app::OsmilogApp;
+
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -9,7 +11,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "osmilog",
         options,
-        Box::new(|cc| Ok(Box::new(osmilog::app::OsmilogApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(OsmilogApp::new(cc)))),
     )
 }
 
@@ -36,7 +38,7 @@ mod wasm_entry {
                 .start(
                     canvas,
                     eframe::WebOptions::default(),
-                    Box::new(|cc| Ok(Box::new(osmilog::app::OsmilogApp::new(cc)))),
+                    Box::new(|cc| Ok(Box::new(osmilog::gui::app::OsmilogApp::new(cc)))),
                 )
                 .await
                 .expect("failed to start eframe");

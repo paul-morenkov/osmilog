@@ -1,5 +1,5 @@
-use crate::net::{Net, NetKey};
-use crate::value::Value;
+use crate::sim::net::{Net, NetKey};
+use crate::sim::value::Value;
 use slotmap::{new_key_type, SlotMap};
 
 new_key_type! {
@@ -192,7 +192,7 @@ impl Component {
                 }
                 LogicComb::Splitter(s) => match read_pin(0) {
                     // TODO: Use `width` to validate total width in arms
-                    Value::Fixed { bits, width } => {
+                    Value::Fixed { bits, .. } => {
                         let mut out = Vec::new();
                         for out_arm in 0..s.arms {
                             let mut out_bits = 0;

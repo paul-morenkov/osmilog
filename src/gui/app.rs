@@ -2,17 +2,15 @@ use eframe;
 use egui::epaint::{PathShape, PathStroke};
 use egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Sense, Stroke, Vec2};
 
-use crate::{
-    circuit::{Circuit, TunnelKey, TunnelRole},
-    component::{CompKey, Component, GateOp, InIdx, OutIdx, PinId},
-    geometry::{
-        demux_shape, demux_size, gate_shape, gate_size, mux_shape, mux_size, rect_outline,
-        reg_shape, reg_size, snap_to_grid, splitter_shape, splitter_size, tunnel_shape,
-        COMP_MIN_HEIGHT, COMP_WIDTH, GRID_SIZE,
-    },
-    shape::{tessellate_path, ComponentShape, PinAnchor, BUBBLE_R},
-    value::Value,
+use crate::gui::geometry::{
+    demux_shape, demux_size, gate_shape, gate_size, mux_shape, mux_size, rect_outline, reg_shape,
+    reg_size, snap_to_grid, splitter_shape, splitter_size, tunnel_shape, COMP_MIN_HEIGHT,
+    COMP_WIDTH, GRID_SIZE,
 };
+use crate::gui::shape::{tessellate_path, ComponentShape, PinAnchor, BUBBLE_R};
+use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
+use crate::sim::component::{CompKey, Component, GateOp, InIdx, OutIdx, PinId};
+use crate::sim::value::Value;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -298,7 +296,7 @@ impl OsmilogApp {
         }
     }
 
-    fn record_settle_result<T>(&mut self, result: Result<T, crate::circuit::SettleError>) {
+    fn record_settle_result<T>(&mut self, result: Result<T, crate::sim::circuit::SettleError>) {
         match result {
             Ok(_) => self.last_settle_error = None,
             Err(e) => self.last_settle_error = Some(e.to_string()),
