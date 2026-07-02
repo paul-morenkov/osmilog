@@ -403,7 +403,7 @@ impl OsmilogApp {
                     ui.horizontal(|ui| {
                         ui.label("Bits:");
                         changed |= ui
-                            .add(egui::DragValue::new(&mut bits).range(1..=Value::mask(width)))
+                            .add(egui::DragValue::new(&mut bits).range(0..=Value::mask(width)))
                             .changed();
                     });
                 }
