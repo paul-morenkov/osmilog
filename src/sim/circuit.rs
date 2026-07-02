@@ -1,12 +1,9 @@
-use crate::sim::{
-    component::{CompKey, Component, Logic, LogicComb, PinId},
-    value::Value,
-};
+use crate::sim::component::{CompKey, Component, Logic, LogicComb, PinId};
+use crate::sim::net::{Net, NetKey};
+use crate::sim::value::Value;
 
 use slotmap::{new_key_type, SecondaryMap, SlotMap};
 use std::collections::{HashMap, VecDeque};
-
-use crate::sim::net::{Net, NetKey};
 
 new_key_type! {
     pub struct TunnelKey;
@@ -282,7 +279,6 @@ impl Circuit {
     }
 
     pub fn rename_tunnel(&mut self, tunnel: TunnelKey, new_label: String) {
-        println!("Renaming tunnel {:?} to {}", tunnel, new_label);
         let Some(t) = self.tunnels.get_mut(tunnel) else {
             return;
         };
