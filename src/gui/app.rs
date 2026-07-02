@@ -7,7 +7,10 @@ use std::collections::HashMap;
 use crate::gui::geometry::{snap_to_grid, tunnel_shape, GRID_SIZE};
 use crate::gui::placed_component::{ComponentDef, PlacedComponent};
 use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
-use crate::io::{CircuitFile, ComponentEntry, LoadError, TunnelEntry, TunnelWireEntry, WireEntry, CURRENT_VERSION};
+use crate::io::{
+    CircuitFile, ComponentEntry, LoadError, TunnelEntry, TunnelWireEntry, WireEntry,
+    CURRENT_VERSION,
+};
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::component::{CompKey, FanDirection, GateOp, InIdx, OutIdx, PinId};
 use crate::sim::value::Value;
@@ -736,134 +739,138 @@ impl eframe::App for OsmilogApp {
 
         // ── Menu bar ──────────────────────────────────────────────────────
         egui::Panel::top("menu_bar").show(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("Save").clicked() {
-                    match self.to_circuit_file().to_json() {
-                        Ok(json) => {
-                            #[cfg(not(target_arch = "wasm32"))]
-                            if let Some(Err(e)) = crate::io::native::save_dialog(&json) {
-                                self.last_settle_error = Some(format!("save failed: {e}"));
+            ui.horizontal(|ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Save").clicked() {
+                        match self.to_circuit_file().to_json() {
+                            Ok(json) => {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if let Some(Err(e)) = crate::io::native::save_dialog(&json) {
+                                    self.last_settle_error = Some(format!("save failed: {e}"));
+                                }
+                                #[cfg(target_arch = "wasm32")]
+                                crate::io::wasm::trigger_download("circuit.json", &json);
                             }
-                            #[cfg(target_arch = "wasm32")]
-                            crate::io::wasm::trigger_download("circuit.json", &json);
+                            Err(e) => self.last_settle_error = Some(format!("save failed: {e}")),
                         }
-                        Err(e) => self.last_settle_error = Some(format!("save failed: {e}")),
+                        ui.close();
                     }
-                    ui.close();
-                }
-                if ui.button("Load").clicked() {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    if let Some(outcome) = crate::io::native::load_dialog() {
-                        match outcome {
-                            Ok(file) => {
-                                if let Err(e) = self.load_circuit_file(&file) {
-                                    self.last_settle_error = Some(format!("load failed: {e}"));
+                    if ui.button("Load").clicked() {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if let Some(outcome) = crate::io::native::load_dialog() {
+                            match outcome {
+                                Ok(file) => {
+                                    if let Err(e) = self.load_circuit_file(&file) {
+                                        self.last_settle_error = Some(format!("load failed: {e}"));
+                                    }
+                                }
+                                Err(e) => {
+                                    self.last_settle_error = Some(format!("load failed: {e}"))
                                 }
                             }
-                            Err(e) => self.last_settle_error = Some(format!("load failed: {e}")),
                         }
+                        // WASM's file pick + read is async - this just kicks the
+                        // task off; the result lands in pending_load and is
+                        // applied by apply_pending_load on a later frame.
+                        #[cfg(target_arch = "wasm32")]
+                        crate::io::wasm::spawn_load_dialog(self.pending_load.clone());
+                        ui.close();
                     }
-                    // WASM's file pick + read is async - this just kicks the
-                    // task off; the result lands in pending_load and is
-                    // applied by apply_pending_load on a later frame.
-                    #[cfg(target_arch = "wasm32")]
-                    crate::io::wasm::spawn_load_dialog(self.pending_load.clone());
-                    ui.close();
-                }
-            });
-            ui.menu_button("Add", |ui| {
-                ui.menu_button("Gates", |ui| {
-                    let gates = [
-                        ("AND", GateOp::And, 2),
-                        ("OR", GateOp::Or, 2),
-                        ("XOR", GateOp::Xor, 2),
-                        ("NAND", GateOp::Nand, 2),
-                        ("NOR", GateOp::Nor, 2),
-                        ("NOT", GateOp::Not, 1),
-                    ];
-                    for (name, op, n) in gates {
-                        if ui.button(name).clicked() {
+                });
+                ui.menu_button("Add", |ui| {
+                    ui.menu_button("Gates", |ui| {
+                        let gates = [
+                            ("AND", GateOp::And, 2),
+                            ("OR", GateOp::Or, 2),
+                            ("XOR", GateOp::Xor, 2),
+                            ("NAND", GateOp::Nand, 2),
+                            ("NOR", GateOp::Nor, 2),
+                            ("NOT", GateOp::Not, 1),
+                        ];
+                        for (name, op, n) in gates {
+                            if ui.button(name).clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    def: ComponentDef::Gate {
+                                        op,
+                                        n_inputs: n,
+                                        width: 1,
+                                    },
+                                };
+                                ui.close();
+                            }
+                        }
+                    });
+                    if ui.button("Input").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Input { bits: 0, width: 1 },
+                        };
+                        ui.close();
+                    }
+                    if ui.button("Output").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Output,
+                        };
+                        ui.close();
+                    }
+                    if ui.button("Mux").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Mux {
+                                data_width: 1,
+                                sel_width: 1,
+                            },
+                        };
+                        ui.close();
+                    }
+                    if ui.button("Demux").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Demux {
+                                data_width: 1,
+                                sel_width: 1,
+                            },
+                        };
+                        ui.close();
+                    }
+                    if ui.button("Splitter").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Splitter {
+                                width: 2,
+                                arm_bits: vec![vec![0], vec![1]],
+                                direction: FanDirection::Right,
+                            },
+                        };
+                        ui.close();
+                    }
+                    ui.menu_button("Memory", |ui| {
+                        if ui.button("Register").clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentDef::Gate {
-                                    op,
-                                    n_inputs: n,
-                                    width: 1,
-                                },
+                                def: ComponentDef::Reg { data_width: 1 },
                             };
                             ui.close();
                         }
-                    }
+                    });
+                    ui.menu_button("Tunnel", |ui| {
+                        if ui.button("Feed").clicked() {
+                            self.mode = InteractionMode::PlacingTunnel {
+                                role: TunnelRole::Feed,
+                            };
+                            ui.close();
+                        }
+                        if ui.button("Pull").clicked() {
+                            self.mode = InteractionMode::PlacingTunnel {
+                                role: TunnelRole::Pull,
+                            };
+                            ui.close();
+                        }
+                    });
                 });
-                if ui.button("Input").clicked() {
-                    self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Input { bits: 0, width: 1 },
-                    };
-                    ui.close();
+                if ui.button("Tick Clock").clicked() {
+                    let result = self.circuit.tick_clock();
+                    self.record_settle_result(result);
                 }
-                if ui.button("Output").clicked() {
-                    self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Output,
-                    };
-                    ui.close();
+                if let Some(err) = &self.last_settle_error {
+                    ui.colored_label(Color32::RED, err);
                 }
-                if ui.button("Mux").clicked() {
-                    self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Mux {
-                            data_width: 1,
-                            sel_width: 1,
-                        },
-                    };
-                    ui.close();
-                }
-                if ui.button("Demux").clicked() {
-                    self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Demux {
-                            data_width: 1,
-                            sel_width: 1,
-                        },
-                    };
-                    ui.close();
-                }
-                if ui.button("Splitter").clicked() {
-                    self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Splitter {
-                            width: 2,
-                            arm_bits: vec![vec![0], vec![1]],
-                            direction: FanDirection::Right,
-                        },
-                    };
-                    ui.close();
-                }
-                ui.menu_button("Memory", |ui| {
-                    if ui.button("Register").clicked() {
-                        self.mode = InteractionMode::Placing {
-                            def: ComponentDef::Reg { data_width: 1 },
-                        };
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Tunnel", |ui| {
-                    if ui.button("Feed").clicked() {
-                        self.mode = InteractionMode::PlacingTunnel {
-                            role: TunnelRole::Feed,
-                        };
-                        ui.close();
-                    }
-                    if ui.button("Pull").clicked() {
-                        self.mode = InteractionMode::PlacingTunnel {
-                            role: TunnelRole::Pull,
-                        };
-                        ui.close();
-                    }
-                });
-            });
-            if ui.button("Tick Clock").clicked() {
-                let result = self.circuit.tick_clock();
-                self.record_settle_result(result);
-            }
-            if let Some(err) = &self.last_settle_error {
-                ui.colored_label(Color32::RED, err);
-            }
+            })
         });
 
         // ── Properties panel ──────────────────────────────────────────────
@@ -1656,8 +1663,7 @@ mod tests {
         // Pull reads FROM its attached net (here: inp's output) and
         // contributes that value TO the shared label group; Feed drives its
         // attached net (here: out's input) FROM the group's resolved value.
-        app.circuit
-            .link_tunnel(pull_key, inp_key, PinId::output(0));
+        app.circuit.link_tunnel(pull_key, inp_key, PinId::output(0));
         app.tunnel_wires.push(TunnelWire {
             tunnel: pull_key,
             comp: inp_key,
