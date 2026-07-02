@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use crate::gui::geometry::{snap_to_grid, tunnel_shape, GRID_SIZE};
 use crate::gui::placed_component::{ComponentDef, PlacedComponent};
 use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
+use crate::gui::theme::Theme;
 use crate::io::{
     CircuitFile, ComponentEntry, LoadError, TunnelEntry, TunnelWireEntry, WireEntry,
     CURRENT_VERSION,
@@ -736,6 +737,7 @@ impl eframe::App for OsmilogApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let theme = Theme::from_visuals(ui.visuals());
 
         // ── Menu bar ──────────────────────────────────────────────────────
         egui::Panel::top("menu_bar").show(ui, |ui| {
@@ -868,7 +870,7 @@ impl eframe::App for OsmilogApp {
                     self.record_settle_result(result);
                 }
                 if let Some(err) = &self.last_settle_error {
-                    ui.colored_label(Color32::RED, err);
+                    ui.colored_label(theme.error_text, err);
                 }
             })
         });
@@ -903,7 +905,8 @@ impl eframe::App for OsmilogApp {
                 self.mode = InteractionMode::Idle;
             }
 
-            draw_grid(&painter, clip_rect, pan);
+            painter.rect_filled(clip_rect, 0.0, theme.canvas_bg);
+            draw_grid(&painter, clip_rect, pan, theme);
 
             // Draw wires. Resolves the net live via Component::net_of rather
             // than caching a NetKey on Wire: a cached key can go stale if a
@@ -941,8 +944,8 @@ impl eframe::App for OsmilogApp {
                 let net =
                     self.circuit.components[wire.src_comp].net_of(PinId::output(wire.src_pin.0));
                 let color = net
-                    .map(|nk| value_stroke(self.circuit.nets[nk].value))
-                    .unwrap_or(value_stroke(Value::Floating));
+                    .map(|nk| value_stroke(theme, self.circuit.nets[nk].value))
+                    .unwrap_or(value_stroke(theme, Value::Floating));
                 draw_wire(&painter, p0, p1, color);
             }
 
@@ -960,21 +963,21 @@ impl eframe::App for OsmilogApp {
                 let p1 = comp_pin_pos(&pc.def.shape(), pc.grid_pos, pan, tw.pin);
                 let net = self.circuit.components[tw.comp].net_of(tw.pin);
                 let color = net
-                    .map(|nk| value_stroke(self.circuit.nets[nk].value))
-                    .unwrap_or(value_stroke(Value::Floating));
+                    .map(|nk| value_stroke(theme, self.circuit.nets[nk].value))
+                    .unwrap_or(value_stroke(theme, Value::Floating));
                 draw_wire(&painter, p0, p1, color);
             }
 
             // Draw components
             for (pc_key, pc) in &self.components {
                 let is_selected = self.selected == Some(Selected::Component(pc_key));
-                draw_component(&painter, pc, pan, &self.circuit, is_selected);
+                draw_component(&painter, pc, pan, &self.circuit, is_selected, theme);
             }
 
             // Draw tunnels
             for (pt_key, pt) in &self.tunnels {
                 let is_selected = self.selected == Some(Selected::Tunnel(pt_key));
-                draw_tunnel(&painter, pt, pan, &self.circuit, is_selected);
+                draw_tunnel(&painter, pt, pan, &self.circuit, is_selected, theme);
             }
 
             let pointer = response
@@ -1050,7 +1053,7 @@ impl eframe::App for OsmilogApp {
                 InteractionMode::Placing { def } => {
                     if let Some(pos) = pointer {
                         let gp = snap_to_grid(pos, pan);
-                        draw_ghost(&painter, &def, gp, pan);
+                        draw_ghost(&painter, &def, gp, pan, theme);
                     }
                     if response.clicked() {
                         if let Some(pos) = pointer {
@@ -1064,7 +1067,7 @@ impl eframe::App for OsmilogApp {
                 InteractionMode::PlacingTunnel { role } => {
                     if let Some(pos) = pointer {
                         let gp = snap_to_grid(pos, pan);
-                        draw_tunnel_ghost(&painter, role, gp, pan);
+                        draw_tunnel_ghost(&painter, role, gp, pan, theme);
                     }
                     if response.clicked() {
                         if let Some(pos) = pointer {
@@ -1093,7 +1096,7 @@ impl eframe::App for OsmilogApp {
                     };
 
                     let end = pointer.unwrap_or(current_end);
-                    let stroke = Stroke::new(WIRE_THICKNESS_THIN, Color32::from_gray(150));
+                    let stroke = Stroke::new(WIRE_THICKNESS_THIN, theme.wire_drag_preview);
                     draw_wire(&painter, p0, end, stroke);
 
                     self.mode = InteractionMode::WireDrag {
@@ -1302,14 +1305,14 @@ fn tunnel_pin_at_pos<'a>(
 
 // ── Color ─────────────────────────────────────────────────────────────────────
 
-fn value_stroke(val: Value) -> Stroke {
+fn value_stroke(theme: Theme, val: Value) -> Stroke {
     let (color, weight) = match val {
-        Value::Floating => (Color32::GRAY, WIRE_THICKNESS_THIN),
+        Value::Floating => (theme.value_floating, WIRE_THICKNESS_THIN),
         Value::Fixed { bits, width } => (
             if bits == 0 {
-                Color32::from_rgb(40, 40, 80)
+                theme.value_low
             } else {
-                Color32::from_rgb(50, 200, 80)
+                theme.value_high
             },
             if width == 1 {
                 WIRE_THICKNESS_THIN
@@ -1323,7 +1326,7 @@ fn value_stroke(val: Value) -> Stroke {
 
 // ── Drawing ───────────────────────────────────────────────────────────────────
 
-fn draw_grid(painter: &Painter, clip_rect: Rect, pan: Vec2) {
+fn draw_grid(painter: &Painter, clip_rect: Rect, pan: Vec2, theme: Theme) {
     let x0 = ((clip_rect.left() - pan.x) / GRID_SIZE).floor() as i32;
     let x1 = ((clip_rect.right() - pan.x) / GRID_SIZE).ceil() as i32;
     let y0 = ((clip_rect.top() - pan.y) / GRID_SIZE).floor() as i32;
@@ -1333,7 +1336,7 @@ fn draw_grid(painter: &Painter, clip_rect: Rect, pan: Vec2) {
             painter.circle_filled(
                 egui::pos2(gx as f32 * GRID_SIZE + pan.x, gy as f32 * GRID_SIZE + pan.y),
                 1.0,
-                Color32::from_gray(60),
+                theme.grid_dot,
             );
         }
     }
@@ -1354,14 +1357,15 @@ fn draw_component(
     pan: Vec2,
     circuit: &Circuit,
     is_selected: bool,
+    theme: Theme,
 ) {
     let shape = pc.def.shape();
     let rect = component_bounding_rect(pc, pan);
-    let fill = Color32::from_rgb(45, 45, 65);
+    let fill = theme.component_fill;
     let (stroke_w, stroke_col) = if is_selected {
-        (COMP_STROKE + 1.0, Color32::from_rgb(100, 160, 255))
+        (COMP_STROKE + 1.0, theme.outline_selected)
     } else {
-        (COMP_STROKE, Color32::from_gray(160))
+        (COMP_STROKE, theme.outline_default)
     };
     let outline_stroke = Stroke::new(stroke_w, stroke_col);
 
@@ -1415,7 +1419,7 @@ fn draw_component(
             Align2::CENTER_CENTER,
             label.text,
             FontId::monospace(LABEL_FONT_SIZE),
-            Color32::WHITE,
+            theme.label_text,
         );
     }
 
@@ -1424,12 +1428,12 @@ fn draw_component(
         let val = circuit.components[pc.key].pins.inputs[i]
             .map(|nk| circuit.nets[nk].value)
             .unwrap_or(Value::Floating);
-        painter.circle_filled(pos, PIN_RADIUS, value_stroke(val).color);
+        painter.circle_filled(pos, PIN_RADIUS, value_stroke(theme, val).color);
     }
     for i in 0..pc.def.n_outputs() {
         let pos = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::output(i as u8));
         let val = circuit.components[pc.key].pins.out_cache[i];
-        painter.circle_filled(pos, PIN_RADIUS, value_stroke(val).color);
+        painter.circle_filled(pos, PIN_RADIUS, value_stroke(theme, val).color);
     }
 }
 
@@ -1439,15 +1443,17 @@ fn draw_tunnel(
     pan: Vec2,
     circuit: &Circuit,
     is_selected: bool,
+    theme: Theme,
 ) {
     let shape = tunnel_shape(pt.role);
     let rect = tunnel_bounding_rect(pt, pan);
-    // Slightly different tint from components, to visually distinguish tunnels.
-    let fill = Color32::from_rgb(65, 45, 65);
+    // Distinct fill from components (theme's "open" widget tone), to visually
+    // distinguish tunnels.
+    let fill = theme.tunnel_fill;
     let (stroke_w, stroke_col) = if is_selected {
-        (COMP_STROKE + 1.0, Color32::from_rgb(100, 160, 255))
+        (COMP_STROKE + 1.0, theme.outline_selected)
     } else {
-        (COMP_STROKE, Color32::from_gray(160))
+        (COMP_STROKE, theme.outline_default)
     };
 
     let fill_pts = tessellate_path(&shape.outline, rect);
@@ -1475,7 +1481,7 @@ fn draw_tunnel(
         Align2::CENTER_CENTER,
         &pt.label,
         FontId::monospace(LABEL_FONT_SIZE),
-        Color32::WHITE,
+        theme.label_text,
     );
 
     let val = circuit
@@ -1484,17 +1490,21 @@ fn draw_tunnel(
         .and_then(|t| t.net)
         .map(|nk| circuit.nets[nk].value)
         .unwrap_or(Value::Floating);
-    painter.circle_filled(tunnel_pin_pos(pt, pan), PIN_RADIUS, value_stroke(val).color);
+    painter.circle_filled(
+        tunnel_pin_pos(pt, pan),
+        PIN_RADIUS,
+        value_stroke(theme, val).color,
+    );
 }
 
-fn draw_ghost(painter: &Painter, def: &ComponentDef, grid_pos: [i32; 2], pan: Vec2) {
+fn draw_ghost(painter: &Painter, def: &ComponentDef, grid_pos: [i32; 2], pan: Vec2, theme: Theme) {
     let shape = def.shape();
     let tl = egui::pos2(
         grid_pos[0] as f32 * GRID_SIZE + pan.x,
         grid_pos[1] as f32 * GRID_SIZE + pan.y,
     );
     let rect = Rect::from_min_size(tl, shape.size);
-    let ghost_col = Color32::from_gray(120);
+    let ghost_col = theme.ghost_preview;
 
     let pts = tessellate_path(&shape.outline, rect);
     painter.add(egui::Shape::Path(PathShape {
@@ -1527,14 +1537,20 @@ fn draw_ghost(painter: &Painter, def: &ComponentDef, grid_pos: [i32; 2], pan: Ve
     }
 }
 
-fn draw_tunnel_ghost(painter: &Painter, role: TunnelRole, grid_pos: [i32; 2], pan: Vec2) {
+fn draw_tunnel_ghost(
+    painter: &Painter,
+    role: TunnelRole,
+    grid_pos: [i32; 2],
+    pan: Vec2,
+    theme: Theme,
+) {
     let shape = tunnel_shape(role);
     let tl = egui::pos2(
         grid_pos[0] as f32 * GRID_SIZE + pan.x,
         grid_pos[1] as f32 * GRID_SIZE + pan.y,
     );
     let rect = Rect::from_min_size(tl, shape.size);
-    let ghost_col = Color32::from_gray(120);
+    let ghost_col = theme.ghost_preview;
 
     let pts = tessellate_path(&shape.outline, rect);
     painter.add(egui::Shape::Path(PathShape {
