@@ -381,7 +381,7 @@ pub enum LogicSeq {
     Reg { value: Value, data_width: u8 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GateOp {
     And,
     Or,
@@ -392,7 +392,7 @@ pub enum GateOp {
     Not,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FanDirection {
     Right,
     Left,
