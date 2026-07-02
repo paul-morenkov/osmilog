@@ -89,7 +89,7 @@ impl ComponentDef {
     // every frame for hit-testing/selection.
     pub fn size(&self) -> Vec2 {
         match self {
-            Self::Input { .. } | Self::Output => egui::vec2(COMP_WIDTH, COMP_MIN_HEIGHT),
+            Self::Input { .. } | Self::Output => egui::vec2(COMP_MIN_WIDTH, COMP_MIN_HEIGHT),
             Self::Gate { op, n_inputs, .. } => gate_size(*op, *n_inputs),
             Self::Mux { sel_width, .. } => mux_size(*sel_width),
             Self::Demux { sel_width, .. } => demux_size(*sel_width),
@@ -152,7 +152,7 @@ impl ComponentDef {
             Self::Input { .. } => {
                 let h = COMP_MIN_HEIGHT;
                 ComponentShape {
-                    size: egui::vec2(COMP_WIDTH, h),
+                    size: egui::vec2(COMP_MIN_WIDTH, h),
                     outline: rect_outline(),
                     fill_outline: None,
                     input_anchors: vec![],
@@ -166,7 +166,7 @@ impl ComponentDef {
             Self::Output => {
                 let h = COMP_MIN_HEIGHT;
                 ComponentShape {
-                    size: egui::vec2(COMP_WIDTH, h),
+                    size: egui::vec2(COMP_MIN_WIDTH, h),
                     outline: rect_outline(),
                     fill_outline: None,
                     input_anchors: vec![PinAnchor::left(0.5)],
