@@ -14,7 +14,7 @@ pub struct PlacedComponent {
 
 // ── ComponentDef ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ComponentDef {
     Input {
         bits: u32,

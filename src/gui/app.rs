@@ -2,10 +2,15 @@ use eframe;
 use egui::epaint::{PathShape, PathStroke};
 use egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Sense, Stroke, Vec2};
 use slotmap::{new_key_type, SlotMap};
+use std::collections::HashMap;
 
 use crate::gui::geometry::{snap_to_grid, tunnel_shape, GRID_SIZE};
 use crate::gui::placed_component::{ComponentDef, PlacedComponent};
 use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
+use crate::io::{
+    CircuitFile, ComponentEntry, LoadError, TunnelEntry, TunnelWireEntry, WireEntry,
+    CURRENT_VERSION,
+};
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::component::{CompKey, FanDirection, GateOp, InIdx, OutIdx, PinId};
 use crate::sim::value::Value;
@@ -121,11 +126,23 @@ pub struct OsmilogApp {
     pub mode: InteractionMode,
     pub pan: Vec2,
     pub selected: Option<Selected>,
+    // Also surfaces File > Save/Load I/O errors, not just settle() errors -
+    // both are transient "something went wrong" status shown in the same
+    // red label in the menu bar (see the "Menu bar" section of `ui`).
     pub last_settle_error: Option<String>,
+    // WASM has no synchronous file dialogs (picking/reading a file is
+    // Promise-based), so a load kicked off from the File menu delivers its
+    // result here on some later frame instead of returning directly to the
+    // click handler that started it - see `apply_pending_load`.
+    #[cfg(target_arch = "wasm32")]
+    pending_load: crate::io::wasm::PendingLoad,
 }
 
 impl OsmilogApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    // Split out from `new` so tests (and `load_circuit_file`) can construct
+    // a fresh app without an eframe::CreationContext, which isn't
+    // constructible outside a running eframe host.
+    pub fn empty() -> Self {
         Self {
             circuit: Circuit::new(),
             components: SlotMap::default(),
@@ -136,7 +153,13 @@ impl OsmilogApp {
             pan: Vec2::ZERO,
             selected: None,
             last_settle_error: None,
+            #[cfg(target_arch = "wasm32")]
+            pending_load: crate::io::wasm::new_pending_load(),
         }
+    }
+
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        Self::empty()
     }
 
     fn record_settle_result<T>(&mut self, result: Result<T, crate::sim::circuit::SettleError>) {
@@ -155,6 +178,18 @@ impl OsmilogApp {
 
     fn place_tunnel(&mut self, role: TunnelRole, grid_pos: [i32; 2]) -> PlacedTunnelKey {
         let label = format!("Tunnel{}", self.tunnels.len());
+        self.place_tunnel_labeled(label, role, grid_pos)
+    }
+
+    // Shared by place_tunnel (auto-generated label) and load_circuit_file
+    // (label restored from a saved file - tunnels connect to each other by
+    // matching label, so a loaded tunnel must keep its exact saved label).
+    fn place_tunnel_labeled(
+        &mut self,
+        label: String,
+        role: TunnelRole,
+        grid_pos: [i32; 2],
+    ) -> PlacedTunnelKey {
         let key = self.circuit.add_tunnel(label.clone(), role);
         let pt = PlacedTunnel {
             key,
@@ -163,6 +198,145 @@ impl OsmilogApp {
             grid_pos,
         };
         self.tunnels.insert(pt)
+    }
+
+    // ── Save / load ──────────────────────────────────────────────────────
+
+    pub fn to_circuit_file(&self) -> CircuitFile {
+        // CompKey/TunnelKey (the sim's own keys, held on PlacedComponent/
+        // PlacedTunnel) -> position in the Vec being emitted, so wires can
+        // be re-expressed as indices instead of slotmap keys. Populated as
+        // a side effect of building `components`/`tunnels` below, so it
+        // must be fully built before `wires`/`tunnel_wires` read it.
+        let mut comp_index: HashMap<CompKey, usize> = HashMap::new();
+        let components: Vec<ComponentEntry> = self
+            .components
+            .values()
+            .enumerate()
+            .map(|(i, pc)| {
+                comp_index.insert(pc.key, i);
+                ComponentEntry {
+                    def: pc.def.clone(),
+                    grid_pos: pc.grid_pos,
+                }
+            })
+            .collect();
+
+        let mut tunnel_index: HashMap<TunnelKey, usize> = HashMap::new();
+        let tunnels: Vec<TunnelEntry> = self
+            .tunnels
+            .values()
+            .enumerate()
+            .map(|(i, pt)| {
+                tunnel_index.insert(pt.key, i);
+                TunnelEntry {
+                    label: pt.label.clone(),
+                    role: pt.role,
+                    grid_pos: pt.grid_pos,
+                }
+            })
+            .collect();
+
+        let wires = self
+            .wires
+            .iter()
+            .map(|w| WireEntry {
+                src: comp_index[&w.src_comp],
+                src_pin: w.src_pin.0,
+                dst: comp_index[&w.dst_comp],
+                dst_pin: w.dst_pin.0,
+            })
+            .collect();
+
+        let tunnel_wires = self
+            .tunnel_wires
+            .iter()
+            .map(|tw| {
+                let (is_input, pin_index) = match tw.pin {
+                    PinId::In(InIdx(i)) => (true, i),
+                    PinId::Out(OutIdx(i)) => (false, i),
+                };
+                TunnelWireEntry {
+                    tunnel: tunnel_index[&tw.tunnel],
+                    comp: comp_index[&tw.comp],
+                    is_input,
+                    pin_index,
+                }
+            })
+            .collect();
+
+        CircuitFile {
+            version: CURRENT_VERSION,
+            components,
+            tunnels,
+            wires,
+            tunnel_wires,
+        }
+    }
+
+    // Replaces the current circuit entirely with the one described by
+    // `file`. Validates first so a malformed file (e.g. hand-edited with a
+    // bad index) is rejected before any existing state is touched, rather
+    // than leaving `self` half-overwritten.
+    pub fn load_circuit_file(&mut self, file: &CircuitFile) -> Result<(), LoadError> {
+        file.validate()?;
+
+        self.circuit = Circuit::new();
+        self.components = SlotMap::default();
+        self.tunnels = SlotMap::default();
+        self.wires = Vec::new();
+        self.tunnel_wires = Vec::new();
+        self.selected = None;
+        self.mode = InteractionMode::Idle;
+        self.last_settle_error = None;
+
+        let comp_keys: Vec<CompKey> = file
+            .components
+            .iter()
+            .map(|entry| {
+                let key = self.place_component(entry.def.clone(), entry.grid_pos);
+                self.components[key].key
+            })
+            .collect();
+
+        let tunnel_keys: Vec<TunnelKey> = file
+            .tunnels
+            .iter()
+            .map(|entry| {
+                let key =
+                    self.place_tunnel_labeled(entry.label.clone(), entry.role, entry.grid_pos);
+                self.tunnels[key].key
+            })
+            .collect();
+
+        for w in &file.wires {
+            let src = comp_keys[w.src];
+            let dst = comp_keys[w.dst];
+            self.circuit
+                .link(src, PinId::output(w.src_pin), dst, PinId::input(w.dst_pin));
+            self.wires.push(Wire {
+                src_comp: src,
+                src_pin: OutIdx(w.src_pin),
+                dst_comp: dst,
+                dst_pin: InIdx(w.dst_pin),
+            });
+        }
+
+        for tw in &file.tunnel_wires {
+            let tunnel = tunnel_keys[tw.tunnel];
+            let comp = comp_keys[tw.comp];
+            let pin = if tw.is_input {
+                PinId::input(tw.pin_index)
+            } else {
+                PinId::output(tw.pin_index)
+            };
+            self.circuit.link_tunnel(tunnel, comp, pin);
+            self.tunnel_wires.push(TunnelWire { tunnel, comp, pin });
+        }
+
+        let result = self.circuit.settle();
+        self.record_settle_result(result);
+        Ok(())
     }
 
     /// Shows property menu for the currently selected item. ComponentDef for the UI element is
@@ -530,10 +704,30 @@ impl OsmilogApp {
         // Now that Selected holds a PlacedCompKey, it doesn't need to be updated on reconfigure
         self.selected = Some(Selected::Component(old_pc_key));
     }
+
+    // Applies a File > Load result that a spawned WASM load task has
+    // delivered into `pending_load`, if any is waiting. No-op most frames.
+    #[cfg(target_arch = "wasm32")]
+    fn apply_pending_load(&mut self) {
+        let Some(outcome) = self.pending_load.borrow_mut().take() else {
+            return;
+        };
+        match outcome {
+            Ok(file) => {
+                if let Err(e) = self.load_circuit_file(&file) {
+                    self.last_settle_error = Some(format!("load failed: {e}"));
+                }
+            }
+            Err(e) => self.last_settle_error = Some(format!("load failed: {e}")),
+        }
+    }
 }
 
 impl eframe::App for OsmilogApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_arch = "wasm32")]
+        self.apply_pending_load();
+
         if ctx.input(|i| i.viewport().close_requested()) {
             #[cfg(not(target_arch = "wasm32"))]
             std::process::exit(0);
@@ -545,99 +739,138 @@ impl eframe::App for OsmilogApp {
 
         // ── Menu bar ──────────────────────────────────────────────────────
         egui::Panel::top("menu_bar").show(ui, |ui| {
-            ui.menu_button("Add", |ui| {
-                ui.menu_button("Gates", |ui| {
-                    let gates = [
-                        ("AND", GateOp::And, 2),
-                        ("OR", GateOp::Or, 2),
-                        ("XOR", GateOp::Xor, 2),
-                        ("NAND", GateOp::Nand, 2),
-                        ("NOR", GateOp::Nor, 2),
-                        ("NOT", GateOp::Not, 1),
-                    ];
-                    for (name, op, n) in gates {
-                        if ui.button(name).clicked() {
+            ui.horizontal(|ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Save").clicked() {
+                        match self.to_circuit_file().to_json() {
+                            Ok(json) => {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if let Some(Err(e)) = crate::io::native::save_dialog(&json) {
+                                    self.last_settle_error = Some(format!("save failed: {e}"));
+                                }
+                                #[cfg(target_arch = "wasm32")]
+                                crate::io::wasm::trigger_download("circuit.json", &json);
+                            }
+                            Err(e) => self.last_settle_error = Some(format!("save failed: {e}")),
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Load").clicked() {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if let Some(outcome) = crate::io::native::load_dialog() {
+                            match outcome {
+                                Ok(file) => {
+                                    if let Err(e) = self.load_circuit_file(&file) {
+                                        self.last_settle_error = Some(format!("load failed: {e}"));
+                                    }
+                                }
+                                Err(e) => {
+                                    self.last_settle_error = Some(format!("load failed: {e}"))
+                                }
+                            }
+                        }
+                        // WASM's file pick + read is async - this just kicks the
+                        // task off; the result lands in pending_load and is
+                        // applied by apply_pending_load on a later frame.
+                        #[cfg(target_arch = "wasm32")]
+                        crate::io::wasm::spawn_load_dialog(self.pending_load.clone());
+                        ui.close();
+                    }
+                });
+                ui.menu_button("Add", |ui| {
+                    ui.menu_button("Gates", |ui| {
+                        let gates = [
+                            ("AND", GateOp::And, 2),
+                            ("OR", GateOp::Or, 2),
+                            ("XOR", GateOp::Xor, 2),
+                            ("NAND", GateOp::Nand, 2),
+                            ("NOR", GateOp::Nor, 2),
+                            ("NOT", GateOp::Not, 1),
+                        ];
+                        for (name, op, n) in gates {
+                            if ui.button(name).clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    def: ComponentDef::Gate {
+                                        op,
+                                        n_inputs: n,
+                                        width: 1,
+                                    },
+                                };
+                                ui.close();
+                            }
+                        }
+                    });
+                    if ui.button("Input").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Input { bits: 0, width: 1 },
+                        };
+                        ui.close();
+                    }
+                    if ui.button("Output").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Output,
+                        };
+                        ui.close();
+                    }
+                    if ui.button("Mux").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Mux {
+                                data_width: 1,
+                                sel_width: 1,
+                            },
+                        };
+                        ui.close();
+                    }
+                    if ui.button("Demux").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Demux {
+                                data_width: 1,
+                                sel_width: 1,
+                            },
+                        };
+                        ui.close();
+                    }
+                    if ui.button("Splitter").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Splitter {
+                                width: 2,
+                                arm_bits: vec![vec![0], vec![1]],
+                                direction: FanDirection::Right,
+                            },
+                        };
+                        ui.close();
+                    }
+                    ui.menu_button("Memory", |ui| {
+                        if ui.button("Register").clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentDef::Gate {
-                                    op,
-                                    n_inputs: n,
-                                    width: 1,
-                                },
+                                def: ComponentDef::Reg { data_width: 1 },
                             };
                             ui.close();
                         }
-                    }
+                    });
+                    ui.menu_button("Tunnel", |ui| {
+                        if ui.button("Feed").clicked() {
+                            self.mode = InteractionMode::PlacingTunnel {
+                                role: TunnelRole::Feed,
+                            };
+                            ui.close();
+                        }
+                        if ui.button("Pull").clicked() {
+                            self.mode = InteractionMode::PlacingTunnel {
+                                role: TunnelRole::Pull,
+                            };
+                            ui.close();
+                        }
+                    });
                 });
-                if ui.button("Input").clicked() {
-                    self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Input { bits: 0, width: 1 },
-                    };
-                    ui.close();
+                if ui.button("Tick Clock").clicked() {
+                    let result = self.circuit.tick_clock();
+                    self.record_settle_result(result);
                 }
-                if ui.button("Output").clicked() {
-                    self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Output,
-                    };
-                    ui.close();
+                if let Some(err) = &self.last_settle_error {
+                    ui.colored_label(Color32::RED, err);
                 }
-                if ui.button("Mux").clicked() {
-                    self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Mux {
-                            data_width: 1,
-                            sel_width: 1,
-                        },
-                    };
-                    ui.close();
-                }
-                if ui.button("Demux").clicked() {
-                    self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Demux {
-                            data_width: 1,
-                            sel_width: 1,
-                        },
-                    };
-                    ui.close();
-                }
-                if ui.button("Splitter").clicked() {
-                    self.mode = InteractionMode::Placing {
-                        def: ComponentDef::Splitter {
-                            width: 2,
-                            arm_bits: vec![vec![0], vec![1]],
-                            direction: FanDirection::Right,
-                        },
-                    };
-                    ui.close();
-                }
-                ui.menu_button("Memory", |ui| {
-                    if ui.button("Register").clicked() {
-                        self.mode = InteractionMode::Placing {
-                            def: ComponentDef::Reg { data_width: 1 },
-                        };
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Tunnel", |ui| {
-                    if ui.button("Feed").clicked() {
-                        self.mode = InteractionMode::PlacingTunnel {
-                            role: TunnelRole::Feed,
-                        };
-                        ui.close();
-                    }
-                    if ui.button("Pull").clicked() {
-                        self.mode = InteractionMode::PlacingTunnel {
-                            role: TunnelRole::Pull,
-                        };
-                        ui.close();
-                    }
-                });
-            });
-            if ui.button("Tick Clock").clicked() {
-                let result = self.circuit.tick_clock();
-                self.record_settle_result(result);
-            }
-            if let Some(err) = &self.last_settle_error {
-                ui.colored_label(Color32::RED, err);
-            }
+            })
         });
 
         // ── Properties panel ──────────────────────────────────────────────
@@ -1326,4 +1559,185 @@ fn draw_tunnel_ghost(painter: &Painter, role: TunnelRole, grid_pos: [i32; 2], pa
         FontId::monospace(LABEL_FONT_SIZE),
         ghost_col,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::component::GateOp;
+
+    fn place(app: &mut OsmilogApp, def: ComponentDef) -> PlacedCompKey {
+        app.place_component(def, [0, 0])
+    }
+
+    #[test]
+    fn test_circuit_file_round_trip_basic() {
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentDef::Input { bits: 1, width: 1 });
+        let b = place(&mut app, ComponentDef::Input { bits: 1, width: 1 });
+        let g = place(
+            &mut app,
+            ComponentDef::Gate {
+                op: GateOp::And,
+                n_inputs: 2,
+                width: 1,
+            },
+        );
+        let o = place(&mut app, ComponentDef::Output);
+
+        let (a_key, b_key, g_key, o_key) = (
+            app.components[a].key,
+            app.components[b].key,
+            app.components[g].key,
+            app.components[o].key,
+        );
+        app.circuit
+            .link(a_key, PinId::output(0), g_key, PinId::input(0));
+        app.circuit
+            .link(b_key, PinId::output(0), g_key, PinId::input(1));
+        app.circuit
+            .link(g_key, PinId::output(0), o_key, PinId::input(0));
+        app.wires.push(Wire {
+            src_comp: a_key,
+            src_pin: OutIdx(0),
+            dst_comp: g_key,
+            dst_pin: InIdx(0),
+        });
+        app.wires.push(Wire {
+            src_comp: b_key,
+            src_pin: OutIdx(0),
+            dst_comp: g_key,
+            dst_pin: InIdx(1),
+        });
+        app.wires.push(Wire {
+            src_comp: g_key,
+            src_pin: OutIdx(0),
+            dst_comp: o_key,
+            dst_pin: InIdx(0),
+        });
+
+        app.circuit.settle().unwrap();
+        assert_eq!(app.circuit.read_output(o_key), Value::new(1, 1));
+
+        // Save -> JSON -> parse -> load into a fresh app, and confirm the
+        // loaded circuit behaves identically.
+        let file = app.to_circuit_file();
+        let json = file.to_json().unwrap();
+        let file2 = CircuitFile::from_json(&json).unwrap();
+
+        let mut loaded = OsmilogApp::empty();
+        loaded.load_circuit_file(&file2).unwrap();
+
+        assert_eq!(loaded.components.len(), 4);
+        assert_eq!(loaded.wires.len(), 3);
+        let loaded_out_key = loaded
+            .components
+            .values()
+            .find(|pc| matches!(pc.def, ComponentDef::Output))
+            .unwrap()
+            .key;
+        assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_circuit_file_round_trip_with_tunnel() {
+        let mut app = OsmilogApp::empty();
+        let inp = place(&mut app, ComponentDef::Input { bits: 1, width: 1 });
+        let out = place(&mut app, ComponentDef::Output);
+        let feed = app.place_tunnel(TunnelRole::Feed, [0, 0]);
+        let pull = app.place_tunnel(TunnelRole::Pull, [1, 1]);
+
+        // Tunnels connect to each other by matching label, not by wire -
+        // give `pull` the same label as `feed` so they form one virtual net.
+        let shared_label = app.tunnels[feed].label.clone();
+        app.circuit
+            .rename_tunnel(app.tunnels[pull].key, shared_label.clone());
+        app.tunnels[pull].label = shared_label;
+
+        let (inp_key, out_key, feed_key, pull_key) = (
+            app.components[inp].key,
+            app.components[out].key,
+            app.tunnels[feed].key,
+            app.tunnels[pull].key,
+        );
+        // Pull reads FROM its attached net (here: inp's output) and
+        // contributes that value TO the shared label group; Feed drives its
+        // attached net (here: out's input) FROM the group's resolved value.
+        app.circuit.link_tunnel(pull_key, inp_key, PinId::output(0));
+        app.tunnel_wires.push(TunnelWire {
+            tunnel: pull_key,
+            comp: inp_key,
+            pin: PinId::output(0),
+        });
+        app.circuit.link_tunnel(feed_key, out_key, PinId::input(0));
+        app.tunnel_wires.push(TunnelWire {
+            tunnel: feed_key,
+            comp: out_key,
+            pin: PinId::input(0),
+        });
+
+        app.circuit.settle().unwrap();
+        assert_eq!(app.circuit.read_output(out_key), Value::new(1, 1));
+
+        let file = app.to_circuit_file();
+        let json = file.to_json().unwrap();
+        let file2 = CircuitFile::from_json(&json).unwrap();
+
+        let mut loaded = OsmilogApp::empty();
+        loaded.load_circuit_file(&file2).unwrap();
+
+        assert_eq!(loaded.tunnels.len(), 2);
+        let loaded_out_key = loaded
+            .components
+            .values()
+            .find(|pc| matches!(pc.def, ComponentDef::Output))
+            .unwrap()
+            .key;
+        assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_load_circuit_file_rejects_bad_component_index() {
+        let file = CircuitFile {
+            version: CURRENT_VERSION,
+            components: vec![ComponentEntry {
+                def: ComponentDef::Output,
+                grid_pos: [0, 0],
+            }],
+            tunnels: vec![],
+            wires: vec![WireEntry {
+                src: 5,
+                src_pin: 0,
+                dst: 0,
+                dst_pin: 0,
+            }],
+            tunnel_wires: vec![],
+        };
+
+        let mut app = OsmilogApp::empty();
+        let before = app.components.len();
+        assert!(app.load_circuit_file(&file).is_err());
+        // A rejected file must not leave the app half-overwritten.
+        assert_eq!(app.components.len(), before);
+    }
+
+    #[test]
+    fn test_load_circuit_file_rejects_unsupported_version() {
+        let file = CircuitFile {
+            version: CURRENT_VERSION + 1,
+            components: vec![],
+            tunnels: vec![],
+            wires: vec![],
+            tunnel_wires: vec![],
+        };
+
+        let mut app = OsmilogApp::empty();
+        assert_eq!(
+            app.load_circuit_file(&file),
+            Err(LoadError::UnsupportedVersion {
+                found: CURRENT_VERSION + 1,
+                supported: CURRENT_VERSION,
+            })
+        );
+    }
 }

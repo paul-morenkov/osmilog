@@ -14,7 +14,7 @@ new_key_type! {
 // connector). Feed tunnels drive their attached net FROM the shared label
 // group's resolved value; Pull tunnels read their attached net's value and
 // contribute it TO the group. See Circuit::settle()/resolve_net().
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TunnelRole {
     Feed,
     Pull,
