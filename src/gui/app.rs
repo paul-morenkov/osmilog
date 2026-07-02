@@ -1346,9 +1346,9 @@ fn draw_wire(painter: &Painter, p0: Pos2, p1: Pos2, stroke: Stroke) {
     let mid_x = (p0.x + p1.x) / 2.0;
     let elbow1 = egui::pos2(mid_x, p0.y);
     let elbow2 = egui::pos2(mid_x, p1.y);
-    painter.line_segment([p0, elbow1], stroke);
-    painter.line_segment([elbow1, elbow2], stroke);
-    painter.line_segment([elbow2, p1], stroke);
+    // A single open Path (rather than separate line_segment calls) lets the tessellator
+    // join the elbow corners, avoiding the notch that butt-capped independent segments leave.
+    painter.add(PathShape::line(vec![p0, elbow1, elbow2, p1], stroke));
 }
 
 fn draw_component(

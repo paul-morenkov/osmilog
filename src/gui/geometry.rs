@@ -6,8 +6,9 @@ use crate::sim::circuit::TunnelRole;
 use crate::sim::component::{FanDirection, GateOp};
 
 pub const GRID_SIZE: f32 = 20.0;
+pub const COMP_MIN_WIDTH: f32 = 20.0;
 pub const COMP_WIDTH: f32 = 40.0;
-pub const COMP_MIN_HEIGHT: f32 = 30.0;
+pub const COMP_MIN_HEIGHT: f32 = 20.0;
 const COMP_HEIGHT_PER_PIN: f32 = 10.0;
 // Splitter doesn't compute anything - it just re-routes bits - so it's drawn
 // much narrower than other components to read as a connector rather than a
