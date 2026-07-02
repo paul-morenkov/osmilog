@@ -7,7 +7,8 @@ use crate::{
     component::{CompKey, Component, GateOp, InIdx, OutIdx, PinId},
     geometry::{
         demux_shape, demux_size, gate_shape, gate_size, mux_shape, mux_size, rect_outline,
-        reg_shape, reg_size, snap_to_grid, tunnel_shape, COMP_MIN_HEIGHT, COMP_WIDTH, GRID_SIZE,
+        reg_shape, reg_size, snap_to_grid, splitter_shape, splitter_size, tunnel_shape,
+        COMP_MIN_HEIGHT, COMP_WIDTH, GRID_SIZE,
     },
     shape::{tessellate_path, ComponentShape, PinAnchor, BUBBLE_R},
     value::Value,
@@ -46,6 +47,10 @@ pub enum ComponentDef {
     Reg {
         data_width: u8,
     },
+    Splitter {
+        width: u8,
+        arm_bits: Vec<Vec<u8>>,
+    },
 }
 
 impl ComponentDef {
@@ -57,6 +62,7 @@ impl ComponentDef {
             Self::Mux { sel_width, .. } => (1usize << sel_width) + 1,
             Self::Demux { .. } => 2,
             Self::Reg { .. } => 2,
+            Self::Splitter { .. } => 1,
         }
     }
 
@@ -68,6 +74,7 @@ impl ComponentDef {
             Self::Mux { .. } => 1,
             Self::Demux { sel_width, .. } => 1usize << sel_width,
             Self::Reg { .. } => 1,
+            Self::Splitter { arm_bits, .. } => arm_bits.len(),
         }
     }
 
@@ -82,6 +89,7 @@ impl ComponentDef {
             Self::Mux { sel_width, .. } => mux_size(*sel_width),
             Self::Demux { sel_width, .. } => demux_size(*sel_width),
             Self::Reg { .. } => reg_size(),
+            Self::Splitter { arm_bits, .. } => splitter_size(arm_bits.len() as u8),
         }
     }
 
@@ -101,6 +109,7 @@ impl ComponentDef {
             Self::Mux { .. } => "MUX",
             Self::Demux { .. } => "DEMUX",
             Self::Reg { .. } => "REG",
+            Self::Splitter { .. } => "SPLIT",
         }
     }
 
@@ -122,6 +131,7 @@ impl ComponentDef {
                 sel_width,
             } => Component::demux(*data_width, *sel_width),
             Self::Reg { data_width } => Component::reg(*data_width),
+            Self::Splitter { arm_bits, .. } => Component::splitter(arm_bits.clone()),
         }
     }
 
@@ -159,6 +169,7 @@ impl ComponentDef {
             Self::Mux { sel_width, .. } => mux_shape(*sel_width),
             Self::Demux { sel_width, .. } => demux_shape(*sel_width),
             Self::Reg { .. } => reg_shape(),
+            Self::Splitter { arm_bits, .. } => splitter_shape(arm_bits.len() as u8),
         }
     }
 }
@@ -507,6 +518,75 @@ impl OsmilogApp {
                 };
                 ui.label(format!("Value: {}", val_str));
             }
+            ComponentDef::Splitter {
+                mut width,
+                mut arm_bits,
+            } => {
+                let mut changed = false;
+
+                ui.horizontal(|ui| {
+                    ui.label("Data width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut width).range(1..=32))
+                        .changed();
+                });
+                let mut arms = arm_bits.len() as u8;
+                ui.horizontal(|ui| {
+                    ui.label("Arms:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut arms).range(1..=16))
+                        .changed();
+                });
+
+                // Apply width/arms bookkeeping before rendering bit rows below, so a
+                // shrink is reflected in the same frame. Truncating arm_bits below
+                // `arms` correctly drops any bits assigned to a removed arm - nothing
+                // else references that arm index, since arm-major storage has nothing
+                // else to clean up.
+                arm_bits.resize_with(arms as usize, Vec::new);
+                for list in &mut arm_bits {
+                    list.retain(|&b| b < width);
+                }
+
+                for bit in 0..width {
+                    let mut current_arm = arm_bits
+                        .iter()
+                        .position(|list| list.contains(&bit))
+                        .map(|i| i as u8);
+                    let before = current_arm;
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Bit {bit}:"));
+                        egui::ComboBox::from_id_salt((key, bit))
+                            .selected_text(match current_arm {
+                                Some(a) => format!("Arm {a}"),
+                                None => "None".to_string(),
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut current_arm, None, "None");
+                                for a in 0..arms {
+                                    ui.selectable_value(
+                                        &mut current_arm,
+                                        Some(a),
+                                        format!("Arm {a}"),
+                                    );
+                                }
+                            });
+                    });
+                    if current_arm != before {
+                        for list in &mut arm_bits {
+                            list.retain(|&b| b != bit);
+                        }
+                        if let Some(a) = current_arm {
+                            arm_bits[a as usize].push(bit);
+                        }
+                        changed = true;
+                    }
+                }
+
+                if changed {
+                    self.reconfigure_component(key, ComponentDef::Splitter { width, arm_bits });
+                }
+            }
         }
     }
 
@@ -659,6 +739,15 @@ impl eframe::App for OsmilogApp {
                         def: ComponentDef::Demux {
                             data_width: 1,
                             sel_width: 1,
+                        },
+                    };
+                    ui.close();
+                }
+                if ui.button("Splitter").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        def: ComponentDef::Splitter {
+                            width: 2,
+                            arm_bits: vec![vec![0], vec![1]],
                         },
                     };
                     ui.close();

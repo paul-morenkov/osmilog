@@ -64,6 +64,31 @@ impl Component {
         }
     }
 
+    // arm_bits[j] lists the data-bit indices routed to arm j, e.g.
+    // arm_bits = [[0, 2], [1, 3]] sends bits 0,2 to arm0 and bits 1,3 to arm1.
+    // Arm indices are just positions in `arm_bits`, so an out-of-range arm
+    // reference isn't representable. If a bit index is listed in more than one
+    // arm, the later arm (by position in `arm_bits`) wins.
+    pub fn splitter(arm_bits: Vec<Vec<u8>>) -> Self {
+        let arms = arm_bits.len() as u8;
+        let width = arm_bits
+            .iter()
+            .flatten()
+            .map(|&bit| bit + 1)
+            .max()
+            .unwrap_or(0);
+        let mut in_out_map = vec![None; width as usize];
+        for (arm, bits) in arm_bits.into_iter().enumerate() {
+            for bit in bits {
+                in_out_map[bit as usize] = Some(arm as u8);
+            }
+        }
+        Self {
+            pins: Pins::new(1, arms as usize),
+            logic: Logic::Comb(LogicComb::Splitter(Splitter { arms, in_out_map })),
+        }
+    }
+
     // Reads the current Value of every input pin from net state, without mutating
     // anything. Used by evaluate() and by Circuit::tick_clock()'s input-collection stage.
     pub fn read_inputs(&self, nets: &SlotMap<NetKey, Net>) -> Vec<Value> {
@@ -165,6 +190,30 @@ impl Component {
                         _ => vec![Value::Floating; branches],
                     }
                 }
+                LogicComb::Splitter(s) => match read_pin(0) {
+                    // TODO: Use `width` to validate total width in arms
+                    Value::Fixed { bits, width } => {
+                        let mut out = Vec::new();
+                        for out_arm in 0..s.arms {
+                            let mut out_bits = 0;
+                            let mut out_width = 0;
+                            for (data_i, &arm) in s.in_out_map.iter().enumerate() {
+                                if arm == Some(out_arm) {
+                                    let is_set = bits & (1 << data_i) > 0;
+                                    if is_set {
+                                        out_bits |= 1 << out_width;
+                                    }
+                                    out_width += 1;
+                                }
+                            }
+                            out.push(Value::new(out_bits, out_width));
+                        }
+                        out
+                    }
+                    Value::Floating => {
+                        vec![Value::Floating; s.arms as usize]
+                    }
+                },
             },
             // Sequential components never mutate state or recompute outputs via the
             // combinational path (add_component / attach / neighboring net changes) -
@@ -275,6 +324,7 @@ pub enum LogicComb {
     Gate { op: GateOp, width: u8 },
     Mux { data_width: u8, sel_width: u8 },
     Demux { data_width: u8, sel_width: u8 },
+    Splitter(Splitter),
 }
 
 #[derive(Debug)]
@@ -291,4 +341,19 @@ pub enum GateOp {
     Nand,
     Nor,
     Not,
+}
+
+#[derive(Debug)]
+pub struct Splitter {
+    arms: u8,
+    // in_out_map[i] = Some(j) => the i'th bit of data goes to arm j; None => unrouted.
+    // Only constructible via Component::splitter(), which builds this from an
+    // arm-major Vec<Vec<u8>> so every arm index here is guaranteed valid.
+    in_out_map: Vec<Option<u8>>,
+}
+
+impl Splitter {
+    pub fn data_width(&self) -> u8 {
+        self.in_out_map.len() as u8
+    }
 }
