@@ -6,8 +6,8 @@
     <title>osmilog</title>
     
 <script type="module">
-import init, * as bindings from './osmilog-bd7a00edac588039.js';
-const wasm = await init({ module_or_path: './osmilog-bd7a00edac588039_bg.wasm' });
+import init, * as bindings from './osmilog-ca90f0067355b6db.js';
+const wasm = await init({ module_or_path: './osmilog-ca90f0067355b6db_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -31,7 +31,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             height: 100%;
         }
     </style>
-<link rel="modulepreload" href="./osmilog-bd7a00edac588039.js" crossorigin="anonymous" integrity="sha384-zhKr87/efbMduQ0QaTv/NZDnDTZaT+NG6RKDG3q9WgoYv309dOk6KwLT6HzIt/rl"><link rel="preload" href="./osmilog-bd7a00edac588039_bg.wasm" crossorigin="anonymous" integrity="sha384-UV//5O3mlZnN6D8AqGDe/TBJPGeLOkAkWd/PSJDa/RaiT87QoTkvN1AkZpKUKi3i" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="./osmilog-ca90f0067355b6db.js" crossorigin="anonymous" integrity="sha384-3hR8FSq8NsYiWHmDyZ9KwUUq7DVQprdgVxc8ybGJNT/yySO+FjD636w7HdbN/A2d"><link rel="preload" href="./osmilog-ca90f0067355b6db_bg.wasm" crossorigin="anonymous" integrity="sha384-iXHr769avYZS1TdRcpkjgmYBtU7/cUtU/PQbuHpijvIthqz7dJ1m7WtRP2PcggxC" as="fetch" type="application/wasm"></head>
 <body>
     <canvas id="the_canvas_id"></canvas>
 </body>
