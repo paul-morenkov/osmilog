@@ -2,10 +2,16 @@ use osmilog::gui::app::OsmilogApp;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!(
+        "../assets/osmilog_icons/osmilog_256.png"
+    ))
+    .expect("valid icon png");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("osmilog")
-            .with_inner_size([1200.0, 800.0]),
+            .with_inner_size([1200.0, 800.0])
+            .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()
     };
     eframe::run_native(

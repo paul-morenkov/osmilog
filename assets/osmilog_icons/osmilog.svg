@@ -1,0 +1,51 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <!-- Osmilog — octopus (AND-gate mantle) x circuit, Rust palette -->
+  <defs>
+    <clipPath id="round">
+      <rect x="0" y="0" width="512" height="512" rx="112" ry="112"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#round)">
+    <rect x="0" y="0" width="512" height="512" fill="#1A1512"/>
+
+    <!-- Tentacles as traces -> two vertical pad columns of four -->
+    <g fill="none" stroke="#DE6B2F" stroke-width="20" stroke-linecap="round">
+      <!-- LEFT -->
+      <path d="M170 214 C 144 202, 128 194, 110 188 L 102 185"/>
+      <path d="M162 250 C 140 252, 126 252, 110 252 L 102 251"/>
+      <path d="M182 302 C 152 322, 138 320, 114 320 L 102 320"/>
+      <path d="M212 336 C 178 386, 150 388, 112 389"/>
+      <!-- RIGHT -->
+      <path d="M342 214 C 368 202, 384 194, 402 188 L 410 185"/>
+      <path d="M350 250 C 372 252, 386 252, 402 252 L 410 251"/>
+      <path d="M330 302 C 360 322, 374 320, 398 320 L 410 320"/>
+      <path d="M300 336 C 334 386, 362 388, 400 389"/>
+    </g>
+
+    <g fill="#F2A65A">
+      <circle cx="88"  cy="185" r="16"/>
+      <circle cx="88"  cy="251" r="16"/>
+      <circle cx="88"  cy="320" r="16"/>
+      <circle cx="88"  cy="389" r="16"/>
+      <circle cx="424" cy="185" r="16"/>
+      <circle cx="424" cy="251" r="16"/>
+      <circle cx="424" cy="320" r="16"/>
+      <circle cx="424" cy="389" r="16"/>
+    </g>
+
+    <!-- Larger AND-gate mantle: flat top + sides, true semicircle bulge (r=100, center 256,244) -->
+    <path d="M156 140
+             L 356 140
+             L 356 244
+             A 100 100 0 0 1 156 244
+             Z"
+          fill="#DE6B2F"/>
+
+    <!-- eyes -->
+    <circle cx="226" cy="212" r="20" fill="#1A1512"/>
+    <circle cx="286" cy="212" r="20" fill="#1A1512"/>
+    <circle cx="226" cy="212" r="8" fill="#F2A65A"/>
+    <circle cx="286" cy="212" r="8" fill="#F2A65A"/>
+  </g>
+</svg>
