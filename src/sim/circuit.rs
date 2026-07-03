@@ -1958,4 +1958,341 @@ mod tests {
         assert_eq!(c.read_output(out_new), Value::new(1, 1)); // now follows "NEW"
         assert_eq!(c.read_output(out_old), Value::Floating); // "OLD" lost its only Pull
     }
+
+    // ---- Group 9: priority encoder ----
+
+    struct EncoderIo {
+        enable: CompKey,
+        arms: Vec<CompKey>,
+        sel: CompKey,
+        en_out: CompKey,
+        grp_out: CompKey,
+    }
+
+    // Builds enable_in as Component::input(enable_bits, enable_width), 2^sel_width arm
+    // Input components (all initialized to 0), a priority_encoder(sel_width), and 3 Output
+    // components, fully wired together.
+    fn build_priority_encoder(
+        c: &mut Circuit,
+        sel_width: u8,
+        enable_bits: u32,
+        enable_width: u8,
+    ) -> EncoderIo {
+        let n_arms = 1usize << sel_width;
+        let enable = c.add_component(Component::input(enable_bits, enable_width));
+        let arms: Vec<CompKey> = (0..n_arms)
+            .map(|_| c.add_component(Component::input(0, 1)))
+            .collect();
+        let enc = c.add_component(Component::priority_encoder(sel_width));
+        let sel = c.add_component(Component::output());
+        let en_out = c.add_component(Component::output());
+        let grp_out = c.add_component(Component::output());
+
+        c.link(enable, PinId::output(0), enc, PinId::input(0));
+        for (i, arm) in arms.iter().enumerate() {
+            c.link(*arm, PinId::output(0), enc, PinId::input(i as u8 + 1));
+        }
+        c.link(enc, PinId::output(0), sel, PinId::input(0));
+        c.link(enc, PinId::output(1), en_out, PinId::input(0));
+        c.link(enc, PinId::output(2), grp_out, PinId::input(0));
+
+        EncoderIo {
+            enable,
+            arms,
+            sel,
+            en_out,
+            grp_out,
+        }
+    }
+
+    // Sets each arm to bit i of `mask` (does not settle).
+    fn set_arms(c: &mut Circuit, arms: &[CompKey], mask: u32) {
+        for (i, arm) in arms.iter().enumerate() {
+            c.set_input(*arm, (mask >> i) & 1, 1);
+        }
+    }
+
+    #[test_case(0b0000, None,    1, 0 ; "no arms set")]
+    #[test_case(0b0001, Some(0), 0, 1 ; "arm 0 only")]
+    #[test_case(0b0010, Some(1), 0, 1 ; "arm 1 only")]
+    #[test_case(0b0100, Some(2), 0, 1 ; "arm 2 only")]
+    #[test_case(0b1000, Some(3), 0, 1 ; "arm 3 only")]
+    #[test_case(0b0011, Some(1), 0, 1 ; "arms 0 and 1 set, highest wins")]
+    #[test_case(0b1010, Some(3), 0, 1 ; "arms 1 and 3 set, highest wins")]
+    #[test_case(0b1111, Some(3), 0, 1 ; "all arms set, highest wins")]
+    fn test_encoder_truth_table_priority_selects_highest_set_arm(
+        mask: u32,
+        expected_sel: Option<u32>,
+        expected_en: u32,
+        expected_grp: u32,
+    ) {
+        let mut c = Circuit::new();
+        let io = build_priority_encoder(&mut c, 2, 1, 1);
+        set_arms(&mut c, &io.arms, mask);
+        c.settle().unwrap();
+
+        let expected_sel_value = match expected_sel {
+            Some(i) => Value::new(i, 2),
+            None => Value::Floating,
+        };
+        assert_eq!(c.read_output(io.sel), expected_sel_value);
+        assert_eq!(c.read_output(io.en_out), Value::new(expected_en, 1));
+        assert_eq!(c.read_output(io.grp_out), Value::new(expected_grp, 1));
+    }
+
+    #[test_case(0b0000 ; "disabled, no arms set")]
+    #[test_case(0b0001 ; "disabled, arm 0 set")]
+    #[test_case(0b1111 ; "disabled, all arms set")]
+    fn test_encoder_disabled_forces_floating_selector_and_zero_flags(mask: u32) {
+        let mut c = Circuit::new();
+        let io = build_priority_encoder(&mut c, 2, 0, 1); // enable_in = 0
+        set_arms(&mut c, &io.arms, mask);
+        c.settle().unwrap();
+
+        assert_eq!(c.read_output(io.sel), Value::Floating);
+        assert_eq!(c.read_output(io.en_out), Value::new(0, 1));
+        assert_eq!(c.read_output(io.grp_out), Value::new(0, 1));
+    }
+
+    #[test]
+    fn test_encoder_enable_dynamic_toggle_updates_outputs() {
+        let mut c = Circuit::new();
+        let io = build_priority_encoder(&mut c, 2, 0, 1); // start disabled
+        set_arms(&mut c, &io.arms, 0b0010);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(io.sel), Value::Floating);
+        assert_eq!(c.read_output(io.en_out), Value::new(0, 1));
+        assert_eq!(c.read_output(io.grp_out), Value::new(0, 1));
+
+        // Enable it: arm 1 is still hot, so it should now fire.
+        c.set_input(io.enable, 1, 1);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(io.sel), Value::new(1, 2));
+        assert_eq!(c.read_output(io.en_out), Value::new(0, 1));
+        assert_eq!(c.read_output(io.grp_out), Value::new(1, 1));
+    }
+
+    #[test]
+    fn test_encoder_enable_in_floating_passes_through() {
+        let mut c = Circuit::new();
+        let n_arms = 4usize;
+        let arms: Vec<CompKey> = (0..n_arms)
+            .map(|_| c.add_component(Component::input(0, 1)))
+            .collect();
+        let enc = c.add_component(Component::priority_encoder(2));
+        let sel = c.add_component(Component::output());
+        let en_out = c.add_component(Component::output());
+        let grp_out = c.add_component(Component::output());
+        // enable_in (input 0) intentionally left unconnected -> Floating.
+        for (i, arm) in arms.iter().enumerate() {
+            c.link(*arm, PinId::output(0), enc, PinId::input(i as u8 + 1));
+        }
+        c.link(enc, PinId::output(0), sel, PinId::input(0));
+        c.link(enc, PinId::output(1), en_out, PinId::input(0));
+        c.link(enc, PinId::output(2), grp_out, PinId::input(0));
+
+        c.set_input(arms[1], 1, 1);
+        c.settle().unwrap();
+
+        // A Floating enable_in is not treated as disabled - it falls through to the
+        // normal arm scan, same as an explicitly-enabled encoder.
+        assert_eq!(c.read_output(sel), Value::new(1, 2));
+        assert_eq!(c.read_output(en_out), Value::new(0, 1));
+        assert_eq!(c.read_output(grp_out), Value::new(1, 1));
+    }
+
+    #[test_case(2 ; "enable width 2")]
+    #[test_case(3 ; "enable width 3")]
+    fn test_encoder_enable_in_wrong_width_forces_all_outputs_floating(enable_width: u8) {
+        let mut c = Circuit::new();
+        let io = build_priority_encoder(&mut c, 2, 0, enable_width);
+        set_arms(&mut c, &io.arms, 0b0001); // arm 0 hot; would fire if enabled normally
+        c.settle().unwrap();
+
+        assert_eq!(c.read_output(io.sel), Value::Floating);
+        assert_eq!(c.read_output(io.en_out), Value::Floating);
+        assert_eq!(c.read_output(io.grp_out), Value::Floating);
+    }
+
+    #[test]
+    fn test_encoder_unconnected_arm_treated_as_unset() {
+        let mut c = Circuit::new();
+        let enable = c.add_component(Component::input(1, 1));
+        let n_arms = 4usize;
+        let arms: Vec<CompKey> = (0..n_arms)
+            .map(|_| c.add_component(Component::input(0, 1)))
+            .collect();
+        let enc = c.add_component(Component::priority_encoder(2));
+        let sel = c.add_component(Component::output());
+        let en_out = c.add_component(Component::output());
+        let grp_out = c.add_component(Component::output());
+
+        c.link(enable, PinId::output(0), enc, PinId::input(0));
+        // Link only arms 0..3; leave arm 3 (input pin 4) unconnected.
+        for (i, arm) in arms.iter().enumerate().take(3) {
+            c.link(*arm, PinId::output(0), enc, PinId::input(i as u8 + 1));
+        }
+        c.link(enc, PinId::output(0), sel, PinId::input(0));
+        c.link(enc, PinId::output(1), en_out, PinId::input(0));
+        c.link(enc, PinId::output(2), grp_out, PinId::input(0));
+
+        c.settle().unwrap(); // must not panic on the unconnected arm pin
+        assert_eq!(c.read_output(sel), Value::Floating);
+        assert_eq!(c.read_output(en_out), Value::new(1, 1));
+        assert_eq!(c.read_output(grp_out), Value::new(0, 1));
+    }
+
+    #[test]
+    fn test_encoder_wide_arm_value_never_registers_as_set() {
+        let mut c = Circuit::new();
+        let enable = c.add_component(Component::input(1, 1));
+        let n_arms = 4usize;
+        let arms: Vec<CompKey> = (0..n_arms)
+            .map(|_| c.add_component(Component::input(0, 1)))
+            .collect();
+        let enc = c.add_component(Component::priority_encoder(2));
+        let sel = c.add_component(Component::output());
+        let en_out = c.add_component(Component::output());
+        let grp_out = c.add_component(Component::output());
+
+        c.link(enable, PinId::output(0), enc, PinId::input(0));
+        for (i, arm) in arms.iter().enumerate() {
+            if i == 2 {
+                continue; // arm 2 is driven separately below, at the wrong width
+            }
+            c.link(*arm, PinId::output(0), enc, PinId::input(i as u8 + 1));
+        }
+        let wide_arm = c.add_component(Component::input(1, 2)); // bits=1, width=2
+        c.link(wide_arm, PinId::output(0), enc, PinId::input(3)); // arm index 2 -> pin 3
+
+        c.link(enc, PinId::output(0), sel, PinId::input(0));
+        c.link(enc, PinId::output(1), en_out, PinId::input(0));
+        c.link(enc, PinId::output(2), grp_out, PinId::input(0));
+
+        c.settle().unwrap();
+        // Arm 2 never registers as "set" despite bits=1, because its width (2) != 1:
+        // the encoder's arm comparison requires an exact Value::Fixed{bits:1,width:1}.
+        assert_eq!(c.read_output(sel), Value::Floating);
+        assert_eq!(c.read_output(en_out), Value::new(1, 1));
+        assert_eq!(c.read_output(grp_out), Value::new(0, 1));
+    }
+
+    #[test]
+    fn test_encoder_sel_width_zero_degenerate_single_arm() {
+        let mut c = Circuit::new();
+        let io = build_priority_encoder(&mut c, 0, 1, 1);
+        assert_eq!(io.arms.len(), 1);
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(io.sel), Value::Floating);
+        assert_eq!(c.read_output(io.en_out), Value::new(1, 1));
+        assert_eq!(c.read_output(io.grp_out), Value::new(0, 1));
+
+        c.set_input(io.arms[0], 1, 1);
+        c.settle().unwrap();
+        // A 0-bit-wide selector: the only possible index (0) is still a well-formed
+        // Value::Fixed{bits:0,width:0} rather than Floating.
+        assert_eq!(c.read_output(io.sel), Value::new(0, 0));
+        assert_eq!(c.read_output(io.en_out), Value::new(0, 1));
+        assert_eq!(c.read_output(io.grp_out), Value::new(1, 1));
+    }
+
+    // Cascades two 4-arm priority encoders: enc1's enable_out feeds enc2's enable_in, so
+    // enc2 only ever gets a chance to fire when enc1 found nothing. Only the top-level
+    // enable_in (enc1's) is externally driven.
+    #[test_case(0, 0b0000, 0b0000, false, false ; "top disabled, no arms hot anywhere")]
+    #[test_case(0, 0b0101, 0b1111, false, false ; "top disabled, arms hot on both sides, still fully quiet")]
+    #[test_case(1, 0b0101, 0b1111, true,  false ; "enc1 fires, suppresses enc2 despite its arms being hot")]
+    #[test_case(1, 0b0000, 0b0010, false, true  ; "enc1 empty, enc2 fires")]
+    #[test_case(1, 0b0000, 0b0000, false, false ; "enc1 empty, enc2 empty, both quiet but chain enabled")]
+    fn test_encoder_chain_group_priority_and_activation(
+        top_enable: u32,
+        arms1_mask: u32,
+        arms2_mask: u32,
+        expect_enc1_fires: bool,
+        expect_enc2_fires: bool,
+    ) {
+        let mut c = Circuit::new();
+        let sel_width = 2u8;
+        let n_arms = 1usize << sel_width;
+
+        let top_en = c.add_component(Component::input(top_enable, 1));
+        let arms1: Vec<CompKey> = (0..n_arms)
+            .map(|_| c.add_component(Component::input(0, 1)))
+            .collect();
+        let arms2: Vec<CompKey> = (0..n_arms)
+            .map(|_| c.add_component(Component::input(0, 1)))
+            .collect();
+
+        let enc1 = c.add_component(Component::priority_encoder(sel_width));
+        let enc2 = c.add_component(Component::priority_encoder(sel_width));
+
+        let sel1 = c.add_component(Component::output());
+        let en1_out = c.add_component(Component::output());
+        let grp1_out = c.add_component(Component::output());
+        let sel2 = c.add_component(Component::output());
+        let en2_out = c.add_component(Component::output());
+        let grp2_out = c.add_component(Component::output());
+
+        c.link(top_en, PinId::output(0), enc1, PinId::input(0));
+        for (i, arm) in arms1.iter().enumerate() {
+            c.link(*arm, PinId::output(0), enc1, PinId::input(i as u8 + 1));
+        }
+        c.link(enc1, PinId::output(0), sel1, PinId::input(0));
+        c.link(enc1, PinId::output(1), en1_out, PinId::input(0));
+        c.link(enc1, PinId::output(2), grp1_out, PinId::input(0));
+
+        // Cascade: enc1's enable_out feeds enc2's enable_in.
+        c.link(enc1, PinId::output(1), enc2, PinId::input(0));
+        for (i, arm) in arms2.iter().enumerate() {
+            c.link(*arm, PinId::output(0), enc2, PinId::input(i as u8 + 1));
+        }
+        c.link(enc2, PinId::output(0), sel2, PinId::input(0));
+        c.link(enc2, PinId::output(1), en2_out, PinId::input(0));
+        c.link(enc2, PinId::output(2), grp2_out, PinId::input(0));
+
+        set_arms(&mut c, &arms1, arms1_mask);
+        set_arms(&mut c, &arms2, arms2_mask);
+        c.settle().unwrap();
+
+        assert_eq!(
+            c.read_output(grp1_out),
+            Value::new(expect_enc1_fires as u32, 1)
+        );
+        assert_eq!(
+            c.read_output(grp2_out),
+            Value::new(expect_enc2_fires as u32, 1)
+        );
+        // The two encoders never both claim to have fired.
+        assert!(!(expect_enc1_fires && expect_enc2_fires));
+
+        if expect_enc1_fires {
+            let expected_i = 31 - arms1_mask.leading_zeros(); // highest set bit index
+            assert_eq!(c.read_output(sel1), Value::new(expected_i, sel_width));
+            assert_eq!(c.read_output(en1_out), Value::new(0, 1));
+            // enc2 never got an enabled enable_in, so it stays fully quiet even
+            // though arms2_mask may be hot.
+            assert_eq!(c.read_output(sel2), Value::Floating);
+            assert_eq!(c.read_output(en2_out), Value::new(0, 1));
+        } else if expect_enc2_fires {
+            let expected_i = 31 - arms2_mask.leading_zeros();
+            assert_eq!(c.read_output(sel1), Value::Floating);
+            assert_eq!(c.read_output(en1_out), Value::new(1, 1));
+            assert_eq!(c.read_output(sel2), Value::new(expected_i, sel_width));
+            assert_eq!(c.read_output(en2_out), Value::new(0, 1));
+        } else if top_enable == 1 {
+            // Chain fully enabled but nothing anywhere is set.
+            assert_eq!(c.read_output(sel1), Value::Floating);
+            assert_eq!(c.read_output(en1_out), Value::new(1, 1));
+            assert_eq!(c.read_output(sel2), Value::Floating);
+            assert_eq!(c.read_output(en2_out), Value::new(1, 1));
+        } else {
+            // Top disabled: enc1 is disabled outright (en1_out forced to 0), so enc2's
+            // enable_in sees an explicit 0 too and is disabled regardless of its arms.
+            assert_eq!(c.read_output(sel1), Value::Floating);
+            assert_eq!(c.read_output(en1_out), Value::new(0, 1));
+            assert_eq!(c.read_output(sel2), Value::Floating);
+            assert_eq!(c.read_output(en2_out), Value::new(0, 1));
+        }
+    }
 }

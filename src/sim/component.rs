@@ -117,6 +117,15 @@ impl Component {
         }
     }
 
+    pub fn priority_encoder(sel_width: u8) -> Self {
+        // Inputs: enable_in, 2^sel_width arms
+        // Outputs: priority signal, enable_out, group_out
+        Self {
+            pins: Pins::new((1usize << sel_width) + 1, 3),
+            logic: Logic::Comb(LogicComb::Encoder { sel_width }),
+        }
+    }
+
     // Reads the current Value of every input pin from net state, without mutating
     // anything. Used by evaluate() and by Circuit::tick_clock()'s input-collection stage.
     pub fn read_inputs(&self, nets: &SlotMap<NetKey, Net>) -> Vec<Value> {
@@ -263,6 +272,41 @@ impl Component {
                         }
                     }
                 },
+                LogicComb::Encoder { sel_width } => {
+                    // input order: enable_in, arms
+                    // output order: selector, enable_out, group_out
+                    let enable_in = read_pin(0);
+                    let n_arms = 1 << sel_width;
+
+                    match enable_in {
+                        // Malformed enable_in (wrong bit width): the whole component goes Floating.
+                        Value::Fixed { width, .. } if width != 1 => {
+                            vec![Value::Floating, Value::Floating, Value::Floating]
+                        }
+                        // Explicitly disabled: selector = Floating, EN_OUT/GRP_OUT = 0.
+                        Value::Fixed { bits: 0, width: 1 } => {
+                            vec![Value::Floating, Value::new(0, 1), Value::new(0, 1)]
+                        }
+                        // Enabled: Floating or Fixed{width:1, bits != 0}.
+                        _ => {
+                            let highest_set = (1..n_arms + 1)
+                                .map(read_pin)
+                                .rposition(|v| v == Value::new(1, 1));
+
+                            if let Some(i) = highest_set {
+                                // If an input is 1: selector = i, EN_OUT = 0, GRP_OUT = 1.
+                                vec![
+                                    Value::new(i as u32, *sel_width),
+                                    Value::new(0, 1),
+                                    Value::new(1, 1),
+                                ]
+                            } else {
+                                // If enabled but no inputs 1: selector = Floating, EN_OUT = 1, GRP_OUT = 0.
+                                vec![Value::Floating, Value::new(1, 1), Value::new(0, 1)]
+                            }
+                        }
+                    }
+                }
             },
             // Sequential components never mutate state or recompute outputs via the
             // combinational path (add_component / attach / neighboring net changes) -
@@ -374,6 +418,9 @@ pub enum LogicComb {
     Mux { data_width: u8, sel_width: u8 },
     Demux { data_width: u8, sel_width: u8 },
     Splitter(Splitter),
+    // Inputs: 0 -> enable_in; 1.. -> arms (2^sel_width of them)
+    // Outputs: 0 -> selector; 1 -> enable_out; 2 -> group_out
+    Encoder { sel_width: u8 },
 }
 
 #[derive(Debug)]
