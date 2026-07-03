@@ -548,6 +548,11 @@ impl Circuit {
         // nets need re-dirtying too, but only after the trailing
         // dirty/queued clear below, or the marks would be wiped.
         let mut affected_labels: Vec<String> = Vec::new();
+        // Sink components that lose an input driver here must be re-evaluated
+        // (their nulled pin now reads Floating), or their out_cache/output
+        // nets keep the removed component's stale value. Collected now, re-run
+        // after the dirty/queued reset below so their fresh marks survive.
+        let mut affected_sinks: Vec<CompKey> = Vec::new();
 
         // Remove nets driven by this component; clear each sink's input pin slot
         for net_key in output_nets {
@@ -556,6 +561,9 @@ impl Circuit {
                 for (sink_comp, sink_pin) in sinks {
                     if let Some(sc) = self.components.get_mut(sink_comp) {
                         sc.pins.inputs[sink_pin.0 as usize] = None;
+                    }
+                    if sink_comp != key {
+                        affected_sinks.push(sink_comp);
                     }
                 }
             }
@@ -580,6 +588,15 @@ impl Circuit {
         self.queued.clear();
 
         self.components.remove(key);
+
+        // Re-evaluate sinks that lost their driver so their now-Floating input
+        // propagates: eval_component recomputes out_cache and marks any changed
+        // output net dirty for the caller's settle() to carry downstream.
+        for sink in affected_sinks {
+            if self.components.contains_key(sink) {
+                self.eval_component(sink);
+            }
+        }
 
         // Re-dirty sibling Feed-tunnel nets now that propagation state has
         // already been reset above.
@@ -1766,14 +1783,10 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_component_leaves_downstream_out_cache_stale() {
-        // Documents a gap between remove_component's doc comment ("the
-        // caller is expected to call settle() after") and actual behavior:
-        // only the directly-adjacent sink's input pin is nulled
-        // synchronously; nothing is marked dirty, and dirty/queued are
-        // unconditionally cleared. A subsequent settle() call is therefore a
-        // no-op and cannot refresh out_cache/output values more than one hop
-        // downstream of the removal.
+    fn test_remove_component_refreshes_downstream_sinks() {
+        // Removing a driver re-evaluates the sinks that lose it and re-dirties
+        // their output nets, so a following settle() refreshes values more than
+        // one hop downstream rather than leaving stale out_cache behind.
         let mut c = Circuit::new();
         let a = c.add_component(Component::input(1, 1));
         let g1 = c.add_component(Component::gate(GateOp::Not, 1, 1));
@@ -1786,12 +1799,11 @@ mod tests {
         assert_eq!(c.read_output(o), Value::new(1, 1)); // NOT(NOT(1)) = 1
 
         c.remove_component(g1);
-        c.settle().unwrap(); // documented as sufficient, but is actually a no-op here
+        c.settle().unwrap();
 
-        // g2's input pin was nulled (would read Floating if re-evaluated),
-        // but g2's out_cache still holds its stale pre-removal value, and
-        // settle() never re-dirtied anything to refresh it.
-        assert_eq!(c.read_output(o), Value::new(1, 1)); // stale: unchanged
+        // g2's input pin was nulled -> it now reads Floating, so g2 =
+        // NOT(Floating) = Floating, and that refresh propagates through to o.
+        assert_eq!(c.read_output(o), Value::Floating);
     }
 
     // ---- Group 7: error / edge-case behavior ----

@@ -351,6 +351,14 @@ impl OsmilogApp {
             Selected::Component(key) => self.show_component_properties(key, ui),
             Selected::Tunnel(key) => self.show_tunnel_properties(key, ui),
         }
+
+        ui.separator();
+        if ui.button("Delete").clicked() {
+            match sel {
+                Selected::Component(key) => self.delete_component(key),
+                Selected::Tunnel(key) => self.delete_tunnel(key),
+            }
+        }
     }
 
     fn show_tunnel_properties(&mut self, key: PlacedTunnelKey, ui: &mut egui::Ui) {
@@ -706,6 +714,41 @@ impl OsmilogApp {
         self.selected = Some(Selected::Component(old_pc_key));
     }
 
+    // Removes a placed component from both the circuit and the GUI's visual
+    // records. circuit.remove_component unlinks its nets and re-evaluates
+    // affected sinks; here we drop the visual Wire/TunnelWire records that
+    // referenced it (same "touches this CompKey" retain as reconfigure_component)
+    // so the draw loop doesn't chase a dangling key.
+    fn delete_component(&mut self, key: PlacedCompKey) {
+        let comp_key = self.components[key].key;
+        self.circuit.remove_component(comp_key);
+        self.wires
+            .retain(|w| w.src_comp != comp_key && w.dst_comp != comp_key);
+        self.tunnel_wires.retain(|tw| tw.comp != comp_key);
+        self.components.remove(key);
+        if self.selected == Some(Selected::Component(key)) {
+            self.selected = None;
+        }
+        let result = self.circuit.settle();
+        self.record_settle_result(result);
+    }
+
+    // Removes a placed tunnel from both the circuit and the GUI's visual
+    // records. circuit.remove_tunnel detaches its net and re-dirties the label
+    // group's feed nets; here we drop the visual TunnelWire records that tied a
+    // component pin to it.
+    fn delete_tunnel(&mut self, key: PlacedTunnelKey) {
+        let tunnel_key = self.tunnels[key].key;
+        self.circuit.remove_tunnel(tunnel_key);
+        self.tunnel_wires.retain(|tw| tw.tunnel != tunnel_key);
+        self.tunnels.remove(key);
+        if self.selected == Some(Selected::Tunnel(key)) {
+            self.selected = None;
+        }
+        let result = self.circuit.settle();
+        self.record_settle_result(result);
+    }
+
     // Applies a File > Load result that a spawned WASM load task has
     // delivered into `pending_load`, if any is waiting. No-op most frames.
     #[cfg(target_arch = "wasm32")]
@@ -903,6 +946,19 @@ impl eframe::App for OsmilogApp {
                     }
                 }
                 self.mode = InteractionMode::Idle;
+            }
+
+            // Backspace deletes the current selection. Guard on widget focus so
+            // a Backspace aimed at the tunnel-label text field (or any focused
+            // widget) edits text instead of deleting.
+            let editing_text = ctx.memory(|m| m.focused().is_some());
+            if ctx.input(|i| i.key_pressed(egui::Key::Backspace)) && !editing_text {
+                if let Some(sel) = self.selected {
+                    match sel {
+                        Selected::Component(k) => self.delete_component(k),
+                        Selected::Tunnel(k) => self.delete_tunnel(k),
+                    }
+                }
             }
 
             painter.rect_filled(clip_rect, 0.0, theme.canvas_bg);
@@ -1755,5 +1811,88 @@ mod tests {
                 supported: CURRENT_VERSION,
             })
         );
+    }
+
+    #[test]
+    fn test_delete_component_drops_visual_records_and_refreshes_downstream() {
+        // Input -> NOT(g) -> Output, then delete the middle gate: its visual
+        // record and both wires touching it must be gone, the circuit component
+        // removed, the selection cleared, and the downstream Output refreshed
+        // (its input is now Floating).
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentDef::Input { bits: 1, width: 1 });
+        let g = place(
+            &mut app,
+            ComponentDef::Gate {
+                op: GateOp::Not,
+                n_inputs: 1,
+                width: 1,
+            },
+        );
+        let o = place(&mut app, ComponentDef::Output);
+        let (a_key, g_key, o_key) = (
+            app.components[a].key,
+            app.components[g].key,
+            app.components[o].key,
+        );
+        app.circuit
+            .link(a_key, PinId::output(0), g_key, PinId::input(0));
+        app.circuit
+            .link(g_key, PinId::output(0), o_key, PinId::input(0));
+        app.wires.push(Wire {
+            src_comp: a_key,
+            src_pin: OutIdx(0),
+            dst_comp: g_key,
+            dst_pin: InIdx(0),
+        });
+        app.wires.push(Wire {
+            src_comp: g_key,
+            src_pin: OutIdx(0),
+            dst_comp: o_key,
+            dst_pin: InIdx(0),
+        });
+        app.circuit.settle().unwrap();
+        assert_eq!(app.circuit.read_output(o_key), Value::new(0, 1)); // NOT(1) = 0
+        app.selected = Some(Selected::Component(g));
+
+        app.delete_component(g);
+
+        assert!(!app.components.contains_key(g));
+        assert!(app.circuit.components.get(g_key).is_none());
+        // Only the a->? wire is gone along with g->o; no wire references g_key.
+        assert!(app
+            .wires
+            .iter()
+            .all(|w| w.src_comp != g_key && w.dst_comp != g_key));
+        assert_eq!(app.selected, None);
+        // Output's input pin was nulled and re-evaluated to Floating.
+        assert_eq!(app.circuit.read_output(o_key), Value::Floating);
+    }
+
+    #[test]
+    fn test_delete_tunnel_drops_visual_records() {
+        // A component pin tied to a tunnel: deleting the tunnel removes its
+        // visual record, drops the TunnelWire referencing it, and clears the
+        // selection.
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentDef::Input { bits: 1, width: 1 });
+        let t = app.place_tunnel(TunnelRole::Pull, [1, 1]);
+        let (a_key, t_key) = (app.components[a].key, app.tunnels[t].key);
+        let pin = PinId::output(0);
+        app.circuit.link_tunnel(t_key, a_key, pin);
+        app.tunnel_wires.push(TunnelWire {
+            tunnel: t_key,
+            comp: a_key,
+            pin,
+        });
+        app.circuit.settle().unwrap();
+        app.selected = Some(Selected::Tunnel(t));
+
+        app.delete_tunnel(t);
+
+        assert!(!app.tunnels.contains_key(t));
+        assert!(app.circuit.tunnels.get(t_key).is_none());
+        assert!(app.tunnel_wires.iter().all(|tw| tw.tunnel != t_key));
+        assert_eq!(app.selected, None);
     }
 }
