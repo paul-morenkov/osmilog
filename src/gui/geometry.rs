@@ -134,6 +134,17 @@ pub const fn reg_size() -> Vec2 {
     )
 }
 
+// Height scales with the arm count on the left edge, same formula as mux/demux's
+// branches - the bottom/top pins (enable_in/enable_out) sit at the y=0/y=1 corners
+// and don't consume extra vertical space of their own.
+pub const fn encoder_size(sel_width: u8) -> Vec2 {
+    let arms = 1usize << sel_width;
+    vec2(
+        COMP_WIDTH,
+        ((arms + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT),
+    )
+}
+
 pub fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
     let n = if matches!(op, GateOp::Not) {
         1
@@ -266,6 +277,71 @@ pub fn demux_shape(sel_width: u8) -> ComponentShape {
         extra_strokes: vec![],
         output_bubbles: vec![false; branches],
         labels: vec![],
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// Pin layout matches Component::priority_encoder's fixed order: input[0] = enable_in
+// (bottom edge), input[1..] = arms (left edge, evenly spaced); output[0] = selector and
+// output[2] = group_out (right edge, top/bottom of the pair), output[1] = enable_out
+// (top edge).
+pub fn encoder_shape(sel_width: u8) -> ComponentShape {
+    let arms = 1usize << sel_width;
+    let h = encoder_size(sel_width).y;
+
+    let enable_in_anchor = PinAnchor {
+        norm_pos: vec2(0.5, 1.0),
+        wire_dir: vec2(0.0, 1.0),
+        pixel_offset: 0.0,
+    };
+    let arm_anchors = (0..arms).map(|i| PinAnchor::left(spaced(i, arms)));
+    let input_anchors = std::iter::once(enable_in_anchor)
+        .chain(arm_anchors)
+        .collect();
+
+    let enable_out_anchor = PinAnchor {
+        norm_pos: vec2(0.5, 0.0),
+        wire_dir: vec2(0.0, -1.0),
+        pixel_offset: 0.0,
+    };
+    let sel_y = spaced(0, 2);
+    let grp_y = spaced(1, 2);
+    let output_anchors = vec![
+        PinAnchor::right(sel_y),
+        enable_out_anchor,
+        PinAnchor::right(grp_y),
+    ];
+
+    // EN sits just above the bottom edge by a fixed pixel distance rather than a fixed
+    // fraction of height - height grows with sel_width (more arms), but the label should
+    // stay close to the pin it names instead of drifting toward the middle of a tall body.
+    const BOTTOM_LABEL_INSET_PX: f32 = 6.0;
+    let en_y = 1.0 - BOTTOM_LABEL_INSET_PX / h;
+
+    let labels = vec![
+        ComponentLabel {
+            text: "EN",
+            pos: vec2(0.5, en_y),
+        },
+        ComponentLabel {
+            text: "S",
+            pos: vec2(0.78, sel_y),
+        },
+        ComponentLabel {
+            text: "G",
+            pos: vec2(0.78, grp_y),
+        },
+    ];
+
+    ComponentShape {
+        size: vec2(COMP_WIDTH, h),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors,
+        extra_strokes: vec![],
+        output_bubbles: vec![false, false, false],
+        labels,
         dynamic_label_pos: Vec2::ZERO,
     }
 }

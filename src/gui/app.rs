@@ -13,7 +13,9 @@ use crate::io::{
     CURRENT_VERSION,
 };
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
-use crate::sim::component::{CompKey, FanDirection, GateOp, InIdx, OutIdx, PinId};
+use crate::sim::component::{
+    CompKey, Demux, Encoder, FanDirection, Gate, GateOp, InIdx, Input, Mux, OutIdx, PinId, Reg,
+};
 use crate::sim::value::Value;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -394,10 +396,10 @@ impl OsmilogApp {
 
         let def = pc.def.clone();
         match def {
-            ComponentDef::Input {
+            ComponentDef::Input(Input {
                 mut bits,
                 mut width,
-            } => {
+            }) => {
                 let mut changed = false;
                 ui.label(format!("Value: 0x{:X}", bits));
 
@@ -424,7 +426,7 @@ impl OsmilogApp {
                 });
                 if changed {
                     bits &= Value::mask(width); // In case width was changed below max `bits` value
-                    self.reconfigure_component(key, ComponentDef::Input { bits, width });
+                    self.reconfigure_component(key, ComponentDef::Input(Input { bits, width }));
                 }
             }
             ComponentDef::Output => {
@@ -435,11 +437,11 @@ impl OsmilogApp {
                 };
                 ui.label(format!("Value: {}", val_str));
             }
-            ComponentDef::Gate {
+            ComponentDef::Gate(Gate {
                 op,
                 mut n_inputs,
                 mut width,
-            } => {
+            }) => {
                 let mut changed = false;
                 if op != GateOp::Not {
                     ui.horizontal(|ui| {
@@ -458,18 +460,18 @@ impl OsmilogApp {
                 if changed {
                     self.reconfigure_component(
                         key,
-                        ComponentDef::Gate {
+                        ComponentDef::Gate(Gate {
                             op,
                             n_inputs,
                             width,
-                        },
+                        }),
                     );
                 }
             }
-            ComponentDef::Mux {
+            ComponentDef::Mux(Mux {
                 mut data_width,
                 mut sel_width,
-            } => {
+            }) => {
                 let mut changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Data width:");
@@ -486,17 +488,17 @@ impl OsmilogApp {
                 if changed {
                     self.reconfigure_component(
                         key,
-                        ComponentDef::Mux {
+                        ComponentDef::Mux(Mux {
                             data_width,
                             sel_width,
-                        },
+                        }),
                     );
                 }
             }
-            ComponentDef::Demux {
+            ComponentDef::Demux(Demux {
                 mut data_width,
                 mut sel_width,
-            } => {
+            }) => {
                 let mut changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Data width:");
@@ -513,14 +515,14 @@ impl OsmilogApp {
                 if changed {
                     self.reconfigure_component(
                         key,
-                        ComponentDef::Demux {
+                        ComponentDef::Demux(Demux {
                             data_width,
                             sel_width,
-                        },
+                        }),
                     );
                 }
             }
-            ComponentDef::Reg { mut data_width } => {
+            ComponentDef::Reg(Reg { mut data_width }) => {
                 let mut changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Data width:");
@@ -529,7 +531,7 @@ impl OsmilogApp {
                         .changed();
                 });
                 if changed {
-                    self.reconfigure_component(key, ComponentDef::Reg { data_width });
+                    self.reconfigure_component(key, ComponentDef::Reg(Reg { data_width }));
                 }
 
                 let cur = self.circuit.components[comp_key].pins.out_cache[0];
@@ -538,6 +540,18 @@ impl OsmilogApp {
                     Value::Floating => "Floating".to_string(),
                 };
                 ui.label(format!("Value: {}", val_str));
+            }
+            ComponentDef::Encoder(Encoder { mut sel_width }) => {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Sel width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut sel_width).range(0..=4))
+                        .changed();
+                });
+                if changed {
+                    self.reconfigure_component(key, ComponentDef::Encoder(Encoder { sel_width }));
+                }
             }
             ComponentDef::Splitter {
                 mut width,
@@ -835,11 +849,11 @@ impl eframe::App for OsmilogApp {
                         for (name, op, n) in gates {
                             if ui.button(name).clicked() {
                                 self.mode = InteractionMode::Placing {
-                                    def: ComponentDef::Gate {
+                                    def: ComponentDef::Gate(Gate {
                                         op,
                                         n_inputs: n,
                                         width: 1,
-                                    },
+                                    }),
                                 };
                                 ui.close();
                             }
@@ -847,7 +861,7 @@ impl eframe::App for OsmilogApp {
                     });
                     if ui.button("Input").clicked() {
                         self.mode = InteractionMode::Placing {
-                            def: ComponentDef::Input { bits: 0, width: 1 },
+                            def: ComponentDef::Input(Input { bits: 0, width: 1 }),
                         };
                         ui.close();
                     }
@@ -859,19 +873,19 @@ impl eframe::App for OsmilogApp {
                     }
                     if ui.button("Mux").clicked() {
                         self.mode = InteractionMode::Placing {
-                            def: ComponentDef::Mux {
+                            def: ComponentDef::Mux(Mux {
                                 data_width: 1,
                                 sel_width: 1,
-                            },
+                            }),
                         };
                         ui.close();
                     }
                     if ui.button("Demux").clicked() {
                         self.mode = InteractionMode::Placing {
-                            def: ComponentDef::Demux {
+                            def: ComponentDef::Demux(Demux {
                                 data_width: 1,
                                 sel_width: 1,
-                            },
+                            }),
                         };
                         ui.close();
                     }
@@ -885,10 +899,16 @@ impl eframe::App for OsmilogApp {
                         };
                         ui.close();
                     }
+                    if ui.button("Encoder").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Encoder(Encoder { sel_width: 1 }),
+                        };
+                        ui.close();
+                    }
                     ui.menu_button("Memory", |ui| {
                         if ui.button("Register").clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentDef::Reg { data_width: 1 },
+                                def: ComponentDef::Reg(Reg { data_width: 1 }),
                             };
                             ui.close();
                         }
@@ -1645,15 +1665,15 @@ mod tests {
     #[test]
     fn test_circuit_file_round_trip_basic() {
         let mut app = OsmilogApp::empty();
-        let a = place(&mut app, ComponentDef::Input { bits: 1, width: 1 });
-        let b = place(&mut app, ComponentDef::Input { bits: 1, width: 1 });
+        let a = place(&mut app, ComponentDef::Input(Input { bits: 1, width: 1 }));
+        let b = place(&mut app, ComponentDef::Input(Input { bits: 1, width: 1 }));
         let g = place(
             &mut app,
-            ComponentDef::Gate {
+            ComponentDef::Gate(Gate {
                 op: GateOp::And,
                 n_inputs: 2,
                 width: 1,
-            },
+            }),
         );
         let o = place(&mut app, ComponentDef::Output);
 
@@ -1714,7 +1734,7 @@ mod tests {
     #[test]
     fn test_circuit_file_round_trip_with_tunnel() {
         let mut app = OsmilogApp::empty();
-        let inp = place(&mut app, ComponentDef::Input { bits: 1, width: 1 });
+        let inp = place(&mut app, ComponentDef::Input(Input { bits: 1, width: 1 }));
         let out = place(&mut app, ComponentDef::Output);
         let feed = app.place_tunnel(TunnelRole::Feed, [0, 0]);
         let pull = app.place_tunnel(TunnelRole::Pull, [1, 1]);
@@ -1820,14 +1840,14 @@ mod tests {
         // removed, the selection cleared, and the downstream Output refreshed
         // (its input is now Floating).
         let mut app = OsmilogApp::empty();
-        let a = place(&mut app, ComponentDef::Input { bits: 1, width: 1 });
+        let a = place(&mut app, ComponentDef::Input(Input { bits: 1, width: 1 }));
         let g = place(
             &mut app,
-            ComponentDef::Gate {
+            ComponentDef::Gate(Gate {
                 op: GateOp::Not,
                 n_inputs: 1,
                 width: 1,
-            },
+            }),
         );
         let o = place(&mut app, ComponentDef::Output);
         let (a_key, g_key, o_key) = (
@@ -1875,7 +1895,7 @@ mod tests {
         // visual record, drops the TunnelWire referencing it, and clears the
         // selection.
         let mut app = OsmilogApp::empty();
-        let a = place(&mut app, ComponentDef::Input { bits: 1, width: 1 });
+        let a = place(&mut app, ComponentDef::Input(Input { bits: 1, width: 1 }));
         let t = app.place_tunnel(TunnelRole::Pull, [1, 1]);
         let (a_key, t_key) = (app.components[a].key, app.tunnels[t].key);
         let pin = PinId::output(0);

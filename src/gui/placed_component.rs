@@ -2,7 +2,9 @@ use egui::Vec2;
 
 use crate::gui::geometry::*;
 use crate::gui::shape::{ComponentShape, PinAnchor};
-use crate::sim::component::{CompKey, Component, FanDirection, GateOp};
+use crate::sim::component::{
+    CombLogic, CompKey, Component, Demux, Encoder, FanDirection, Gate, GateOp, Input, Mux, Reg,
+};
 
 // ── PlacedComponent ───────────────────────────────────────────────────────────
 
@@ -16,27 +18,17 @@ pub struct PlacedComponent {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ComponentDef {
-    Input {
-        bits: u32,
-        width: u8,
-    },
+    Input(Input),
     Output,
-    Gate {
-        op: GateOp,
-        n_inputs: usize,
-        width: u8,
-    },
-    Mux {
-        data_width: u8,
-        sel_width: u8,
-    },
-    Demux {
-        data_width: u8,
-        sel_width: u8,
-    },
-    Reg {
-        data_width: u8,
-    },
+    Gate(Gate),
+    Mux(Mux),
+    Demux(Demux),
+    Reg(Reg),
+    Encoder(Encoder),
+    // Kept as its own lightweight, GUI-only shape rather than wrapping the sim's Splitter
+    // struct (method 2 elsewhere in this enum): the sim struct bundles raw params together
+    // with a precomputed routing table cached for evaluate() performance, which the GUI has
+    // no use for and which would go stale whenever the user edits arm_bits here.
     Splitter {
         width: u8,
         arm_bits: Vec<Vec<u8>>,
@@ -47,12 +39,13 @@ pub enum ComponentDef {
 impl ComponentDef {
     pub fn n_inputs(&self) -> usize {
         match self {
-            Self::Input { .. } => 0,
+            Self::Input(_) => 0,
             Self::Output => 1,
-            Self::Gate { n_inputs, .. } => *n_inputs,
-            Self::Mux { sel_width, .. } => (1usize << sel_width) + 1,
-            Self::Demux { .. } => 2,
-            Self::Reg { .. } => 2,
+            Self::Gate(g) => g.n_inputs(),
+            Self::Mux(m) => m.n_inputs(),
+            Self::Demux(d) => d.n_inputs(),
+            Self::Reg(r) => r.n_inputs(),
+            Self::Encoder(e) => e.n_inputs(),
             Self::Splitter {
                 arm_bits,
                 direction,
@@ -66,12 +59,13 @@ impl ComponentDef {
 
     pub fn n_outputs(&self) -> usize {
         match self {
-            Self::Input { .. } => 1,
+            Self::Input(_) => 1,
             Self::Output => 0,
-            Self::Gate { .. } => 1,
-            Self::Mux { .. } => 1,
-            Self::Demux { sel_width, .. } => 1usize << sel_width,
-            Self::Reg { .. } => 1,
+            Self::Gate(g) => g.n_outputs(),
+            Self::Mux(m) => m.n_outputs(),
+            Self::Demux(d) => d.n_outputs(),
+            Self::Reg(r) => r.n_outputs(),
+            Self::Encoder(e) => e.n_outputs(),
             Self::Splitter {
                 arm_bits,
                 direction,
@@ -89,20 +83,21 @@ impl ComponentDef {
     // every frame for hit-testing/selection.
     pub fn size(&self) -> Vec2 {
         match self {
-            Self::Input { .. } | Self::Output => egui::vec2(COMP_MIN_WIDTH, COMP_MIN_HEIGHT),
-            Self::Gate { op, n_inputs, .. } => gate_size(*op, *n_inputs),
-            Self::Mux { sel_width, .. } => mux_size(*sel_width),
-            Self::Demux { sel_width, .. } => demux_size(*sel_width),
-            Self::Reg { .. } => reg_size(),
+            Self::Input(_) | Self::Output => egui::vec2(COMP_MIN_WIDTH, COMP_MIN_HEIGHT),
+            Self::Gate(g) => gate_size(g.op, g.n_inputs),
+            Self::Mux(m) => mux_size(m.sel_width),
+            Self::Demux(d) => demux_size(d.sel_width),
+            Self::Reg(_) => reg_size(),
+            Self::Encoder(e) => encoder_size(e.sel_width),
             Self::Splitter { arm_bits, .. } => splitter_size(arm_bits.len() as u8),
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Input { .. } => "IN",
+            Self::Input(_) => "IN",
             Self::Output => "OUT",
-            Self::Gate { op, .. } => match op {
+            Self::Gate(g) => match g.op {
                 GateOp::And => "AND",
                 GateOp::Or => "OR",
                 GateOp::Xor => "XOR",
@@ -111,9 +106,10 @@ impl ComponentDef {
                 GateOp::Xnor => "XNOR",
                 GateOp::Not => "NOT",
             },
-            Self::Mux { .. } => "MUX",
-            Self::Demux { .. } => "DEMUX",
-            Self::Reg { .. } => "REG",
+            Self::Mux(_) => "MUX",
+            Self::Demux(_) => "DEMUX",
+            Self::Reg(_) => "REG",
+            Self::Encoder(_) => "ENC",
             Self::Splitter { direction, .. } => match direction {
                 FanDirection::Right => "SPLIT",
                 FanDirection::Left => "COMBINE",
@@ -123,22 +119,13 @@ impl ComponentDef {
 
     pub fn make_component(&self) -> Component {
         match self {
-            Self::Input { bits, width } => Component::input(*bits, *width),
+            Self::Input(p) => Component::input(p.bits, p.width),
             Self::Output => Component::output(),
-            Self::Gate {
-                op,
-                n_inputs,
-                width,
-            } => Component::gate(*op, *n_inputs, *width),
-            Self::Mux {
-                data_width,
-                sel_width,
-            } => Component::mux(*data_width, *sel_width),
-            Self::Demux {
-                data_width,
-                sel_width,
-            } => Component::demux(*data_width, *sel_width),
-            Self::Reg { data_width } => Component::reg(*data_width),
+            Self::Gate(g) => Component::gate(g.op, g.n_inputs, g.width),
+            Self::Mux(m) => Component::mux(m.data_width, m.sel_width),
+            Self::Demux(d) => Component::demux(d.data_width, d.sel_width),
+            Self::Reg(r) => Component::reg(r.data_width),
+            Self::Encoder(e) => Component::priority_encoder(e.sel_width),
             Self::Splitter {
                 arm_bits,
                 direction,
@@ -149,7 +136,7 @@ impl ComponentDef {
 
     pub fn shape(&self) -> ComponentShape {
         match self {
-            Self::Input { .. } => {
+            Self::Input(_) => {
                 let h = COMP_MIN_HEIGHT;
                 ComponentShape {
                     size: egui::vec2(COMP_MIN_WIDTH, h),
@@ -177,10 +164,11 @@ impl ComponentDef {
                     dynamic_label_pos: Vec2::ZERO,
                 }
             }
-            Self::Gate { op, n_inputs, .. } => gate_shape(*op, *n_inputs),
-            Self::Mux { sel_width, .. } => mux_shape(*sel_width),
-            Self::Demux { sel_width, .. } => demux_shape(*sel_width),
-            Self::Reg { .. } => reg_shape(),
+            Self::Gate(g) => gate_shape(g.op, g.n_inputs),
+            Self::Mux(m) => mux_shape(m.sel_width),
+            Self::Demux(d) => demux_shape(d.sel_width),
+            Self::Reg(_) => reg_shape(),
+            Self::Encoder(e) => encoder_shape(e.sel_width),
             Self::Splitter {
                 arm_bits,
                 direction,
