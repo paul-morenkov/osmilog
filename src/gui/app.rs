@@ -904,52 +904,57 @@ impl eframe::App for OsmilogApp {
                         };
                         ui.close();
                     }
-                    if ui.button("Mux").clicked() {
-                        self.mode = InteractionMode::Placing {
-                            def: ComponentDef::Mux(Mux {
-                                data_width: 1,
-                                sel_width: 1,
-                            }),
-                        };
-                        ui.close();
-                    }
-                    if ui.button("Demux").clicked() {
-                        self.mode = InteractionMode::Placing {
-                            def: ComponentDef::Demux(Demux {
-                                data_width: 1,
-                                sel_width: 1,
-                            }),
-                        };
-                        ui.close();
-                    }
-                    if ui.button("Splitter").clicked() {
-                        self.mode = InteractionMode::Placing {
-                            def: ComponentDef::Splitter {
-                                width: 2,
-                                arm_bits: vec![vec![0], vec![1]],
-                                direction: FanDirection::Right,
-                            },
-                        };
-                        ui.close();
-                    }
-                    if ui.button("Encoder").clicked() {
-                        self.mode = InteractionMode::Placing {
-                            def: ComponentDef::Encoder(Encoder { sel_width: 1 }),
-                        };
-                        ui.close();
-                    }
-                    if ui.button("Adder").clicked() {
-                        self.mode = InteractionMode::Placing {
-                            def: ComponentDef::Adder(Adder { data_width: 1 }),
-                        };
-                        ui.close();
-                    }
-                    if ui.button("Subtractor").clicked() {
-                        self.mode = InteractionMode::Placing {
-                            def: ComponentDef::Subtractor(Subtractor { data_width: 1 }),
-                        };
-                        ui.close();
-                    }
+
+                    ui.menu_button("Plexers", |ui| {
+                        if ui.button("Mux").clicked() {
+                            self.mode = InteractionMode::Placing {
+                                def: ComponentDef::Mux(Mux {
+                                    data_width: 1,
+                                    sel_width: 1,
+                                }),
+                            };
+                            ui.close();
+                        }
+                        if ui.button("Demux").clicked() {
+                            self.mode = InteractionMode::Placing {
+                                def: ComponentDef::Demux(Demux {
+                                    data_width: 1,
+                                    sel_width: 1,
+                                }),
+                            };
+                            ui.close();
+                        }
+                        if ui.button("Splitter").clicked() {
+                            self.mode = InteractionMode::Placing {
+                                def: ComponentDef::Splitter {
+                                    width: 2,
+                                    arm_bits: vec![vec![0], vec![1]],
+                                    direction: FanDirection::Right,
+                                },
+                            };
+                            ui.close();
+                        }
+                        if ui.button("Encoder").clicked() {
+                            self.mode = InteractionMode::Placing {
+                                def: ComponentDef::Encoder(Encoder { sel_width: 1 }),
+                            };
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Arithmetic", |ui| {
+                        if ui.button("Adder").clicked() {
+                            self.mode = InteractionMode::Placing {
+                                def: ComponentDef::Adder(Adder { data_width: 1 }),
+                            };
+                            ui.close();
+                        }
+                        if ui.button("Subtractor").clicked() {
+                            self.mode = InteractionMode::Placing {
+                                def: ComponentDef::Subtractor(Subtractor { data_width: 1 }),
+                            };
+                            ui.close();
+                        }
+                    });
                     ui.menu_button("Memory", |ui| {
                         if ui.button("Register").clicked() {
                             self.mode = InteractionMode::Placing {
