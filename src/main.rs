@@ -9,7 +9,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("osmilog")
+            .with_title(format!("osmilog v{}", env!("CARGO_PKG_VERSION")))
             .with_inner_size([1200.0, 800.0])
             .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()

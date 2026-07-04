@@ -26,6 +26,9 @@ const WIRE_THICKNESS_THICK: f32 = 4.0;
 const LABEL_FONT_SIZE: f32 = 8.0;
 const COMP_STROKE: f32 = 1.5;
 
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_SHA: &str = env!("OSMILOG_GIT_SHA");
+
 // ── PlacedTunnel ──────────────────────────────────────────────────────────────
 
 // Visual record for a Tunnel (net label / off-page connector). Deliberately
@@ -935,6 +938,9 @@ impl eframe::App for OsmilogApp {
                 if let Some(err) = &self.last_settle_error {
                     ui.colored_label(theme.error_text, err);
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(format!("v{APP_VERSION} ({GIT_SHA})"));
+                });
             })
         });
 
