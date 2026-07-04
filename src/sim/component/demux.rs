@@ -7,6 +7,11 @@ pub struct Demux {
     pub sel_width: u8,
 }
 
+impl Demux {
+    const DATA_PIN: usize = 0;
+    const SEL_PIN: usize = 1;
+}
+
 impl CombLogic for Demux {
     fn n_inputs(&self) -> usize {
         2
@@ -17,21 +22,23 @@ impl CombLogic for Demux {
     // inputs[0] => data, inputs[1] => selector
     fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
         let branches = 1 << self.sel_width;
-        match inputs[1] {
+        match inputs[Self::SEL_PIN] {
             Value::Fixed { bits: sel, width } if width == self.sel_width => {
                 let mut values = vec![Value::new(0, self.data_width); branches];
                 // TODO: check data_width?
-                values[sel as usize] = inputs[0];
+                values[sel as usize] = inputs[Self::DATA_PIN];
                 values
             }
             _ => vec![Value::Floating; branches],
         }
     }
     fn input_width(&self, i: usize) -> Option<u8> {
-        if i == 0 {
+        if i == Self::DATA_PIN {
             Some(self.data_width) // data
-        } else {
+        } else if i == Self::SEL_PIN {
             Some(self.sel_width) // selector
+        } else {
+            None
         }
     }
     fn output_width(&self, _i: usize) -> Option<u8> {
