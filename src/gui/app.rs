@@ -14,7 +14,8 @@ use crate::io::{
 };
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::component::{
-    CompKey, Demux, Encoder, FanDirection, Gate, GateOp, InIdx, Input, Mux, OutIdx, PinId, Reg,
+    Adder, CompKey, Demux, Encoder, FanDirection, Gate, GateOp, InIdx, Input, Mux, OutIdx, PinId,
+    Reg, Subtractor,
 };
 use crate::sim::value::Value;
 
@@ -558,6 +559,33 @@ impl OsmilogApp {
                     self.reconfigure_component(key, ComponentDef::Encoder(Encoder { sel_width }));
                 }
             }
+            ComponentDef::Adder(Adder { mut data_width }) => {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Data width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                        .changed();
+                });
+                if changed {
+                    self.reconfigure_component(key, ComponentDef::Adder(Adder { data_width }));
+                }
+            }
+            ComponentDef::Subtractor(Subtractor { mut data_width }) => {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Data width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                        .changed();
+                });
+                if changed {
+                    self.reconfigure_component(
+                        key,
+                        ComponentDef::Subtractor(Subtractor { data_width }),
+                    );
+                }
+            }
             ComponentDef::Splitter {
                 mut width,
                 mut arm_bits,
@@ -907,6 +935,18 @@ impl eframe::App for OsmilogApp {
                     if ui.button("Encoder").clicked() {
                         self.mode = InteractionMode::Placing {
                             def: ComponentDef::Encoder(Encoder { sel_width: 1 }),
+                        };
+                        ui.close();
+                    }
+                    if ui.button("Adder").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Adder(Adder { data_width: 1 }),
+                        };
+                        ui.close();
+                    }
+                    if ui.button("Subtractor").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Subtractor(Subtractor { data_width: 1 }),
                         };
                         ui.close();
                     }

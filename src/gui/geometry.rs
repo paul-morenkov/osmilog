@@ -134,6 +134,22 @@ pub const fn reg_size() -> Vec2 {
     )
 }
 
+// Height accounts only for the two addend pins on the left edge, same formula as a
+// 2-input gate - the carry-in/carry-out pins sit at the bottom/top edges (like
+// encoder's enable_in/enable_out) and don't consume extra vertical space of their own.
+pub const fn adder_size() -> Vec2 {
+    vec2(
+        COMP_WIDTH,
+        ((2 + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT),
+    )
+}
+
+// Same layout/formula as adder_size(): minuend/subtrahend on the left edge,
+// borrow-in/borrow-out at the bottom/top edges.
+pub const fn subtractor_size() -> Vec2 {
+    adder_size()
+}
+
 // Height scales with the arm count on the left edge, same formula as mux/demux's
 // branches - the bottom/top pins (enable_in/enable_out) sit at the y=0/y=1 corners
 // and don't consume extra vertical space of their own.
@@ -341,6 +357,114 @@ pub fn encoder_shape(sel_width: u8) -> ComponentShape {
         output_anchors,
         extra_strokes: vec![],
         output_bubbles: vec![false, false, false],
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// Pin layout matches Component::adder's fixed order: input[0]/[1] = addends (left
+// edge), input[2] = carry-in (bottom edge); output[0] = sum (right edge), output[1]
+// = carry-out (top edge) - carry-in/out mirror encoder's enable_in/enable_out corner
+// placement so they read as "flow-through" pins distinct from the data pins.
+pub fn adder_shape() -> ComponentShape {
+    let h = adder_size().y;
+
+    let carry_in_anchor = PinAnchor::bottom_mid(0.5, 1.0);
+    let input_anchors = vec![
+        PinAnchor::left(spaced(0, 2)),
+        PinAnchor::left(spaced(1, 2)),
+        carry_in_anchor,
+    ];
+
+    let carry_out_anchor = PinAnchor {
+        norm_pos: vec2(0.5, 0.0),
+        wire_dir: vec2(0.0, -1.0),
+        pixel_offset: 0.0,
+    };
+    let output_anchors = vec![PinAnchor::right(0.5), carry_out_anchor];
+
+    // CIN/CO sit a fixed pixel distance in from the bottom/top edges, next to
+    // their pins; "+" sits just inside the right edge, next to the sum pin.
+    const EDGE_LABEL_INSET_PX: f32 = 6.0;
+    let cin_y = 1.0 - EDGE_LABEL_INSET_PX / h;
+    let co_y = EDGE_LABEL_INSET_PX / h;
+
+    let labels = vec![
+        ComponentLabel {
+            text: "+",
+            pos: vec2(0.72, 0.5),
+        },
+        ComponentLabel {
+            text: "CIN",
+            pos: vec2(0.5, cin_y),
+        },
+        ComponentLabel {
+            text: "CO",
+            pos: vec2(0.5, co_y),
+        },
+    ];
+
+    ComponentShape {
+        size: vec2(COMP_WIDTH, h),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors,
+        extra_strokes: vec![],
+        output_bubbles: vec![false, false],
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// Pin layout matches Component::subtractor's fixed order: input[0]/[1] = minuend/
+// subtrahend (left edge), input[2] = borrow-in (bottom edge); output[0] = difference
+// (right edge), output[1] = borrow-out (top edge). Same corner placement rationale
+// as adder_shape()'s carry-in/carry-out.
+pub fn subtractor_shape() -> ComponentShape {
+    let h = subtractor_size().y;
+
+    let borrow_in_anchor = PinAnchor::bottom_mid(0.5, 1.0);
+    let input_anchors = vec![
+        PinAnchor::left(spaced(0, 2)),
+        PinAnchor::left(spaced(1, 2)),
+        borrow_in_anchor,
+    ];
+
+    let borrow_out_anchor = PinAnchor {
+        norm_pos: vec2(0.5, 0.0),
+        wire_dir: vec2(0.0, -1.0),
+        pixel_offset: 0.0,
+    };
+    let output_anchors = vec![PinAnchor::right(0.5), borrow_out_anchor];
+
+    const EDGE_LABEL_INSET_PX: f32 = 6.0;
+    let bin_y = 1.0 - EDGE_LABEL_INSET_PX / h;
+    let bo_y = EDGE_LABEL_INSET_PX / h;
+
+    let labels = vec![
+        ComponentLabel {
+            text: "-",
+            pos: vec2(0.72, 0.5),
+        },
+        ComponentLabel {
+            text: "BIN",
+            pos: vec2(0.5, bin_y),
+        },
+        ComponentLabel {
+            text: "BO",
+            pos: vec2(0.5, bo_y),
+        },
+    ];
+
+    ComponentShape {
+        size: vec2(COMP_WIDTH, h),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors,
+        extra_strokes: vec![],
+        output_bubbles: vec![false, false],
         labels,
         dynamic_label_pos: Vec2::ZERO,
     }

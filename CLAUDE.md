@@ -8,7 +8,8 @@ desktop (native window) and the browser (WASM), and circuits can be saved to / l
 plain JSON file.
 
 The crate is both a library (`src/lib.rs`, modules `gui`/`io`/`sim`) and a thin binary
-(`src/main.rs`); tests live in `#[cfg(test)]` modules inside `circuit.rs` and `app.rs`.
+(`src/main.rs`); tests live in `#[cfg(test)]` modules alongside the code they test (each
+`src/sim/component/*.rs`, plus `circuit.rs` and `app.rs`).
 
 Dependencies: slotmap 1.1.1 (stable generational arena keys), eframe/egui 0.35.0 (GUI),
 serde + serde_json (save/load), rfd 0.15 (native + async file dialogs). WASM adds
@@ -17,18 +18,25 @@ wasm-bindgen / wasm-bindgen-futures / js-sys / web-sys.
 
 ## Module Map
 
-    src/lib.rs            crate root: pub mod gui / io / sim
-    src/sim/value.rs      Value enum - signal representation
-    src/sim/net.rs        Net struct - a wire connecting component pins
-    src/sim/component.rs  Component, Logic/LogicComb/LogicSeq, GateOp, Splitter, FanDirection, Pins, PinId, key types
-    src/sim/circuit.rs    Circuit - the simulation graph and evaluation engine; Tunnel, TunnelRole, SettleError
-    src/io.rs             CircuitFile JSON save/load format + native/wasm file-dialog submodules
-    src/gui/shape.rs      ComponentShape, ShapeCmd, PinAnchor, ComponentLabel, tessellate_path - visual shape system
-    src/gui/geometry.rs   ComponentDef shape builders (gate_shape, mux_shape, splitter_shape, ...) and geometry constants (GRID_SIZE, COMP_WIDTH, ...)
-    src/gui/theme.rs      Theme - canvas colors derived from the ambient egui Visuals (light/dark responsive)
-    src/gui/placed_component.rs  PlacedComponent, ComponentDef - visual/construction record for a placed component
-    src/gui/app.rs        OsmilogApp - eframe/egui GUI (PlacedTunnel, Wire, TunnelWire, Selected, DragSource, InteractionMode)
-    src/main.rs           entry point: native eframe::run_native, plus a wasm_bindgen(start) WASM entry
+    src/lib.rs                    crate root: pub mod gui / io / sim
+    src/sim/value.rs               Value enum - signal representation (Floating / Fixed / Invalid)
+    src/sim/net.rs                 Net struct - a wire connecting component pins
+    src/sim/component.rs           Component, Pins, Logic/LogicComb/LogicSeq, CombLogic trait, PinId, key types
+    src/sim/component/input.rs     Input - source node
+    src/sim/component/gate.rs      Gate, GateOp - AND/OR/XOR/NAND/NOR/XNOR/NOT
+    src/sim/component/mux.rs       Mux
+    src/sim/component/demux.rs     Demux
+    src/sim/component/encoder.rs   Encoder - priority encoder
+    src/sim/component/splitter.rs  Splitter, FanDirection - bit re-router / combiner
+    src/sim/component/reg.rs       Reg - config struct for the one sequential component
+    src/sim/circuit.rs             Circuit - the simulation graph and evaluation engine; Tunnel, TunnelRole, SettleError
+    src/io.rs                      CircuitFile JSON save/load format + native/wasm file-dialog submodules
+    src/gui/shape.rs                ComponentShape, ShapeCmd, PinAnchor, ComponentLabel, tessellate_path - visual shape system
+    src/gui/geometry.rs             ComponentDef shape builders (gate_shape, mux_shape, splitter_shape, ...) and geometry constants (GRID_SIZE, COMP_WIDTH, ...)
+    src/gui/theme.rs                Theme - canvas + signal colors derived from the ambient egui Visuals (light/dark responsive)
+    src/gui/placed_component.rs     PlacedComponent, ComponentDef - visual/construction record for a placed component
+    src/gui/app.rs                  OsmilogApp - eframe/egui GUI (PlacedTunnel, Wire, TunnelWire, Selected, DragSource, InteractionMode)
+    src/main.rs                     entry point: native eframe::run_native, plus a wasm_bindgen(start) WASM entry
 
 
 ## Core Types
@@ -37,11 +45,16 @@ wasm-bindgen / wasm-bindgen-futures / js-sys / web-sys.
 
     pub enum Value {
         Floating,                       // unconnected or undefined
-        Fixed { bits: u32, width: u8 } // concrete signal of given bit width
+        Fixed { bits: u32, width: u8 }, // concrete signal of given bit width
+        Invalid,                        // Net wiring is structurally wrong (see resolve_net below)
     }
 
-Floating is the default. Binary ops (AND, OR, XOR, NOT, Add, Sub) return Floating when
-operands have mismatched widths. NOT masks the result to width bits.
+`Floating` is the default. Binary ops (AND, OR, XOR, NOT, Add, Sub) return `Floating` when
+operands have mismatched widths, or when either operand is `Invalid`; `NOT` masks the result to
+`width` bits. `Invalid` is never produced by a `CombLogic::evaluate()` impl directly - it's set
+only by `Circuit::resolve_net()` - and it never propagates past the component that reads it: any
+op involving `Invalid` just falls through the same catch-all as any other non-`Fixed` operand and
+yields `Floating`, so a mismatch stays local to the one net where it occurs.
 
     Value::new(bits, width)  -- construct a Fixed value
     Value::mask(width)       -- bitmask of `width` ones (u32)
@@ -54,10 +67,11 @@ operands have mismatched widths. NOT masks the result to width bits.
         pub sinks:  Vec<(CompKey, InIdx)>,      // zero or more receivers
     }
 
-Nets are identified by NetKey (slotmap generational key). Multiple component sources ending up
-on the same net is still an unresolved case (merge() has a documented bug — see the
-`test_link_merge_keeps_original_source_documents_bug` test). Conflicting *tunnel* drivers, by
-contrast, are detected: settle() returns `SettleError::TunnelConflict`.
+Nets are identified by `NetKey` (slotmap generational key). Multiple component sources ending up
+on the same net is still an unresolved case (`merge()` has a documented bug - see the
+`test_link_merge_keeps_original_source_documents_bug` test). Conflicting *tunnel* drivers, and
+now conflicting *pin widths*, are both detected (`SettleError::TunnelConflict`, `Value::Invalid`
+respectively - see Evaluation Model).
 
 ### Component (component.rs)
 
@@ -72,23 +86,52 @@ contrast, are detected: settle() returns `SettleError::TunnelConflict`.
         pub out_cache: Vec<Value>,   // last computed output, parallel to outputs
     }
 
-CompKey is the slotmap key for a Component. out_cache is written by eval_component and read
-by resolve_net; it decouples evaluation from net updates.
+`CompKey` is the slotmap key for a `Component`. `out_cache` is written by `eval_component` and
+read by `resolve_net`; it decouples evaluation from net updates.
 
-### Logic (component.rs)
+### Logic, CombLogic, and per-component files (component.rs + component/*.rs)
 
 `Logic` splits combinational and sequential behavior at the type level:
 
     pub enum Logic { Comb(LogicComb), Seq(LogicSeq) }
 
-    pub enum LogicComb { Input { bits, width }, Output, Gate { op, width },
-                         Mux { .. }, Demux { .. }, Splitter(Splitter) }
+    pub enum LogicComb { Input(Input), Output, Gate(Gate), Mux(Mux), Demux(Demux),
+                          Splitter(Splitter), Encoder(Encoder) }
 
-    pub enum LogicSeq  { Reg { value: Value, data_width: u8 } }
+    pub enum LogicSeq  { Reg { config: Reg, value: Value } }
 
-`is_sequential()` is `matches!(logic, Logic::Seq(_))`. Combinational components compute via
-`evaluate(&nets)`; sequential components hold latched state and advance only via `tick(&inputs)`
-(see Evaluation Model).
+Each `LogicComb` variant (other than the parameterless `Output`) wraps a struct - `Input`,
+`Gate`, `Mux`, `Demux`, `Splitter`, `Encoder` - living in its own file under
+`src/sim/component/`, that implements:
+
+    pub trait CombLogic {
+        fn n_inputs(&self) -> usize;
+        fn n_outputs(&self) -> usize;
+        fn evaluate(&self, inputs: &[Value]) -> Vec<Value>;
+        fn input_width(&self, i: usize) -> Option<u8>;
+        fn output_width(&self, i: usize) -> Option<u8>;
+    }
+
+Bundling a component's construction params, pin arity, `evaluate()`, and per-pin expected width
+in one trait impl means these can't drift apart the way a separate constructor and match arms
+could - the compiler enforces the whole contract when a new component struct is added.
+`input_width`/`output_width` report the width a pin expects **from that component's own
+construction parameters** (e.g. `Gate.width`, `Mux.data_width`/`sel_width`), not from any `Value`
+currently on a net; `None` means the pin accepts/produces any width (currently only `Output`).
+`LogicComb`/`LogicSeq` dispatch all five methods to the active variant; `Component::input_width`/
+`output_width` dispatch through `Logic::Comb`/`Logic::Seq` in turn. `Reg` (reg.rs) is a plain
+config struct (not `CombLogic`, since it's sequential) with its own `n_inputs`/`n_outputs`;
+`LogicSeq` implements `tick`/`observe`/`input_width`/`output_width` by delegating to it, mirroring
+the `CombLogic` dispatch pattern. See Component Types below for each type's declared pin widths.
+
+### PinId (component.rs)
+
+    pub enum PinId { In(InIdx), Out(OutIdx) }
+
+    PinId::input(i)   -- shorthand for PinId::In(InIdx(i))
+    PinId::output(i)  -- shorthand for PinId::Out(OutIdx(i))
+
+Pin indices are 0-based u8 values.
 
 ### Circuit (circuit.rs)
 
@@ -101,10 +144,8 @@ by resolve_net; it decouples evaluation from net updates.
         tunnel_labels:         HashMap<String, Vec<TunnelKey>>,
     }
 
-The dirty queue drives propagation; queued prevents duplicate entries. Tunnels are a second
-connectivity mechanism layered on top of nets (see Tunnels below): `tunnels` holds each
-`Tunnel { label, role, net }`, and `tunnel_labels` indexes them by shared label so a label
-group can be resolved and re-dirtied together.
+The dirty queue drives propagation; `queued` prevents duplicate entries. Tunnels are a second
+connectivity mechanism layered on top of nets (see Tunnels below).
 
 ### Tunnels (circuit.rs)
 
@@ -119,96 +160,23 @@ virtual net without a drawn wire between them.
 values within a group surface as `SettleError::TunnelConflict`. Managed via `add_tunnel`,
 `link_tunnel`, `detach_tunnel`, `remove_tunnel`, and `rename_tunnel`.
 
-### PinId (component.rs)
-
-    pub enum PinId { In(InIdx), Out(OutIdx) }
-
-    PinId::input(i)   -- shorthand for PinId::In(InIdx(i))
-    PinId::output(i)  -- shorthand for PinId::Out(OutIdx(i))
-
-Pin indices are 0-based u8 values.
-
 
 ## Component Types and Pin Conventions
 
-All constructors are on Component. Logic enum variants are listed with their pin layouts.
+All constructors are on `Component`. Pin widths are each type's `CombLogic::input_width`/
+`output_width` (or `LogicSeq`'s, for `Reg`) - the per-pin expected width used by both `evaluate()`
+and, structurally, by `Circuit`'s width-conflict check (see `resolve_net` below).
 
-### Input
-
-    Component::input(bits: u32, width: u8)
-    outputs: [0] driven value
-
-Source node. Updated at runtime via circuit.set_input(key, bits, width).
-
-### Output
-
-    Component::output()
-    inputs: [0] observed value
-
-Sink node. Read via circuit.read_output(key), which returns the value of its input net.
-
-### Gate
-
-    Component::gate(op: GateOp, n_inputs: usize, width: u8)
-    inputs:  [0..n] operands
-    outputs: [0]    result
-
-GateOp variants: And, Or, Xor, Xnor, Nand, Nor, Not. All inputs and the output share the
-same bit width. NOT ignores n_inputs and only reads input[0].
-
-And/Nand accumulate from all-ones identity; Or/Nor/Xor/Xnor accumulate from zero identity.
-
-### Mux
-
-    Component::mux(data_width: u8, sel_width: u8)
-    inputs:  [0]         selector (sel_width bits)
-             [1..2^sel]  data branches (data_width bits each)
-    outputs: [0]         selected branch
-
-NOTE: pin ordering is provisional and may change.
-
-sel_width controls how many data inputs exist: 2^sel_width branches. Selector value is used
-directly as the index into the data inputs (input[sel + 1]).
-
-### Demux
-
-    Component::demux(data_width: u8, sel_width: u8)
-    inputs:  [0]  data (data_width bits)
-             [1]  selector (sel_width bits)
-    outputs: [0..2^sel]  routed outputs (data_width bits each)
-
-NOTE: pin ordering is provisional and may change.
-
-Selected output carries the data value; all other outputs are zero.
-
-### Splitter / Combine
-
-    Component::splitter(arm_bits: Vec<Vec<u8>>, direction: FanDirection)
-
-A bit re-router (no computation). `arm_bits[j]` lists the data-bit indices routed to arm `j`,
-e.g. `[[0, 2], [1, 3]]` sends bits 0,2 to arm 0 and bits 1,3 to arm 1. The trunk bus width is
-derived as `max(bit) + 1`; a bit claimed by multiple arms is won by the later arm.
-`direction` picks which side is the input:
-
-- `FanDirection::Right` (Splitter): inputs [0] = trunk bus; outputs [0..arms] = arms.
-- `FanDirection::Left`  (Combine):  inputs [0..arms] = arms; outputs [0] = trunk bus.
-
-In Combine mode every arm that owns ≥1 bit must be driven at exactly its owned width or the
-whole merged output is Floating (mirroring Value's width-mismatch convention). The
-`Splitter { arms, direction, routing, arm_width }` struct precomputes a per-data-bit
-`routing: Vec<Option<(arm, slot)>>` once at construction so `evaluate()` doesn't recount.
-
-### Reg
-
-    Component::reg(data_width: u8)
-    inputs:  [0] data (data_width bits)
-             [1] write_enable (1 bit)
-    outputs: [0] latched value (data_width bits)
-
-The one sequential component (`Logic::Seq(LogicSeq::Reg { value, data_width })`). `evaluate()`
-just reports the currently latched `value`; state changes only on `tick()`: when
-write_enable is `Fixed { bits: 1, width: 1 }`, `value` is replaced with the data input.
-Advanced through the circuit via `tick_clock()`.
+| Type | Constructor | Inputs (pin → width) | Outputs (pin → width) | Notes |
+|---|---|---|---|---|
+| Input | `Component::input(bits, width)` | none | `[0]` → `width` | source node; `set_input` mutates bits/width in place |
+| Output | `Component::output()` | `[0]` → any (`None`) | none | sink node; `read_output` reads its input net's value |
+| Gate | `Component::gate(op, n, width)` | `[0..n]` → `width` each | `[0]` → `width` | `GateOp`: And/Or/Xor/Xnor/Nand/Nor/Not; `NOT` ignores `n` and only reads input `[0]`; And/Nand accumulate from all-ones identity, Or/Nor/Xor/Xnor from zero |
+| Mux | `Component::mux(data_width, sel_width)` | `[0]` selector → `sel_width`; `[1..2^sel]` data branches → `data_width` each | `[0]` → `data_width` | selector value indexes directly into the data inputs; pin order provisional |
+| Demux | `Component::demux(data_width, sel_width)` | `[0]` data → `data_width`; `[1]` selector → `sel_width` | `[0..2^sel]` → `data_width` each | selected output carries the data verbatim (not re-checked against `data_width` at runtime - only `Circuit`'s structural check covers that); others read zero; pin order provisional |
+| Encoder | `Component::priority_encoder(sel_width)` | `[0]` enable_in → 1; `[1..2^sel+1]` arms → 1 each | `[0]` selector → `sel_width`; `[1]` enable_out → 1; `[2]` group_out → 1 | priority encoder: highest-index hot arm wins; cascadable by chaining `enable_out` → next stage's `enable_in` |
+| Splitter / Combine | `Component::splitter(arm_bits, direction)` | `Right` (Splitter): `[0]` trunk → `data_width()`. `Left` (Combine): `[0..arms]` → each arm's owned bit count (`0` → any width) | mirrored per direction | `arm_bits[j]` lists trunk bit indices routed to arm `j`; a bit claimed by multiple arms is won by the later arm; in Combine mode every arm owning ≥1 bit must be driven at exactly its owned width or the merged output is `Floating` |
+| Reg | `Component::reg(data_width)` | `[0]` data → `data_width`; `[1]` write_enable → 1 | `[0]` → `data_width` | the one sequential component (`Logic::Seq`); `evaluate()`/`observe()` just report the latched value - state only changes via `tick()`, driven by `Circuit::tick_clock()`, when write_enable is exactly `Fixed{bits:1,width:1}` |
 
 
 ## Evaluation Model
@@ -219,27 +187,45 @@ Advanced through the circuit via `tick_clock()`.
 change (set_input). It drains the dirty queue in a BFS loop.
 
 For each dirty net:
-1. resolve_net(net) -- copies out_cache[i] from the source component into net.value (also
-   folding in tunnel Feed/Pull contributions for that net's label group); returns true if the
-   value changed.
-2. If changed, find all combinational sink components (is_sequential() == false) and call
-   eval_component on each.
+1. `resolve_net(net)` - recomputes `net.value` (see below); returns true if the value changed.
+2. If changed, find all combinational sink components (`is_sequential() == false`) and call
+   `eval_component` on each.
 
 Instead of a single fixed iteration cap, non-convergence is detected two ways and returned as
 `SettleError::Oscillation` rather than panicking: a per-net `REVISIT_THRESHOLD` (16 value
 changes on one net) and a whole-call `ITERATION_BUDGET_PER_NET` (64) backstop scaled to
 circuit size. Tunnel label-group conflicts return `SettleError::TunnelConflict`.
 
+### resolve_net() and Value::Invalid
+
+Before pulling a value from the source (or a Feed tunnel), `resolve_net` calls
+`net_width_conflict(net)`: it collects `output_width`/`input_width` from every pin attached to
+the net (the single source, plus all sinks), drops any `None` ("accepts any width") entries, and
+checks whether more than one distinct declared width remains. If so, `net.value` becomes
+`Value::Invalid` - unconditionally, regardless of what the driver's `out_cache` holds or whether
+any attached pin currently carries a concrete value. This is a purely structural/configuration
+check (not runtime-value-based), so a net can read `Invalid` even while every attached pin is
+still `Floating`. It's recomputed fresh on every call rather than cached on `Net`, so it can't go
+stale after a `merge()`, relink, or component reconfigure - whatever last dirtied the net drives
+the next check. As noted under Value above, `Invalid` doesn't cascade past the flagged net.
+
+Each `CombLogic::evaluate()` impl also keeps its own runtime width guards (e.g. Mux/Demux
+checking the selector's actual width, Splitter's Left-mode `widths_ok`) even though a
+Circuit-driven net can no longer hand them a wrongly-shaped value - `evaluate()` is directly unit
+tested (and callable) without going through `Circuit`/`resolve_net` at all, so those guards are
+what keeps it a sound, non-panicking contract on its own (e.g. avoiding an out-of-range branch
+index from a malformed selector).
+
 ### eval_component()
 
-Calls component.evaluate(&nets) to compute new output values from current input net values,
-then writes results into out_cache. If any cache slot changes and the output pin is
+Calls `component.evaluate(&nets)` to compute new output values from current input net values,
+then writes results into `out_cache`. If any cache slot changes and the output pin is
 connected, its net is marked dirty.
 
-### Combinational vs Sequential — tick_clock()
+### Combinational vs Sequential - tick_clock()
 
-is_sequential() returns true only for `Logic::Seq` (currently just Reg). Sequential components
-are skipped during settle propagation; they advance via `tick_clock() -> Result<(),
+`is_sequential()` returns true only for `Logic::Seq` (currently just `Reg`). Sequential
+components are skipped during settle propagation; they advance via `tick_clock() -> Result<(),
 SettleError>`, which uses snapshot semantics: it first reads every sequential component's input
 values (`read_inputs`), then applies `tick()` to all of them against that snapshot (so chained
 registers shift by one stage per tick rather than racing), writes the new outputs, and finally
@@ -247,13 +233,13 @@ registers shift by one stage per tick rather than racing), writes the new output
 
 ### add_component / link / set_input / remove_component
 
-These call eval_component or mark_dirty automatically, so partial evaluation happens
-incrementally. settle() is still needed to fully propagate.
+These call `eval_component` or `mark_dirty` automatically, so partial evaluation happens
+incrementally. `settle()` is still needed to fully propagate.
 
 `remove_component(key)` deletes a component: it removes the nets it drives (nulling each sink's
 input pin), detaches it from nets it receives, detaches any tunnels left dangling, resets
 propagation state, and re-evaluates the sinks that lost their driver (so their now-Floating
-inputs propagate on the caller's following settle() rather than leaving stale downstream
+inputs propagate on the caller's following `settle()` rather than leaving stale downstream
 values). `remove_tunnel(key)` likewise dirties the tunnel's net and its label group's feed
 nets. `clear_nets()` disconnects all pins and removes all nets (and detaches all tunnels) while
 keeping components in place.
@@ -337,8 +323,10 @@ type's parameters via `DragValue`/`ComboBox`/`selectable_value` widgets (e.g. In
 Gate n_inputs/width, Mux/Demux data_width/sel_width, Reg data_width, Splitter width/arms/
 direction and per-bit arm assignment). Any edit calls `reconfigure_component`, which builds a
 new `ComponentDef`, `remove_component`s the old circuit component, and re-places a fresh one
-(the `PlacedCompKey` is stable, so `Selected` doesn't need updating). The panel also has a
-**Delete** button at the bottom that removes the selected component/tunnel.
+(the `PlacedCompKey` is stable, so `Selected` doesn't need updating). For Output and Reg, the
+panel also shows the component's current value as text (`"0x{bits:X} ({width}b)"`, `"Floating"`,
+or `"Invalid (width mismatch)"` for `Value::Invalid`). The panel also has a **Delete** button at
+the bottom that removes the selected component/tunnel.
 
 ### Deleting components and tunnels
 
@@ -463,20 +451,21 @@ In app.rs:
 
     PIN_RADIUS             3 px — drawn radius; hit radius is 2 ×
     BUBBLE_R               4 px — inversion bubble radius (from shape.rs)
-    WIRE_THICKNESS_THIN    2 px — 1-bit (or floating) wire
+    WIRE_THICKNESS_THIN    2 px — 1-bit (or floating/invalid) wire
     WIRE_THICKNESS_THICK   4 px — multi-bit bus wire
     LABEL_FONT_SIZE        8 px
 
 ### Signal color coding
 
-Colors come from `Theme`; the first three below track the theme, the low/high signal colors are
-intentionally fixed (they encode circuit data, not UI chrome). Wire thickness encodes bus width
-(see `value_stroke`).
+Colors come from `Theme`; `value_floating` tracks the ambient egui theme, the other three are
+fixed (they encode circuit data, not UI chrome). Wire thickness encodes bus width for `Fixed`
+values (see `value_stroke`); `Floating` and `Invalid` are both drawn thin/thick respectively as
+fixed choices, not derived from any width.
 
-    Floating                 theme.value_floating (muted gray)
-    Fixed { bits: 0, .. }   dark blue (logic low)
-    Fixed { .. }            green (logic high / non-zero bus)
-    width == 1               thin wire; width > 1  thick wire
+    Floating                 theme.value_floating (muted gray)     — WIRE_THICKNESS_THIN
+    Invalid                  theme.value_invalid (orange, #DE6B2F) — WIRE_THICKNESS_THICK
+    Fixed { bits: 0, .. }   theme.value_low (dark blue)           — thin/thick by width
+    Fixed { .. }            theme.value_high (green)              — thin/thick by width
 
 ### Window close (macOS)
 
@@ -489,7 +478,11 @@ otherwise trigger Apple's crash reporter.
 ## Known Limitations / TODOs
 
 - No conflict detection when multiple *component* sources end up on the same net (merge() has a
-  documented bug); tunnel-driver conflicts *are* detected via `SettleError::TunnelConflict`
+  documented bug); tunnel-driver conflicts *are* detected via `SettleError::TunnelConflict`, and
+  Net-level pin-width conflicts *are* detected via `Value::Invalid`
+- `net_width_conflict` only compares each pin's *declared* width; it trusts that every
+  `CombLogic::evaluate()` impl actually emits a `Value` whose width matches its own declared
+  `output_width` whenever it's `Fixed` - that invariant isn't independently re-verified
 - set_input and read_output do not return errors for wrong component type (silent no-op / panic)
 - width is not verified to be nonzero in Value::Fixed
 - Add/Sub Value ops exist but are unused by any component; may overflow, behavior unspecified

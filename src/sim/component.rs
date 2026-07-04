@@ -2,6 +2,7 @@ use crate::sim::net::{Net, NetKey};
 use crate::sim::value::Value;
 use slotmap::{new_key_type, SlotMap};
 
+mod adder;
 mod demux;
 mod encoder;
 mod gate;
@@ -9,7 +10,9 @@ mod input;
 mod mux;
 mod reg;
 mod splitter;
+mod subtractor;
 
+pub use adder::Adder;
 pub use demux::Demux;
 pub use encoder::Encoder;
 pub use gate::{Gate, GateOp};
@@ -17,6 +20,7 @@ pub use input::Input;
 pub use mux::Mux;
 pub use reg::Reg;
 pub use splitter::{FanDirection, Splitter};
+pub use subtractor::Subtractor;
 
 new_key_type! {
     pub struct CompKey;
@@ -87,6 +91,14 @@ impl Component {
 
     pub fn priority_encoder(sel_width: u8) -> Self {
         Self::from_comb(LogicComb::Encoder(Encoder { sel_width }))
+    }
+
+    pub fn adder(data_width: u8) -> Self {
+        Self::from_comb(LogicComb::Adder(Adder { data_width }))
+    }
+
+    pub fn subtractor(data_width: u8) -> Self {
+        Self::from_comb(LogicComb::Subtractor(Subtractor { data_width }))
     }
 
     // Reads the current Value of every input pin from net state, without mutating
@@ -240,6 +252,8 @@ pub enum LogicComb {
     Demux(Demux),
     Splitter(Splitter),
     Encoder(Encoder),
+    Adder(Adder),
+    Subtractor(Subtractor),
 }
 
 impl LogicComb {
@@ -252,6 +266,8 @@ impl LogicComb {
             Self::Demux(d) => d.n_inputs(),
             Self::Splitter(s) => s.n_inputs(),
             Self::Encoder(e) => e.n_inputs(),
+            Self::Adder(a) => a.n_inputs(),
+            Self::Subtractor(s) => s.n_inputs(),
         }
     }
 
@@ -264,6 +280,8 @@ impl LogicComb {
             Self::Demux(d) => d.n_outputs(),
             Self::Splitter(s) => s.n_outputs(),
             Self::Encoder(e) => e.n_outputs(),
+            Self::Adder(a) => a.n_outputs(),
+            Self::Subtractor(s) => s.n_outputs(),
         }
     }
 
@@ -276,6 +294,8 @@ impl LogicComb {
             Self::Demux(d) => d.evaluate(inputs),
             Self::Splitter(s) => s.evaluate(inputs),
             Self::Encoder(e) => e.evaluate(inputs),
+            Self::Adder(a) => a.evaluate(inputs),
+            Self::Subtractor(s) => s.evaluate(inputs),
         }
     }
 
@@ -288,6 +308,8 @@ impl LogicComb {
             Self::Demux(d) => d.input_width(i),
             Self::Splitter(s) => s.input_width(i),
             Self::Encoder(e) => e.input_width(i),
+            Self::Adder(a) => a.input_width(i),
+            Self::Subtractor(s) => s.input_width(i),
         }
     }
 
@@ -300,6 +322,8 @@ impl LogicComb {
             Self::Demux(d) => d.output_width(i),
             Self::Splitter(s) => s.output_width(i),
             Self::Encoder(e) => e.output_width(i),
+            Self::Adder(a) => a.output_width(i),
+            Self::Subtractor(s) => s.output_width(i),
         }
     }
 }
