@@ -9,6 +9,7 @@ pub const GRID_SIZE: f32 = 20.0;
 pub const COMP_MIN_WIDTH: f32 = 20.0;
 pub const COMP_WIDTH: f32 = 40.0;
 pub const COMP_MIN_HEIGHT: f32 = 20.0;
+pub const LABEL_FONT_SIZE: f32 = 8.0;
 const COMP_HEIGHT_PER_PIN: f32 = 10.0;
 // Splitter doesn't compute anything - it just re-routes bits - so it's drawn
 // much narrower than other components to read as a connector rather than a
@@ -241,10 +242,12 @@ pub fn reg_shape() -> ComponentShape {
         ComponentLabel {
             text: "D",
             pos: vec2(0.28, spaced(0, 3)),
+            ..Default::default()
         },
         ComponentLabel {
             text: "WE",
             pos: vec2(0.28, spaced(2, 3)),
+            ..Default::default()
         },
     ];
 
@@ -338,14 +341,17 @@ pub fn encoder_shape(sel_width: u8) -> ComponentShape {
         ComponentLabel {
             text: "EN",
             pos: vec2(0.5, en_y),
+            ..Default::default()
         },
         ComponentLabel {
             text: "S",
             pos: vec2(0.78, sel_y),
+            ..Default::default()
         },
         ComponentLabel {
             text: "G",
             pos: vec2(0.78, grp_y),
+            ..Default::default()
         },
     ];
 
@@ -393,14 +399,17 @@ pub fn adder_shape() -> ComponentShape {
         ComponentLabel {
             text: "+",
             pos: vec2(0.72, 0.5),
+            font_size: 12.0,
         },
         ComponentLabel {
             text: "CIN",
             pos: vec2(0.5, cin_y),
+            ..Default::default()
         },
         ComponentLabel {
             text: "CO",
             pos: vec2(0.5, co_y),
+            ..Default::default()
         },
     ];
 
@@ -446,14 +455,17 @@ pub fn subtractor_shape() -> ComponentShape {
         ComponentLabel {
             text: "-",
             pos: vec2(0.72, 0.5),
+            font_size: 12.0,
         },
         ComponentLabel {
             text: "BIN",
             pos: vec2(0.5, bin_y),
+            ..Default::default()
         },
         ComponentLabel {
             text: "BO",
             pos: vec2(0.5, bo_y),
+            ..Default::default()
         },
     ];
 

@@ -4,7 +4,7 @@ use egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Sense, Stroke, Vec
 use slotmap::{new_key_type, SlotMap};
 use std::collections::HashMap;
 
-use crate::gui::geometry::{snap_to_grid, tunnel_shape, GRID_SIZE};
+use crate::gui::geometry::{snap_to_grid, tunnel_shape, GRID_SIZE, LABEL_FONT_SIZE};
 use crate::gui::placed_component::{ComponentDef, PlacedComponent};
 use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
 use crate::gui::theme::Theme;
@@ -24,7 +24,6 @@ use crate::sim::value::Value;
 const PIN_RADIUS: f32 = 3.0;
 const WIRE_THICKNESS_THIN: f32 = 2.0;
 const WIRE_THICKNESS_THICK: f32 = 4.0;
-const LABEL_FONT_SIZE: f32 = 8.0;
 const COMP_STROKE: f32 = 1.5;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1548,7 +1547,7 @@ fn draw_component(
             label_pos,
             Align2::CENTER_CENTER,
             label.text,
-            FontId::monospace(LABEL_FONT_SIZE),
+            FontId::monospace(label.font_size),
             theme.label_text,
         );
     }
