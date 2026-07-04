@@ -2,7 +2,9 @@ use egui::Vec2;
 
 use crate::gui::geometry::*;
 use crate::gui::shape::{ComponentShape, PinAnchor};
-use crate::sim::component::{CompKey, Component, Demux, FanDirection, Gate, GateOp, Input, Mux, Reg};
+use crate::sim::component::{
+    CombLogic, CompKey, Component, Demux, Encoder, FanDirection, Gate, GateOp, Input, Mux, Reg,
+};
 
 // ── PlacedComponent ───────────────────────────────────────────────────────────
 
@@ -22,6 +24,7 @@ pub enum ComponentDef {
     Mux(Mux),
     Demux(Demux),
     Reg(Reg),
+    Encoder(Encoder),
     // Kept as its own lightweight, GUI-only shape rather than wrapping the sim's Splitter
     // struct (method 2 elsewhere in this enum): the sim struct bundles raw params together
     // with a precomputed routing table cached for evaluate() performance, which the GUI has
@@ -42,6 +45,7 @@ impl ComponentDef {
             Self::Mux(m) => m.n_inputs(),
             Self::Demux(d) => d.n_inputs(),
             Self::Reg(r) => r.n_inputs(),
+            Self::Encoder(e) => e.n_inputs(),
             Self::Splitter {
                 arm_bits,
                 direction,
@@ -61,6 +65,7 @@ impl ComponentDef {
             Self::Mux(m) => m.n_outputs(),
             Self::Demux(d) => d.n_outputs(),
             Self::Reg(r) => r.n_outputs(),
+            Self::Encoder(e) => e.n_outputs(),
             Self::Splitter {
                 arm_bits,
                 direction,
@@ -83,6 +88,7 @@ impl ComponentDef {
             Self::Mux(m) => mux_size(m.sel_width),
             Self::Demux(d) => demux_size(d.sel_width),
             Self::Reg(_) => reg_size(),
+            Self::Encoder(e) => encoder_size(e.sel_width),
             Self::Splitter { arm_bits, .. } => splitter_size(arm_bits.len() as u8),
         }
     }
@@ -103,6 +109,7 @@ impl ComponentDef {
             Self::Mux(_) => "MUX",
             Self::Demux(_) => "DEMUX",
             Self::Reg(_) => "REG",
+            Self::Encoder(_) => "ENC",
             Self::Splitter { direction, .. } => match direction {
                 FanDirection::Right => "SPLIT",
                 FanDirection::Left => "COMBINE",
@@ -118,6 +125,7 @@ impl ComponentDef {
             Self::Mux(m) => Component::mux(m.data_width, m.sel_width),
             Self::Demux(d) => Component::demux(d.data_width, d.sel_width),
             Self::Reg(r) => Component::reg(r.data_width),
+            Self::Encoder(e) => Component::priority_encoder(e.sel_width),
             Self::Splitter {
                 arm_bits,
                 direction,
@@ -160,6 +168,7 @@ impl ComponentDef {
             Self::Mux(m) => mux_shape(m.sel_width),
             Self::Demux(d) => demux_shape(d.sel_width),
             Self::Reg(_) => reg_shape(),
+            Self::Encoder(e) => encoder_shape(e.sel_width),
             Self::Splitter {
                 arm_bits,
                 direction,

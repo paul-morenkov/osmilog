@@ -223,11 +223,20 @@ pub enum Logic {
     Seq(LogicSeq),
 }
 
-// Each LogicComb variant wraps a struct (named after the component itself) that owns its
-// construction parameters, its own pin arity (n_inputs/n_outputs), and its own evaluate() -
-// together in one place, so a component's declared pin count and what evaluate() actually
-// reads/returns can't drift apart the way a separate constructor and evaluate() match arm
-// could. Pins::new() in Component::from_comb() is sized directly from these same methods.
+// Each LogicComb variant (other than the parameterless Output) wraps a struct, named after the
+// component itself, that implements CombLogic: its construction parameters, its own pin arity
+// (n_inputs/n_outputs), and its own evaluate() live together in one place, so a component's
+// declared pin count and what evaluate() actually reads/returns can't drift apart the way a
+// separate constructor and evaluate() match arm could. The trait (rather than separate inherent
+// impls) makes that trio a compiler-checked contract: forgetting evaluate() on a new component
+// struct is a "trait not implemented" error, not a silent gap only caught when some match arm
+// tries to call it. Pins::new() in Component::from_comb() is sized directly from these methods.
+pub trait CombLogic {
+    fn n_inputs(&self) -> usize;
+    fn n_outputs(&self) -> usize;
+    fn evaluate(&self, inputs: &[Value]) -> Vec<Value>;
+}
+
 #[derive(Debug)]
 pub enum LogicComb {
     Input(Input),
@@ -242,7 +251,7 @@ pub enum LogicComb {
 impl LogicComb {
     pub fn n_inputs(&self) -> usize {
         match self {
-            Self::Input(_) => 0,
+            Self::Input(p) => p.n_inputs(),
             Self::Output => 1,
             Self::Gate(g) => g.n_inputs(),
             Self::Mux(m) => m.n_inputs(),
@@ -254,7 +263,7 @@ impl LogicComb {
 
     pub fn n_outputs(&self) -> usize {
         match self {
-            Self::Input(_) => 1,
+            Self::Input(p) => p.n_outputs(),
             Self::Output => 0,
             Self::Gate(g) => g.n_outputs(),
             Self::Mux(m) => m.n_outputs(),
@@ -266,10 +275,7 @@ impl LogicComb {
 
     pub fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
         match self {
-            Self::Input(p) => vec![Value::Fixed {
-                bits: p.bits,
-                width: p.width,
-            }],
+            Self::Input(p) => p.evaluate(inputs),
             Self::Output => vec![],
             Self::Gate(g) => g.evaluate(inputs),
             Self::Mux(m) => m.evaluate(inputs),
@@ -328,6 +334,21 @@ pub struct Input {
     pub width: u8,
 }
 
+impl CombLogic for Input {
+    fn n_inputs(&self) -> usize {
+        0
+    }
+    fn n_outputs(&self) -> usize {
+        1
+    }
+    fn evaluate(&self, _inputs: &[Value]) -> Vec<Value> {
+        vec![Value::Fixed {
+            bits: self.bits,
+            width: self.width,
+        }]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Gate {
     pub op: GateOp,
@@ -335,14 +356,14 @@ pub struct Gate {
     pub width: u8,
 }
 
-impl Gate {
-    pub fn n_inputs(&self) -> usize {
+impl CombLogic for Gate {
+    fn n_inputs(&self) -> usize {
         self.n_inputs
     }
-    pub fn n_outputs(&self) -> usize {
+    fn n_outputs(&self) -> usize {
         1
     }
-    pub fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
+    fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
         let width = self.width;
         let val = match self.op {
             GateOp::And | GateOp::Nand => {
@@ -393,14 +414,14 @@ pub struct Mux {
     pub sel_width: u8,
 }
 
-impl Mux {
-    pub fn n_inputs(&self) -> usize {
+impl CombLogic for Mux {
+    fn n_inputs(&self) -> usize {
         (1usize << self.sel_width) + 1
     }
-    pub fn n_outputs(&self) -> usize {
+    fn n_outputs(&self) -> usize {
         1
     }
-    pub fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
+    fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
         match inputs[0] {
             Value::Floating => vec![Value::Floating],
             Value::Fixed { bits, width } => {
@@ -420,15 +441,15 @@ pub struct Demux {
     pub sel_width: u8,
 }
 
-impl Demux {
-    pub fn n_inputs(&self) -> usize {
+impl CombLogic for Demux {
+    fn n_inputs(&self) -> usize {
         2
     }
-    pub fn n_outputs(&self) -> usize {
+    fn n_outputs(&self) -> usize {
         1usize << self.sel_width
     }
     // inputs[0] => data, inputs[1] => selector
-    pub fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
+    fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
         let branches = 1 << self.sel_width;
         match inputs[1] {
             Value::Fixed { bits: sel, width } if width == self.sel_width => {
@@ -449,14 +470,14 @@ pub struct Encoder {
     pub sel_width: u8,
 }
 
-impl Encoder {
-    pub fn n_inputs(&self) -> usize {
+impl CombLogic for Encoder {
+    fn n_inputs(&self) -> usize {
         (1usize << self.sel_width) + 1
     }
-    pub fn n_outputs(&self) -> usize {
+    fn n_outputs(&self) -> usize {
         3
     }
-    pub fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
+    fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
         let enable_in = inputs[0];
         let n_arms = 1 << self.sel_width;
 
@@ -547,19 +568,22 @@ impl Splitter {
     pub fn direction(&self) -> FanDirection {
         self.direction
     }
-    pub fn n_inputs(&self) -> usize {
+}
+
+impl CombLogic for Splitter {
+    fn n_inputs(&self) -> usize {
         match self.direction {
             FanDirection::Right => 1,
             FanDirection::Left => self.arms as usize,
         }
     }
-    pub fn n_outputs(&self) -> usize {
+    fn n_outputs(&self) -> usize {
         match self.direction {
             FanDirection::Right => self.arms as usize,
             FanDirection::Left => 1,
         }
     }
-    pub fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
+    fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
         match self.direction {
             FanDirection::Right => match inputs[0] {
                 Value::Fixed { bits, .. } => {

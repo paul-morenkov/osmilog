@@ -14,7 +14,7 @@ use crate::io::{
 };
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::component::{
-    CompKey, Demux, FanDirection, Gate, GateOp, InIdx, Input, Mux, OutIdx, PinId, Reg,
+    CompKey, Demux, Encoder, FanDirection, Gate, GateOp, InIdx, Input, Mux, OutIdx, PinId, Reg,
 };
 use crate::sim::value::Value;
 
@@ -541,6 +541,18 @@ impl OsmilogApp {
                 };
                 ui.label(format!("Value: {}", val_str));
             }
+            ComponentDef::Encoder(Encoder { mut sel_width }) => {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Sel width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut sel_width).range(0..=4))
+                        .changed();
+                });
+                if changed {
+                    self.reconfigure_component(key, ComponentDef::Encoder(Encoder { sel_width }));
+                }
+            }
             ComponentDef::Splitter {
                 mut width,
                 mut arm_bits,
@@ -884,6 +896,12 @@ impl eframe::App for OsmilogApp {
                                 arm_bits: vec![vec![0], vec![1]],
                                 direction: FanDirection::Right,
                             },
+                        };
+                        ui.close();
+                    }
+                    if ui.button("Encoder").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            def: ComponentDef::Encoder(Encoder { sel_width: 1 }),
                         };
                         ui.close();
                     }

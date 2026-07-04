@@ -1029,7 +1029,10 @@ mod tests {
         let mut c = Circuit::new();
         let splitter = c.add_component(Component::splitter(vec![], FanDirection::Left));
         assert!(c.components[splitter].pins.inputs.is_empty());
-        assert_eq!(c.components[splitter].pins.out_cache, vec![Value::new(0, 0)]);
+        assert_eq!(
+            c.components[splitter].pins.out_cache,
+            vec![Value::new(0, 0)]
+        );
     }
 
     #[test]
