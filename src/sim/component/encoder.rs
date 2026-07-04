@@ -48,6 +48,15 @@ impl CombLogic for Encoder {
             }
         }
     }
+    fn input_width(&self, _i: usize) -> Option<u8> {
+        Some(1) // enable_in and every arm are all 1-bit
+    }
+    fn output_width(&self, i: usize) -> Option<u8> {
+        match i {
+            0 => Some(self.sel_width), // selector
+            _ => Some(1),              // enable_out / group_out
+        }
+    }
 }
 
 #[cfg(test)]

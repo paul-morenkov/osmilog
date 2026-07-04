@@ -107,7 +107,7 @@ impl CombLogic for Splitter {
                         .map(|arm| Value::new(arm_bits_out[arm], self.arm_width[arm]))
                         .collect()
                 }
-                Value::Floating => vec![Value::Floating; self.arms as usize],
+                Value::Floating | Value::Invalid => vec![Value::Floating; self.arms as usize],
             },
             FanDirection::Left => {
                 let arm_vals: Vec<Value> = (0..self.arms as usize).map(|i| inputs[i]).collect();
@@ -136,6 +136,26 @@ impl CombLogic for Splitter {
                     vec![Value::new(out_bits, self.data_width())]
                 }
             }
+        }
+    }
+    fn input_width(&self, i: usize) -> Option<u8> {
+        match self.direction {
+            FanDirection::Right => Some(self.data_width()), // trunk bus
+            // An arm owning zero bits accepts any width, mirroring evaluate()'s own
+            // `arm_width == 0` "accepts anything" special case.
+            FanDirection::Left => match self.arm_width[i] {
+                0 => None,
+                w => Some(w),
+            },
+        }
+    }
+    fn output_width(&self, i: usize) -> Option<u8> {
+        match self.direction {
+            FanDirection::Right => match self.arm_width[i] {
+                0 => None,
+                w => Some(w),
+            },
+            FanDirection::Left => Some(self.data_width()), // trunk bus
         }
     }
 }

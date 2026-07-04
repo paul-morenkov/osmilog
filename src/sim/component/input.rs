@@ -20,4 +20,10 @@ impl CombLogic for Input {
             width: self.width,
         }]
     }
+    fn input_width(&self, _i: usize) -> Option<u8> {
+        unreachable!("Input has no input pins")
+    }
+    fn output_width(&self, _i: usize) -> Option<u8> {
+        Some(self.width)
+    }
 }

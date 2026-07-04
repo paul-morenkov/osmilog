@@ -27,6 +27,16 @@ impl CombLogic for Demux {
             _ => vec![Value::Floating; branches],
         }
     }
+    fn input_width(&self, i: usize) -> Option<u8> {
+        if i == 0 {
+            Some(self.data_width) // data
+        } else {
+            Some(self.sel_width) // selector
+        }
+    }
+    fn output_width(&self, _i: usize) -> Option<u8> {
+        Some(self.data_width)
+    }
 }
 
 #[cfg(test)]

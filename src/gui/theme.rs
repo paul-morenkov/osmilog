@@ -22,6 +22,7 @@ pub struct Theme {
     // light/dark. Kept here anyway so every color decision lives in one place.
     pub value_low: Color32,
     pub value_high: Color32,
+    pub value_invalid: Color32,
 }
 
 impl Theme {
@@ -40,6 +41,7 @@ impl Theme {
             value_floating: visuals.widgets.noninteractive.fg_stroke.color,
             value_low: Color32::from_rgb(40, 40, 80),
             value_high: Color32::from_rgb(50, 200, 80),
+            value_invalid: Color32::from_rgb(0xDE, 0x6B, 0x2F),
         }
     }
 }
