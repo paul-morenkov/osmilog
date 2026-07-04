@@ -7,6 +7,10 @@ pub struct Mux {
     pub sel_width: u8,
 }
 
+impl Mux {
+    const SEL_PIN: usize = 0;
+}
+
 impl CombLogic for Mux {
     fn n_inputs(&self) -> usize {
         (1usize << self.sel_width) + 1
@@ -15,8 +19,8 @@ impl CombLogic for Mux {
         1
     }
     fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
-        match inputs[0] {
-            Value::Floating => vec![Value::Floating],
+        match inputs[Self::SEL_PIN] {
+            Value::Floating | Value::Invalid => vec![Value::Floating],
             Value::Fixed { bits, width } => {
                 if self.sel_width == width {
                     vec![inputs[bits as usize + 1]]
@@ -25,6 +29,16 @@ impl CombLogic for Mux {
                 }
             }
         }
+    }
+    fn input_width(&self, i: usize) -> Option<u8> {
+        if i == Self::SEL_PIN {
+            Some(self.sel_width) // selector
+        } else {
+            Some(self.data_width) // data branch
+        }
+    }
+    fn output_width(&self, _i: usize) -> Option<u8> {
+        Some(self.data_width)
     }
 }
 

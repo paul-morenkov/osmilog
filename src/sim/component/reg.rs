@@ -6,6 +6,9 @@ pub struct Reg {
 }
 
 impl Reg {
+    const _DATA_PIN: usize = 0;
+    const _WRITE_EN_PIN: usize = 1;
+
     pub fn n_inputs(&self) -> usize {
         2
     }

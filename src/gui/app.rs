@@ -437,6 +437,7 @@ impl OsmilogApp {
                 let val_str = match val {
                     Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
                     Value::Floating => "Floating".to_string(),
+                    Value::Invalid => "Invalid (width mismatch)".to_string(),
                 };
                 ui.label(format!("Value: {}", val_str));
             }
@@ -541,6 +542,7 @@ impl OsmilogApp {
                 let val_str = match cur {
                     Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
                     Value::Floating => "Floating".to_string(),
+                    Value::Invalid => "Invalid (width mismatch)".to_string(),
                 };
                 ui.label(format!("Value: {}", val_str));
             }
@@ -1390,6 +1392,7 @@ fn tunnel_pin_at_pos<'a>(
 fn value_stroke(theme: Theme, val: Value) -> Stroke {
     let (color, weight) = match val {
         Value::Floating => (theme.value_floating, WIRE_THICKNESS_THIN),
+        Value::Invalid => (theme.value_invalid, WIRE_THICKNESS_THICK),
         Value::Fixed { bits, width } => (
             if bits == 0 {
                 theme.value_low

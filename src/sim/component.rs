@@ -142,6 +142,20 @@ impl Component {
         matches!(self.logic, Logic::Seq(_))
     }
 
+    pub fn input_width(&self, i: InIdx) -> Option<u8> {
+        match &self.logic {
+            Logic::Comb(c) => c.input_width(i.0 as usize),
+            Logic::Seq(s) => s.input_width(i.0 as usize),
+        }
+    }
+
+    pub fn output_width(&self, i: OutIdx) -> Option<u8> {
+        match &self.logic {
+            Logic::Comb(c) => c.output_width(i.0 as usize),
+            Logic::Seq(s) => s.output_width(i.0 as usize),
+        }
+    }
+
     pub(crate) fn clear_pins(&mut self) {
         for input in &mut self.pins.inputs {
             *input = None;
@@ -209,6 +223,12 @@ pub trait CombLogic {
     fn n_inputs(&self) -> usize;
     fn n_outputs(&self) -> usize;
     fn evaluate(&self, inputs: &[Value]) -> Vec<Value>;
+    // Expected bit width of input/output pin `i`, from this component's own construction
+    // parameters (not from any Value currently on a net). None means the pin accepts/produces
+    // any width (currently only Output). Used by Circuit::resolve_net() to flag a Net whose
+    // attached pins disagree on width, independent of whether a concrete Value is present.
+    fn input_width(&self, i: usize) -> Option<u8>;
+    fn output_width(&self, i: usize) -> Option<u8>;
 }
 
 #[derive(Debug)]
@@ -258,6 +278,30 @@ impl LogicComb {
             Self::Encoder(e) => e.evaluate(inputs),
         }
     }
+
+    pub fn input_width(&self, i: usize) -> Option<u8> {
+        match self {
+            Self::Input(p) => p.input_width(i),
+            Self::Output => None,
+            Self::Gate(g) => g.input_width(i),
+            Self::Mux(m) => m.input_width(i),
+            Self::Demux(d) => d.input_width(i),
+            Self::Splitter(s) => s.input_width(i),
+            Self::Encoder(e) => e.input_width(i),
+        }
+    }
+
+    pub fn output_width(&self, i: usize) -> Option<u8> {
+        match self {
+            Self::Input(p) => p.output_width(i),
+            Self::Output => None,
+            Self::Gate(g) => g.output_width(i),
+            Self::Mux(m) => m.output_width(i),
+            Self::Demux(d) => d.output_width(i),
+            Self::Splitter(s) => s.output_width(i),
+            Self::Encoder(e) => e.output_width(i),
+        }
+    }
 }
 
 // LogicSeq mirrors LogicComb, except its config struct (Reg) holds only static construction
@@ -298,6 +342,21 @@ impl LogicSeq {
     pub fn observe(&self) -> Vec<Value> {
         match self {
             Self::Reg { value, .. } => vec![*value],
+        }
+    }
+
+    pub fn input_width(&self, i: usize) -> Option<u8> {
+        match self {
+            Self::Reg { config, .. } => match i {
+                0 => Some(config.data_width), // data
+                _ => Some(1),                 // write_enable
+            },
+        }
+    }
+
+    pub fn output_width(&self, _i: usize) -> Option<u8> {
+        match self {
+            Self::Reg { config, .. } => Some(config.data_width),
         }
     }
 }

@@ -8,6 +8,14 @@ pub enum Value {
         bits: u32,
         width: u8, // TODO: Verification of nonzero width
     },
+    // A Net whose attached pins declare conflicting expected bit widths (e.g. a driver's
+    // output width doesn't match a sink's expected input width). Distinct from Floating,
+    // which just means "no concrete value yet" - Invalid means the wiring itself is wrong,
+    // and holds regardless of whether any attached pin currently carries a real value. Set
+    // only by Circuit::resolve_net(); CombLogic::evaluate() never produces it directly, and
+    // an Invalid operand falls through the same catch-all arms as any other non-Fixed value
+    // below, so it does not propagate past the one component reading it.
+    Invalid,
 }
 
 impl Value {
@@ -115,6 +123,7 @@ impl Not for Value {
                 width,
             },
             Self::Floating => Self::Floating,
+            Self::Invalid => Self::Floating,
         }
     }
 }

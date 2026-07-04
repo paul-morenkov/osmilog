@@ -58,6 +58,12 @@ impl CombLogic for Gate {
         };
         vec![val] // Assumes single output
     }
+    fn input_width(&self, _i: usize) -> Option<u8> {
+        Some(self.width)
+    }
+    fn output_width(&self, _i: usize) -> Option<u8> {
+        Some(self.width)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

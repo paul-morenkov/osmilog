@@ -458,18 +458,43 @@ impl Circuit {
         Ok(())
     }
 
+    // True if this net's attached pins (source + sinks) declare conflicting expected bit
+    // widths, per each component's own configuration (Component::input_width/output_width) -
+    // independent of any Value currently on the net, so a mismatch is flagged even when every
+    // attached pin is presently Floating. A single pin (or zero pins with a declared width -
+    // e.g. an Output, which accepts any width) can't conflict with itself.
+    fn net_width_conflict(&self, net: NetKey) -> bool {
+        let n = &self.nets[net];
+        let mut widths = n
+            .source
+            .iter()
+            .filter_map(|&(comp, i)| self.components[comp].output_width(i))
+            .chain(
+                n.sinks
+                    .iter()
+                    .filter_map(|&(comp, i)| self.components[comp].input_width(i)),
+            );
+        let Some(first) = widths.next() else {
+            return false;
+        };
+        widths.any(|w| w != first)
+    }
+
     // Recomputes the Net's Value from it's source. Returns whether the value changed.
     // TODO: Add functionality for multiple sources and conflict detection.
     fn resolve_net(&mut self, net: NetKey) -> bool {
         let old = self.nets[net].value;
-        let source = self.nets[net].source;
 
-        let new = match source {
-            // Net takes value from pins.out_cache, which is updated in eval_component
-            Some((comp, i)) => self.components[comp].pins.out_cache[i.0 as usize],
-            // A component driver always takes priority; only fall back to a
-            // Feed tunnel's group value when this net has no real driver.
-            None => self.tunnel_feed_value(net),
+        let new = if self.net_width_conflict(net) {
+            Value::Invalid
+        } else {
+            match self.nets[net].source {
+                // Net takes value from pins.out_cache, which is updated in eval_component
+                Some((comp, i)) => self.components[comp].pins.out_cache[i.0 as usize],
+                // A component driver always takes priority; only fall back to a
+                // Feed tunnel's group value when this net has no real driver.
+                None => self.tunnel_feed_value(net),
+            }
         };
         self.nets[net].value = new;
         new != old
@@ -1209,5 +1234,81 @@ mod tests {
 
         assert_eq!(c.read_output(out_new), Value::new(1, 1)); // now follows "NEW"
         assert_eq!(c.read_output(out_old), Value::Floating); // "OLD" lost its only Pull
+    }
+
+    // ---- Group 7: net width-conflict detection (Value::Invalid) ----
+
+    #[test]
+    fn test_width_conflict_between_fanned_out_sinks_is_invalid() {
+        let mut c = Circuit::new();
+        let driver = c.add_component(Component::input(1, 4));
+        let g4 = c.add_component(Component::gate(GateOp::Not, 1, 4));
+        let g8 = c.add_component(Component::gate(GateOp::Not, 1, 8)); // wrong width sink
+        let out = c.add_component(Component::output());
+
+        c.link(driver, PinId::output(0), g4, PinId::input(0));
+        c.link(driver, PinId::output(0), g8, PinId::input(0));
+        c.link(driver, PinId::output(0), out, PinId::input(0));
+        c.settle().unwrap();
+
+        // driver's net has a concrete Fixed value, but two sinks disagree on
+        // expected width (4 vs 8), so it resolves to Invalid rather than
+        // whatever driver's out_cache happens to hold.
+        assert_eq!(c.read_output(out), Value::Invalid);
+    }
+
+    #[test]
+    fn test_width_conflict_detected_even_with_no_driver() {
+        let mut c = Circuit::new();
+        // No component drives this net at all (both endpoints below are input
+        // pins) - it should still be flagged Invalid purely from the two
+        // sinks' conflicting declared widths, not from any concrete Value.
+        let g4 = c.add_component(Component::gate(GateOp::Not, 1, 4));
+        let g8 = c.add_component(Component::gate(GateOp::Not, 1, 8));
+        let out = c.add_component(Component::output());
+
+        c.link(g4, PinId::input(0), g8, PinId::input(0));
+        c.link(out, PinId::input(0), g4, PinId::input(0));
+        c.settle().unwrap();
+
+        assert_eq!(c.read_output(out), Value::Invalid);
+    }
+
+    #[test]
+    fn test_lone_widthed_pin_with_unconstrained_sink_is_not_invalid() {
+        let mut c = Circuit::new();
+        // Output declares no expected width (input_width returns None), so a
+        // single width-declaring participant (g's output) has nothing to
+        // conflict with - this must stay an ordinary Floating, not Invalid.
+        let g = c.add_component(Component::gate(GateOp::Not, 1, 4));
+        let out = c.add_component(Component::output());
+        c.link(g, PinId::output(0), out, PinId::input(0));
+        c.settle().unwrap();
+
+        assert_eq!(c.read_output(out), Value::Floating);
+    }
+
+    #[test]
+    fn test_width_mismatch_local_only_does_not_propagate_downstream() {
+        let mut c = Circuit::new();
+        let driver = c.add_component(Component::input(1, 4));
+        let g4 = c.add_component(Component::gate(GateOp::Not, 1, 4));
+        let g8 = c.add_component(Component::gate(GateOp::Not, 1, 8)); // conflicts with g4 on driver's net
+        let probe = c.add_component(Component::output()); // reads the conflicted net directly
+        let downstream = c.add_component(Component::gate(GateOp::Not, 1, 4));
+        let out = c.add_component(Component::output());
+
+        c.link(driver, PinId::output(0), g4, PinId::input(0));
+        c.link(driver, PinId::output(0), g8, PinId::input(0));
+        c.link(driver, PinId::output(0), probe, PinId::input(0));
+        c.link(g4, PinId::output(0), downstream, PinId::input(0));
+        c.link(downstream, PinId::output(0), out, PinId::input(0));
+        c.settle().unwrap();
+
+        assert_eq!(c.read_output(probe), Value::Invalid); // the mismatched net itself
+        // One hop downstream: g4 read an Invalid input and produced Floating
+        // (per Value::Not), and that net's own widths agree - so it resolves
+        // as ordinary Floating rather than carrying Invalid any further.
+        assert_eq!(c.read_output(out), Value::Floating);
     }
 }

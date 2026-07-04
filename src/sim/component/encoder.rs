@@ -8,44 +8,67 @@ pub struct Encoder {
     pub sel_width: u8,
 }
 
+impl Encoder {
+    const EN_IN_PIN: usize = 0;
+
+    fn n_arms(&self) -> usize {
+        1 << self.sel_width
+    }
+}
+
 impl CombLogic for Encoder {
     fn n_inputs(&self) -> usize {
-        (1usize << self.sel_width) + 1
+        self.n_arms() + 1
     }
     fn n_outputs(&self) -> usize {
         3
     }
     fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
-        let enable_in = inputs[0];
-        let n_arms = 1 << self.sel_width;
+        let sel;
+        let en_out;
+        let grp_out;
 
-        match enable_in {
+        match inputs[Self::EN_IN_PIN] {
             // Malformed enable_in (wrong bit width): the whole component goes Floating.
             Value::Fixed { width, .. } if width != 1 => {
-                vec![Value::Floating, Value::Floating, Value::Floating]
+                sel = Value::Floating;
+                en_out = Value::Floating;
+                grp_out = Value::Floating;
             }
             // Explicitly disabled: selector = Floating, EN_OUT/GRP_OUT = 0.
             Value::Fixed { bits: 0, width: 1 } => {
-                vec![Value::Floating, Value::new(0, 1), Value::new(0, 1)]
+                sel = Value::Floating;
+                en_out = Value::new(0, 1);
+                grp_out = Value::new(0, 1);
             }
             // Enabled: Floating or Fixed{width:1, bits != 0}.
             _ => {
-                let highest_set = (1..n_arms + 1)
+                let highest_set = (1..self.n_arms() + 1)
                     .map(|i| inputs[i])
                     .rposition(|v| v == Value::new(1, 1));
 
                 if let Some(i) = highest_set {
                     // If an input is 1: selector = i, EN_OUT = 0, GRP_OUT = 1.
-                    vec![
-                        Value::new(i as u32, self.sel_width),
-                        Value::new(0, 1),
-                        Value::new(1, 1),
-                    ]
+                    sel = Value::new(i as u32, self.sel_width);
+                    en_out = Value::new(0, 1);
+                    grp_out = Value::new(1, 1);
                 } else {
                     // If enabled but no inputs 1: selector = Floating, EN_OUT = 1, GRP_OUT = 0.
-                    vec![Value::Floating, Value::new(1, 1), Value::new(0, 1)]
+                    sel = Value::Floating;
+                    en_out = Value::new(1, 1);
+                    grp_out = Value::new(0, 1);
                 }
             }
+        }
+        vec![sel, en_out, grp_out]
+    }
+    fn input_width(&self, _i: usize) -> Option<u8> {
+        Some(1) // enable_in and every arm are all 1-bit
+    }
+    fn output_width(&self, i: usize) -> Option<u8> {
+        match i {
+            0 => Some(self.sel_width), // selector
+            _ => Some(1),              // enable_out / group_out
         }
     }
 }
