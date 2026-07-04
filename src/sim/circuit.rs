@@ -1,4 +1,4 @@
-use crate::sim::component::{CompKey, Component, Logic, LogicComb, PinId};
+use crate::sim::component::{CompKey, Component, Input, Logic, LogicComb, PinId};
 use crate::sim::net::{Net, NetKey};
 use crate::sim::value::Value;
 
@@ -88,7 +88,7 @@ impl Circuit {
     pub fn set_input(&mut self, comp: CompKey, bits: u32, width: u8) {
         // TODO: Should you be able to change width via this function?
         // TODO: Make this return a result
-        if let Logic::Comb(LogicComb::Input { bits: b, width: w }) =
+        if let Logic::Comb(LogicComb::Input(Input { bits: b, width: w })) =
             &mut self.components[comp].logic
         {
             *b = bits;
