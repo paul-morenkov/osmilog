@@ -5,53 +5,133 @@ use crate::gui::shape::{ComponentLabel, ComponentShape, PinAnchor, ShapeCmd};
 use crate::sim::circuit::TunnelRole;
 use crate::sim::component::{FanDirection, GateOp};
 
+// ── Grid unit ───────────────────────────────────────────────────────────────
+//
+// Everything below is declared in whole grid CELLS (u32). Pixels enter the
+// picture only through `px()`, and pin coordinates are only ever built from
+// these integer cell counts - so every pin lands on a grid intersection by
+// construction, with no arithmetic to hand-verify. The `PinAnchor` constructors
+// take `u32` cells too, so an off-grid pin can't even be spelled.
+
+/// Pixels per grid cell - the sole cell⇄pixel conversion factor.
 pub const GRID_SIZE: f32 = 10.0;
-pub const COMP_MIN_WIDTH: f32 = 20.0; // Input/Output body width (1 cell)
-pub const COMP_WIDTH: f32 = 30.0; // standard body width (2 cells)
-                                  // Floor height for a single-pin edge: 2 grid cells, so the lone pin centres on
-                                  // grid row 1. Also the box height for Input/Output/Tunnel.
-pub const COMP_MIN_HEIGHT: f32 = 20.0;
 pub const LABEL_FONT_SIZE: f32 = 8.0;
 
-// Body widths expressed in whole grid cells - used to place right-edge pins
-// (col == width in cells) so they land on the grid.
-const COMP_W_CELLS: f32 = COMP_WIDTH / GRID_SIZE; // 2
-const SPLITTER_W_CELLS: f32 = SPLITTER_WIDTH / GRID_SIZE; // 1
-                                                          // Grid column of a centred top/bottom-edge pin (selector, carry, enable).
-const MID_COL: f32 = COMP_W_CELLS / 2.0; // 1
+/// A whole-cell count converted to pixels.
+pub const fn px(cells: u32) -> f32 {
+    cells as f32 * GRID_SIZE
+}
 
-// Splitter doesn't compute anything - it just re-routes bits - so it's drawn
-// much narrower than other components to read as a connector rather than a
-// processing block. See splitter_shape() for the comb-shaped body this pairs
-// with.
-const SPLITTER_WIDTH: f32 = 20.0;
-// Normalized x-band (relative to SPLITTER_WIDTH) of the splitter's thin
-// "spine" rectangle; the comb's trunk/teeth strokes extend from here out to
-// x=0.0/x=1.0 to reach the pins. Kept narrow (a thin rod, not a block) so
-// most of SPLITTER_WIDTH is free for trunk/tooth length - each side needs to
-// clear the ~3px pin dot radius drawn at its far end, plus some margin, or
-// the teeth end up fully hidden under the pin dots.
+/// Width of components whose pins sit only on the left/right edges (gates,
+/// register, comparator). Any whole-cell value keeps their pins on-grid.
+const EDGE_BODY_W: u32 = 2;
+
+/// Half-width of components that ALSO carry a centerd top/bottom-edge pin
+/// (mux/demux selector, arithmetic carry, encoder enable). The full width is
+/// `2 * CENTER_HALF_W`, so it is always even and its center column
+/// (`CENTER_COL`) is a whole cell - the property that keeps those pins on-grid.
+const CENTER_HALF_W: u32 = 1;
+const CENTERED_BODY_W: u32 = 2 * CENTER_HALF_W;
+/// center column of a `CENTERED_BODY_W`-wide body. Read this instead of dividing
+/// a width, so the "is it whole?" question never comes up.
+const CENTER_COL: u32 = CENTER_HALF_W;
+
+/// Input / Output box width.
+const IO_W: u32 = 2;
+
+// Splitter/combine doesn't compute anything - it just re-routes bits - so it's
+// drawn narrow to read as a connector rather than a processing block; only
+// left/right-edge pins, so any whole-cell width is on-grid. See splitter_shape()
+// for the comb-shaped body this pairs with.
+const SPLITTER_W: u32 = 2;
+// Normalized x-band (relative to the splitter width) of the thin "spine"
+// rectangle; the comb's trunk/teeth strokes extend from here out to x=0.0/x=1.0
+// to reach the pins. Kept narrow (a thin rod, not a block) so most of the width
+// is free for trunk/tooth length - each side needs to clear the ~3px pin dot
+// radius drawn at its far end, plus some margin, or the teeth end up fully
+// hidden under the pin dots.
 const SPLITTER_BODY_X: (f32, f32) = (0.25, 0.60);
+
+// ── Stack geometry (in cells) ─────────────────────────────────────────────────
+
+/// How a stack of pins is distributed along a component edge. Both layouts keep
+/// every pin on a whole grid row and keep the stack's centre row whole (height
+/// is always even), so an opposite centred pin (a gate's output, a comparator's
+/// inputs) always has a definite row to line up with.
+#[derive(Clone, Copy)]
+enum Pitch {
+    /// 2 cells per pin: rows 1, 3, 5, … A roomy, Logisim-style stack.
+    Spread,
+    /// 1 cell per pin: rows 1, 2, 3, … For an *even* pin count a 2-cell gap
+    /// straddles the centre, leaving the centre row empty so it can still serve
+    /// as the definite central row. (An odd count keeps its middle pin there,
+    /// so no gap is needed.)
+    Tight,
+}
+
+impl Pitch {
+    /// Grid row of pin `i` (0-based) in a stack of `k` pins.
+    const fn row(self, i: usize, k: usize) -> u32 {
+        match self {
+            Pitch::Spread => 2 * (i as u32) + 1,
+            Pitch::Tight => {
+                // Pack up from row 1; once past the lower half, bump down by the
+                // gap size - 1 cell for an even stack (leaving the centre row
+                // empty), 0 for an odd one (its middle pin sits on the centre).
+                let bump: u32 = if i >= k / 2 { 1 - (k as u32 % 2) } else { 0 };
+                i as u32 + 1 + bump
+            }
+        }
+    }
+
+    /// Height (in cells) of an edge carrying `k` pins (k>=1). Always even, so the
+    /// stack's centre row is `height / 2` (a whole cell) in either layout.
+    const fn height(self, k: usize) -> u32 {
+        let k = if k == 0 { 1 } else { k };
+        match self {
+            Pitch::Spread => 2 * (k as u32),
+            // k+1 when odd (contiguous rows), k+2 when even (one extra for the
+            // gap). `(k+1) % 2` is 0 for odd k and 1 for even k.
+            Pitch::Tight => k as u32 + 1 + (k as u32 + 1) % 2,
+        }
+    }
+}
+
+/// Gates pack their inputs tightly once there are enough of them that the roomy
+/// spread would make the body needlessly tall; below that they stay spread.
+const fn gate_pitch(n_inputs: usize) -> Pitch {
+    if n_inputs > 3 {
+        Pitch::Tight
+    } else {
+        Pitch::Spread
+    }
+}
+
+/// Mux/demux data branches and encoder arms pack tightly once there are enough of
+/// them (sel_width >= 2, i.e. >= 4 branches) that the roomy spread would make the
+/// body needlessly tall; below that they stay spread.
+const fn sel_pitch(sel_width: u8) -> Pitch {
+    if sel_width >= 2 {
+        Pitch::Tight
+    } else {
+        Pitch::Spread
+    }
+}
+
+// Spread is the default layout; these terse wrappers keep the many spread call
+// sites readable (Spread ignores the pin count, so the `0` below is a placeholder).
+fn pin_row(i: usize) -> u32 {
+    Pitch::Spread.row(i, 0)
+}
+const fn stack_h(k: usize) -> u32 {
+    Pitch::Spread.height(k)
+}
 
 pub fn snap_to_grid(pos: Pos2, pan: Vec2) -> [i32; 2] {
     [
         ((pos.x - pan.x) / GRID_SIZE).round() as i32,
         ((pos.y - pan.y) / GRID_SIZE).round() as i32,
     ]
-}
-
-// Grid row (in cells from the top edge) of pin `i` in a 2-cell-pitch stack:
-// 1, 3, 5, ... A stack of `k` such pins spans rows 1..2k-1 with a 1-cell
-// margin above/below, so its centre sits on integer grid row `k`.
-fn pin_row(i: usize) -> f32 {
-    2.0 * i as f32 + 1.0
-}
-
-// Pixel height of an edge carrying `k` stacked pins (k>=1): 2k cells (see
-// pin_row) - the single source of truth for the height formulas below.
-const fn stack_height_px(k: usize) -> f32 {
-    let k = if k == 0 { 1 } else { k };
-    2.0 * k as f32 * GRID_SIZE
 }
 
 pub fn rect_outline() -> Vec<ShapeCmd> {
@@ -111,23 +191,28 @@ fn xor_extra_arc() -> Vec<ShapeCmd> {
     ]
 }
 
+// ── Bounding-box sizes ────────────────────────────────────────────────────────
+//
 // Zero-allocation size queries, kept as the single source of truth for the
-// height formulas below - the corresponding *_shape() functions call these
-// rather than recomputing the formula, so callers that only need a
-// bounding box (e.g. component_bounding_rect) don't have to build and
-// immediately discard a full ComponentShape (outline/anchors/bubbles Vecs).
+// width/height formulas - the corresponding *_shape() functions call the same
+// cell helpers (EDGE_BODY_W/CENTERED_BODY_W, stack_h), so a bounding box
+// (e.g. component_bounding_rect) needn't build and discard a full ComponentShape.
+
 pub const fn gate_size(op: GateOp, n_inputs: usize) -> Vec2 {
     let n = if matches!(op, GateOp::Not) {
         1
     } else {
         n_inputs
     };
-    vec2(COMP_WIDTH, stack_height_px(n))
+    vec2(px(EDGE_BODY_W), px(gate_pitch(n).height(n)))
 }
 
 pub const fn mux_size(sel_width: u8) -> Vec2 {
     let branches = 1usize << sel_width;
-    vec2(COMP_WIDTH, stack_height_px(branches))
+    vec2(
+        px(CENTERED_BODY_W),
+        px(sel_pitch(sel_width).height(branches)),
+    )
 }
 
 pub const fn demux_size(sel_width: u8) -> Vec2 {
@@ -135,19 +220,20 @@ pub const fn demux_size(sel_width: u8) -> Vec2 {
 }
 
 pub const fn splitter_size(arms: u8) -> Vec2 {
-    vec2(SPLITTER_WIDTH, stack_height_px(arms as usize))
+    // Arms pack tightly (1 cell each) so a wide fan stays a compact connector.
+    vec2(px(SPLITTER_W), px(Pitch::Tight.height(arms as usize)))
 }
 
 pub const fn reg_size() -> Vec2 {
-    // D + WE as a 2-pin stack (height 4 cells); the output centres on grid row 2.
-    vec2(COMP_WIDTH, stack_height_px(2))
+    // D + WE as a 2-pin stack (height 4 cells); the output centers on grid row 2.
+    vec2(px(EDGE_BODY_W), px(stack_h(2)))
 }
 
 // Height accounts only for the two addend pins on the left edge, same formula as a
 // 2-input gate - the carry-in/carry-out pins sit at the bottom/top edges (like
 // encoder's enable_in/enable_out) and don't consume extra vertical space of their own.
 pub const fn adder_size() -> Vec2 {
-    vec2(COMP_WIDTH, stack_height_px(2))
+    vec2(px(CENTERED_BODY_W), px(stack_h(2)))
 }
 
 // Same layout/formula as adder_size(): minuend/subtrahend on the left edge,
@@ -169,19 +255,64 @@ pub const fn divider_size() -> Vec2 {
 }
 
 // Height scales off the busier side - the 3 comparison outputs on the right,
-// same formula as a 3-input gate - rather than the 2 operand inputs on the left.
+// packed tightly (1 cell each) - rather than the 2 operand inputs on the left.
 pub const fn comparator_size() -> Vec2 {
-    vec2(COMP_WIDTH, stack_height_px(3))
+    vec2(px(EDGE_BODY_W), px(Pitch::Tight.height(3)))
 }
 
 // Height scales with the arm count on the left edge, but never below 4 cells so
-// the three right-side pins (enable_out at top, selector + group as a centred
+// the three right-side pins (enable_out at top, selector + group as a centerd
 // pair) always have room - the bottom/top pins (enable_in/enable_out) sit at the
 // edges and don't consume extra vertical space of their own.
 pub const fn encoder_size(sel_width: u8) -> Vec2 {
     let arms = 1usize << sel_width;
     let k = if arms < 2 { 2 } else { arms };
-    vec2(COMP_WIDTH, stack_height_px(k))
+    vec2(
+        px(CENTERED_BODY_W),
+        px(sel_pitch(sel_width).height(k)),
+    )
+}
+
+pub const fn io_size() -> Vec2 {
+    // 1-pin edge → 2 cells tall, so the single side-pin centers on grid row 1.
+    vec2(px(IO_W), px(stack_h(1)))
+}
+
+// ── Shape builders ────────────────────────────────────────────────────────────
+
+pub fn input_shape() -> ComponentShape {
+    io_shape(true)
+}
+
+pub fn output_shape() -> ComponentShape {
+    io_shape(false)
+}
+
+// Input (source, pin on the right) and Output (sink, pin on the left) share a
+// plain box; the single pin centers on the middle grid row.
+fn io_shape(is_input: bool) -> ComponentShape {
+    let center_row = stack_h(1) / 2; // 1
+    let (input_anchors, output_anchors, output_bubbles) = if is_input {
+        (
+            vec![],
+            vec![PinAnchor::right(IO_W, center_row)],
+            vec![false],
+        )
+    } else {
+        (vec![PinAnchor::left(center_row)], vec![], vec![])
+    };
+
+    ComponentShape {
+        size: io_size(),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors,
+        extra_strokes: vec![],
+        output_bubbles,
+        labels: vec![],
+        dynamic_label_pos: Vec2::ZERO,
+    }
 }
 
 pub fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
@@ -190,8 +321,8 @@ pub fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
     } else {
         n_inputs
     };
-    let h = gate_size(op, n_inputs).y;
-    let h_cells = h / GRID_SIZE; // 2n
+    let pitch = gate_pitch(n); // tight once n > 3, else spread
+    let h_cells = pitch.height(n);
     let bubble = matches!(op, GateOp::Nand | GateOp::Nor | GateOp::Xnor | GateOp::Not);
 
     let (outline, fill_outline, extra_strokes) = match op {
@@ -203,17 +334,17 @@ pub fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
         GateOp::Not => (not_outline(), None, vec![]),
     };
 
-    // Output centres on the input stack: grid row n (= h_cells / 2).
-    let center_row = h_cells / 2.0;
+    // Output centers on the input stack: the (whole) centre row.
+    let center_row = h_cells / 2;
     let out_anchor = if bubble {
-        PinAnchor::right_bubble(COMP_W_CELLS, center_row)
+        PinAnchor::right_bubble(EDGE_BODY_W, center_row)
     } else {
-        PinAnchor::right(COMP_W_CELLS, center_row)
+        PinAnchor::right(EDGE_BODY_W, center_row)
     };
-    let input_anchors = (0..n).map(|i| PinAnchor::left(pin_row(i))).collect();
+    let input_anchors = (0..n).map(|i| PinAnchor::left(pitch.row(i, n))).collect();
 
     ComponentShape {
-        size: vec2(COMP_WIDTH, h),
+        size: vec2(px(EDGE_BODY_W), px(h_cells)),
         outline,
         fill_outline,
         input_anchors,
@@ -227,8 +358,8 @@ pub fn gate_shape(op: GateOp, n_inputs: usize) -> ComponentShape {
 
 pub fn mux_shape(sel_width: u8) -> ComponentShape {
     let branches = 1usize << sel_width;
-    let h = mux_size(sel_width).y;
-    let h_cells = h / GRID_SIZE; // 2 * branches
+    let pitch = sel_pitch(sel_width); // tight once sel_width >= 2
+    let h_cells = pitch.height(branches);
     const T: f32 = 0.2;
 
     let outline = vec![
@@ -239,12 +370,12 @@ pub fn mux_shape(sel_width: u8) -> ComponentShape {
     ];
 
     // input[0] = selector → bottom-center of shape; input[1..] = data → left edge
-    let sel_anchor = PinAnchor::bottom(MID_COL, h_cells);
-    let data_anchors = (0..branches).map(|i| PinAnchor::left(pin_row(i)));
+    let sel_anchor = PinAnchor::bottom(CENTER_COL, h_cells);
+    let data_anchors = (0..branches).map(|i| PinAnchor::left(pitch.row(i, branches)));
     let input_anchors = std::iter::once(sel_anchor).chain(data_anchors).collect();
 
     // The selector pin sits on the bottom grid row, but the trapezoid's bottom
-    // edge tapers up to y = 1 - T/2 at the centre; draw a short stub down to the
+    // edge tapers up to y = 1 - T/2 at the center; draw a short stub down to the
     // pin (like the splitter's teeth) so the wire visibly meets the body.
     let sel_stub = vec![
         ShapeCmd::MoveTo(vec2(0.5, 1.0 - T / 2.0)),
@@ -252,11 +383,11 @@ pub fn mux_shape(sel_width: u8) -> ComponentShape {
     ];
 
     ComponentShape {
-        size: vec2(COMP_WIDTH, h),
+        size: vec2(px(CENTERED_BODY_W), px(h_cells)),
         outline,
         fill_outline: None,
         input_anchors,
-        output_anchors: vec![PinAnchor::right(COMP_W_CELLS, h_cells / 2.0)],
+        output_anchors: vec![PinAnchor::right(CENTERED_BODY_W, h_cells / 2)],
         extra_strokes: vec![sel_stub],
         output_bubbles: vec![false],
         labels: vec![],
@@ -265,34 +396,34 @@ pub fn mux_shape(sel_width: u8) -> ComponentShape {
 }
 
 pub fn reg_shape() -> ComponentShape {
-    let h = reg_size().y;
-    let h_cells = h / GRID_SIZE; // 4
+    let h_cells = stack_h(2); // 4
 
     // input[0] = data (row 1), input[1] = write_enable (row 3), both on the left
-    // edge; output[0] centres on the right (row 2).
+    // edge; output[0] centers on the right (row 2).
     let input_anchors = vec![PinAnchor::left(pin_row(0)), PinAnchor::left(pin_row(1))];
 
     // "D"/"WE" sit level with their pins (same y as the anchors above), offset
-    // right of the left-edge pin dot with room to spare in the 40px-wide box.
+    // right of the left-edge pin dot with room to spare in the box.
+    let row_y = |i: usize| pin_row(i) as f32 / h_cells as f32;
     let labels = vec![
         ComponentLabel {
             text: "D",
-            pos: vec2(0.28, pin_row(0) / h_cells),
+            pos: vec2(0.28, row_y(0)),
             ..Default::default()
         },
         ComponentLabel {
             text: "WE",
-            pos: vec2(0.28, pin_row(1) / h_cells),
+            pos: vec2(0.28, row_y(1)),
             ..Default::default()
         },
     ];
 
     ComponentShape {
-        size: vec2(COMP_WIDTH, h),
+        size: vec2(px(EDGE_BODY_W), px(h_cells)),
         outline: rect_outline(),
         fill_outline: None,
         input_anchors,
-        output_anchors: vec![PinAnchor::right(COMP_W_CELLS, h_cells / 2.0)],
+        output_anchors: vec![PinAnchor::right(EDGE_BODY_W, h_cells / 2)],
         extra_strokes: vec![],
         output_bubbles: vec![false],
         labels,
@@ -302,8 +433,8 @@ pub fn reg_shape() -> ComponentShape {
 
 pub fn demux_shape(sel_width: u8) -> ComponentShape {
     let branches = 1usize << sel_width;
-    let h = demux_size(sel_width).y;
-    let h_cells = h / GRID_SIZE; // 2 * branches
+    let pitch = sel_pitch(sel_width); // tight once sel_width >= 2
+    let h_cells = pitch.height(branches);
     const T: f32 = 0.2;
 
     let outline = vec![
@@ -313,12 +444,12 @@ pub fn demux_shape(sel_width: u8) -> ComponentShape {
         ShapeCmd::LineTo(vec2(0.0, 1.0 - T)),
     ];
 
-    // input[0] = data → left center (aligned with the output stack's centre);
+    // input[0] = data → left center (aligned with the output stack's center);
     // input[1] = selector → bottom center.
-    let data_anchor = PinAnchor::left(h_cells / 2.0);
-    let sel_anchor = PinAnchor::bottom(MID_COL, h_cells);
+    let data_anchor = PinAnchor::left(h_cells / 2);
+    let sel_anchor = PinAnchor::bottom(CENTER_COL, h_cells);
     let output_anchors = (0..branches)
-        .map(|i| PinAnchor::right(COMP_W_CELLS, pin_row(i)))
+        .map(|i| PinAnchor::right(CENTERED_BODY_W, pitch.row(i, branches)))
         .collect();
 
     // Stub from the tapered bottom edge down to the on-grid selector pin.
@@ -328,7 +459,7 @@ pub fn demux_shape(sel_width: u8) -> ComponentShape {
     ];
 
     ComponentShape {
-        size: vec2(COMP_WIDTH, h),
+        size: vec2(px(CENTERED_BODY_W), px(h_cells)),
         outline,
         fill_outline: None,
         input_anchors: vec![data_anchor, sel_anchor],
@@ -342,27 +473,32 @@ pub fn demux_shape(sel_width: u8) -> ComponentShape {
 
 // Pin layout matches Component::priority_encoder's fixed order: input[0] = enable_in
 // (bottom edge), input[1..] = arms (left edge, evenly spaced); output[0] = selector and
-// output[2] = group_out (right edge, a centred pair), output[1] = enable_out (top edge).
+// output[2] = group_out (right edge, a centerd pair), output[1] = enable_out (top edge).
 pub fn encoder_shape(sel_width: u8) -> ComponentShape {
     let arms = 1usize << sel_width;
-    let h = encoder_size(sel_width).y;
-    let h_cells = h / GRID_SIZE; // max(2 * arms, 4)
-    let center_row = h_cells / 2.0;
+    // Never below 4 cells, so the three right-side pins always have room (mirrors
+    // encoder_size). height() keeps it even, so the center row stays whole. Once
+    // tight kicks in (sel_width >= 2) arms >= 4, so k == arms.
+    let k = if arms < 2 { 2 } else { arms };
+    let pitch = sel_pitch(sel_width); // tight once sel_width >= 2
+    let h_cells = pitch.height(k);
+    let h = px(h_cells);
+    let center_row = h_cells / 2;
 
-    let enable_in_anchor = PinAnchor::bottom(MID_COL, h_cells);
-    let arm_anchors = (0..arms).map(|i| PinAnchor::left(pin_row(i)));
+    let enable_in_anchor = PinAnchor::bottom(CENTER_COL, h_cells);
+    let arm_anchors = (0..arms).map(move |i| PinAnchor::left(pitch.row(i, k)));
     let input_anchors = std::iter::once(enable_in_anchor)
         .chain(arm_anchors)
         .collect();
 
-    let enable_out_anchor = PinAnchor::top(MID_COL);
-    // selector/group_out sit as a centred pair, one grid row either side of centre.
-    let sel_row = center_row - 1.0;
-    let grp_row = center_row + 1.0;
+    let enable_out_anchor = PinAnchor::top(CENTER_COL);
+    // selector/group_out sit as a centerd pair, one grid row either side of center.
+    let sel_row = center_row - 1;
+    let grp_row = center_row + 1;
     let output_anchors = vec![
-        PinAnchor::right(COMP_W_CELLS, sel_row),
+        PinAnchor::right(CENTERED_BODY_W, sel_row),
         enable_out_anchor,
-        PinAnchor::right(COMP_W_CELLS, grp_row),
+        PinAnchor::right(CENTERED_BODY_W, grp_row),
     ];
 
     // EN sits just above the bottom edge by a fixed pixel distance rather than a fixed
@@ -370,6 +506,7 @@ pub fn encoder_shape(sel_width: u8) -> ComponentShape {
     // stay close to the pin it names instead of drifting toward the middle of a tall body.
     const BOTTOM_LABEL_INSET_PX: f32 = 6.0;
     let en_y = 1.0 - BOTTOM_LABEL_INSET_PX / h;
+    let row_y = |row: u32| row as f32 / h_cells as f32;
 
     let labels = vec![
         ComponentLabel {
@@ -379,18 +516,18 @@ pub fn encoder_shape(sel_width: u8) -> ComponentShape {
         },
         ComponentLabel {
             text: "S",
-            pos: vec2(0.78, sel_row / h_cells),
+            pos: vec2(0.78, row_y(sel_row)),
             ..Default::default()
         },
         ComponentLabel {
             text: "G",
-            pos: vec2(0.78, grp_row / h_cells),
+            pos: vec2(0.78, row_y(grp_row)),
             ..Default::default()
         },
     ];
 
     ComponentShape {
-        size: vec2(COMP_WIDTH, h),
+        size: vec2(px(CENTERED_BODY_W), px(h_cells)),
         outline: rect_outline(),
         fill_outline: None,
         input_anchors,
@@ -403,7 +540,7 @@ pub fn encoder_shape(sel_width: u8) -> ComponentShape {
 }
 
 // Pin layout matches Component::adder's fixed order: input[0]/[1] = addends (left
-// edge), input[2] = carry-in (bottom edge); output[0] = sum (right edge, centred),
+// edge), input[2] = carry-in (bottom edge); output[0] = sum (right edge, centerd),
 // output[1] = carry-out (top edge) - carry-in/out mirror encoder's enable_in/enable_out
 // corner placement so they read as "flow-through" pins distinct from the data pins.
 pub fn adder_shape() -> ComponentShape {
@@ -427,7 +564,7 @@ pub fn divider_shape() -> ComponentShape {
 }
 
 // Shared body for the two-operand arithmetic units (adder/subtractor/multiplier/
-// divider): two data inputs on the left, a centred result output on the right, and
+// divider): two data inputs on the left, a centerd result output on the right, and
 // carry/borrow-style flow-through pins on the bottom (in) and top (out) edges.
 fn op2_shape(
     op_label: &'static str,
@@ -435,19 +572,19 @@ fn op2_shape(
     bottom_label: &'static str,
     top_label: &'static str,
 ) -> ComponentShape {
-    let h = adder_size().y;
-    let h_cells = h / GRID_SIZE; // 4
+    let h_cells = stack_h(2); // 4
+    let h = px(h_cells);
 
-    let carry_in_anchor = PinAnchor::bottom(MID_COL, h_cells);
+    let carry_in_anchor = PinAnchor::bottom(CENTER_COL, h_cells);
     let input_anchors = vec![
         PinAnchor::left(pin_row(0)),
         PinAnchor::left(pin_row(1)),
         carry_in_anchor,
     ];
 
-    let carry_out_anchor = PinAnchor::top(MID_COL);
+    let carry_out_anchor = PinAnchor::top(CENTER_COL);
     let output_anchors = vec![
-        PinAnchor::right(COMP_W_CELLS, h_cells / 2.0),
+        PinAnchor::right(CENTERED_BODY_W, h_cells / 2),
         carry_out_anchor,
     ];
 
@@ -476,7 +613,7 @@ fn op2_shape(
     ];
 
     ComponentShape {
-        size: vec2(COMP_WIDTH, h),
+        size: vec2(px(CENTERED_BODY_W), h),
         outline: rect_outline(),
         fill_outline: None,
         input_anchors,
@@ -489,43 +626,44 @@ fn op2_shape(
 }
 
 // Pin layout matches Component::comparator's fixed order: input[0]/[1] = the two
-// compared operands (left edge, centred on the output stack); output[0] = greater-than,
+// compared operands (left edge, centerd on the output stack); output[0] = greater-than,
 // output[1] = equal, output[2] = less-than (right edge, evenly spaced, each labeled).
 pub fn comparator_shape() -> ComponentShape {
-    let h = comparator_size().y;
-    let h_cells = h / GRID_SIZE; // 6
-    let center_row = h_cells / 2.0; // 3
+    let pitch = Pitch::Tight; // the 3 outputs pack tightly
+    let h_cells = pitch.height(3); // 4
+    let center_row = h_cells / 2; // 2
 
-    // Two inputs centred on the 3-output stack: one grid row either side of centre.
+    // Two inputs centerd on the 3-output stack: one grid row either side of center.
     let input_anchors = vec![
-        PinAnchor::left(center_row - 1.0),
-        PinAnchor::left(center_row + 1.0),
+        PinAnchor::left(center_row - 1),
+        PinAnchor::left(center_row + 1),
     ];
 
     let output_anchors = (0..3)
-        .map(|i| PinAnchor::right(COMP_W_CELLS, pin_row(i)))
+        .map(|i| PinAnchor::right(EDGE_BODY_W, pitch.row(i, 3)))
         .collect();
 
+    let row_y = |i: usize| pitch.row(i, 3) as f32 / h_cells as f32;
     let labels = vec![
         ComponentLabel {
             text: ">",
-            pos: vec2(0.72, pin_row(0) / h_cells),
+            pos: vec2(0.72, row_y(0)),
             ..Default::default()
         },
         ComponentLabel {
             text: "=",
-            pos: vec2(0.72, pin_row(1) / h_cells),
+            pos: vec2(0.72, row_y(1)),
             ..Default::default()
         },
         ComponentLabel {
             text: "<",
-            pos: vec2(0.72, pin_row(2) / h_cells),
+            pos: vec2(0.72, row_y(2)),
             ..Default::default()
         },
     ];
 
     ComponentShape {
-        size: vec2(COMP_WIDTH, h),
+        size: vec2(px(EDGE_BODY_W), px(h_cells)),
         outline: rect_outline(),
         fill_outline: None,
         input_anchors,
@@ -546,8 +684,8 @@ pub fn comparator_shape() -> ComponentShape {
 // input pin index, ascending).
 pub fn splitter_shape(arms: u8, direction: FanDirection) -> ComponentShape {
     let n = arms as usize;
-    let h = splitter_size(arms).y;
-    let h_cells = h / GRID_SIZE; // 2n
+    let pitch = Pitch::Tight; // arms pack tightly
+    let h_cells = pitch.height(n);
     let flip = matches!(direction, FanDirection::Left);
     let mx = |x: f32| if flip { 1.0 - x } else { x };
 
@@ -569,8 +707,8 @@ pub fn splitter_shape(arms: u8, direction: FanDirection) -> ComponentShape {
     // pin lines up with it rather than sitting at mid-height, so the shape itself
     // communicates "arm 0 is the near/top one, arm N-1 is the far/bottom one".
     // Normalized y of a grid row = row / h_cells.
-    let row_y = |row: f32| row / h_cells;
-    let data_y = row_y(pin_row(0));
+    let row_y = |row: u32| row as f32 / h_cells as f32;
+    let data_y = row_y(pitch.row(0, n));
 
     // One trunk line from the data pin into the spine, then one tooth line
     // per arm fanning out from the spine to that arm's pin - drawn past the
@@ -581,7 +719,7 @@ pub fn splitter_shape(arms: u8, direction: FanDirection) -> ComponentShape {
         ShapeCmd::LineTo(vec2(mx(x0), data_y)),
     ];
     let teeth = (0..n).map(|i| {
-        let y = row_y(pin_row(i));
+        let y = row_y(pitch.row(i, n));
         vec![
             ShapeCmd::MoveTo(vec2(mx(x1), y)),
             ShapeCmd::LineTo(vec2(mx(1.0), y)),
@@ -591,15 +729,15 @@ pub fn splitter_shape(arms: u8, direction: FanDirection) -> ComponentShape {
 
     let arm_anchor = |i: usize| {
         if flip {
-            PinAnchor::left(pin_row(i))
+            PinAnchor::left(pitch.row(i, n))
         } else {
-            PinAnchor::right(SPLITTER_W_CELLS, pin_row(i))
+            PinAnchor::right(SPLITTER_W, pitch.row(i, n))
         }
     };
     let trunk_anchor = if flip {
-        PinAnchor::right(SPLITTER_W_CELLS, pin_row(0))
+        PinAnchor::right(SPLITTER_W, pitch.row(0, n))
     } else {
-        PinAnchor::left(pin_row(0))
+        PinAnchor::left(pitch.row(0, n))
     };
 
     let (input_anchors, output_anchors): (Vec<PinAnchor>, Vec<PinAnchor>) = if flip {
@@ -611,7 +749,7 @@ pub fn splitter_shape(arms: u8, direction: FanDirection) -> ComponentShape {
     let output_bubbles = vec![false; output_anchors.len()];
 
     ComponentShape {
-        size: vec2(SPLITTER_WIDTH, h),
+        size: vec2(px(SPLITTER_W), px(h_cells)),
         outline,
         fill_outline: None,
         input_anchors,
@@ -641,19 +779,19 @@ pub fn tunnel_shape(role: TunnelRole) -> ComponentShape {
         ],
     };
 
-    // 40 x 40 box (2 cells each way); the single pin centres on grid row 1.
-    let center_row = COMP_MIN_HEIGHT / GRID_SIZE / 2.0; // 1
+    // Same 2x2-cell box as Input/Output; the single pin centers on grid row 1.
+    let center_row = stack_h(1) / 2; // 1
     let input_anchors = match role {
         TunnelRole::Feed => vec![],
         TunnelRole::Pull => vec![PinAnchor::left(center_row)],
     };
     let output_anchors = match role {
-        TunnelRole::Feed => vec![PinAnchor::right(COMP_W_CELLS, center_row)],
+        TunnelRole::Feed => vec![PinAnchor::right(EDGE_BODY_W, center_row)],
         TunnelRole::Pull => vec![],
     };
 
     ComponentShape {
-        size: vec2(COMP_WIDTH, COMP_MIN_HEIGHT),
+        size: vec2(px(EDGE_BODY_W), px(stack_h(1))),
         outline,
         fill_outline: None,
         input_anchors,
@@ -673,6 +811,8 @@ mod tests {
     // grid intersection. Since a pin's screen position is `top_left (grid-aligned)
     // + anchor.cell * GRID_SIZE`, that holds iff every anchor cell is an integer
     // number of cells - so assert exactly that for every shape/parameter combo.
+    // (The `u32` PinAnchor API already makes this true by construction; this test
+    // additionally guards the bounding boxes and documents the invariant.)
     fn assert_shape_on_grid(name: &str, shape: &ComponentShape) {
         // The bounding box must itself be a whole number of grid cells, or a pin
         // on a far edge (col == width in cells) wouldn't be integer either.
@@ -714,6 +854,9 @@ mod tests {
 
     #[test]
     fn all_component_pins_land_on_grid() {
+        assert_shape_on_grid("input", &input_shape());
+        assert_shape_on_grid("output", &output_shape());
+
         for op in [
             GateOp::And,
             GateOp::Or,
@@ -763,5 +906,38 @@ mod tests {
         let shape = gate_shape(GateOp::Not, 1);
         let w_cells = shape.size.x / GRID_SIZE;
         assert_eq!(shape.output_anchors[0].cell.x, w_cells + 1.0);
+    }
+
+    // centerd top/bottom-edge pins (mux selector here) must sit on a whole column,
+    // which holds only because CENTERED_BODY_W is even by construction.
+    #[test]
+    fn centered_body_width_is_even() {
+        assert_eq!(CENTERED_BODY_W % 2, 0);
+        assert_eq!(CENTER_COL, CENTERED_BODY_W / 2);
+    }
+
+    // Tight layout: 1 cell per pin, with a 2-cell gap straddling the centre for an
+    // even count so there's always a definite (whole) centre row. Both layouts keep
+    // the height even, so `height / 2` is the centre row either way.
+    #[test]
+    fn tight_pitch_gaps_the_centre_for_even_stacks() {
+        // Even k=4: rows 1,2,4,5 — centre row 3 is empty (the gap).
+        let rows: Vec<u32> = (0..4).map(|i| Pitch::Tight.row(i, 4)).collect();
+        assert_eq!(rows, vec![1, 2, 4, 5]);
+        assert_eq!(Pitch::Tight.height(4), 6);
+        assert!(!rows.contains(&(Pitch::Tight.height(4) / 2))); // centre (3) has no pin
+
+        // Odd k=3: contiguous rows 1,2,3 — the middle pin sits on centre row 2.
+        let rows: Vec<u32> = (0..3).map(|i| Pitch::Tight.row(i, 3)).collect();
+        assert_eq!(rows, vec![1, 2, 3]);
+        assert_eq!(Pitch::Tight.height(3), 4);
+        assert!(rows.contains(&(Pitch::Tight.height(3) / 2))); // centre (2) holds a pin
+
+        // Spread stays 2-cell pitch regardless of count.
+        assert_eq!(
+            (0..3).map(|i| Pitch::Spread.row(i, 3)).collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+        assert_eq!(Pitch::Spread.height(3), 6);
     }
 }

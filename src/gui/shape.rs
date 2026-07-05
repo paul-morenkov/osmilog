@@ -13,9 +13,7 @@ pub enum ShapeCmd {
 /// A pin's location, expressed as an integer grid-cell offset from the
 /// component's top-left corner (which is itself always grid-aligned). Because
 /// `cell` is whole grid cells, every pin lands exactly on a grid intersection
-/// by construction - the invariant the wire-routing rework relies on. The old
-/// `norm_pos * size` scheme is gone: pins no longer depend on the (arbitrary)
-/// pixel size, only on integer cell coordinates.
+/// by construction - the invariant the wire-routing rework relies on.
 #[derive(Clone)]
 pub struct PinAnchor {
     /// Grid-cell offset from the component's top-left (in cells, not pixels).
@@ -25,32 +23,35 @@ pub struct PinAnchor {
 }
 
 impl PinAnchor {
-    fn at(col: f32, row: f32, wire_dir: Vec2) -> Self {
+    // Cell coordinates are `u32`: a pin can only be placed at a whole grid cell,
+    // so it is impossible to construct an off-grid anchor. Callers pass cell
+    // counts (columns/rows), never pixels or fractions.
+    fn at(col: u32, row: u32, wire_dir: Vec2) -> Self {
         Self {
-            cell: vec2(col, row),
+            cell: vec2(col as f32, row as f32),
             wire_dir,
         }
     }
     /// Pin on the left edge (col 0) at the given grid row.
-    pub fn left(row: f32) -> Self {
-        Self::at(0.0, row, vec2(-1.0, 0.0))
+    pub fn left(row: u32) -> Self {
+        Self::at(0, row, vec2(-1.0, 0.0))
     }
     /// Pin on the right edge (col = body width in cells) at the given grid row.
-    pub fn right(w_cells: f32, row: f32) -> Self {
+    pub fn right(w_cells: u32, row: u32) -> Self {
         Self::at(w_cells, row, vec2(1.0, 0.0))
     }
     /// Bubble output pin: one cell beyond the right edge, so the inversion
     /// bubble drawn in the gap doesn't push the pin off-grid.
-    pub fn right_bubble(w_cells: f32, row: f32) -> Self {
-        Self::at(w_cells + 1.0, row, vec2(1.0, 0.0))
+    pub fn right_bubble(w_cells: u32, row: u32) -> Self {
+        Self::at(w_cells + 1, row, vec2(1.0, 0.0))
     }
     /// Pin on the bottom edge (row = body height in cells) at the given grid col.
-    pub fn bottom(col: f32, h_cells: f32) -> Self {
+    pub fn bottom(col: u32, h_cells: u32) -> Self {
         Self::at(col, h_cells, vec2(0.0, 1.0))
     }
     /// Pin on the top edge (row 0) at the given grid col.
-    pub fn top(col: f32) -> Self {
-        Self::at(col, 0.0, vec2(0.0, -1.0))
+    pub fn top(col: u32) -> Self {
+        Self::at(col, 0, vec2(0.0, -1.0))
     }
 }
 

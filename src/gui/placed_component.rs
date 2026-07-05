@@ -1,7 +1,7 @@
 use egui::Vec2;
 
 use crate::gui::geometry::*;
-use crate::gui::shape::{ComponentShape, PinAnchor};
+use crate::gui::shape::ComponentShape;
 use crate::sim::component::{
     Adder, CombLogic, CompKey, Comparator, Component, Demux, Divider, Encoder, FanDirection, Gate,
     GateOp, Input, Multiplier, Mux, Reg, Subtractor,
@@ -99,8 +99,7 @@ impl ComponentDef {
     // every frame for hit-testing/selection.
     pub fn size(&self) -> Vec2 {
         match self {
-            // 1 cell wide x 2 cells tall, so the single side-pin centres on grid row 1.
-            Self::Input(_) | Self::Output => egui::vec2(COMP_MIN_WIDTH, COMP_MIN_HEIGHT),
+            Self::Input(_) | Self::Output => io_size(),
             Self::Gate(g) => gate_size(g.op, g.n_inputs),
             Self::Mux(m) => mux_size(m.sel_width),
             Self::Demux(d) => demux_size(d.sel_width),
@@ -168,38 +167,8 @@ impl ComponentDef {
 
     pub fn shape(&self) -> ComponentShape {
         match self {
-            Self::Input(_) => {
-                let h = COMP_MIN_HEIGHT;
-                // 1 cell wide (right edge at col 1), pin centred on grid row 1.
-                let w_cells = COMP_MIN_WIDTH / GRID_SIZE;
-                let center_row = h / GRID_SIZE / 2.0;
-                ComponentShape {
-                    size: egui::vec2(COMP_MIN_WIDTH, h),
-                    outline: rect_outline(),
-                    fill_outline: None,
-                    input_anchors: vec![],
-                    output_anchors: vec![PinAnchor::right(w_cells, center_row)],
-                    extra_strokes: vec![],
-                    output_bubbles: vec![false],
-                    labels: vec![],
-                    dynamic_label_pos: Vec2::ZERO,
-                }
-            }
-            Self::Output => {
-                let h = COMP_MIN_HEIGHT;
-                let center_row = h / GRID_SIZE / 2.0;
-                ComponentShape {
-                    size: egui::vec2(COMP_MIN_WIDTH, h),
-                    outline: rect_outline(),
-                    fill_outline: None,
-                    input_anchors: vec![PinAnchor::left(center_row)],
-                    output_anchors: vec![],
-                    extra_strokes: vec![],
-                    output_bubbles: vec![],
-                    labels: vec![],
-                    dynamic_label_pos: Vec2::ZERO,
-                }
-            }
+            Self::Input(_) => input_shape(),
+            Self::Output => output_shape(),
             Self::Gate(g) => gate_shape(g.op, g.n_inputs),
             Self::Mux(m) => mux_shape(m.sel_width),
             Self::Demux(d) => demux_shape(d.sel_width),
