@@ -38,25 +38,25 @@ impl CombLogic for Encoder {
             // Explicitly disabled: selector = Floating, EN_OUT/GRP_OUT = 0.
             Value::Fixed { bits: 0, width: 1 } => {
                 sel = Value::Floating;
-                en_out = Value::new(0, 1);
-                grp_out = Value::new(0, 1);
+                en_out = Value::ZERO;
+                grp_out = Value::ZERO;
             }
             // Enabled: Floating or Fixed{width:1, bits != 0}.
             _ => {
                 let highest_set = (1..self.n_arms() + 1)
                     .map(|i| inputs[i])
-                    .rposition(|v| v == Value::new(1, 1));
+                    .rposition(|v| v == Value::ONE);
 
                 if let Some(i) = highest_set {
                     // If an input is 1: selector = i, EN_OUT = 0, GRP_OUT = 1.
                     sel = Value::new(i as u32, self.sel_width);
-                    en_out = Value::new(0, 1);
-                    grp_out = Value::new(1, 1);
+                    en_out = Value::ZERO;
+                    grp_out = Value::ONE;
                 } else {
                     // If enabled but no inputs 1: selector = Floating, EN_OUT = 1, GRP_OUT = 0.
                     sel = Value::Floating;
-                    en_out = Value::new(1, 1);
-                    grp_out = Value::new(0, 1);
+                    en_out = Value::ONE;
+                    grp_out = Value::ZERO;
                 }
             }
         }
@@ -107,7 +107,7 @@ mod tests {
             None => Value::Floating,
         };
         assert_eq!(
-            enc.evaluate(&make_inputs(2, Value::new(1, 1), mask)),
+            enc.evaluate(&make_inputs(2, Value::ONE, mask)),
             vec![
                 expected_sel_value,
                 Value::new(expected_en, 1),
@@ -122,8 +122,8 @@ mod tests {
     fn test_disabled_forces_floating_selector_and_zero_flags(mask: u32) {
         let enc = Encoder { sel_width: 2 };
         assert_eq!(
-            enc.evaluate(&make_inputs(2, Value::new(0, 1), mask)),
-            vec![Value::Floating, Value::new(0, 1), Value::new(0, 1)]
+            enc.evaluate(&make_inputs(2, Value::ZERO, mask)),
+            vec![Value::Floating, Value::ZERO, Value::ZERO]
         );
     }
 
@@ -132,13 +132,13 @@ mod tests {
         let enc = Encoder { sel_width: 2 };
         // Disabled: arm 1 hot but ignored.
         assert_eq!(
-            enc.evaluate(&make_inputs(2, Value::new(0, 1), 0b0010)),
-            vec![Value::Floating, Value::new(0, 1), Value::new(0, 1)]
+            enc.evaluate(&make_inputs(2, Value::ZERO, 0b0010)),
+            vec![Value::Floating, Value::ZERO, Value::ZERO]
         );
         // Enabled: arm 1 is still hot, so it should now fire.
         assert_eq!(
-            enc.evaluate(&make_inputs(2, Value::new(1, 1), 0b0010)),
-            vec![Value::new(1, 2), Value::new(0, 1), Value::new(1, 1)]
+            enc.evaluate(&make_inputs(2, Value::ONE, 0b0010)),
+            vec![Value::new(1, 2), Value::ZERO, Value::ONE]
         );
     }
 
@@ -149,7 +149,7 @@ mod tests {
         // normal arm scan, same as an explicitly-enabled encoder.
         assert_eq!(
             enc.evaluate(&make_inputs(2, Value::Floating, 0b0010)),
-            vec![Value::new(1, 2), Value::new(0, 1), Value::new(1, 1)]
+            vec![Value::new(1, 2), Value::ZERO, Value::ONE]
         );
     }
 
@@ -170,13 +170,13 @@ mod tests {
         // Arm 3 (input pin 4) is unconnected -> Floating.
         assert_eq!(
             enc.evaluate(&[
-                Value::new(1, 1),
-                Value::new(0, 1),
-                Value::new(0, 1),
-                Value::new(0, 1),
+                Value::ONE,
+                Value::ZERO,
+                Value::ZERO,
+                Value::ZERO,
                 Value::Floating,
             ]),
-            vec![Value::Floating, Value::new(1, 1), Value::new(0, 1)]
+            vec![Value::Floating, Value::ONE, Value::ZERO]
         );
     }
 
@@ -187,13 +187,13 @@ mod tests {
         // the encoder's arm comparison requires an exact Value::Fixed{bits:1,width:1}.
         assert_eq!(
             enc.evaluate(&[
-                Value::new(1, 1),
-                Value::new(0, 1),
-                Value::new(0, 1),
+                Value::ONE,
+                Value::ZERO,
+                Value::ZERO,
                 Value::new(1, 2),
-                Value::new(0, 1),
+                Value::ZERO,
             ]),
-            vec![Value::Floating, Value::new(1, 1), Value::new(0, 1)]
+            vec![Value::Floating, Value::ONE, Value::ZERO]
         );
     }
 
@@ -203,15 +203,15 @@ mod tests {
         assert_eq!(enc.n_inputs(), 2); // enable_in + 1 arm
 
         assert_eq!(
-            enc.evaluate(&[Value::new(1, 1), Value::new(0, 1)]),
-            vec![Value::Floating, Value::new(1, 1), Value::new(0, 1)]
+            enc.evaluate(&[Value::ONE, Value::ZERO]),
+            vec![Value::Floating, Value::ONE, Value::ZERO]
         );
 
         // A 0-bit-wide selector: the only possible index (0) is still a well-formed
         // Value::Fixed{bits:0,width:0} rather than Floating.
         assert_eq!(
             enc.evaluate(&[Value::new(1, 1), Value::new(1, 1)]),
-            vec![Value::new(0, 0), Value::new(0, 1), Value::new(1, 1)]
+            vec![Value::new(0, 0), Value::ZERO, Value::new(1, 1)]
         );
     }
 
@@ -253,30 +253,30 @@ mod tests {
         if expect_enc1_fires {
             let expected_i = 31 - arms1_mask.leading_zeros(); // highest set bit index
             assert_eq!(sel1, Value::new(expected_i, sel_width));
-            assert_eq!(en1_out, Value::new(0, 1));
+            assert_eq!(en1_out, Value::ZERO);
             // enc2 never got an enabled enable_in, so it stays fully quiet even
             // though arms2_mask may be hot.
             assert_eq!(sel2, Value::Floating);
-            assert_eq!(en2_out, Value::new(0, 1));
+            assert_eq!(en2_out, Value::ZERO);
         } else if expect_enc2_fires {
             let expected_i = 31 - arms2_mask.leading_zeros();
             assert_eq!(sel1, Value::Floating);
-            assert_eq!(en1_out, Value::new(1, 1));
+            assert_eq!(en1_out, Value::ONE);
             assert_eq!(sel2, Value::new(expected_i, sel_width));
-            assert_eq!(en2_out, Value::new(0, 1));
+            assert_eq!(en2_out, Value::ZERO);
         } else if top_enable == 1 {
             // Chain fully enabled but nothing anywhere is set.
             assert_eq!(sel1, Value::Floating);
-            assert_eq!(en1_out, Value::new(1, 1));
+            assert_eq!(en1_out, Value::ONE);
             assert_eq!(sel2, Value::Floating);
-            assert_eq!(en2_out, Value::new(1, 1));
+            assert_eq!(en2_out, Value::ONE);
         } else {
             // Top disabled: enc1 is disabled outright (en1_out forced to 0), so enc2's
             // enable_in sees an explicit 0 too and is disabled regardless of its arms.
             assert_eq!(sel1, Value::Floating);
-            assert_eq!(en1_out, Value::new(0, 1));
+            assert_eq!(en1_out, Value::ZERO);
             assert_eq!(sel2, Value::Floating);
-            assert_eq!(en2_out, Value::new(0, 1));
+            assert_eq!(en2_out, Value::ZERO);
         }
     }
 }

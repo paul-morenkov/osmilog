@@ -37,34 +37,27 @@ mod tests {
         assert_eq!(reg.observe(), vec![Value::new(0, 4)]);
     }
 
-    #[test]
-    fn test_latches_on_write_enable_holds_otherwise() {
+    #[test_case(Value::ONE; "write_enable exactly one")]
+    #[test_case(Value::Floating; "write_enable floating")]
+    fn test_latches_on_write_enable_holds_otherwise(we: Value) {
         let mut reg = new_reg(4);
         // Zero-initialized, unaffected by data already present pre-tick.
         assert_eq!(reg.observe(), vec![Value::new(0, 4)]);
 
         // write_enable=1, tick: latches data.
-        assert_eq!(
-            reg.tick(&[Value::new(5, 4), Value::new(1, 1)]),
-            vec![Value::new(5, 4)]
-        );
+        assert_eq!(reg.tick(&[Value::new(5, 4), we]), vec![Value::new(5, 4)]);
 
         // write_enable=0, data changes, tick: holds previous value.
         assert_eq!(
-            reg.tick(&[Value::new(9, 4), Value::new(0, 1)]),
+            reg.tick(&[Value::new(9, 4), Value::ZERO]),
             vec![Value::new(5, 4)]
         );
     }
 
-    #[test_case(None ; "write_enable floating (unconnected)")]
-    #[test_case(Some((1, 2)) ; "write_enable wrong width (bits=1, width=2)")]
-    #[test_case(Some((0, 1)) ; "write_enable exactly zero")]
-    fn test_write_enable_non_latching_cases(we_input: Option<(u32, u8)>) {
+    #[test_case(Value::new(1, 2); "write_enable wrong width (bits=1, width=2)")]
+    #[test_case(Value::ZERO; "write_enable exactly zero")]
+    fn test_write_enable_non_latching_cases(we: Value) {
         let mut reg = new_reg(4);
-        let we = match we_input {
-            Some((bits, width)) => Value::new(bits, width),
-            None => Value::Floating,
-        };
         assert_eq!(reg.tick(&[Value::new(7, 4), we]), vec![Value::new(0, 4)]);
     }
 
@@ -74,19 +67,19 @@ mod tests {
 
         // tick 1: we=1, data=3 -> latches 3.
         assert_eq!(
-            reg.tick(&[Value::new(3, 4), Value::new(1, 1)]),
+            reg.tick(&[Value::new(3, 4), Value::ONE]),
             vec![Value::new(3, 4)]
         );
 
         // tick 2: we=0, data=9 -> holds 3.
         assert_eq!(
-            reg.tick(&[Value::new(9, 4), Value::new(0, 1)]),
+            reg.tick(&[Value::new(9, 4), Value::ZERO]),
             vec![Value::new(3, 4)]
         );
 
         // tick 3: we=1, data=9 -> latches 9.
         assert_eq!(
-            reg.tick(&[Value::new(9, 4), Value::new(1, 1)]),
+            reg.tick(&[Value::new(9, 4), Value::ONE]),
             vec![Value::new(9, 4)]
         );
     }

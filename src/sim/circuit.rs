@@ -657,8 +657,8 @@ mod tests {
         c.link(or, PinId::output(0), o2, PinId::input(0));
 
         c.settle().unwrap();
-        assert_eq!(c.read_output(o1), Value::new(0, 1));
-        assert_eq!(c.read_output(o2), Value::new(1, 1));
+        assert_eq!(c.read_output(o1), Value::ZERO);
+        assert_eq!(c.read_output(o2), Value::ONE);
     }
 
     #[test]
@@ -697,8 +697,8 @@ mod tests {
         c.link(g2, PinId::output(0), o2, PinId::input(0));
 
         c.settle().unwrap();
-        assert_eq!(c.read_output(o1), Value::new(0, 1));
-        assert_eq!(c.read_output(o2), Value::new(0, 1));
+        assert_eq!(c.read_output(o1), Value::ZERO);
+        assert_eq!(c.read_output(o2), Value::ZERO);
     }
 
     #[test]
@@ -719,7 +719,7 @@ mod tests {
         c.link(g2, PinId::output(0), o, PinId::input(0));
 
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::new(1, 1));
+        assert_eq!(c.read_output(o), Value::ONE);
     }
 
     #[test]
@@ -751,8 +751,8 @@ mod tests {
                                                                    // test_link_merge_of_still_dirty_nets_panics_documents_bug for what
                                                                    // happens if a merged-away net is still pending in the dirty queue.
         c.settle().unwrap();
-        assert_eq!(c.read_output(sink1), Value::new(1, 1));
-        assert_eq!(c.read_output(sink2), Value::new(0, 1));
+        assert_eq!(c.read_output(sink1), Value::ONE);
+        assert_eq!(c.read_output(sink2), Value::ZERO);
 
         // Merge net1 and net2 by linking their already-attached input pins.
         c.link(sink1, PinId::input(0), sink2, PinId::input(0));
@@ -760,8 +760,8 @@ mod tests {
         c.settle().unwrap();
         // Both sinks now share one net; merge() keeps net1's original source
         // (driver1), even though driver2's output pin was repointed at it.
-        assert_eq!(c.read_output(sink1), Value::new(1, 1));
-        assert_eq!(c.read_output(sink2), Value::new(1, 1));
+        assert_eq!(c.read_output(sink1), Value::ONE);
+        assert_eq!(c.read_output(sink2), Value::ONE);
     }
 
     #[test]
@@ -797,7 +797,7 @@ mod tests {
         c.link(not_g, PinId::output(0), o, PinId::input(0));
 
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::new(0, 1)); // NOT(1 AND 1) = 0
+        assert_eq!(c.read_output(o), Value::ZERO); // NOT(1 AND 1) = 0
     }
 
     #[test]
@@ -807,9 +807,9 @@ mod tests {
         let o = c.add_component(Component::output());
         c.link(a, PinId::output(0), o, PinId::input(0));
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::new(1, 1));
+        assert_eq!(c.read_output(o), Value::ONE);
         c.settle().unwrap(); // nothing dirty; must be a no-op
-        assert_eq!(c.read_output(o), Value::new(1, 1));
+        assert_eq!(c.read_output(o), Value::ONE);
     }
 
     #[test]
@@ -900,12 +900,12 @@ mod tests {
         c.link(reg, PinId::output(0), not_g, PinId::input(0));
         c.link(not_g, PinId::output(0), out, PinId::input(0));
         c.settle().unwrap();
-        assert_eq!(c.read_output(out), Value::new(1, 1)); // NOT(0) = 1
+        assert_eq!(c.read_output(out), Value::ONE); // NOT(0) = 1
 
         c.set_input(data, 1, 1);
         c.settle().unwrap();
         c.tick_clock().unwrap(); // latches 1; trailing settle() propagates through not_g
-        assert_eq!(c.read_output(out), Value::new(0, 1)); // NOT(1) = 0
+        assert_eq!(c.read_output(out), Value::ZERO); // NOT(1) = 0
     }
 
     #[test]
@@ -975,7 +975,7 @@ mod tests {
 
         c.settle().unwrap();
         c.tick_clock().unwrap(); // no sequential components; behaves like settle()
-        assert_eq!(c.read_output(o), Value::new(1, 1));
+        assert_eq!(c.read_output(o), Value::ONE);
     }
 
     // ---- Group 4: structural operations ----
@@ -996,8 +996,8 @@ mod tests {
         c.link(and_g, PinId::output(0), o1, PinId::input(0));
         c.link(or_g, PinId::output(0), o2, PinId::input(0));
         c.settle().unwrap();
-        assert_eq!(c.read_output(o1), Value::new(0, 1));
-        assert_eq!(c.read_output(o2), Value::new(1, 1));
+        assert_eq!(c.read_output(o1), Value::ZERO);
+        assert_eq!(c.read_output(o2), Value::ONE);
 
         c.clear_nets();
         assert_eq!(c.read_output(o1), Value::Floating);
@@ -1015,7 +1015,7 @@ mod tests {
         c.link(b, PinId::output(0), g, PinId::input(1));
         c.link(g, PinId::output(0), o, PinId::input(0));
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::new(1, 1));
+        assert_eq!(c.read_output(o), Value::ONE);
 
         c.clear_nets();
         c.set_input(a, 0, 1);
@@ -1023,7 +1023,7 @@ mod tests {
         c.link(b, PinId::output(0), g, PinId::input(1));
         c.link(g, PinId::output(0), o, PinId::input(0));
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::new(0, 1));
+        assert_eq!(c.read_output(o), Value::ZERO);
     }
 
     #[test]
@@ -1035,7 +1035,7 @@ mod tests {
         c.link(a, PinId::output(0), g, PinId::input(0));
         c.link(g, PinId::output(0), o, PinId::input(0));
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::new(0, 1));
+        assert_eq!(c.read_output(o), Value::ZERO);
 
         c.remove_component(g);
         assert_eq!(c.read_output(o), Value::Floating);
@@ -1052,11 +1052,11 @@ mod tests {
         c.link(a, PinId::output(0), g2, PinId::input(0));
         c.link(g2, PinId::output(0), o2, PinId::input(0));
         c.settle().unwrap();
-        assert_eq!(c.read_output(o2), Value::new(0, 1));
+        assert_eq!(c.read_output(o2), Value::ZERO);
 
         c.remove_component(g1); // g1 only reads from a's net
         c.settle().unwrap();
-        assert_eq!(c.read_output(o2), Value::new(0, 1));
+        assert_eq!(c.read_output(o2), Value::ZERO);
     }
 
     #[test]
@@ -1073,7 +1073,7 @@ mod tests {
         c.link(g1, PinId::output(0), g2, PinId::input(0));
         c.link(g2, PinId::output(0), o, PinId::input(0));
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::new(1, 1)); // NOT(NOT(1)) = 1
+        assert_eq!(c.read_output(o), Value::ONE); // NOT(NOT(1)) = 1
 
         c.remove_component(g1);
         c.settle().unwrap();
@@ -1104,11 +1104,11 @@ mod tests {
         c.link(b, PinId::output(0), g, PinId::input(1));
         c.link(g, PinId::output(0), o, PinId::input(0));
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::new(1, 1));
+        assert_eq!(c.read_output(o), Value::ONE);
 
         c.set_input(g, 99, 4); // g is a Gate, not an Input; silently no-ops
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::new(1, 1)); // unaffected
+        assert_eq!(c.read_output(o), Value::ONE); // unaffected
     }
 
     // ---- Group 6: tunnels ----
@@ -1125,7 +1125,7 @@ mod tests {
         c.link_tunnel(feed, out, PinId::input(0));
 
         c.settle().unwrap();
-        assert_eq!(c.read_output(out), Value::new(1, 1));
+        assert_eq!(c.read_output(out), Value::ONE);
     }
 
     #[test]
@@ -1171,7 +1171,7 @@ mod tests {
         let out = c.add_component(Component::output());
         c.link_tunnel(feed, out, PinId::input(0));
         c.settle().unwrap();
-        assert_eq!(c.read_output(out), Value::new(1, 1));
+        assert_eq!(c.read_output(out), Value::ONE);
     }
 
     #[test]
@@ -1206,7 +1206,7 @@ mod tests {
         c.link_tunnel(pull, driver, PinId::output(0));
         c.link_tunnel(feed, out, PinId::input(0));
         c.settle().unwrap();
-        assert_eq!(c.read_output(out), Value::new(1, 1));
+        assert_eq!(c.read_output(out), Value::ONE);
     }
 
     #[test]
@@ -1225,14 +1225,14 @@ mod tests {
         c.link_tunnel(feed_new, out_new, PinId::input(0));
 
         c.settle().unwrap();
-        assert_eq!(c.read_output(out_old), Value::new(1, 1)); // still "OLD" group
+        assert_eq!(c.read_output(out_old), Value::ONE); // still "OLD" group
         assert_eq!(c.read_output(out_new), Value::Floating); // "NEW" has no Pull yet
 
         // Rename the Pull tunnel from "OLD" to "NEW".
         c.rename_tunnel(pull, "NEW".to_string());
         c.settle().unwrap();
 
-        assert_eq!(c.read_output(out_new), Value::new(1, 1)); // now follows "NEW"
+        assert_eq!(c.read_output(out_new), Value::ONE); // now follows "NEW"
         assert_eq!(c.read_output(out_old), Value::Floating); // "OLD" lost its only Pull
     }
 
@@ -1306,9 +1306,9 @@ mod tests {
         c.settle().unwrap();
 
         assert_eq!(c.read_output(probe), Value::Invalid); // the mismatched net itself
-        // One hop downstream: g4 read an Invalid input and produced Floating
-        // (per Value::Not), and that net's own widths agree - so it resolves
-        // as ordinary Floating rather than carrying Invalid any further.
+                                                          // One hop downstream: g4 read an Invalid input and produced Floating
+                                                          // (per Value::Not), and that net's own widths agree - so it resolves
+                                                          // as ordinary Floating rather than carrying Invalid any further.
         assert_eq!(c.read_output(out), Value::Floating);
     }
 }

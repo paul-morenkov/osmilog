@@ -57,13 +57,8 @@ mod tests {
             sel_width: 2,
         };
         assert_eq!(
-            demux.evaluate(&[Value::new(1, 1), Value::new(2, 2)]),
-            vec![
-                Value::new(0, 1),
-                Value::new(0, 1),
-                Value::new(1, 1),
-                Value::new(0, 1),
-            ]
+            demux.evaluate(&[Value::ONE, Value::new(2, 2)]),
+            vec![Value::ZERO, Value::ZERO, Value::ONE, Value::ZERO,]
         );
     }
 
@@ -74,7 +69,7 @@ mod tests {
             sel_width: 2,
         };
         assert_eq!(
-            demux.evaluate(&[Value::new(1, 1), Value::Floating]),
+            demux.evaluate(&[Value::ONE, Value::Floating]),
             vec![Value::Floating; 4]
         );
     }
@@ -87,7 +82,7 @@ mod tests {
         };
         // Selector is width 1, but the demux expects sel_width=2.
         assert_eq!(
-            demux.evaluate(&[Value::new(1, 1), Value::new(0, 1)]),
+            demux.evaluate(&[Value::ONE, Value::ZERO]),
             vec![Value::Floating; 4]
         );
     }
@@ -118,7 +113,7 @@ mod tests {
             data_width: 1,
             sel_width: 1,
         };
-        let out = demux.evaluate(&[Value::new(3, 2), Value::new(0, 1)]);
+        let out = demux.evaluate(&[Value::new(3, 2), Value::ZERO]);
         assert_eq!(out[0], Value::new(3, 2));
     }
 }

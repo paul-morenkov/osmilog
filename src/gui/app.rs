@@ -1762,7 +1762,7 @@ mod tests {
         });
 
         app.circuit.settle().unwrap();
-        assert_eq!(app.circuit.read_output(o_key), Value::new(1, 1));
+        assert_eq!(app.circuit.read_output(o_key), Value::ONE);
 
         // Save -> JSON -> parse -> load into a fresh app, and confirm the
         // loaded circuit behaves identically.
@@ -1781,7 +1781,7 @@ mod tests {
             .find(|pc| matches!(pc.def, ComponentDef::Output))
             .unwrap()
             .key;
-        assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::new(1, 1));
+        assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::ONE);
     }
 
     #[test]
@@ -1822,7 +1822,7 @@ mod tests {
         });
 
         app.circuit.settle().unwrap();
-        assert_eq!(app.circuit.read_output(out_key), Value::new(1, 1));
+        assert_eq!(app.circuit.read_output(out_key), Value::ONE);
 
         let file = app.to_circuit_file();
         let json = file.to_json().unwrap();
@@ -1838,7 +1838,7 @@ mod tests {
             .find(|pc| matches!(pc.def, ComponentDef::Output))
             .unwrap()
             .key;
-        assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::new(1, 1));
+        assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::ONE);
     }
 
     #[test]
@@ -1925,7 +1925,7 @@ mod tests {
             dst_pin: InIdx(0),
         });
         app.circuit.settle().unwrap();
-        assert_eq!(app.circuit.read_output(o_key), Value::new(0, 1)); // NOT(1) = 0
+        assert_eq!(app.circuit.read_output(o_key), Value::ZERO); // NOT(1) = 0
         app.selected = Some(Selected::Component(g));
 
         app.delete_component(g);

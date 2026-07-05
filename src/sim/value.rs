@@ -19,6 +19,9 @@ pub enum Value {
 }
 
 impl Value {
+    pub const ZERO: Value = Value::Fixed { bits: 0, width: 1 };
+    pub const ONE: Value = Value::Fixed { bits: 1, width: 1 };
+
     pub fn new(bits: u32, width: u8) -> Self {
         Value::Fixed { bits, width }
     }

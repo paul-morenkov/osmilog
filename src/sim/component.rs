@@ -355,7 +355,10 @@ impl LogicSeq {
             Self::Reg { value, .. } => {
                 let data = inputs[Reg::DATA_PIN];
                 let write_enable = inputs[Reg::WRITE_EN_PIN];
-                if matches!(write_enable, Value::Fixed { bits: 1, width: 1 }) {
+                if matches!(
+                    write_enable,
+                    Value::Fixed { bits: 1, width: 1 } | Value::Floating
+                ) {
                     *value = data;
                 }
                 vec![*value]

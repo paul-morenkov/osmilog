@@ -72,7 +72,7 @@ mod tests {
             sel_width: 1,
         };
         assert_eq!(
-            mux.evaluate(&[Value::Floating, Value::new(1, 1), Value::new(0, 1)]),
+            mux.evaluate(&[Value::Floating, Value::ONE, Value::ZERO]),
             vec![Value::Floating]
         );
     }
@@ -85,7 +85,7 @@ mod tests {
         };
         // Selector is width 1, but the mux expects sel_width=2.
         let inputs = [
-            Value::new(0, 1),
+            Value::ZERO,
             Value::new(5, 2),
             Value::Floating,
             Value::Floating,
@@ -102,7 +102,7 @@ mod tests {
         };
         // Selector picks branch 0, which is unconnected -> Floating.
         assert_eq!(
-            mux.evaluate(&[Value::new(0, 1), Value::Floating, Value::new(0, 1)]),
+            mux.evaluate(&[Value::ZERO, Value::Floating, Value::ZERO]),
             vec![Value::Floating]
         );
     }

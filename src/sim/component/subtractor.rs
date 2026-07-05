@@ -80,8 +80,8 @@ mod tests {
     fn test_diff_no_borrow() {
         let s = subtractor(4);
         assert_eq!(
-            s.evaluate(&[Value::new(5, 4), Value::new(3, 4), Value::new(0, 1)]),
-            vec![Value::new(2, 4), Value::new(0, 1)]
+            s.evaluate(&[Value::new(5, 4), Value::new(3, 4), Value::ZERO]),
+            vec![Value::new(2, 4), Value::ZERO]
         );
     }
 
@@ -89,8 +89,8 @@ mod tests {
     fn test_borrow_in_propagates() {
         let s = subtractor(4);
         assert_eq!(
-            s.evaluate(&[Value::new(5, 4), Value::new(3, 4), Value::new(1, 1)]),
-            vec![Value::new(1, 4), Value::new(0, 1)]
+            s.evaluate(&[Value::new(5, 4), Value::new(3, 4), Value::ONE]),
+            vec![Value::new(1, 4), Value::ZERO]
         );
     }
 
@@ -99,8 +99,8 @@ mod tests {
         let s = subtractor(4);
         // 2 - 3 = -1, which wraps to 0b1111 (15) with borrow-out set.
         assert_eq!(
-            s.evaluate(&[Value::new(2, 4), Value::new(3, 4), Value::new(0, 1)]),
-            vec![Value::new(15, 4), Value::new(1, 1)]
+            s.evaluate(&[Value::new(2, 4), Value::new(3, 4), Value::ZERO]),
+            vec![Value::new(15, 4), Value::ONE]
         );
     }
 
@@ -109,8 +109,8 @@ mod tests {
         let s = subtractor(4);
         // 0 - 0 - 1 = -1, which wraps to 0b1111 (15) with borrow-out set.
         assert_eq!(
-            s.evaluate(&[Value::new(0, 4), Value::new(0, 4), Value::new(1, 1)]),
-            vec![Value::new(15, 4), Value::new(1, 1)]
+            s.evaluate(&[Value::new(0, 4), Value::new(0, 4), Value::ONE]),
+            vec![Value::new(15, 4), Value::ONE]
         );
     }
 
@@ -121,12 +121,8 @@ mod tests {
         // on plain u32 addition (b + bin).
         let s = subtractor(32);
         assert_eq!(
-            s.evaluate(&[
-                Value::new(0, 32),
-                Value::new(u32::MAX, 32),
-                Value::new(1, 1)
-            ]),
-            vec![Value::new(0, 32), Value::new(1, 1)]
+            s.evaluate(&[Value::new(0, 32), Value::new(u32::MAX, 32), Value::ONE]),
+            vec![Value::new(0, 32), Value::ONE]
         );
     }
 
@@ -134,7 +130,7 @@ mod tests {
     fn test_mismatched_operand_width_yields_floating() {
         let s = subtractor(4);
         assert_eq!(
-            s.evaluate(&[Value::new(1, 3), Value::new(1, 4), Value::new(0, 1)]),
+            s.evaluate(&[Value::new(1, 3), Value::new(1, 4), Value::ZERO]),
             vec![Value::Floating, Value::Floating]
         );
     }
@@ -143,7 +139,7 @@ mod tests {
     fn test_floating_minuend_yields_floating() {
         let s = subtractor(4);
         assert_eq!(
-            s.evaluate(&[Value::Floating, Value::new(1, 4), Value::new(0, 1)]),
+            s.evaluate(&[Value::Floating, Value::new(1, 4), Value::ZERO]),
             vec![Value::Floating, Value::Floating]
         );
     }

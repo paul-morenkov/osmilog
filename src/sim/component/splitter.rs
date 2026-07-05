@@ -221,30 +221,15 @@ mod tests {
         );
         assert_eq!(
             s.evaluate(&[Value::new(0, 4)]),
-            vec![
-                Value::new(0, 1),
-                Value::new(0, 1),
-                Value::new(0, 1),
-                Value::new(0, 1)
-            ]
+            vec![Value::ZERO, Value::ZERO, Value::ZERO, Value::ZERO]
         );
         assert_eq!(
             s.evaluate(&[Value::new(0b0100, 4)]),
-            vec![
-                Value::new(0, 1),
-                Value::new(0, 1),
-                Value::new(1, 1),
-                Value::new(0, 1)
-            ]
+            vec![Value::ZERO, Value::ZERO, Value::ONE, Value::ZERO]
         );
         assert_eq!(
             s.evaluate(&[Value::new(0b1111, 4)]),
-            vec![
-                Value::new(1, 1),
-                Value::new(1, 1),
-                Value::new(1, 1),
-                Value::new(1, 1)
-            ]
+            vec![Value::ONE, Value::ONE, Value::ONE, Value::ONE]
         );
     }
 
@@ -276,7 +261,7 @@ mod tests {
         let s = Splitter::new(vec![vec![0], vec![1]], FanDirection::Right);
         assert_eq!(
             s.evaluate(&[Value::new(0b1101, 4)]),
-            vec![Value::new(1, 1), Value::new(0, 1)]
+            vec![Value::ONE, Value::ZERO]
         );
     }
 
@@ -287,11 +272,11 @@ mod tests {
         let s = Splitter::new(vec![vec![0, 1], vec![1]], FanDirection::Right);
         assert_eq!(
             s.evaluate(&[Value::new(0b01, 2)]), // bit0 set, bit1 clear
-            vec![Value::new(1, 1), Value::new(0, 1)]
+            vec![Value::ONE, Value::ZERO]
         );
         assert_eq!(
             s.evaluate(&[Value::new(0b10, 2)]), // bit0 clear, bit1 set
-            vec![Value::new(0, 1), Value::new(1, 1)]
+            vec![Value::ZERO, Value::ONE]
         );
     }
 
@@ -340,7 +325,7 @@ mod tests {
         // arm0 owns 2 bits but is driven by a 3-bit source -> Floating.
         let s = Splitter::new(vec![vec![0, 1], vec![2]], FanDirection::Left);
         assert_eq!(
-            s.evaluate(&[Value::new(0, 3), Value::new(0, 1)]),
+            s.evaluate(&[Value::new(0, 3), Value::ZERO]),
             vec![Value::Floating]
         );
     }

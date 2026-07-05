@@ -82,8 +82,8 @@ mod tests {
     fn test_sum_no_carry() {
         let a = adder(4);
         assert_eq!(
-            a.evaluate(&[Value::new(2, 4), Value::new(3, 4), Value::new(0, 1)]),
-            vec![Value::new(5, 4), Value::new(0, 1)]
+            a.evaluate(&[Value::new(2, 4), Value::new(3, 4), Value::ZERO]),
+            vec![Value::new(5, 4), Value::ZERO]
         );
     }
 
@@ -91,8 +91,8 @@ mod tests {
     fn test_carry_in_propagates() {
         let a = adder(4);
         assert_eq!(
-            a.evaluate(&[Value::new(2, 4), Value::new(3, 4), Value::new(1, 1)]),
-            vec![Value::new(6, 4), Value::new(0, 1)]
+            a.evaluate(&[Value::new(2, 4), Value::new(3, 4), Value::ONE]),
+            vec![Value::new(6, 4), Value::ZERO]
         );
     }
 
@@ -101,8 +101,8 @@ mod tests {
         let a = adder(4);
         // 15 + 2 = 17, which is 0b10001: wraps to 0b0001 (1) with carry-out set.
         assert_eq!(
-            a.evaluate(&[Value::new(15, 4), Value::new(2, 4), Value::new(0, 1)]),
-            vec![Value::new(1, 4), Value::new(1, 1)]
+            a.evaluate(&[Value::new(15, 4), Value::new(2, 4), Value::ZERO]),
+            vec![Value::new(1, 4), Value::ONE]
         );
     }
 
@@ -111,8 +111,8 @@ mod tests {
         let a = adder(4);
         // 15 + 0 + 1 = 16, which is 0b10000: wraps to 0 with carry-out set.
         assert_eq!(
-            a.evaluate(&[Value::new(15, 4), Value::new(0, 4), Value::new(1, 1)]),
-            vec![Value::new(0, 4), Value::new(1, 1)]
+            a.evaluate(&[Value::new(15, 4), Value::new(0, 4), Value::ONE]),
+            vec![Value::new(0, 4), Value::ONE]
         );
     }
 
@@ -126,9 +126,9 @@ mod tests {
             a.evaluate(&[
                 Value::new(u32::MAX, 32),
                 Value::new(u32::MAX, 32),
-                Value::new(1, 1)
+                Value::ONE
             ]),
-            vec![Value::new(u32::MAX, 32), Value::new(1, 1)]
+            vec![Value::new(u32::MAX, 32), Value::ONE]
         );
     }
 
@@ -136,7 +136,7 @@ mod tests {
     fn test_mismatched_addend_width_yields_floating() {
         let a = adder(4);
         assert_eq!(
-            a.evaluate(&[Value::new(1, 3), Value::new(1, 4), Value::new(0, 1)]),
+            a.evaluate(&[Value::new(1, 3), Value::new(1, 4), Value::ZERO]),
             vec![Value::Floating, Value::Floating]
         );
     }
@@ -145,7 +145,7 @@ mod tests {
     fn test_floating_addend_yields_floating() {
         let a = adder(4);
         assert_eq!(
-            a.evaluate(&[Value::Floating, Value::new(1, 4), Value::new(0, 1)]),
+            a.evaluate(&[Value::Floating, Value::new(1, 4), Value::ZERO]),
             vec![Value::Floating, Value::Floating]
         );
     }
