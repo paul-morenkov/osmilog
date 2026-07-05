@@ -353,8 +353,8 @@ impl LogicSeq {
     pub fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
         match self {
             Self::Reg { value, .. } => {
-                let data = inputs[0];
-                let write_enable = inputs[1];
+                let data = inputs[Reg::DATA_PIN];
+                let write_enable = inputs[Reg::WRITE_EN_PIN];
                 if matches!(write_enable, Value::Fixed { bits: 1, width: 1 }) {
                     *value = data;
                 }
@@ -372,15 +372,19 @@ impl LogicSeq {
     pub fn input_width(&self, i: usize) -> Option<u8> {
         match self {
             Self::Reg { config, .. } => match i {
-                0 => Some(config.data_width), // data
-                _ => Some(1),                 // write_enable
+                Reg::DATA_PIN => Some(config.data_width), // data
+                Reg::WRITE_EN_PIN => Some(1),             // write_enable
+                _ => None,
             },
         }
     }
 
-    pub fn output_width(&self, _i: usize) -> Option<u8> {
+    pub fn output_width(&self, i: usize) -> Option<u8> {
         match self {
-            Self::Reg { config, .. } => Some(config.data_width),
+            Self::Reg { config, .. } => match i {
+                0 => Some(config.data_width),
+                _ => None,
+            },
         }
     }
 }
