@@ -4,7 +4,7 @@ use egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Sense, Stroke, Vec
 use slotmap::{new_key_type, SlotMap};
 use std::collections::HashMap;
 
-use crate::gui::geometry::{snap_to_grid, tunnel_shape, GRID_SIZE};
+use crate::gui::geometry::{snap_to_grid, tunnel_shape, GRID_SIZE, LABEL_FONT_SIZE};
 use crate::gui::placed_component::{ComponentDef, PlacedComponent};
 use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
 use crate::gui::theme::Theme;
@@ -14,8 +14,8 @@ use crate::io::{
 };
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::component::{
-    Adder, CompKey, Demux, Encoder, FanDirection, Gate, GateOp, InIdx, Input, Mux, OutIdx, PinId,
-    Reg, Subtractor,
+    Adder, CompKey, Demux, Divider, Encoder, FanDirection, Gate, GateOp, InIdx, Input, Multiplier,
+    Mux, OutIdx, PinId, Reg, Subtractor,
 };
 use crate::sim::value::Value;
 
@@ -24,7 +24,6 @@ use crate::sim::value::Value;
 const PIN_RADIUS: f32 = 3.0;
 const WIRE_THICKNESS_THIN: f32 = 2.0;
 const WIRE_THICKNESS_THICK: f32 = 4.0;
-const LABEL_FONT_SIZE: f32 = 8.0;
 const COMP_STROKE: f32 = 1.5;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -586,6 +585,33 @@ impl OsmilogApp {
                     );
                 }
             }
+            ComponentDef::Multiplier(Multiplier { mut data_width }) => {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Data width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                        .changed();
+                });
+                if changed {
+                    self.reconfigure_component(
+                        key,
+                        ComponentDef::Multiplier(Multiplier { data_width }),
+                    );
+                }
+            }
+            ComponentDef::Divider(Divider { mut data_width }) => {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Data width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                        .changed();
+                });
+                if changed {
+                    self.reconfigure_component(key, ComponentDef::Divider(Divider { data_width }));
+                }
+            }
             ComponentDef::Splitter {
                 mut width,
                 mut arm_bits,
@@ -951,6 +977,18 @@ impl eframe::App for OsmilogApp {
                         if ui.button("Subtractor").clicked() {
                             self.mode = InteractionMode::Placing {
                                 def: ComponentDef::Subtractor(Subtractor { data_width: 1 }),
+                            };
+                            ui.close();
+                        }
+                        if ui.button("Multiplier").clicked() {
+                            self.mode = InteractionMode::Placing {
+                                def: ComponentDef::Multiplier(Multiplier { data_width: 1 }),
+                            };
+                            ui.close();
+                        }
+                        if ui.button("Divider").clicked() {
+                            self.mode = InteractionMode::Placing {
+                                def: ComponentDef::Divider(Divider { data_width: 1 }),
                             };
                             ui.close();
                         }
@@ -1548,7 +1586,7 @@ fn draw_component(
             label_pos,
             Align2::CENTER_CENTER,
             label.text,
-            FontId::monospace(LABEL_FONT_SIZE),
+            FontId::monospace(label.font_size),
             theme.label_text,
         );
     }
@@ -1763,7 +1801,7 @@ mod tests {
         });
 
         app.circuit.settle().unwrap();
-        assert_eq!(app.circuit.read_output(o_key), Value::new(1, 1));
+        assert_eq!(app.circuit.read_output(o_key), Value::ONE);
 
         // Save -> JSON -> parse -> load into a fresh app, and confirm the
         // loaded circuit behaves identically.
@@ -1782,7 +1820,7 @@ mod tests {
             .find(|pc| matches!(pc.def, ComponentDef::Output))
             .unwrap()
             .key;
-        assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::new(1, 1));
+        assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::ONE);
     }
 
     #[test]
@@ -1823,7 +1861,7 @@ mod tests {
         });
 
         app.circuit.settle().unwrap();
-        assert_eq!(app.circuit.read_output(out_key), Value::new(1, 1));
+        assert_eq!(app.circuit.read_output(out_key), Value::ONE);
 
         let file = app.to_circuit_file();
         let json = file.to_json().unwrap();
@@ -1839,7 +1877,7 @@ mod tests {
             .find(|pc| matches!(pc.def, ComponentDef::Output))
             .unwrap()
             .key;
-        assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::new(1, 1));
+        assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::ONE);
     }
 
     #[test]
@@ -1926,7 +1964,7 @@ mod tests {
             dst_pin: InIdx(0),
         });
         app.circuit.settle().unwrap();
-        assert_eq!(app.circuit.read_output(o_key), Value::new(0, 1)); // NOT(1) = 0
+        assert_eq!(app.circuit.read_output(o_key), Value::ZERO); // NOT(1) = 0
         app.selected = Some(Selected::Component(g));
 
         app.delete_component(g);

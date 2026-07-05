@@ -56,6 +56,17 @@ impl PinAnchor {
 pub struct ComponentLabel {
     pub text: &'static str,
     pub pos: Vec2,
+    pub font_size: f32,
+}
+
+impl Default for ComponentLabel {
+    fn default() -> Self {
+        Self {
+            text: Default::default(),
+            pos: Default::default(),
+            font_size: crate::gui::geometry::LABEL_FONT_SIZE,
+        }
+    }
 }
 
 pub struct ComponentShape {

@@ -181,14 +181,12 @@ pub mod native {
         let path = rfd::FileDialog::new()
             .add_filter("osmilog circuit", &["json"])
             .pick_file()?;
-        Some(
-            (|| {
-                let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-                let file = CircuitFile::from_json(&text).map_err(|e| e.to_string())?;
-                file.validate().map_err(|e| e.to_string())?;
-                Ok(file)
-            })(),
-        )
+        Some((|| {
+            let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+            let file = CircuitFile::from_json(&text).map_err(|e| e.to_string())?;
+            file.validate().map_err(|e| e.to_string())?;
+            Ok(file)
+        })())
     }
 }
 
@@ -227,8 +225,8 @@ pub mod wasm {
         parts.push(&wasm_bindgen::JsValue::from_str(contents));
         let opts = BlobPropertyBag::new();
         opts.set_type("application/json");
-        let blob = Blob::new_with_str_sequence_and_options(&parts, &opts)
-            .expect("failed to build blob");
+        let blob =
+            Blob::new_with_str_sequence_and_options(&parts, &opts).expect("failed to build blob");
         let url = Url::create_object_url_with_blob(&blob).expect("failed to create object url");
 
         let anchor: HtmlAnchorElement = document

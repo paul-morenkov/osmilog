@@ -140,12 +140,12 @@ mod tests {
             width: 1,
         };
         assert_eq!(
-            gate.evaluate(&[Value::new(1, 1), Value::new(1, 1), Value::new(1, 1)]),
-            vec![Value::new(1, 1)]
+            gate.evaluate(&[Value::ONE, Value::ONE, Value::ONE]),
+            vec![Value::ONE]
         );
         assert_eq!(
-            gate.evaluate(&[Value::new(1, 1), Value::new(1, 1), Value::new(0, 1)]),
-            vec![Value::new(0, 1)]
+            gate.evaluate(&[Value::ONE, Value::ONE, Value::ZERO]),
+            vec![Value::ZERO]
         );
     }
 
@@ -157,12 +157,12 @@ mod tests {
             width: 1,
         };
         assert_eq!(
-            gate.evaluate(&[Value::new(0, 1), Value::new(0, 1), Value::new(0, 1)]),
-            vec![Value::new(0, 1)]
+            gate.evaluate(&[Value::ZERO, Value::ZERO, Value::ZERO]),
+            vec![Value::ZERO]
         );
         assert_eq!(
-            gate.evaluate(&[Value::new(0, 1), Value::new(0, 1), Value::new(1, 1)]),
-            vec![Value::new(1, 1)]
+            gate.evaluate(&[Value::ZERO, Value::ZERO, Value::ONE]),
+            vec![Value::ONE]
         );
     }
 
@@ -193,7 +193,7 @@ mod tests {
         };
         // Second operand unconnected -> Floating.
         assert_eq!(
-            gate.evaluate(&[Value::new(1, 1), Value::Floating]),
+            gate.evaluate(&[Value::ONE, Value::Floating]),
             vec![Value::Floating]
         );
     }
