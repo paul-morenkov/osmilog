@@ -151,6 +151,18 @@ pub const fn subtractor_size() -> Vec2 {
     adder_size()
 }
 
+// Same layout/formula as adder_size(): multiplicand/multiplier on the left edge,
+// carry-in/carry-out at the bottom/top edges.
+pub const fn multiplier_size() -> Vec2 {
+    adder_size()
+}
+
+// Same layout/formula as adder_size(): dividend/divisor on the left edge,
+// carry-in/remainder at the bottom/top edges.
+pub const fn divider_size() -> Vec2 {
+    adder_size()
+}
+
 // Height scales with the arm count on the left edge, same formula as mux/demux's
 // branches - the bottom/top pins (enable_in/enable_out) sit at the y=0/y=1 corners
 // and don't consume extra vertical space of their own.
@@ -465,6 +477,122 @@ pub fn subtractor_shape() -> ComponentShape {
         ComponentLabel {
             text: "BO",
             pos: vec2(0.5, bo_y),
+            ..Default::default()
+        },
+    ];
+
+    ComponentShape {
+        size: vec2(COMP_WIDTH, h),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors,
+        extra_strokes: vec![],
+        output_bubbles: vec![false, false],
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// Pin layout matches Component::multiplier's fixed order: input[0]/[1] = multiplicand/
+// multiplier (left edge), input[2] = carry-in (bottom edge); output[0] = product
+// (right edge), output[1] = carry-out - the top half of the product (top edge). Same
+// corner placement rationale as adder_shape()'s carry-in/carry-out.
+pub fn multiplier_shape() -> ComponentShape {
+    let h = multiplier_size().y;
+
+    let carry_in_anchor = PinAnchor::bottom_mid(0.5, 1.0);
+    let input_anchors = vec![
+        PinAnchor::left(spaced(0, 2)),
+        PinAnchor::left(spaced(1, 2)),
+        carry_in_anchor,
+    ];
+
+    let carry_out_anchor = PinAnchor {
+        norm_pos: vec2(0.5, 0.0),
+        wire_dir: vec2(0.0, -1.0),
+        pixel_offset: 0.0,
+    };
+    let output_anchors = vec![PinAnchor::right(0.5), carry_out_anchor];
+
+    // CIN/CO sit a fixed pixel distance in from the bottom/top edges, next to
+    // their pins; "X" sits just inside the right edge, next to the product pin.
+    const EDGE_LABEL_INSET_PX: f32 = 6.0;
+    let cin_y = 1.0 - EDGE_LABEL_INSET_PX / h;
+    let co_y = EDGE_LABEL_INSET_PX / h;
+
+    let labels = vec![
+        ComponentLabel {
+            text: "X",
+            pos: vec2(0.72, 0.5),
+            font_size: 12.0,
+        },
+        ComponentLabel {
+            text: "CIN",
+            pos: vec2(0.5, cin_y),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "CO",
+            pos: vec2(0.5, co_y),
+            ..Default::default()
+        },
+    ];
+
+    ComponentShape {
+        size: vec2(COMP_WIDTH, h),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors,
+        extra_strokes: vec![],
+        output_bubbles: vec![false, false],
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// Pin layout matches Component::divider's fixed order: input[0]/[1] = dividend/
+// divisor (left edge), input[2] = carry-in - the upper half of the dividend (bottom
+// edge); output[0] = quotient (right edge), output[1] = remainder (top edge). Same
+// corner placement rationale as adder_shape()'s carry-in/carry-out.
+pub fn divider_shape() -> ComponentShape {
+    let h = divider_size().y;
+
+    let carry_in_anchor = PinAnchor::bottom_mid(0.5, 1.0);
+    let input_anchors = vec![
+        PinAnchor::left(spaced(0, 2)),
+        PinAnchor::left(spaced(1, 2)),
+        carry_in_anchor,
+    ];
+
+    let remainder_anchor = PinAnchor {
+        norm_pos: vec2(0.5, 0.0),
+        wire_dir: vec2(0.0, -1.0),
+        pixel_offset: 0.0,
+    };
+    let output_anchors = vec![PinAnchor::right(0.5), remainder_anchor];
+
+    // UP/REM sit a fixed pixel distance in from the bottom/top edges, next to
+    // their pins; "÷" sits just inside the right edge, next to the quotient pin.
+    const EDGE_LABEL_INSET_PX: f32 = 6.0;
+    let up_y = 1.0 - EDGE_LABEL_INSET_PX / h;
+    let rem_y = EDGE_LABEL_INSET_PX / h;
+
+    let labels = vec![
+        ComponentLabel {
+            text: "÷",
+            pos: vec2(0.72, 0.5),
+            font_size: 12.0,
+        },
+        ComponentLabel {
+            text: "UP",
+            pos: vec2(0.5, up_y),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "REM",
+            pos: vec2(0.5, rem_y),
             ..Default::default()
         },
     ];
