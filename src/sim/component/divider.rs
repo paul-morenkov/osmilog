@@ -60,8 +60,8 @@ impl CombLogic for Divider {
                 } else {
                     dividend as u64
                 };
-                let quotient = (full_dividend / divisor & Value::mask(width) as u64) as u32;
-                let remainder = (full_dividend % divisor & Value::mask(width) as u64) as u32;
+                let quotient = ((full_dividend / divisor) & Value::mask(width) as u64) as u32;
+                let remainder = ((full_dividend % divisor) & Value::mask(width) as u64) as u32;
                 vec![Value::new(quotient, width), Value::new(remainder, width)]
             }
             _ => vec![Value::Floating, Value::Floating],
