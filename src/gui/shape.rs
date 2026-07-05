@@ -10,41 +10,47 @@ pub enum ShapeCmd {
     CubicTo(Vec2, Vec2, Vec2),
 }
 
+/// A pin's location, expressed as an integer grid-cell offset from the
+/// component's top-left corner (which is itself always grid-aligned). Because
+/// `cell` is whole grid cells, every pin lands exactly on a grid intersection
+/// by construction - the invariant the wire-routing rework relies on. The old
+/// `norm_pos * size` scheme is gone: pins no longer depend on the (arbitrary)
+/// pixel size, only on integer cell coordinates.
 #[derive(Clone)]
 pub struct PinAnchor {
-    pub norm_pos: Vec2,
+    /// Grid-cell offset from the component's top-left (in cells, not pixels).
+    pub cell: Vec2,
+    /// Unit direction the wire exits the pin (away from the component body).
     pub wire_dir: Vec2,
-    pub pixel_offset: f32,
 }
 
 impl PinAnchor {
-    pub fn left(y: f32) -> Self {
+    fn at(col: f32, row: f32, wire_dir: Vec2) -> Self {
         Self {
-            norm_pos: vec2(0.0, y),
-            wire_dir: vec2(-1.0, 0.0),
-            pixel_offset: 0.0,
+            cell: vec2(col, row),
+            wire_dir,
         }
     }
-    pub fn right(y: f32) -> Self {
-        Self {
-            norm_pos: vec2(1.0, y),
-            wire_dir: vec2(1.0, 0.0),
-            pixel_offset: 0.0,
-        }
+    /// Pin on the left edge (col 0) at the given grid row.
+    pub fn left(row: f32) -> Self {
+        Self::at(0.0, row, vec2(-1.0, 0.0))
     }
-    pub fn right_bubble(y: f32) -> Self {
-        Self {
-            norm_pos: vec2(1.0, y),
-            wire_dir: vec2(1.0, 0.0),
-            pixel_offset: BUBBLE_R * 2.0,
-        }
+    /// Pin on the right edge (col = body width in cells) at the given grid row.
+    pub fn right(w_cells: f32, row: f32) -> Self {
+        Self::at(w_cells, row, vec2(1.0, 0.0))
     }
-    pub fn bottom_mid(x: f32, y: f32) -> Self {
-        Self {
-            norm_pos: vec2(x, y),
-            wire_dir: vec2(0.0, 1.0),
-            pixel_offset: 0.0,
-        }
+    /// Bubble output pin: one cell beyond the right edge, so the inversion
+    /// bubble drawn in the gap doesn't push the pin off-grid.
+    pub fn right_bubble(w_cells: f32, row: f32) -> Self {
+        Self::at(w_cells + 1.0, row, vec2(1.0, 0.0))
+    }
+    /// Pin on the bottom edge (row = body height in cells) at the given grid col.
+    pub fn bottom(col: f32, h_cells: f32) -> Self {
+        Self::at(col, h_cells, vec2(0.0, 1.0))
+    }
+    /// Pin on the top edge (row 0) at the given grid col.
+    pub fn top(col: f32) -> Self {
+        Self::at(col, 0.0, vec2(0.0, -1.0))
     }
 }
 

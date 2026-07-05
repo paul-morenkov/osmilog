@@ -99,6 +99,7 @@ impl ComponentDef {
     // every frame for hit-testing/selection.
     pub fn size(&self) -> Vec2 {
         match self {
+            // 1 cell wide x 2 cells tall, so the single side-pin centres on grid row 1.
             Self::Input(_) | Self::Output => egui::vec2(COMP_MIN_WIDTH, COMP_MIN_HEIGHT),
             Self::Gate(g) => gate_size(g.op, g.n_inputs),
             Self::Mux(m) => mux_size(m.sel_width),
@@ -169,12 +170,15 @@ impl ComponentDef {
         match self {
             Self::Input(_) => {
                 let h = COMP_MIN_HEIGHT;
+                // 1 cell wide (right edge at col 1), pin centred on grid row 1.
+                let w_cells = COMP_MIN_WIDTH / GRID_SIZE;
+                let center_row = h / GRID_SIZE / 2.0;
                 ComponentShape {
                     size: egui::vec2(COMP_MIN_WIDTH, h),
                     outline: rect_outline(),
                     fill_outline: None,
                     input_anchors: vec![],
-                    output_anchors: vec![PinAnchor::right(0.5)],
+                    output_anchors: vec![PinAnchor::right(w_cells, center_row)],
                     extra_strokes: vec![],
                     output_bubbles: vec![false],
                     labels: vec![],
@@ -183,11 +187,12 @@ impl ComponentDef {
             }
             Self::Output => {
                 let h = COMP_MIN_HEIGHT;
+                let center_row = h / GRID_SIZE / 2.0;
                 ComponentShape {
                     size: egui::vec2(COMP_MIN_WIDTH, h),
                     outline: rect_outline(),
                     fill_outline: None,
-                    input_anchors: vec![PinAnchor::left(0.5)],
+                    input_anchors: vec![PinAnchor::left(center_row)],
                     output_anchors: vec![],
                     extra_strokes: vec![],
                     output_bubbles: vec![],
