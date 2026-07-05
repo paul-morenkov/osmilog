@@ -163,6 +163,15 @@ pub const fn divider_size() -> Vec2 {
     adder_size()
 }
 
+// Height scales off the busier side - the 3 comparison outputs on the right,
+// same formula as a 3-input gate - rather than the 2 operand inputs on the left.
+pub const fn comparator_size() -> Vec2 {
+    vec2(
+        COMP_WIDTH,
+        ((3 + 1) as f32 * COMP_HEIGHT_PER_PIN).max(COMP_MIN_HEIGHT),
+    )
+}
+
 // Height scales with the arm count on the left edge, same formula as mux/demux's
 // branches - the bottom/top pins (enable_in/enable_out) sit at the y=0/y=1 corners
 // and don't consume extra vertical space of their own.
@@ -605,6 +614,48 @@ pub fn divider_shape() -> ComponentShape {
         output_anchors,
         extra_strokes: vec![],
         output_bubbles: vec![false, false],
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// Pin layout matches Component::comparator's fixed order: input[0]/[1] = the two
+// compared operands (left edge); output[0] = greater-than, output[1] = equal,
+// output[2] = less-than (right edge, evenly spaced, each labeled next to its pin).
+pub fn comparator_shape() -> ComponentShape {
+    let h = comparator_size().y;
+
+    let input_anchors = vec![PinAnchor::left(spaced(0, 2)), PinAnchor::left(spaced(1, 2))];
+
+    let out_y = |i: usize| spaced(i, 3);
+    let output_anchors = (0..3).map(|i| PinAnchor::right(out_y(i))).collect();
+
+    let labels = vec![
+        ComponentLabel {
+            text: ">",
+            pos: vec2(0.72, out_y(0)),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "=",
+            pos: vec2(0.72, out_y(1)),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "<",
+            pos: vec2(0.72, out_y(2)),
+            ..Default::default()
+        },
+    ];
+
+    ComponentShape {
+        size: vec2(COMP_WIDTH, h),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors,
+        extra_strokes: vec![],
+        output_bubbles: vec![false, false, false],
         labels,
         dynamic_label_pos: Vec2::ZERO,
     }
