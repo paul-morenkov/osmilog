@@ -3,8 +3,8 @@ use egui::Vec2;
 use crate::gui::geometry::*;
 use crate::gui::shape::{ComponentShape, PinAnchor};
 use crate::sim::component::{
-    Adder, CombLogic, CompKey, Component, Demux, Divider, Encoder, FanDirection, Gate, GateOp,
-    Input, Multiplier, Mux, Reg, Subtractor,
+    Adder, CombLogic, CompKey, Comparator, Component, Demux, Divider, Encoder, FanDirection, Gate,
+    GateOp, Input, Multiplier, Mux, Reg, Subtractor,
 };
 
 // ── PlacedComponent ───────────────────────────────────────────────────────────
@@ -30,6 +30,7 @@ pub enum ComponentDef {
     Subtractor(Subtractor),
     Multiplier(Multiplier),
     Divider(Divider),
+    Comparator(Comparator),
     // Kept as its own lightweight, GUI-only shape rather than wrapping the sim's Splitter
     // struct (method 2 elsewhere in this enum): the sim struct bundles raw params together
     // with a precomputed routing table cached for evaluate() performance, which the GUI has
@@ -55,6 +56,7 @@ impl ComponentDef {
             Self::Subtractor(s) => s.n_inputs(),
             Self::Multiplier(m) => m.n_inputs(),
             Self::Divider(d) => d.n_inputs(),
+            Self::Comparator(c) => c.n_inputs(),
             Self::Splitter {
                 arm_bits,
                 direction,
@@ -79,6 +81,7 @@ impl ComponentDef {
             Self::Subtractor(s) => s.n_outputs(),
             Self::Multiplier(m) => m.n_outputs(),
             Self::Divider(d) => d.n_outputs(),
+            Self::Comparator(c) => c.n_outputs(),
             Self::Splitter {
                 arm_bits,
                 direction,
@@ -106,6 +109,7 @@ impl ComponentDef {
             Self::Subtractor(_) => subtractor_size(),
             Self::Multiplier(_) => multiplier_size(),
             Self::Divider(_) => divider_size(),
+            Self::Comparator(_) => comparator_size(),
             Self::Splitter { arm_bits, .. } => splitter_size(arm_bits.len() as u8),
         }
     }
@@ -131,6 +135,7 @@ impl ComponentDef {
             Self::Subtractor(_) => "SUB",
             Self::Multiplier(_) => "MUL",
             Self::Divider(_) => "DIV",
+            Self::Comparator(_) => "CMP",
             Self::Splitter { direction, .. } => match direction {
                 FanDirection::Right => "SPLIT",
                 FanDirection::Left => "COMBINE",
@@ -151,6 +156,7 @@ impl ComponentDef {
             Self::Subtractor(s) => Component::subtractor(s.data_width),
             Self::Multiplier(m) => Component::multiplier(m.data_width),
             Self::Divider(d) => Component::divider(d.data_width),
+            Self::Comparator(c) => Component::comparator(c.data_width),
             Self::Splitter {
                 arm_bits,
                 direction,
@@ -198,6 +204,7 @@ impl ComponentDef {
             Self::Subtractor(_) => subtractor_shape(),
             Self::Multiplier(_) => multiplier_shape(),
             Self::Divider(_) => divider_shape(),
+            Self::Comparator(_) => comparator_shape(),
             Self::Splitter {
                 arm_bits,
                 direction,

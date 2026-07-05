@@ -14,8 +14,8 @@ use crate::io::{
 };
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::component::{
-    Adder, CompKey, Demux, Divider, Encoder, FanDirection, Gate, GateOp, InIdx, Input, Multiplier,
-    Mux, OutIdx, PinId, Reg, Subtractor,
+    Adder, CompKey, Comparator, Demux, Divider, Encoder, FanDirection, Gate, GateOp, InIdx, Input,
+    Multiplier, Mux, OutIdx, PinId, Reg, Subtractor,
 };
 use crate::sim::value::Value;
 
@@ -612,6 +612,21 @@ impl OsmilogApp {
                     self.reconfigure_component(key, ComponentDef::Divider(Divider { data_width }));
                 }
             }
+            ComponentDef::Comparator(Comparator { mut data_width }) => {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Data width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                        .changed();
+                });
+                if changed {
+                    self.reconfigure_component(
+                        key,
+                        ComponentDef::Comparator(Comparator { data_width }),
+                    );
+                }
+            }
             ComponentDef::Splitter {
                 mut width,
                 mut arm_bits,
@@ -989,6 +1004,12 @@ impl eframe::App for OsmilogApp {
                         if ui.button("Divider").clicked() {
                             self.mode = InteractionMode::Placing {
                                 def: ComponentDef::Divider(Divider { data_width: 1 }),
+                            };
+                            ui.close();
+                        }
+                        if ui.button("Comparator").clicked() {
+                            self.mode = InteractionMode::Placing {
+                                def: ComponentDef::Comparator(Comparator { data_width: 1 }),
                             };
                             ui.close();
                         }

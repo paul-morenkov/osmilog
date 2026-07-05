@@ -3,6 +3,7 @@ use crate::sim::value::Value;
 use slotmap::{new_key_type, SlotMap};
 
 mod adder;
+mod comparator;
 mod demux;
 mod divider;
 mod encoder;
@@ -15,6 +16,7 @@ mod splitter;
 mod subtractor;
 
 pub use adder::Adder;
+pub use comparator::Comparator;
 pub use demux::Demux;
 pub use divider::Divider;
 pub use encoder::Encoder;
@@ -111,6 +113,10 @@ impl Component {
 
     pub fn divider(data_width: u8) -> Self {
         Self::from_comb(LogicComb::Divider(Divider { data_width }))
+    }
+
+    pub fn comparator(data_width: u8) -> Self {
+        Self::from_comb(LogicComb::Comparator(Comparator { data_width }))
     }
 
     // Reads the current Value of every input pin from net state, without mutating
@@ -268,6 +274,7 @@ pub enum LogicComb {
     Subtractor(Subtractor),
     Multiplier(Multiplier),
     Divider(Divider),
+    Comparator(Comparator),
 }
 
 impl LogicComb {
@@ -284,6 +291,7 @@ impl LogicComb {
             Self::Subtractor(s) => s.n_inputs(),
             Self::Multiplier(m) => m.n_inputs(),
             Self::Divider(d) => d.n_inputs(),
+            Self::Comparator(c) => c.n_inputs(),
         }
     }
 
@@ -300,6 +308,7 @@ impl LogicComb {
             Self::Subtractor(s) => s.n_outputs(),
             Self::Multiplier(m) => m.n_outputs(),
             Self::Divider(d) => d.n_outputs(),
+            Self::Comparator(c) => c.n_outputs(),
         }
     }
 
@@ -316,6 +325,7 @@ impl LogicComb {
             Self::Subtractor(s) => s.evaluate(inputs),
             Self::Multiplier(m) => m.evaluate(inputs),
             Self::Divider(d) => d.evaluate(inputs),
+            Self::Comparator(c) => c.evaluate(inputs),
         }
     }
 
@@ -332,6 +342,7 @@ impl LogicComb {
             Self::Subtractor(s) => s.input_width(i),
             Self::Multiplier(m) => m.input_width(i),
             Self::Divider(d) => d.input_width(i),
+            Self::Comparator(c) => c.input_width(i),
         }
     }
 
@@ -348,6 +359,7 @@ impl LogicComb {
             Self::Subtractor(s) => s.output_width(i),
             Self::Multiplier(m) => m.output_width(i),
             Self::Divider(d) => d.output_width(i),
+            Self::Comparator(c) => c.output_width(i),
         }
     }
 }
