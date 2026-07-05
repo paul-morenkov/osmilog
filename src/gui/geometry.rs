@@ -7,10 +7,10 @@ use crate::sim::component::{FanDirection, GateOp};
 
 pub const GRID_SIZE: f32 = 10.0;
 pub const COMP_MIN_WIDTH: f32 = 20.0; // Input/Output body width (1 cell)
-pub const COMP_WIDTH: f32 = 40.0; // standard body width (2 cells)
+pub const COMP_WIDTH: f32 = 30.0; // standard body width (2 cells)
                                   // Floor height for a single-pin edge: 2 grid cells, so the lone pin centres on
                                   // grid row 1. Also the box height for Input/Output/Tunnel.
-pub const COMP_MIN_HEIGHT: f32 = 40.0;
+pub const COMP_MIN_HEIGHT: f32 = 20.0;
 pub const LABEL_FONT_SIZE: f32 = 8.0;
 
 // Body widths expressed in whole grid cells - used to place right-edge pins
