@@ -1,7 +1,7 @@
 use egui::Vec2;
 
 use crate::gui::geometry::*;
-use crate::gui::shape::{ComponentShape, PinAnchor};
+use crate::gui::shape::ComponentShape;
 use crate::sim::component::{
     Adder, CombLogic, CompKey, Comparator, Component, Demux, Divider, Encoder, FanDirection, Gate,
     GateOp, Input, Multiplier, Mux, Reg, Subtractor,
@@ -99,7 +99,7 @@ impl ComponentDef {
     // every frame for hit-testing/selection.
     pub fn size(&self) -> Vec2 {
         match self {
-            Self::Input(_) | Self::Output => egui::vec2(COMP_MIN_WIDTH, COMP_MIN_HEIGHT),
+            Self::Input(_) | Self::Output => io_size(),
             Self::Gate(g) => gate_size(g.op, g.n_inputs),
             Self::Mux(m) => mux_size(m.sel_width),
             Self::Demux(d) => demux_size(d.sel_width),
@@ -167,34 +167,8 @@ impl ComponentDef {
 
     pub fn shape(&self) -> ComponentShape {
         match self {
-            Self::Input(_) => {
-                let h = COMP_MIN_HEIGHT;
-                ComponentShape {
-                    size: egui::vec2(COMP_MIN_WIDTH, h),
-                    outline: rect_outline(),
-                    fill_outline: None,
-                    input_anchors: vec![],
-                    output_anchors: vec![PinAnchor::right(0.5)],
-                    extra_strokes: vec![],
-                    output_bubbles: vec![false],
-                    labels: vec![],
-                    dynamic_label_pos: Vec2::ZERO,
-                }
-            }
-            Self::Output => {
-                let h = COMP_MIN_HEIGHT;
-                ComponentShape {
-                    size: egui::vec2(COMP_MIN_WIDTH, h),
-                    outline: rect_outline(),
-                    fill_outline: None,
-                    input_anchors: vec![PinAnchor::left(0.5)],
-                    output_anchors: vec![],
-                    extra_strokes: vec![],
-                    output_bubbles: vec![],
-                    labels: vec![],
-                    dynamic_label_pos: Vec2::ZERO,
-                }
-            }
+            Self::Input(_) => input_shape(),
+            Self::Output => output_shape(),
             Self::Gate(g) => gate_shape(g.op, g.n_inputs),
             Self::Mux(m) => mux_shape(m.sel_width),
             Self::Demux(d) => demux_shape(d.sel_width),

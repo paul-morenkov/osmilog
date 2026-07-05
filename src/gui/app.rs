@@ -1410,15 +1410,13 @@ fn comp_pin_pos(shape: &ComponentShape, grid_pos: [i32; 2], pan: Vec2, pin: PinI
         grid_pos[0] as f32 * GRID_SIZE + pan.x,
         grid_pos[1] as f32 * GRID_SIZE + pan.y,
     );
-    let rect = Rect::from_min_size(tl, shape.size);
     let anchor = match pin {
         PinId::In(InIdx(i)) => &shape.input_anchors[i as usize],
         PinId::Out(OutIdx(i)) => &shape.output_anchors[i as usize],
     };
-    egui::pos2(
-        rect.left() + anchor.norm_pos.x * rect.width(),
-        rect.top() + anchor.norm_pos.y * rect.height(),
-    ) + anchor.wire_dir * anchor.pixel_offset
+    // Anchors are whole grid cells from the top-left (itself grid-aligned), so
+    // every pin lands exactly on a grid intersection.
+    tl + anchor.cell * GRID_SIZE
 }
 
 fn tunnel_bounding_rect(pt: &PlacedTunnel, pan: Vec2) -> Rect {
@@ -1436,15 +1434,11 @@ fn tunnel_pin_pos(pt: &PlacedTunnel, pan: Vec2) -> Pos2 {
         pt.grid_pos[0] as f32 * GRID_SIZE + pan.x,
         pt.grid_pos[1] as f32 * GRID_SIZE + pan.y,
     );
-    let rect = Rect::from_min_size(tl, shape.size);
     let anchor = match pt.role {
         TunnelRole::Feed => &shape.output_anchors[0],
         TunnelRole::Pull => &shape.input_anchors[0],
     };
-    egui::pos2(
-        rect.left() + anchor.norm_pos.x * rect.width(),
-        rect.top() + anchor.norm_pos.y * rect.height(),
-    ) + anchor.wire_dir * anchor.pixel_offset
+    tl + anchor.cell * GRID_SIZE
 }
 
 fn pin_at_pos<'a>(
@@ -1588,11 +1582,11 @@ fn draw_component(
     for (i, &has_bubble) in shape.output_bubbles.iter().enumerate() {
         if has_bubble {
             let anchor = &shape.output_anchors[i];
-            let boundary = egui::pos2(
-                rect.left() + anchor.norm_pos.x * rect.width(),
-                rect.top() + anchor.norm_pos.y * rect.height(),
-            );
-            let center = boundary + anchor.wire_dir * BUBBLE_R;
+            // The pin sits one cell beyond the body edge; the bubble is drawn in
+            // the gap, just outside the edge (one cell back from the pin).
+            let pin = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::output(i as u8));
+            let edge = pin - anchor.wire_dir * GRID_SIZE;
+            let center = edge + anchor.wire_dir * BUBBLE_R;
             painter.circle_filled(center, BUBBLE_R, fill);
             painter.circle_stroke(center, BUBBLE_R, outline_stroke);
         }
