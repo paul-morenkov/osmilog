@@ -39,9 +39,11 @@ impl CombLogic for Multiplier {
             inputs[Self::MULTIPLIER_PIN],
             carry_in,
         ) {
-            (Value::Fixed { bits: a, width: aw }, Value::Fixed { bits: b, width: bw }, Some(cin))
-                if aw == width && bw == width =>
-            {
+            (
+                Value::Fixed { bits: a, width: aw },
+                Value::Fixed { bits: b, width: bw },
+                Some(cin),
+            ) if aw == width && bw == width => {
                 // Widen to u64: the product of two `width`-bit values plus a
                 // `width`-bit carry-in always fits within 2*width <= 64 bits.
                 let full = a as u64 * b as u64 + cin;
