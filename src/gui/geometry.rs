@@ -637,7 +637,7 @@ fn op2_shape(
     ];
 
     ComponentShape {
-        size: vec2(px(MUX_W), h),
+        size: vec2(px(ARITH_W), h),
         outline: rect_outline(),
         fill_outline: None,
         input_anchors,
