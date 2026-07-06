@@ -23,7 +23,7 @@ use egui::{Pos2, Vec2};
 use slotmap::{new_key_type, SlotMap};
 
 use crate::gui::app::{PlacedCompKey, PlacedTunnelKey};
-use crate::gui::geometry::{snap_to_grid, GRID_SIZE};
+use crate::gui::geometry::{snap_to_grid, GridPos, GRID_SIZE};
 use crate::sim::component::PinId;
 
 new_key_type! {
@@ -47,7 +47,7 @@ pub enum NodeAttach {
 #[derive(Clone, Copy, Debug)]
 pub struct WireNode {
     /// Grid coordinates (same convention as `PlacedComponent::grid_pos`).
-    pub pos: [i32; 2],
+    pub pos: GridPos,
     pub attach: NodeAttach,
 }
 
@@ -81,14 +81,14 @@ impl Wiring {
 
     // ── Geometry helpers ────────────────────────────────────────────────────
 
-    fn screen(gp: [i32; 2], pan: Vec2) -> Pos2 {
+    fn to_screen(gp: GridPos, pan: Vec2) -> Pos2 {
         egui::pos2(
-            gp[0] as f32 * GRID_SIZE + pan.x,
-            gp[1] as f32 * GRID_SIZE + pan.y,
+            gp.x as f32 * GRID_SIZE + pan.x,
+            gp.y as f32 * GRID_SIZE + pan.y,
         )
     }
 
-    fn node_at_grid(&self, gp: [i32; 2]) -> Option<WireNodeKey> {
+    fn node_at_grid(&self, gp: GridPos) -> Option<WireNodeKey> {
         self.nodes.iter().find(|(_, n)| n.pos == gp).map(|(k, _)| k)
     }
 
@@ -104,16 +104,16 @@ impl Wiring {
     // The segment (if any) that gp lies strictly inside: colinear, axis-aligned,
     // and between (not on) the endpoints. Splitting here is what turns a
     // mid-wire tap into a real junction.
-    fn segment_through(&self, gp: [i32; 2]) -> Option<WireSegKey> {
-        self.segments.iter().find_map(|(k, s)| {
-            let a = self.nodes[s.a].pos;
-            let b = self.nodes[s.b].pos;
-            let on = if a[0] == b[0] && gp[0] == a[0] {
-                let (lo, hi) = (a[1].min(b[1]), a[1].max(b[1]));
-                gp[1] > lo && gp[1] < hi
-            } else if a[1] == b[1] && gp[1] == a[1] {
-                let (lo, hi) = (a[0].min(b[0]), a[0].max(b[0]));
-                gp[0] > lo && gp[0] < hi
+    fn segment_through(&self, gp: GridPos) -> Option<WireSegKey> {
+        self.segments.iter().find_map(|(k, seg)| {
+            let a = self.nodes[seg.a].pos;
+            let b = self.nodes[seg.b].pos;
+            let on = if a.x == b.x && gp.x == a.x {
+                let (lo, hi) = (a.y.min(b.y), a.y.max(b.y));
+                gp.y > lo && gp.y < hi
+            } else if a.y == b.y && gp.y == a.y {
+                let (lo, hi) = (a.x.min(b.x), a.x.max(b.x));
+                gp.x > lo && gp.x < hi
             } else {
                 false
             };
@@ -139,7 +139,7 @@ impl Wiring {
     // Find-or-create the node at gp. If gp lands partway along an existing
     // segment, that segment is split so the returned node becomes a real
     // junction. New nodes start `Free`.
-    fn resolve_point(&mut self, gp: [i32; 2]) -> WireNodeKey {
+    fn resolve_point(&mut self, gp: GridPos) -> WireNodeKey {
         if let Some(k) = self.node_at_grid(gp) {
             return k;
         }
@@ -176,7 +176,7 @@ impl Wiring {
     /// pin or tunnel when the route lands on one; interior points stay `Free`.
     pub fn add_route(
         &mut self,
-        points: &[[i32; 2]],
+        points: &[GridPos],
         start_attach: NodeAttach,
         end_attach: NodeAttach,
     ) {
@@ -256,7 +256,7 @@ impl Wiring {
     pub fn sync_component_nodes(
         &mut self,
         pck: PlacedCompKey,
-        mut pin_grid: impl FnMut(PinId) -> [i32; 2],
+        mut pin_grid: impl FnMut(PinId) -> GridPos,
     ) {
         for n in self.nodes.values_mut() {
             if let NodeAttach::Pin(k, pin) = n.attach {
@@ -269,7 +269,7 @@ impl Wiring {
 
     /// Reposition every node bound to `ptk` to the tunnel's current pin grid
     /// position.
-    pub fn sync_tunnel_nodes(&mut self, ptk: PlacedTunnelKey, gp: [i32; 2]) {
+    pub fn sync_tunnel_nodes(&mut self, ptk: PlacedTunnelKey, gp: GridPos) {
         for n in self.nodes.values_mut() {
             if let NodeAttach::Tunnel(k) = n.attach {
                 if k == ptk {
@@ -351,19 +351,19 @@ impl Wiring {
     pub fn node_at_pos(&self, pos: Pos2, pan: Vec2) -> Option<WireNodeKey> {
         self.nodes
             .iter()
-            .find(|(_, n)| Self::screen(n.pos, pan).distance(pos) <= HIT_RADIUS)
+            .find(|(_, n)| Self::to_screen(n.pos, pan).distance(pos) <= HIT_RADIUS)
             .map(|(k, _)| k)
     }
 
     /// The segment nearest to `pos` (within the hit radius) and the on-grid
     /// point along it closest to `pos` - the point a branch would tap.
-    pub fn segment_at_pos(&self, pos: Pos2, pan: Vec2) -> Option<(WireSegKey, [i32; 2])> {
-        let mut best: Option<(WireSegKey, [i32; 2], f32)> = None;
+    pub fn segment_at_pos(&self, pos: Pos2, pan: Vec2) -> Option<(WireSegKey, GridPos)> {
+        let mut best: Option<(WireSegKey, GridPos, f32)> = None;
         for (k, s) in self.segments.iter() {
-            let a = Self::screen(self.nodes[s.a].pos, pan);
-            let b = Self::screen(self.nodes[s.b].pos, pan);
+            let a = Self::to_screen(self.nodes[s.a].pos, pan);
+            let b = Self::to_screen(self.nodes[s.b].pos, pan);
             let (dist, proj) = point_segment(pos, a, b);
-            if dist <= HIT_RADIUS && best.as_ref().map_or(true, |(_, _, d)| dist < *d) {
+            if dist <= HIT_RADIUS && best.as_ref().is_none_or(|(_, _, d)| dist < *d) {
                 let gp = snap_to_grid(proj, pan);
                 best = Some((k, gp, dist));
             }
@@ -399,7 +399,7 @@ mod tests {
         let mut w = Wiring::new();
         let c = comp_keys(2);
         w.add_route(
-            &[[0, 0], [10, 0]],
+            &[GridPos::new(0, 0), GridPos::new(10, 0)],
             NodeAttach::Pin(c[0], PinId::output(0)),
             NodeAttach::Pin(c[1], PinId::input(0)),
         );
@@ -414,13 +414,13 @@ mod tests {
         let c = comp_keys(3);
         // A horizontal wire between two pins.
         w.add_route(
-            &[[0, 0], [10, 0]],
+            &[GridPos::new(0, 0), GridPos::new(10, 0)],
             NodeAttach::Pin(c[0], PinId::output(0)),
             NodeAttach::Pin(c[1], PinId::input(0)),
         );
         // Branch straight down from the middle of that wire to a third pin.
         w.add_route(
-            &[[5, 0], [5, 5]],
+            &[GridPos::new(5, 0), GridPos::new(5, 5)],
             NodeAttach::Free,
             NodeAttach::Pin(c[2], PinId::input(0)),
         );
@@ -438,12 +438,12 @@ mod tests {
         let mut w = Wiring::new();
         let c = comp_keys(3);
         w.add_route(
-            &[[0, 0], [10, 0]],
+            &[GridPos::new(0, 0), GridPos::new(10, 0)],
             NodeAttach::Pin(c[0], PinId::output(0)),
             NodeAttach::Pin(c[1], PinId::input(0)),
         );
         w.add_route(
-            &[[5, 0], [5, 5]],
+            &[GridPos::new(5, 0), GridPos::new(5, 5)],
             NodeAttach::Free,
             NodeAttach::Pin(c[2], PinId::input(0)),
         );
@@ -451,7 +451,7 @@ mod tests {
         let branch = w
             .segments
             .iter()
-            .find(|(_, s)| w.nodes[s.a].pos[0] == w.nodes[s.b].pos[0])
+            .find(|(_, s)| w.nodes[s.a].pos.x == w.nodes[s.b].pos.x)
             .map(|(k, _)| k)
             .unwrap();
         w.delete_segment(branch);

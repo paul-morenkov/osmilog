@@ -4,7 +4,7 @@ use egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Sense, Stroke, Vec
 use slotmap::{new_key_type, SlotMap};
 use std::collections::HashMap;
 
-use crate::gui::geometry::{snap_to_grid, tunnel_shape, GRID_SIZE, LABEL_FONT_SIZE};
+use crate::gui::geometry::{snap_to_grid, tunnel_shape, GridPos, GRID_SIZE, LABEL_FONT_SIZE};
 use crate::gui::placed_component::{ComponentDef, PlacedComponent};
 use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
 use crate::gui::theme::Theme;
@@ -32,8 +32,7 @@ const GIT_SHA: &str = env!("OSMILOG_GIT_SHA");
 
 // ── PlacedTunnel ──────────────────────────────────────────────────────────────
 
-// Visual record for a Tunnel (net label / off-page connector). Deliberately
-// not a PlacedComponent/ComponentDef variant — Tunnel lives at the Circuit
+// Visual record for a Tunnel (net label / off-page connector). Tunnel lives at the Circuit
 // level as its own SlotMap, tied to a net directly rather than via Component
 // pins. `label` mirrors circuit::Tunnel.label directly (editing it both
 // updates the displayed text and calls circuit.rename_tunnel). Components,
@@ -44,7 +43,7 @@ pub struct PlacedTunnel {
     pub key: TunnelKey,
     pub label: String,
     pub role: TunnelRole,
-    pub grid_pos: [i32; 2],
+    pub grid_pos: GridPos,
 }
 
 // ── Selected ──────────────────────────────────────────────────────────────────
@@ -76,7 +75,7 @@ pub enum InteractionMode {
     // distinguishes a drag (finish on release) from a click-polyline (finish on
     // clicking a target, double-click, or Esc).
     WireDraw {
-        points: Vec<[i32; 2]>,
+        points: Vec<GridPos>,
         start_attach: NodeAttach,
         cursor: Pos2,
         dragging: bool,
@@ -84,7 +83,7 @@ pub enum InteractionMode {
     ComponentDrag {
         key: Selected,
         drag_origin: Pos2,
-        original_grid_pos: [i32; 2],
+        original_grid_pos: GridPos,
     },
 }
 
@@ -154,14 +153,14 @@ impl OsmilogApp {
         }
     }
 
-    fn place_component(&mut self, def: ComponentDef, grid_pos: [i32; 2]) -> PlacedCompKey {
+    fn place_component(&mut self, def: ComponentDef, grid_pos: GridPos) -> PlacedCompKey {
         let comp = def.make_component();
         let key = self.circuit.add_component(comp);
         let pc = PlacedComponent { key, def, grid_pos };
         self.components.insert(pc)
     }
 
-    fn place_tunnel(&mut self, role: TunnelRole, grid_pos: [i32; 2]) -> PlacedTunnelKey {
+    fn place_tunnel(&mut self, role: TunnelRole, grid_pos: GridPos) -> PlacedTunnelKey {
         let label = format!("Tunnel{}", self.tunnels.len());
         self.place_tunnel_labeled(label, role, grid_pos)
     }
@@ -173,7 +172,7 @@ impl OsmilogApp {
         &mut self,
         label: String,
         role: TunnelRole,
-        grid_pos: [i32; 2],
+        grid_pos: GridPos,
     ) -> PlacedTunnelKey {
         let key = self.circuit.add_tunnel(label.clone(), role);
         let pt = PlacedTunnel {
@@ -274,7 +273,7 @@ impl OsmilogApp {
     // whether it is a real terminal (pin/tunnel/wire) vs. empty space. Priority:
     // component pin (out, then in), tunnel pin, existing wire node, wire segment,
     // else the snapped cursor cell (empty space, not a terminal).
-    fn wire_target_at(&self, pos: Pos2, pan: Vec2) -> (NodeAttach, [i32; 2], bool) {
+    fn wire_target_at(&self, pos: Pos2, pan: Vec2) -> (NodeAttach, GridPos, bool) {
         if let Some((pck, pin)) = pin_at_pos(self.components.iter(), pan, pos, PinKind::Output) {
             let gp = pin_grid_pos(
                 &self.components[pck].def.shape(),
@@ -309,7 +308,7 @@ impl OsmilogApp {
 
     // A wire may only start on a real terminal (pin, tunnel, or existing wire),
     // not in empty space.
-    fn wire_start_at(&self, pos: Pos2, pan: Vec2) -> Option<(NodeAttach, [i32; 2])> {
+    fn wire_start_at(&self, pos: Pos2, pan: Vec2) -> Option<(NodeAttach, GridPos)> {
         let (attach, gp, terminal) = self.wire_target_at(pos, pan);
         terminal.then_some((attach, gp))
     }
@@ -1437,10 +1436,10 @@ impl eframe::App for OsmilogApp {
                     if let Some(pos) = pointer {
                         let delta_x = ((pos.x - drag_origin.x) / GRID_SIZE).round() as i32;
                         let delta_y = ((pos.y - drag_origin.y) / GRID_SIZE).round() as i32;
-                        let new_grid_pos = [
-                            original_grid_pos[0] + delta_x,
-                            original_grid_pos[1] + delta_y,
-                        ];
+                        let new_grid_pos = GridPos::new(
+                            original_grid_pos.x + delta_x,
+                            original_grid_pos.y + delta_y,
+                        );
                         // Moving a component/tunnel drags its wire-anchor nodes
                         // along; the rest of each attached segment stretches.
                         // Topology is unchanged, so no circuit rebuild is needed.
@@ -1470,55 +1469,55 @@ impl eframe::App for OsmilogApp {
 fn component_bounding_rect(pc: &PlacedComponent, pan: Vec2) -> Rect {
     let size = pc.def.size();
     let tl = egui::pos2(
-        pc.grid_pos[0] as f32 * GRID_SIZE + pan.x,
-        pc.grid_pos[1] as f32 * GRID_SIZE + pan.y,
+        pc.grid_pos.x as f32 * GRID_SIZE + pan.x,
+        pc.grid_pos.y as f32 * GRID_SIZE + pan.y,
     );
     Rect::from_min_size(tl, size)
 }
 
 // Grid coordinate of a pin: the component's grid_pos plus the anchor's whole-cell
 // offset. This is the wiring counterpart of comp_pin_pos (which returns pixels).
-fn pin_grid_pos(shape: &ComponentShape, grid_pos: [i32; 2], pin: PinId) -> [i32; 2] {
+fn pin_grid_pos(shape: &ComponentShape, grid_pos: GridPos, pin: PinId) -> GridPos {
     let anchor = match pin {
         PinId::In(InIdx(i)) => &shape.input_anchors[i as usize],
         PinId::Out(OutIdx(i)) => &shape.output_anchors[i as usize],
     };
-    [
-        grid_pos[0] + anchor.cell.x as i32,
-        grid_pos[1] + anchor.cell.y as i32,
-    ]
+    GridPos {
+        x: grid_pos.x + anchor.cell.x as i32,
+        y: grid_pos.y + anchor.cell.y as i32,
+    }
 }
 
 // Grid coordinate of a tunnel's single pin.
-fn tunnel_pin_grid(pt: &PlacedTunnel) -> [i32; 2] {
+fn tunnel_pin_grid(pt: &PlacedTunnel) -> GridPos {
     let shape = tunnel_shape(pt.role);
     let anchor = match pt.role {
         TunnelRole::Feed => &shape.output_anchors[0],
         TunnelRole::Pull => &shape.input_anchors[0],
     };
-    [
-        pt.grid_pos[0] + anchor.cell.x as i32,
-        pt.grid_pos[1] + anchor.cell.y as i32,
-    ]
+    GridPos::new(
+        pt.grid_pos.x + anchor.cell.x as i32,
+        pt.grid_pos.y + anchor.cell.y as i32,
+    )
 }
 
-fn grid_to_screen(gp: [i32; 2], pan: Vec2) -> Pos2 {
+fn grid_to_screen(gp: GridPos, pan: Vec2) -> Pos2 {
     egui::pos2(
-        gp[0] as f32 * GRID_SIZE + pan.x,
-        gp[1] as f32 * GRID_SIZE + pan.y,
+        gp.x as f32 * GRID_SIZE + pan.x,
+        gp.y as f32 * GRID_SIZE + pan.y,
     )
 }
 
 // A quick L-elbow (one horizontal then one vertical run) from `from` to `to`,
 // returning the intermediate corner (if any) and `to`, but not `from`. Both
 // endpoints are on-grid, so the corner is too.
-fn route_elbow(from: [i32; 2], to: [i32; 2]) -> Vec<[i32; 2]> {
+fn route_elbow(from: GridPos, to: GridPos) -> Vec<GridPos> {
     if from == to {
         vec![]
-    } else if from[0] == to[0] || from[1] == to[1] {
+    } else if from.x == to.x || from.y == to.y {
         vec![to] // already axis-aligned: a single straight run
     } else {
-        vec![[to[0], from[1]], to] // horizontal first, then vertical
+        vec![GridPos::new(to.x, from.y), to] // horizontal first, then vertical
     }
 }
 
@@ -1527,10 +1526,10 @@ fn route_elbow(from: [i32; 2], to: [i32; 2]) -> Vec<[i32; 2]> {
 // pin_at_pos) compute shape() once and reuse it, instead of each call
 // redundantly rebuilding the whole shape (outline/anchors/bubbles Vecs)
 // just to read one anchor.
-fn comp_pin_pos(shape: &ComponentShape, grid_pos: [i32; 2], pan: Vec2, pin: PinId) -> Pos2 {
+fn comp_pin_pos(shape: &ComponentShape, grid_pos: GridPos, pan: Vec2, pin: PinId) -> Pos2 {
     let tl = egui::pos2(
-        grid_pos[0] as f32 * GRID_SIZE + pan.x,
-        grid_pos[1] as f32 * GRID_SIZE + pan.y,
+        grid_pos.x as f32 * GRID_SIZE + pan.x,
+        grid_pos.y as f32 * GRID_SIZE + pan.y,
     );
     let anchor = match pin {
         PinId::In(InIdx(i)) => &shape.input_anchors[i as usize],
@@ -1544,8 +1543,8 @@ fn comp_pin_pos(shape: &ComponentShape, grid_pos: [i32; 2], pan: Vec2, pin: PinI
 fn tunnel_bounding_rect(pt: &PlacedTunnel, pan: Vec2) -> Rect {
     let size = tunnel_shape(pt.role).size;
     let tl = egui::pos2(
-        pt.grid_pos[0] as f32 * GRID_SIZE + pan.x,
-        pt.grid_pos[1] as f32 * GRID_SIZE + pan.y,
+        pt.grid_pos.x as f32 * GRID_SIZE + pan.x,
+        pt.grid_pos.y as f32 * GRID_SIZE + pan.y,
     );
     Rect::from_min_size(tl, size)
 }
@@ -1553,8 +1552,8 @@ fn tunnel_bounding_rect(pt: &PlacedTunnel, pan: Vec2) -> Rect {
 fn tunnel_pin_pos(pt: &PlacedTunnel, pan: Vec2) -> Pos2 {
     let shape = tunnel_shape(pt.role);
     let tl = egui::pos2(
-        pt.grid_pos[0] as f32 * GRID_SIZE + pan.x,
-        pt.grid_pos[1] as f32 * GRID_SIZE + pan.y,
+        pt.grid_pos.x as f32 * GRID_SIZE + pan.x,
+        pt.grid_pos.y as f32 * GRID_SIZE + pan.y,
     );
     let anchor = match pt.role {
         TunnelRole::Feed => &shape.output_anchors[0],
@@ -1803,11 +1802,11 @@ fn draw_tunnel(
     );
 }
 
-fn draw_ghost(painter: &Painter, def: &ComponentDef, grid_pos: [i32; 2], pan: Vec2, theme: Theme) {
+fn draw_ghost(painter: &Painter, def: &ComponentDef, grid_pos: GridPos, pan: Vec2, theme: Theme) {
     let shape = def.shape();
     let tl = egui::pos2(
-        grid_pos[0] as f32 * GRID_SIZE + pan.x,
-        grid_pos[1] as f32 * GRID_SIZE + pan.y,
+        grid_pos.x as f32 * GRID_SIZE + pan.x,
+        grid_pos.y as f32 * GRID_SIZE + pan.y,
     );
     let rect = Rect::from_min_size(tl, shape.size);
     let ghost_col = theme.ghost_preview;
@@ -1846,14 +1845,14 @@ fn draw_ghost(painter: &Painter, def: &ComponentDef, grid_pos: [i32; 2], pan: Ve
 fn draw_tunnel_ghost(
     painter: &Painter,
     role: TunnelRole,
-    grid_pos: [i32; 2],
+    grid_pos: GridPos,
     pan: Vec2,
     theme: Theme,
 ) {
     let shape = tunnel_shape(role);
     let tl = egui::pos2(
-        grid_pos[0] as f32 * GRID_SIZE + pan.x,
-        grid_pos[1] as f32 * GRID_SIZE + pan.y,
+        grid_pos.x as f32 * GRID_SIZE + pan.x,
+        grid_pos.y as f32 * GRID_SIZE + pan.y,
     );
     let rect = Rect::from_min_size(tl, shape.size);
     let ghost_col = theme.ghost_preview;
@@ -1890,7 +1889,7 @@ mod tests {
     use crate::sim::component::GateOp;
 
     fn place(app: &mut OsmilogApp, def: ComponentDef) -> PlacedCompKey {
-        app.place_component(def, [0, 0])
+        app.place_component(def, GridPos::new(0, 0))
     }
 
     // Insert a wire (one segment) between two component pins, positioned at each
@@ -1985,8 +1984,8 @@ mod tests {
         let mut app = OsmilogApp::empty();
         let inp = place(&mut app, ComponentDef::Input(Input { bits: 1, width: 1 }));
         let out = place(&mut app, ComponentDef::Output);
-        let feed = app.place_tunnel(TunnelRole::Feed, [0, 0]);
-        let pull = app.place_tunnel(TunnelRole::Pull, [1, 1]);
+        let feed = app.place_tunnel(TunnelRole::Feed, GridPos::new(0, 0));
+        let pull = app.place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
 
         // Tunnels connect to each other by matching label, not by wire -
         // give `pull` the same label as `feed` so they form one virtual net.
@@ -2026,11 +2025,11 @@ mod tests {
             version: CURRENT_VERSION,
             components: vec![ComponentEntry {
                 def: ComponentDef::Output,
-                grid_pos: [0, 0],
+                grid_pos: GridPos::ZERO,
             }],
             tunnels: vec![],
             nodes: vec![NodeEntry {
-                pos: [0, 0],
+                pos: GridPos::ZERO,
                 attach: NodeAttachEntry::Pin {
                     comp: 5,
                     is_input: true,
@@ -2116,7 +2115,7 @@ mod tests {
         // nodes and clears the selection.
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentDef::Input(Input { bits: 1, width: 1 }));
-        let t = app.place_tunnel(TunnelRole::Pull, [1, 1]);
+        let t = app.place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
         let t_key = app.tunnels[t].key;
         connect_pin_tunnel(&mut app, (a, PinId::output(0)), t);
         app.rebuild_circuit();

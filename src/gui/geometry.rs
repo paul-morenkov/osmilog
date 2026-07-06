@@ -1,5 +1,6 @@
 use egui::vec2;
 use egui::{Pos2, Vec2};
+use serde::{Deserialize, Serialize};
 
 use crate::gui::shape::{ComponentLabel, ComponentShape, PinAnchor, ShapeCmd};
 use crate::sim::circuit::TunnelRole;
@@ -56,6 +57,33 @@ const SPLITTER_BODY_X: (f32, f32) = (0.25, 0.60);
 
 // Tunnels have their own width to account for a potentially long label.
 const TUNNEL_W: u32 = 4;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(from = "[i32; 2]", into = "[i32; 2]")]
+pub struct GridPos {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl GridPos {
+    pub const ZERO: Self = Self { x: 0, y: 0 };
+
+    pub fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+}
+
+impl From<[i32; 2]> for GridPos {
+    fn from(p: [i32; 2]) -> Self {
+        Self { x: p[0], y: p[1] }
+    }
+}
+
+impl From<GridPos> for [i32; 2] {
+    fn from(p: GridPos) -> Self {
+        [p.x, p.y]
+    }
+}
 
 // ── Stack geometry (in cells) ─────────────────────────────────────────────────
 
@@ -132,11 +160,11 @@ const fn stack_h(k: usize) -> u32 {
     Pitch::Spread.height(k)
 }
 
-pub fn snap_to_grid(pos: Pos2, pan: Vec2) -> [i32; 2] {
-    [
+pub fn snap_to_grid(pos: Pos2, pan: Vec2) -> GridPos {
+    GridPos::new(
         ((pos.x - pan.x) / GRID_SIZE).round() as i32,
         ((pos.y - pan.y) / GRID_SIZE).round() as i32,
-    ]
+    )
 }
 
 pub fn rect_outline() -> Vec<ShapeCmd> {
@@ -609,7 +637,7 @@ fn op2_shape(
     ];
 
     ComponentShape {
-        size: vec2(px(MUX_W), h),
+        size: vec2(px(ARITH_W), h),
         outline: rect_outline(),
         fill_outline: None,
         input_anchors,

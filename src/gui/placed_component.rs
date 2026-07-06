@@ -12,7 +12,7 @@ use crate::sim::component::{
 pub struct PlacedComponent {
     pub key: CompKey,
     pub def: ComponentDef,
-    pub grid_pos: [i32; 2],
+    pub grid_pos: GridPos,
 }
 
 // ── ComponentDef ──────────────────────────────────────────────────────────────
