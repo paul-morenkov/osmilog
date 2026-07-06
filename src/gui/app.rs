@@ -8,8 +8,9 @@ use crate::gui::geometry::{snap_to_grid, tunnel_shape, GRID_SIZE, LABEL_FONT_SIZ
 use crate::gui::placed_component::{ComponentDef, PlacedComponent};
 use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
 use crate::gui::theme::Theme;
+use crate::gui::wiring::{NodeAttach, WireNode, WireNodeKey, WireSegKey, WireSegment, Wiring};
 use crate::io::{
-    CircuitFile, ComponentEntry, LoadError, TunnelEntry, TunnelWireEntry, WireEntry,
+    CircuitFile, ComponentEntry, LoadError, NodeAttachEntry, NodeEntry, SegEntry, TunnelEntry,
     CURRENT_VERSION,
 };
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
@@ -46,45 +47,16 @@ pub struct PlacedTunnel {
     pub grid_pos: [i32; 2],
 }
 
-// ── Wire ──────────────────────────────────────────────────────────────────────
+// ── Selected ──────────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
-pub struct Wire {
-    pub src_comp: CompKey,
-    pub src_pin: OutIdx,
-    pub dst_comp: CompKey,
-    pub dst_pin: InIdx,
-}
-
-// Records that a component pin is tied to a Tunnel. Unlike Wire, resolves
-// its net live via Component::net_of rather than caching a NetKey, since a
-// cached NetKey can go stale across a merge() (see draw loop for details).
-#[derive(Clone, Debug)]
-pub struct TunnelWire {
-    pub tunnel: TunnelKey,
-    pub comp: CompKey,
-    pub pin: PinId,
-}
-
-// ── Selected / DragSource ─────────────────────────────────────────────────────
-
-// A component and a tunnel are both selectable/draggable canvas entities;
-// using one enum (rather than parallel Option<CompKey>/Option<TunnelKey>
-// fields) avoids a "can both be Some, who wins" desync.
+// A component, a tunnel, and a wire segment are all selectable canvas entities;
+// using one enum (rather than parallel Option fields) avoids a "can two be Some,
+// who wins" desync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selected {
     Component(PlacedCompKey),
     Tunnel(PlacedTunnelKey),
-}
-
-// The origin of an in-progress wire drag: either a component's output pin
-// or a Feed tunnel's pin (Feed tunnels behave like Input for dragging
-// purposes - valid drag-start only; Pull tunnels behave like Output -
-// valid drop-target only, checked separately at drag_stopped()).
-#[derive(Debug, Clone, Copy)]
-pub enum DragSource {
-    Component(PlacedCompKey, OutIdx),
-    Tunnel(PlacedTunnelKey),
+    Wire(WireSegKey),
 }
 
 // ── InteractionMode ───────────────────────────────────────────────────────────
@@ -98,9 +70,16 @@ pub enum InteractionMode {
     PlacingTunnel {
         role: TunnelRole,
     },
-    WireDrag {
-        src: DragSource,
-        current_end: Pos2,
+    // Drawing a wire (Hybrid: drag = quick elbow, click = add a corner). `points`
+    // are the committed grid corners (points[0] is the anchor); `start_attach`
+    // binds the anchor to a pin/tunnel when the draw began on one; `dragging`
+    // distinguishes a drag (finish on release) from a click-polyline (finish on
+    // clicking a target, double-click, or Esc).
+    WireDraw {
+        points: Vec<[i32; 2]>,
+        start_attach: NodeAttach,
+        cursor: Pos2,
+        dragging: bool,
     },
     ComponentDrag {
         key: Selected,
@@ -127,8 +106,9 @@ pub struct OsmilogApp {
     pub circuit: Circuit,
     pub components: SlotMap<PlacedCompKey, PlacedComponent>,
     pub tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel>,
-    pub wires: Vec<Wire>,
-    pub tunnel_wires: Vec<TunnelWire>,
+    // GUI wiring: the source of truth for connectivity. After any edit the
+    // circuit's nets are rebuilt from this graph (see rebuild_circuit).
+    pub wiring: Wiring,
     pub mode: InteractionMode,
     pub pan: Vec2,
     pub selected: Option<Selected>,
@@ -153,8 +133,7 @@ impl OsmilogApp {
             circuit: Circuit::new(),
             components: SlotMap::default(),
             tunnels: SlotMap::default(),
-            wires: Vec::new(),
-            tunnel_wires: Vec::new(),
+            wiring: Wiring::new(),
             mode: InteractionMode::Idle,
             pan: Vec2::ZERO,
             selected: None,
@@ -206,21 +185,148 @@ impl OsmilogApp {
         self.tunnels.insert(pt)
     }
 
+    // Rebuilds every circuit net from the GUI wiring graph. clear_nets() drops
+    // all nets while keeping components/tunnels in place, then each connected
+    // wire group is replayed as circuit links: its component pins are linked
+    // together (fan-out and driver-conflict handling live in Circuit::link /
+    // resolve_net) and each tunnel in the group is attached to that net. A
+    // wire group with no component pin (tunnels-only, or purely dangling) has
+    // no net to attach to and is skipped. Called after any wiring edit.
+    fn rebuild_circuit(&mut self) {
+        self.circuit.clear_nets();
+        for group in self.wiring.groups() {
+            // Map GUI PlacedCompKeys to live circuit CompKeys; a stale key
+            // (component already gone) is dropped.
+            let pins: Vec<(CompKey, PinId)> = group
+                .pins
+                .iter()
+                .filter_map(|&(pck, pin)| self.components.get(pck).map(|pc| (pc.key, pin)))
+                .collect();
+            let Some(&(anchor_comp, anchor_pin)) = pins.first() else {
+                continue; // no component pin: nothing to drive a net
+            };
+            for &(comp, pin) in &pins[1..] {
+                self.circuit.link(anchor_comp, anchor_pin, comp, pin);
+            }
+            for &ptk in &group.tunnels {
+                if let Some(pt) = self.tunnels.get(ptk) {
+                    self.circuit.link_tunnel(pt.key, anchor_comp, anchor_pin);
+                }
+            }
+        }
+        let result = self.circuit.settle();
+        self.record_settle_result(result);
+    }
+
+    // Repositions the component's wire-anchor nodes to its current pin grid
+    // positions (after a move or reconfigure). Segments to them stretch.
+    fn sync_component_wire_nodes(&mut self, pck: PlacedCompKey) {
+        let Some(pc) = self.components.get(pck) else {
+            return;
+        };
+        let shape = pc.def.shape();
+        let grid_pos = pc.grid_pos;
+        self.wiring
+            .sync_component_nodes(pck, |pin| pin_grid_pos(&shape, grid_pos, pin));
+    }
+
+    fn sync_tunnel_wire_nodes(&mut self, ptk: PlacedTunnelKey) {
+        let Some(pt) = self.tunnels.get(ptk) else {
+            return;
+        };
+        self.wiring.sync_tunnel_nodes(ptk, tunnel_pin_grid(pt));
+    }
+
+    // The resolved circuit Value at each wire node, for colouring segments. All
+    // nodes in a connected group share one net, so we resolve the group's value
+    // from any pin/tunnel endpoint on it (Floating if it has none).
+    fn wire_node_values(&self) -> HashMap<WireNodeKey, Value> {
+        let mut out = HashMap::new();
+        for group in self.wiring.groups() {
+            let mut val = Value::Floating;
+            for &(pck, pin) in &group.pins {
+                if let Some(pc) = self.components.get(pck) {
+                    if let Some(nk) = self.circuit.components[pc.key].net_of(pin) {
+                        val = self.circuit.nets[nk].value;
+                        break;
+                    }
+                }
+            }
+            if val == Value::Floating {
+                for &ptk in &group.tunnels {
+                    if let Some(pt) = self.tunnels.get(ptk) {
+                        if let Some(nk) = self.circuit.tunnels.get(pt.key).and_then(|t| t.net) {
+                            val = self.circuit.nets[nk].value;
+                            break;
+                        }
+                    }
+                }
+            }
+            for nk in group.nodes {
+                out.insert(nk, val);
+            }
+        }
+        out
+    }
+
+    // Resolves what lies under a screen position for wiring purposes: the
+    // attachment to bind (pin/tunnel/free), the on-grid point to route to, and
+    // whether it is a real terminal (pin/tunnel/wire) vs. empty space. Priority:
+    // component pin (out, then in), tunnel pin, existing wire node, wire segment,
+    // else the snapped cursor cell (empty space, not a terminal).
+    fn wire_target_at(&self, pos: Pos2, pan: Vec2) -> (NodeAttach, [i32; 2], bool) {
+        if let Some((pck, pin)) = pin_at_pos(self.components.iter(), pan, pos, PinKind::Output) {
+            let gp = pin_grid_pos(
+                &self.components[pck].def.shape(),
+                self.components[pck].grid_pos,
+                pin,
+            );
+            return (NodeAttach::Pin(pck, pin), gp, true);
+        }
+        if let Some((pck, pin)) = pin_at_pos(self.components.iter(), pan, pos, PinKind::Input) {
+            let gp = pin_grid_pos(
+                &self.components[pck].def.shape(),
+                self.components[pck].grid_pos,
+                pin,
+            );
+            return (NodeAttach::Pin(pck, pin), gp, true);
+        }
+        if let Some(ptk) = tunnel_pin_at_pos(self.tunnels.iter(), pan, pos) {
+            return (
+                NodeAttach::Tunnel(ptk),
+                tunnel_pin_grid(&self.tunnels[ptk]),
+                true,
+            );
+        }
+        if let Some(nk) = self.wiring.node_at_pos(pos, pan) {
+            return (NodeAttach::Free, self.wiring.nodes[nk].pos, true);
+        }
+        if let Some((_, gp)) = self.wiring.segment_at_pos(pos, pan) {
+            return (NodeAttach::Free, gp, true);
+        }
+        (NodeAttach::Free, snap_to_grid(pos, pan), false)
+    }
+
+    // A wire may only start on a real terminal (pin, tunnel, or existing wire),
+    // not in empty space.
+    fn wire_start_at(&self, pos: Pos2, pan: Vec2) -> Option<(NodeAttach, [i32; 2])> {
+        let (attach, gp, terminal) = self.wire_target_at(pos, pan);
+        terminal.then_some((attach, gp))
+    }
+
     // ── Save / load ──────────────────────────────────────────────────────
 
     pub fn to_circuit_file(&self) -> CircuitFile {
-        // CompKey/TunnelKey (the sim's own keys, held on PlacedComponent/
-        // PlacedTunnel) -> position in the Vec being emitted, so wires can
-        // be re-expressed as indices instead of slotmap keys. Populated as
-        // a side effect of building `components`/`tunnels` below, so it
-        // must be fully built before `wires`/`tunnel_wires` read it.
-        let mut comp_index: HashMap<CompKey, usize> = HashMap::new();
+        // PlacedCompKey/PlacedTunnelKey -> position in the Vec being emitted,
+        // so wire nodes can reference components/tunnels by index instead of a
+        // slotmap key. Built here, then read when emitting `nodes` below.
+        let mut comp_index: HashMap<PlacedCompKey, usize> = HashMap::new();
         let components: Vec<ComponentEntry> = self
             .components
-            .values()
+            .iter()
             .enumerate()
-            .map(|(i, pc)| {
-                comp_index.insert(pc.key, i);
+            .map(|(i, (pck, pc))| {
+                comp_index.insert(pck, i);
                 ComponentEntry {
                     def: pc.def.clone(),
                     grid_pos: pc.grid_pos,
@@ -228,13 +334,13 @@ impl OsmilogApp {
             })
             .collect();
 
-        let mut tunnel_index: HashMap<TunnelKey, usize> = HashMap::new();
+        let mut tunnel_index: HashMap<PlacedTunnelKey, usize> = HashMap::new();
         let tunnels: Vec<TunnelEntry> = self
             .tunnels
-            .values()
+            .iter()
             .enumerate()
-            .map(|(i, pt)| {
-                tunnel_index.insert(pt.key, i);
+            .map(|(i, (ptk, pt))| {
+                tunnel_index.insert(ptk, i);
                 TunnelEntry {
                     label: pt.label.clone(),
                     role: pt.role,
@@ -243,31 +349,47 @@ impl OsmilogApp {
             })
             .collect();
 
-        let wires = self
-            .wires
+        // WireNodeKey -> position in `nodes`, so segments can reference nodes by
+        // index. Built before `segments` reads it.
+        let mut node_index: HashMap<crate::gui::wiring::WireNodeKey, usize> = HashMap::new();
+        let nodes: Vec<NodeEntry> = self
+            .wiring
+            .nodes
             .iter()
-            .map(|w| WireEntry {
-                src: comp_index[&w.src_comp],
-                src_pin: w.src_pin.0,
-                dst: comp_index[&w.dst_comp],
-                dst_pin: w.dst_pin.0,
+            .enumerate()
+            .map(|(i, (nk, node))| {
+                node_index.insert(nk, i);
+                let attach = match node.attach {
+                    NodeAttach::Free => NodeAttachEntry::Free,
+                    NodeAttach::Pin(pck, pin) => {
+                        let (is_input, pin_index) = match pin {
+                            PinId::In(InIdx(p)) => (true, p),
+                            PinId::Out(OutIdx(p)) => (false, p),
+                        };
+                        NodeAttachEntry::Pin {
+                            comp: comp_index[&pck],
+                            is_input,
+                            pin_index,
+                        }
+                    }
+                    NodeAttach::Tunnel(ptk) => NodeAttachEntry::Tunnel {
+                        tunnel: tunnel_index[&ptk],
+                    },
+                };
+                NodeEntry {
+                    pos: node.pos,
+                    attach,
+                }
             })
             .collect();
 
-        let tunnel_wires = self
-            .tunnel_wires
-            .iter()
-            .map(|tw| {
-                let (is_input, pin_index) = match tw.pin {
-                    PinId::In(InIdx(i)) => (true, i),
-                    PinId::Out(OutIdx(i)) => (false, i),
-                };
-                TunnelWireEntry {
-                    tunnel: tunnel_index[&tw.tunnel],
-                    comp: comp_index[&tw.comp],
-                    is_input,
-                    pin_index,
-                }
+        let segments = self
+            .wiring
+            .segments
+            .values()
+            .map(|s| SegEntry {
+                a: node_index[&s.a],
+                b: node_index[&s.b],
             })
             .collect();
 
@@ -275,8 +397,8 @@ impl OsmilogApp {
             version: CURRENT_VERSION,
             components,
             tunnels,
-            wires,
-            tunnel_wires,
+            nodes,
+            segments,
         }
     }
 
@@ -290,58 +412,60 @@ impl OsmilogApp {
         self.circuit = Circuit::new();
         self.components = SlotMap::default();
         self.tunnels = SlotMap::default();
-        self.wires = Vec::new();
-        self.tunnel_wires = Vec::new();
+        self.wiring = Wiring::new();
         self.selected = None;
         self.mode = InteractionMode::Idle;
         self.last_settle_error = None;
 
-        let comp_keys: Vec<CompKey> = file
+        // File indices -> the freshly placed GUI keys (wiring nodes reference
+        // components/tunnels by these).
+        let comp_keys: Vec<PlacedCompKey> = file
             .components
             .iter()
-            .map(|entry| {
-                let key = self.place_component(entry.def.clone(), entry.grid_pos);
-                self.components[key].key
-            })
+            .map(|entry| self.place_component(entry.def.clone(), entry.grid_pos))
             .collect();
 
-        let tunnel_keys: Vec<TunnelKey> = file
+        let tunnel_keys: Vec<PlacedTunnelKey> = file
             .tunnels
             .iter()
+            .map(|entry| self.place_tunnel_labeled(entry.label.clone(), entry.role, entry.grid_pos))
+            .collect();
+
+        let node_keys: Vec<crate::gui::wiring::WireNodeKey> = file
+            .nodes
+            .iter()
             .map(|entry| {
-                let key =
-                    self.place_tunnel_labeled(entry.label.clone(), entry.role, entry.grid_pos);
-                self.tunnels[key].key
+                let attach = match entry.attach {
+                    NodeAttachEntry::Free => NodeAttach::Free,
+                    NodeAttachEntry::Pin {
+                        comp,
+                        is_input,
+                        pin_index,
+                    } => {
+                        let pin = if is_input {
+                            PinId::input(pin_index)
+                        } else {
+                            PinId::output(pin_index)
+                        };
+                        NodeAttach::Pin(comp_keys[comp], pin)
+                    }
+                    NodeAttachEntry::Tunnel { tunnel } => NodeAttach::Tunnel(tunnel_keys[tunnel]),
+                };
+                self.wiring.nodes.insert(WireNode {
+                    pos: entry.pos,
+                    attach,
+                })
             })
             .collect();
 
-        for w in &file.wires {
-            let src = comp_keys[w.src];
-            let dst = comp_keys[w.dst];
-            self.circuit
-                .link(src, PinId::output(w.src_pin), dst, PinId::input(w.dst_pin));
-            self.wires.push(Wire {
-                src_comp: src,
-                src_pin: OutIdx(w.src_pin),
-                dst_comp: dst,
-                dst_pin: InIdx(w.dst_pin),
+        for s in &file.segments {
+            self.wiring.segments.insert(WireSegment {
+                a: node_keys[s.a],
+                b: node_keys[s.b],
             });
         }
 
-        for tw in &file.tunnel_wires {
-            let tunnel = tunnel_keys[tw.tunnel];
-            let comp = comp_keys[tw.comp];
-            let pin = if tw.is_input {
-                PinId::input(tw.pin_index)
-            } else {
-                PinId::output(tw.pin_index)
-            };
-            self.circuit.link_tunnel(tunnel, comp, pin);
-            self.tunnel_wires.push(TunnelWire { tunnel, comp, pin });
-        }
-
-        let result = self.circuit.settle();
-        self.record_settle_result(result);
+        self.rebuild_circuit();
         Ok(())
     }
 
@@ -355,6 +479,10 @@ impl OsmilogApp {
         match sel {
             Selected::Component(key) => self.show_component_properties(key, ui),
             Selected::Tunnel(key) => self.show_tunnel_properties(key, ui),
+            Selected::Wire(_) => {
+                ui.heading("WIRE");
+                ui.label("A wire segment. Press Backspace or Delete to remove it.");
+            }
         }
 
         ui.separator();
@@ -362,6 +490,7 @@ impl OsmilogApp {
             match sel {
                 Selected::Component(key) => self.delete_component(key),
                 Selected::Tunnel(key) => self.delete_tunnel(key),
+                Selected::Wire(seg) => self.delete_wire(seg),
             }
         }
     }
@@ -715,126 +844,66 @@ impl OsmilogApp {
         }
     }
 
-    // TODO: write docs, return result
-    fn reconfigure_component(&mut self, old_pc_key: PlacedCompKey, new_def: ComponentDef) {
-        let old_pc = &self.components[old_pc_key];
-        let old_key = old_pc.key;
-        let grid_pos = old_pc.grid_pos;
+    // Swaps a placed component's parameters. The PlacedCompKey is stable and the
+    // wiring binds to it, so attached wires survive automatically - we only drop
+    // wire nodes for pins the new arity no longer has, re-sync the surviving
+    // anchors to the new pin positions, then rebuild the circuit from the wiring.
+    fn reconfigure_component(&mut self, pc_key: PlacedCompKey, new_def: ComponentDef) {
+        let old_key = self.components[pc_key].key;
+        let grid_pos = self.components[pc_key].grid_pos;
 
         let new_comp = new_def.make_component();
         let new_n_in = new_comp.pins.inputs.len();
         let new_n_out = new_comp.pins.outputs.len();
 
-        // Wires touching old_key whose pin index is still valid for the new component
-        let surviving: Vec<Wire> = self
-            .wires
-            .iter()
-            .filter(|w| {
-                if w.src_comp == old_key {
-                    (w.src_pin.0 as usize) < new_n_out
-                } else if w.dst_comp == old_key {
-                    (w.dst_pin.0 as usize) < new_n_in
-                } else {
-                    false
-                }
-            })
-            .cloned()
-            .collect();
-
-        // Tunnel wires touching old_key whose pin index is still valid for
-        // the new component - same "survives if the pin still exists" rule
-        // as regular wires above, so a tunnel connection isn't silently
-        // dropped just because e.g. an Input's value got toggled.
-        let surviving_tunnel_wires: Vec<TunnelWire> = self
-            .tunnel_wires
-            .iter()
-            .filter(|tw| {
-                tw.comp == old_key
-                    && match tw.pin {
-                        PinId::In(i) => (i.0 as usize) < new_n_in,
-                        PinId::Out(i) => (i.0 as usize) < new_n_out,
-                    }
-            })
-            .cloned()
-            .collect();
-
         self.circuit.remove_component(old_key);
-        self.wires
-            .retain(|w| w.src_comp != old_key && w.dst_comp != old_key);
-        self.tunnel_wires.retain(|tw| tw.comp != old_key);
-
         let new_key = self.circuit.add_component(new_comp);
-
-        self.components[old_pc_key] = PlacedComponent {
+        self.components[pc_key] = PlacedComponent {
             key: new_key,
             def: new_def,
             grid_pos,
         };
 
-        for w in surviving {
-            let (src, src_pin, dst, dst_pin) = if w.src_comp == old_key {
-                (new_key, w.src_pin, w.dst_comp, w.dst_pin)
-            } else {
-                (w.src_comp, w.src_pin, new_key, w.dst_pin)
-            };
-            self.circuit
-                .link(src, PinId::output(src_pin.0), dst, PinId::input(dst_pin.0));
-            self.wires.push(Wire {
-                src_comp: src,
-                src_pin,
-                dst_comp: dst,
-                dst_pin,
-            });
-        }
-
-        for tw in surviving_tunnel_wires {
-            self.circuit.link_tunnel(tw.tunnel, new_key, tw.pin);
-            self.tunnel_wires.push(TunnelWire {
-                tunnel: tw.tunnel,
-                comp: new_key,
-                pin: tw.pin,
-            });
-        }
-
-        let result = self.circuit.settle();
-        self.record_settle_result(result);
-        // Now that Selected holds a PlacedCompKey, it doesn't need to be updated on reconfigure
-        self.selected = Some(Selected::Component(old_pc_key));
+        self.wiring.prune_stale_pins(pc_key, new_n_in, new_n_out);
+        self.sync_component_wire_nodes(pc_key);
+        self.rebuild_circuit();
+        self.selected = Some(Selected::Component(pc_key));
     }
 
-    // Removes a placed component from both the circuit and the GUI's visual
-    // records. circuit.remove_component unlinks its nets and re-evaluates
-    // affected sinks; here we drop the visual Wire/TunnelWire records that
-    // referenced it (same "touches this CompKey" retain as reconfigure_component)
-    // so the draw loop doesn't chase a dangling key.
+    // Removes a placed component: drop it from the circuit and its wire nodes
+    // from the wiring graph, then rebuild the circuit's nets from what remains.
     fn delete_component(&mut self, key: PlacedCompKey) {
         let comp_key = self.components[key].key;
         self.circuit.remove_component(comp_key);
-        self.wires
-            .retain(|w| w.src_comp != comp_key && w.dst_comp != comp_key);
-        self.tunnel_wires.retain(|tw| tw.comp != comp_key);
+        self.wiring.remove_component_nodes(key);
         self.components.remove(key);
         if self.selected == Some(Selected::Component(key)) {
             self.selected = None;
         }
-        let result = self.circuit.settle();
-        self.record_settle_result(result);
+        self.rebuild_circuit();
     }
 
-    // Removes a placed tunnel from both the circuit and the GUI's visual
-    // records. circuit.remove_tunnel detaches its net and re-dirties the label
-    // group's feed nets; here we drop the visual TunnelWire records that tied a
-    // component pin to it.
+    // Removes a placed tunnel: drop it from the circuit and its wire nodes from
+    // the wiring graph, then rebuild.
     fn delete_tunnel(&mut self, key: PlacedTunnelKey) {
         let tunnel_key = self.tunnels[key].key;
         self.circuit.remove_tunnel(tunnel_key);
-        self.tunnel_wires.retain(|tw| tw.tunnel != tunnel_key);
+        self.wiring.remove_tunnel_nodes(key);
         self.tunnels.remove(key);
         if self.selected == Some(Selected::Tunnel(key)) {
             self.selected = None;
         }
-        let result = self.circuit.settle();
-        self.record_settle_result(result);
+        self.rebuild_circuit();
+    }
+
+    // Removes a single wire segment; the wiring graph handles orphan cleanup and
+    // any net split, then the circuit is rebuilt.
+    fn delete_wire(&mut self, seg: WireSegKey) {
+        self.wiring.delete_segment(seg);
+        if self.selected == Some(Selected::Wire(seg)) {
+            self.selected = None;
+        }
+        self.rebuild_circuit();
     }
 
     // Applies a File > Load result that a spawned WASM load task has
@@ -1066,16 +1135,37 @@ impl eframe::App for OsmilogApp {
             let pan = self.pan;
 
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                if let InteractionMode::ComponentDrag {
-                    key,
-                    original_grid_pos,
-                    ..
-                } = self.mode
-                {
-                    match key {
-                        Selected::Component(k) => self.components[k].grid_pos = original_grid_pos,
-                        Selected::Tunnel(k) => self.tunnels[k].grid_pos = original_grid_pos,
+                match &self.mode {
+                    InteractionMode::ComponentDrag {
+                        key,
+                        original_grid_pos,
+                        ..
+                    } => {
+                        let (key, original_grid_pos) = (*key, *original_grid_pos);
+                        match key {
+                            Selected::Component(k) => {
+                                self.components[k].grid_pos = original_grid_pos
+                            }
+                            Selected::Tunnel(k) => self.tunnels[k].grid_pos = original_grid_pos,
+                            Selected::Wire(_) => {}
+                        }
                     }
+                    // Esc while drawing commits the polyline drawn so far as a
+                    // dangling run (end in empty space), matching the double-click
+                    // finish; nothing to commit if only the anchor exists.
+                    InteractionMode::WireDraw {
+                        points,
+                        start_attach,
+                        ..
+                    } => {
+                        if points.len() >= 2 {
+                            let (points, start_attach) = (points.clone(), *start_attach);
+                            self.wiring
+                                .add_route(&points, start_attach, NodeAttach::Free);
+                            self.rebuild_circuit();
+                        }
+                    }
+                    _ => {}
                 }
                 self.mode = InteractionMode::Idle;
             }
@@ -1089,6 +1179,7 @@ impl eframe::App for OsmilogApp {
                     match sel {
                         Selected::Component(k) => self.delete_component(k),
                         Selected::Tunnel(k) => self.delete_tunnel(k),
+                        Selected::Wire(seg) => self.delete_wire(seg),
                     }
                 }
             }
@@ -1096,64 +1187,34 @@ impl eframe::App for OsmilogApp {
             painter.rect_filled(clip_rect, 0.0, theme.canvas_bg);
             draw_grid(&painter, clip_rect, pan, theme);
 
-            // Draw wires. Resolves the net live via Component::net_of rather
-            // than caching a NetKey on Wire: a cached key can go stale if a
-            // later link() merges its net away (merge() always removes one
-            // of the two merged NetKeys), which would otherwise panic here
-            // the very next frame.
-            for wire in &self.wires {
-                let (p0, p1) = {
-                    // FIXME: Wire should probably hold a PlacedCompKey
-                    let src = self
-                        .components
-                        .values()
-                        .find(|pc| pc.key == wire.src_comp)
-                        .unwrap();
-                    let dst = self
-                        .components
-                        .values()
-                        .find(|pc| pc.key == wire.dst_comp)
-                        .unwrap();
-                    (
-                        comp_pin_pos(
-                            &src.def.shape(),
-                            src.grid_pos,
-                            pan,
-                            PinId::output(wire.src_pin.0),
-                        ),
-                        comp_pin_pos(
-                            &dst.def.shape(),
-                            dst.grid_pos,
-                            pan,
-                            PinId::input(wire.dst_pin.0),
-                        ),
-                    )
-                };
-                let net =
-                    self.circuit.components[wire.src_comp].net_of(PinId::output(wire.src_pin.0));
-                let color = net
-                    .map(|nk| value_stroke(theme, self.circuit.nets[nk].value))
-                    .unwrap_or(value_stroke(theme, Value::Floating));
-                draw_wire(&painter, p0, p1, color);
+            // Draw wire segments. Colour comes from each connected group's net
+            // value: any component pin / tunnel on the group resolves (live) to
+            // that net's Value; a dangling group (no endpoints) is Floating.
+            let node_value = self.wire_node_values();
+            for (seg_key, seg) in self.wiring.segments.iter() {
+                let a = self.wiring.nodes[seg.a];
+                let b = self.wiring.nodes[seg.b];
+                let p0 = grid_to_screen(a.pos, pan);
+                let p1 = grid_to_screen(b.pos, pan);
+                let val = node_value.get(&seg.a).copied().unwrap_or(Value::Floating);
+                let mut stroke = value_stroke(theme, val);
+                if self.selected == Some(Selected::Wire(seg_key)) {
+                    stroke.color = theme.outline_selected;
+                    stroke.width += 1.5;
+                }
+                painter.line_segment([p0, p1], stroke);
             }
-
-            // Draw tunnel wires (component pin <-> tunnel), same live-lookup
-            // approach as above - no cached NetKey.
-            for tw in &self.tunnel_wires {
-                let (Some(pt), Some(pc)) = (
-                    // FIXME: TunnelWire should probably hold a PlacedTunnelKey
-                    self.tunnels.values().find(|pt| pt.key == tw.tunnel),
-                    self.components.values().find(|pc| pc.key == tw.comp),
-                ) else {
-                    continue;
-                };
-                let p0 = tunnel_pin_pos(pt, pan);
-                let p1 = comp_pin_pos(&pc.def.shape(), pc.grid_pos, pan, tw.pin);
-                let net = self.circuit.components[tw.comp].net_of(tw.pin);
-                let color = net
-                    .map(|nk| value_stroke(theme, self.circuit.nets[nk].value))
-                    .unwrap_or(value_stroke(theme, Value::Floating));
-                draw_wire(&painter, p0, p1, color);
+            // Junction dots where three or more segments meet, so a real branch
+            // reads differently from a mere crossing.
+            for (nk, node) in self.wiring.nodes.iter() {
+                if self.wiring.degree(nk) >= 3 {
+                    let val = node_value.get(&nk).copied().unwrap_or(Value::Floating);
+                    painter.circle_filled(
+                        grid_to_screen(node.pos, pan),
+                        PIN_RADIUS,
+                        value_stroke(theme, val).color,
+                    );
+                }
             }
 
             // Draw components
@@ -1176,64 +1237,92 @@ impl eframe::App for OsmilogApp {
             let mode = self.mode.clone();
             match mode {
                 InteractionMode::Idle => {
+                    // Hover reticle: hovering over a wire (but not a pin) shows
+                    // where a branch would tap the wire.
+                    if let Some(pos) = pointer {
+                        if pin_at_pos(self.components.iter(), pan, pos, PinKind::Output).is_none()
+                            && pin_at_pos(self.components.iter(), pan, pos, PinKind::Input)
+                                .is_none()
+                            && tunnel_pin_at_pos(self.tunnels.iter(), pan, pos).is_none()
+                        {
+                            if let Some((_, gp)) = self.wiring.segment_at_pos(pos, pan) {
+                                draw_reticle(&painter, grid_to_screen(gp, pan), theme);
+                            }
+                        }
+                    }
+
                     if response.drag_started() {
                         let origin = ctx.input(|i| i.pointer.press_origin());
                         if let Some(pos) = origin {
-                            if let Some((comp_key, PinId::Out(out_idx))) =
-                                pin_at_pos(self.components.iter(), pan, pos, PinKind::Output)
-                            {
-                                // Output-pin drag → start wire (highest priority)
-                                self.mode = InteractionMode::WireDrag {
-                                    src: DragSource::Component(comp_key, out_idx),
-                                    current_end: pos,
-                                };
-                            } else if let Some(tunnel_key) =
-                                tunnel_pin_at_pos(self.tunnels.iter(), pan, pos)
-                            {
-                                // Feed-tunnel pin drag → start wire
-                                self.mode = InteractionMode::WireDrag {
-                                    src: DragSource::Tunnel(tunnel_key),
-                                    current_end: pos,
+                            if let Some((attach, gp)) = self.wire_start_at(pos, pan) {
+                                // Drag from a pin / tunnel / existing wire → draw
+                                // a wire (quick elbow, committed on release).
+                                self.mode = InteractionMode::WireDraw {
+                                    points: vec![gp],
+                                    start_attach: attach,
+                                    cursor: pos,
+                                    dragging: true,
                                 };
                             } else if let Some(sel) = self.selected {
                                 // Selected component/tunnel body drag → move it
-                                let (rect, grid_pos) = match sel {
-                                    Selected::Component(key) => {
-                                        let pc = &self.components[key];
-                                        (component_bounding_rect(pc, pan), pc.grid_pos)
-                                    }
-                                    Selected::Tunnel(key) => {
-                                        let pt = &self.tunnels[key];
-                                        (tunnel_bounding_rect(pt, pan), pt.grid_pos)
-                                    }
+                                let rect_grid = match sel {
+                                    Selected::Component(key) => self
+                                        .components
+                                        .get(key)
+                                        .map(|pc| (component_bounding_rect(pc, pan), pc.grid_pos)),
+                                    Selected::Tunnel(key) => self
+                                        .tunnels
+                                        .get(key)
+                                        .map(|pt| (tunnel_bounding_rect(pt, pan), pt.grid_pos)),
+                                    Selected::Wire(_) => None,
                                 };
-                                if rect.contains(pos) {
-                                    self.mode = InteractionMode::ComponentDrag {
-                                        key: sel,
-                                        drag_origin: pos,
-                                        original_grid_pos: grid_pos,
-                                    };
+                                if let Some((rect, grid_pos)) = rect_grid {
+                                    if rect.contains(pos) {
+                                        self.mode = InteractionMode::ComponentDrag {
+                                            key: sel,
+                                            drag_origin: pos,
+                                            original_grid_pos: grid_pos,
+                                        };
+                                    }
                                 }
                             }
                         }
                     }
 
-                    // Click any component/tunnel body to select it (components
-                    // take priority over tunnels on overlap); click empty
-                    // canvas to deselect.
                     if response.clicked() {
                         if let Some(pos) = pointer {
-                            let maybe_comp = self
-                                .components
-                                .iter()
-                                .find(|(_key, pc)| component_bounding_rect(pc, pan).contains(pos))
-                                .map(|(key, _pc)| Selected::Component(key));
-                            let maybe_tunnel = self
-                                .tunnels
-                                .iter()
-                                .find(|(_key, pt)| tunnel_bounding_rect(pt, pan).contains(pos))
-                                .map(|(key, _pt)| Selected::Tunnel(key));
-                            self.selected = maybe_comp.or(maybe_tunnel);
+                            // A click starts a polyline only from a pin/tunnel;
+                            // clicking a bare wire selects it instead (branching
+                            // off a wire is a drag gesture, handled above).
+                            let pin_start = self.wire_start_at(pos, pan).filter(|(a, _)| {
+                                matches!(a, NodeAttach::Pin(..) | NodeAttach::Tunnel(_))
+                            });
+                            if let Some((attach, gp)) = pin_start {
+                                self.mode = InteractionMode::WireDraw {
+                                    points: vec![gp],
+                                    start_attach: attach,
+                                    cursor: pos,
+                                    dragging: false,
+                                };
+                            } else {
+                                // Click a component/tunnel body (components take
+                                // priority), then a wire segment, else deselect.
+                                let maybe_comp = self
+                                    .components
+                                    .iter()
+                                    .find(|(_k, pc)| component_bounding_rect(pc, pan).contains(pos))
+                                    .map(|(k, _)| Selected::Component(k));
+                                let maybe_tunnel = self
+                                    .tunnels
+                                    .iter()
+                                    .find(|(_k, pt)| tunnel_bounding_rect(pt, pan).contains(pos))
+                                    .map(|(k, _)| Selected::Tunnel(k));
+                                let maybe_wire = self
+                                    .wiring
+                                    .segment_at_pos(pos, pan)
+                                    .map(|(seg, _)| Selected::Wire(seg));
+                                self.selected = maybe_comp.or(maybe_tunnel).or(maybe_wire);
+                            }
                         }
                     }
                 }
@@ -1266,100 +1355,77 @@ impl eframe::App for OsmilogApp {
                     }
                 }
 
-                InteractionMode::WireDrag { src, current_end } => {
-                    let p0 = match src {
-                        DragSource::Component(pc_key, out_idx) => {
-                            let src_pc = &self.components[pc_key];
-                            comp_pin_pos(
-                                &src_pc.def.shape(),
-                                src_pc.grid_pos,
-                                pan,
-                                PinId::output(out_idx.0),
-                            )
+                InteractionMode::WireDraw {
+                    points,
+                    start_attach,
+                    cursor,
+                    dragging,
+                } => {
+                    let end = pointer.unwrap_or(cursor);
+                    let (drop_attach, drop_gp, terminal) = self.wire_target_at(end, pan);
+
+                    // Preview: committed segments, then the pending elbow from the
+                    // last committed corner to the (snapped) drop point.
+                    let preview = Stroke::new(WIRE_THICKNESS_THIN, theme.wire_drag_preview);
+                    for w in points.windows(2) {
+                        painter.line_segment(
+                            [grid_to_screen(w[0], pan), grid_to_screen(w[1], pan)],
+                            preview,
+                        );
+                    }
+                    let pending = route_elbow(*points.last().unwrap(), drop_gp);
+                    let mut prev = *points.last().unwrap();
+                    for p in &pending {
+                        painter.line_segment(
+                            [grid_to_screen(prev, pan), grid_to_screen(*p, pan)],
+                            preview,
+                        );
+                        prev = *p;
+                    }
+
+                    if dragging {
+                        self.mode = InteractionMode::WireDraw {
+                            points: points.clone(),
+                            start_attach,
+                            cursor: end,
+                            dragging,
+                        };
+                        if response.drag_stopped() {
+                            let mut route = points.clone();
+                            route.extend(pending);
+                            self.wiring.add_route(&route, start_attach, drop_attach);
+                            self.rebuild_circuit();
+                            self.mode = InteractionMode::Idle;
                         }
-                        DragSource::Tunnel(pt_key) => {
-                            let src_pt = &self.tunnels[pt_key];
-                            tunnel_pin_pos(src_pt, pan)
+                    } else {
+                        // Click-polyline: a click on a terminal (or a double-click)
+                        // finishes; any other click drops a corner and continues.
+                        let mut next_points = points.clone();
+                        let mut finished = false;
+                        if response.double_clicked() {
+                            next_points.extend(pending.clone());
+                            self.wiring
+                                .add_route(&next_points, start_attach, NodeAttach::Free);
+                            finished = true;
+                        } else if response.clicked() {
+                            next_points.extend(pending.clone());
+                            if terminal {
+                                self.wiring
+                                    .add_route(&next_points, start_attach, drop_attach);
+                                finished = true;
+                            }
                         }
-                    };
-
-                    let end = pointer.unwrap_or(current_end);
-                    let stroke = Stroke::new(WIRE_THICKNESS_THIN, theme.wire_drag_preview);
-                    draw_wire(&painter, p0, end, stroke);
-
-                    self.mode = InteractionMode::WireDrag {
-                        src,
-                        current_end: end,
-                    };
-
-                    if response.drag_stopped() {
-                        let target = pin_at_pos(self.components.iter(), pan, end, PinKind::Input);
-                        match (src, target) {
-                            (
-                                DragSource::Component(src_pc, src_pin),
-                                Some((dst_pc, PinId::In(in_idx))),
-                            ) => {
-                                let src_comp = self.components[src_pc].key;
-                                let dst_comp = self.components[dst_pc].key;
-                                if dst_comp != src_comp {
-                                    self.circuit.link(
-                                        src_comp,
-                                        PinId::output(src_pin.0),
-                                        dst_comp,
-                                        PinId::input(in_idx.0),
-                                    );
-                                    let result = self.circuit.settle();
-                                    self.record_settle_result(result);
-                                    self.wires.push(Wire {
-                                        src_comp,
-                                        src_pin,
-                                        dst_comp,
-                                        dst_pin: in_idx,
-                                    });
-                                }
-                            }
-                            (DragSource::Component(src_pc_key, src_pin), None) => {
-                                // Didn't land on a component input pin; check
-                                // whether it landed on a Pull tunnel instead.
-                                let tunnel_key = self
-                                    .tunnels
-                                    .values()
-                                    .find(|pt| {
-                                        pt.role == TunnelRole::Pull
-                                            && tunnel_bounding_rect(pt, pan).contains(end)
-                                    })
-                                    .map(|pt| pt.key);
-                                if let Some(tunnel_key) = tunnel_key {
-                                    let src_comp = self.components[src_pc_key].key;
-                                    let pin = PinId::output(src_pin.0);
-
-                                    self.circuit.link_tunnel(tunnel_key, src_comp, pin);
-                                    let result = self.circuit.settle();
-                                    self.record_settle_result(result);
-                                    self.tunnel_wires.push(TunnelWire {
-                                        tunnel: tunnel_key,
-                                        comp: src_comp,
-                                        pin,
-                                    });
-                                }
-                            }
-                            (DragSource::Tunnel(src_pt), Some((dst_pc, PinId::In(in_idx)))) => {
-                                let tunnel_key = self.tunnels[src_pt].key;
-                                let dst_comp = self.components[dst_pc].key;
-                                let pin = PinId::input(in_idx.0);
-
-                                self.circuit.link_tunnel(tunnel_key, dst_comp, pin);
-                                let result = self.circuit.settle();
-                                self.record_settle_result(result);
-                                self.tunnel_wires.push(TunnelWire {
-                                    tunnel: tunnel_key,
-                                    comp: dst_comp,
-                                    pin,
-                                });
-                            }
-                            _ => {}
+                        if finished {
+                            self.rebuild_circuit();
+                            self.mode = InteractionMode::Idle;
+                        } else {
+                            self.mode = InteractionMode::WireDraw {
+                                points: next_points,
+                                start_attach,
+                                cursor: end,
+                                dragging,
+                            };
                         }
-                        self.mode = InteractionMode::Idle;
                     }
                 }
 
@@ -1375,9 +1441,19 @@ impl eframe::App for OsmilogApp {
                             original_grid_pos[0] + delta_x,
                             original_grid_pos[1] + delta_y,
                         ];
+                        // Moving a component/tunnel drags its wire-anchor nodes
+                        // along; the rest of each attached segment stretches.
+                        // Topology is unchanged, so no circuit rebuild is needed.
                         match key {
-                            Selected::Component(k) => self.components[k].grid_pos = new_grid_pos,
-                            Selected::Tunnel(k) => self.tunnels[k].grid_pos = new_grid_pos,
+                            Selected::Component(k) => {
+                                self.components[k].grid_pos = new_grid_pos;
+                                self.sync_component_wire_nodes(k);
+                            }
+                            Selected::Tunnel(k) => {
+                                self.tunnels[k].grid_pos = new_grid_pos;
+                                self.sync_tunnel_wire_nodes(k);
+                            }
+                            Selected::Wire(_) => {}
                         }
                     }
                     if response.drag_stopped() {
@@ -1398,6 +1474,52 @@ fn component_bounding_rect(pc: &PlacedComponent, pan: Vec2) -> Rect {
         pc.grid_pos[1] as f32 * GRID_SIZE + pan.y,
     );
     Rect::from_min_size(tl, size)
+}
+
+// Grid coordinate of a pin: the component's grid_pos plus the anchor's whole-cell
+// offset. This is the wiring counterpart of comp_pin_pos (which returns pixels).
+fn pin_grid_pos(shape: &ComponentShape, grid_pos: [i32; 2], pin: PinId) -> [i32; 2] {
+    let anchor = match pin {
+        PinId::In(InIdx(i)) => &shape.input_anchors[i as usize],
+        PinId::Out(OutIdx(i)) => &shape.output_anchors[i as usize],
+    };
+    [
+        grid_pos[0] + anchor.cell.x as i32,
+        grid_pos[1] + anchor.cell.y as i32,
+    ]
+}
+
+// Grid coordinate of a tunnel's single pin.
+fn tunnel_pin_grid(pt: &PlacedTunnel) -> [i32; 2] {
+    let shape = tunnel_shape(pt.role);
+    let anchor = match pt.role {
+        TunnelRole::Feed => &shape.output_anchors[0],
+        TunnelRole::Pull => &shape.input_anchors[0],
+    };
+    [
+        pt.grid_pos[0] + anchor.cell.x as i32,
+        pt.grid_pos[1] + anchor.cell.y as i32,
+    ]
+}
+
+fn grid_to_screen(gp: [i32; 2], pan: Vec2) -> Pos2 {
+    egui::pos2(
+        gp[0] as f32 * GRID_SIZE + pan.x,
+        gp[1] as f32 * GRID_SIZE + pan.y,
+    )
+}
+
+// A quick L-elbow (one horizontal then one vertical run) from `from` to `to`,
+// returning the intermediate corner (if any) and `to`, but not `from`. Both
+// endpoints are on-grid, so the corner is too.
+fn route_elbow(from: [i32; 2], to: [i32; 2]) -> Vec<[i32; 2]> {
+    if from == to {
+        vec![]
+    } else if from[0] == to[0] || from[1] == to[1] {
+        vec![to] // already axis-aligned: a single straight run
+    } else {
+        vec![[to[0], from[1]], to] // horizontal first, then vertical
+    }
 }
 
 // Takes an already-computed ComponentShape rather than a &PlacedComponent so
@@ -1471,6 +1593,8 @@ fn pin_at_pos<'a>(
     }
     None
 }
+// A tunnel's single pin under `pos`, regardless of role - a wire can now both
+// start and end on either a Feed or a Pull tunnel.
 fn tunnel_pin_at_pos<'a>(
     tunnels: impl Iterator<Item = (PlacedTunnelKey, &'a PlacedTunnel)>,
     pan: Vec2,
@@ -1478,7 +1602,7 @@ fn tunnel_pin_at_pos<'a>(
 ) -> Option<PlacedTunnelKey> {
     let hit_r = PIN_RADIUS * 2.0;
     for (key, tunnel) in tunnels {
-        if tunnel.role == TunnelRole::Feed && tunnel_pin_pos(tunnel, pan).distance(pos) <= hit_r {
+        if tunnel_pin_pos(tunnel, pan).distance(pos) <= hit_r {
             return Some(key);
         }
     }
@@ -1525,13 +1649,12 @@ fn draw_grid(painter: &Painter, clip_rect: Rect, pan: Vec2, theme: Theme) {
     }
 }
 
-fn draw_wire(painter: &Painter, p0: Pos2, p1: Pos2, stroke: Stroke) {
-    let mid_x = (p0.x + p1.x) / 2.0;
-    let elbow1 = egui::pos2(mid_x, p0.y);
-    let elbow2 = egui::pos2(mid_x, p1.y);
-    // A single open Path (rather than separate line_segment calls) lets the tessellator
-    // join the elbow corners, avoiding the notch that butt-capped independent segments leave.
-    painter.add(PathShape::line(vec![p0, elbow1, elbow2, p1], stroke));
+// A small crosshair marking where a branch would tap an existing wire.
+fn draw_reticle(painter: &Painter, pos: Pos2, theme: Theme) {
+    let r = PIN_RADIUS + 1.0;
+    let stroke = Stroke::new(1.0, theme.wire_drag_preview);
+    painter.line_segment([pos - egui::vec2(r, 0.0), pos + egui::vec2(r, 0.0)], stroke);
+    painter.line_segment([pos - egui::vec2(0.0, r), pos + egui::vec2(0.0, r)], stroke);
 }
 
 fn draw_component(
@@ -1763,10 +1886,54 @@ fn draw_tunnel_ghost(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::wiring::NodeAttach;
     use crate::sim::component::GateOp;
 
     fn place(app: &mut OsmilogApp, def: ComponentDef) -> PlacedCompKey {
         app.place_component(def, [0, 0])
+    }
+
+    // Insert a wire (one segment) between two component pins, positioned at each
+    // pin's grid cell, and return the two node keys.
+    fn connect_pins(app: &mut OsmilogApp, a: (PlacedCompKey, PinId), b: (PlacedCompKey, PinId)) {
+        let pa = pin_grid_pos(
+            &app.components[a.0].def.shape(),
+            app.components[a.0].grid_pos,
+            a.1,
+        );
+        let pb = pin_grid_pos(
+            &app.components[b.0].def.shape(),
+            app.components[b.0].grid_pos,
+            b.1,
+        );
+        let na = app.wiring.nodes.insert(WireNode {
+            pos: pa,
+            attach: NodeAttach::Pin(a.0, a.1),
+        });
+        let nb = app.wiring.nodes.insert(WireNode {
+            pos: pb,
+            attach: NodeAttach::Pin(b.0, b.1),
+        });
+        app.wiring.segments.insert(WireSegment { a: na, b: nb });
+    }
+
+    // Insert a wire (one segment) between a component pin and a tunnel.
+    fn connect_pin_tunnel(app: &mut OsmilogApp, c: (PlacedCompKey, PinId), ptk: PlacedTunnelKey) {
+        let pc = pin_grid_pos(
+            &app.components[c.0].def.shape(),
+            app.components[c.0].grid_pos,
+            c.1,
+        );
+        let pt = tunnel_pin_grid(&app.tunnels[ptk]);
+        let nc = app.wiring.nodes.insert(WireNode {
+            pos: pc,
+            attach: NodeAttach::Pin(c.0, c.1),
+        });
+        let nt = app.wiring.nodes.insert(WireNode {
+            pos: pt,
+            attach: NodeAttach::Tunnel(ptk),
+        });
+        app.wiring.segments.insert(WireSegment { a: nc, b: nt });
     }
 
     #[test]
@@ -1784,38 +1951,12 @@ mod tests {
         );
         let o = place(&mut app, ComponentDef::Output);
 
-        let (a_key, b_key, g_key, o_key) = (
-            app.components[a].key,
-            app.components[b].key,
-            app.components[g].key,
-            app.components[o].key,
-        );
-        app.circuit
-            .link(a_key, PinId::output(0), g_key, PinId::input(0));
-        app.circuit
-            .link(b_key, PinId::output(0), g_key, PinId::input(1));
-        app.circuit
-            .link(g_key, PinId::output(0), o_key, PinId::input(0));
-        app.wires.push(Wire {
-            src_comp: a_key,
-            src_pin: OutIdx(0),
-            dst_comp: g_key,
-            dst_pin: InIdx(0),
-        });
-        app.wires.push(Wire {
-            src_comp: b_key,
-            src_pin: OutIdx(0),
-            dst_comp: g_key,
-            dst_pin: InIdx(1),
-        });
-        app.wires.push(Wire {
-            src_comp: g_key,
-            src_pin: OutIdx(0),
-            dst_comp: o_key,
-            dst_pin: InIdx(0),
-        });
+        connect_pins(&mut app, (a, PinId::output(0)), (g, PinId::input(0)));
+        connect_pins(&mut app, (b, PinId::output(0)), (g, PinId::input(1)));
+        connect_pins(&mut app, (g, PinId::output(0)), (o, PinId::input(0)));
+        app.rebuild_circuit();
 
-        app.circuit.settle().unwrap();
+        let o_key = app.components[o].key;
         assert_eq!(app.circuit.read_output(o_key), Value::ONE);
 
         // Save -> JSON -> parse -> load into a fresh app, and confirm the
@@ -1828,7 +1969,8 @@ mod tests {
         loaded.load_circuit_file(&file2).unwrap();
 
         assert_eq!(loaded.components.len(), 4);
-        assert_eq!(loaded.wires.len(), 3);
+        assert_eq!(loaded.wiring.segments.len(), 3);
+        assert_eq!(loaded.wiring.nodes.len(), 6);
         let loaded_out_key = loaded
             .components
             .values()
@@ -1853,29 +1995,12 @@ mod tests {
             .rename_tunnel(app.tunnels[pull].key, shared_label.clone());
         app.tunnels[pull].label = shared_label;
 
-        let (inp_key, out_key, feed_key, pull_key) = (
-            app.components[inp].key,
-            app.components[out].key,
-            app.tunnels[feed].key,
-            app.tunnels[pull].key,
-        );
-        // Pull reads FROM its attached net (here: inp's output) and
-        // contributes that value TO the shared label group; Feed drives its
-        // attached net (here: out's input) FROM the group's resolved value.
-        app.circuit.link_tunnel(pull_key, inp_key, PinId::output(0));
-        app.tunnel_wires.push(TunnelWire {
-            tunnel: pull_key,
-            comp: inp_key,
-            pin: PinId::output(0),
-        });
-        app.circuit.link_tunnel(feed_key, out_key, PinId::input(0));
-        app.tunnel_wires.push(TunnelWire {
-            tunnel: feed_key,
-            comp: out_key,
-            pin: PinId::input(0),
-        });
+        // Pull reads FROM inp's output; Feed drives out's input.
+        connect_pin_tunnel(&mut app, (inp, PinId::output(0)), pull);
+        connect_pin_tunnel(&mut app, (out, PinId::input(0)), feed);
+        app.rebuild_circuit();
 
-        app.circuit.settle().unwrap();
+        let out_key = app.components[out].key;
         assert_eq!(app.circuit.read_output(out_key), Value::ONE);
 
         let file = app.to_circuit_file();
@@ -1904,13 +2029,15 @@ mod tests {
                 grid_pos: [0, 0],
             }],
             tunnels: vec![],
-            wires: vec![WireEntry {
-                src: 5,
-                src_pin: 0,
-                dst: 0,
-                dst_pin: 0,
+            nodes: vec![NodeEntry {
+                pos: [0, 0],
+                attach: NodeAttachEntry::Pin {
+                    comp: 5,
+                    is_input: true,
+                    pin_index: 0,
+                },
             }],
-            tunnel_wires: vec![],
+            segments: vec![],
         };
 
         let mut app = OsmilogApp::empty();
@@ -1926,8 +2053,8 @@ mod tests {
             version: CURRENT_VERSION + 1,
             components: vec![],
             tunnels: vec![],
-            wires: vec![],
-            tunnel_wires: vec![],
+            nodes: vec![],
+            segments: vec![],
         };
 
         let mut app = OsmilogApp::empty();
@@ -1941,9 +2068,9 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_component_drops_visual_records_and_refreshes_downstream() {
-        // Input -> NOT(g) -> Output, then delete the middle gate: its visual
-        // record and both wires touching it must be gone, the circuit component
+    fn test_delete_component_drops_wire_nodes_and_refreshes_downstream() {
+        // Input -> NOT(g) -> Output, then delete the middle gate: its wire nodes
+        // (and their now-orphaned neighbours) must be gone, the circuit component
         // removed, the selection cleared, and the downstream Output refreshed
         // (its input is now Floating).
         let mut app = OsmilogApp::empty();
@@ -1957,28 +2084,12 @@ mod tests {
             }),
         );
         let o = place(&mut app, ComponentDef::Output);
-        let (a_key, g_key, o_key) = (
-            app.components[a].key,
-            app.components[g].key,
-            app.components[o].key,
-        );
-        app.circuit
-            .link(a_key, PinId::output(0), g_key, PinId::input(0));
-        app.circuit
-            .link(g_key, PinId::output(0), o_key, PinId::input(0));
-        app.wires.push(Wire {
-            src_comp: a_key,
-            src_pin: OutIdx(0),
-            dst_comp: g_key,
-            dst_pin: InIdx(0),
-        });
-        app.wires.push(Wire {
-            src_comp: g_key,
-            src_pin: OutIdx(0),
-            dst_comp: o_key,
-            dst_pin: InIdx(0),
-        });
-        app.circuit.settle().unwrap();
+        connect_pins(&mut app, (a, PinId::output(0)), (g, PinId::input(0)));
+        connect_pins(&mut app, (g, PinId::output(0)), (o, PinId::input(0)));
+        app.rebuild_circuit();
+
+        let g_key = app.components[g].key;
+        let o_key = app.components[o].key;
         assert_eq!(app.circuit.read_output(o_key), Value::ZERO); // NOT(1) = 0
         app.selected = Some(Selected::Component(g));
 
@@ -1986,40 +2097,78 @@ mod tests {
 
         assert!(!app.components.contains_key(g));
         assert!(app.circuit.components.get(g_key).is_none());
-        // Only the a->? wire is gone along with g->o; no wire references g_key.
+        // No wire node references the deleted component; orphan neighbours were
+        // cleaned up too, leaving no segments.
         assert!(app
-            .wires
-            .iter()
-            .all(|w| w.src_comp != g_key && w.dst_comp != g_key));
+            .wiring
+            .nodes
+            .values()
+            .all(|n| !matches!(n.attach, NodeAttach::Pin(k, _) if k == g)));
+        assert_eq!(app.wiring.segments.len(), 0);
         assert_eq!(app.selected, None);
-        // Output's input pin was nulled and re-evaluated to Floating.
+        // Output's input pin is now Floating.
         assert_eq!(app.circuit.read_output(o_key), Value::Floating);
     }
 
     #[test]
-    fn test_delete_tunnel_drops_visual_records() {
-        // A component pin tied to a tunnel: deleting the tunnel removes its
-        // visual record, drops the TunnelWire referencing it, and clears the
-        // selection.
+    fn test_delete_tunnel_drops_wire_nodes() {
+        // A component pin wired to a tunnel: deleting the tunnel removes its wire
+        // nodes and clears the selection.
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentDef::Input(Input { bits: 1, width: 1 }));
         let t = app.place_tunnel(TunnelRole::Pull, [1, 1]);
-        let (a_key, t_key) = (app.components[a].key, app.tunnels[t].key);
-        let pin = PinId::output(0);
-        app.circuit.link_tunnel(t_key, a_key, pin);
-        app.tunnel_wires.push(TunnelWire {
-            tunnel: t_key,
-            comp: a_key,
-            pin,
-        });
-        app.circuit.settle().unwrap();
+        let t_key = app.tunnels[t].key;
+        connect_pin_tunnel(&mut app, (a, PinId::output(0)), t);
+        app.rebuild_circuit();
         app.selected = Some(Selected::Tunnel(t));
 
         app.delete_tunnel(t);
 
         assert!(!app.tunnels.contains_key(t));
         assert!(app.circuit.tunnels.get(t_key).is_none());
-        assert!(app.tunnel_wires.iter().all(|tw| tw.tunnel != t_key));
+        assert!(app
+            .wiring
+            .nodes
+            .values()
+            .all(|n| !matches!(n.attach, NodeAttach::Tunnel(k) if k == t)));
         assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn test_delete_wire_segment_splits_net() {
+        // Input -> NOT -> Output as two wires; delete the input->gate wire and
+        // the gate's input goes Floating (net split), so the output does too.
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentDef::Input(Input { bits: 1, width: 1 }));
+        let g = place(
+            &mut app,
+            ComponentDef::Gate(Gate {
+                op: GateOp::Not,
+                n_inputs: 1,
+                width: 1,
+            }),
+        );
+        let o = place(&mut app, ComponentDef::Output);
+        connect_pins(&mut app, (a, PinId::output(0)), (g, PinId::input(0)));
+        connect_pins(&mut app, (g, PinId::output(0)), (o, PinId::input(0)));
+        app.rebuild_circuit();
+        let o_key = app.components[o].key;
+        assert_eq!(app.circuit.read_output(o_key), Value::ZERO);
+
+        // Delete the a->g segment (the one touching a's output pin node).
+        let seg = app
+            .wiring
+            .segments
+            .iter()
+            .find(|(_, s)| {
+                matches!(app.wiring.nodes[s.a].attach, NodeAttach::Pin(k, _) if k == a)
+                    || matches!(app.wiring.nodes[s.b].attach, NodeAttach::Pin(k, _) if k == a)
+            })
+            .map(|(k, _)| k)
+            .unwrap();
+        app.delete_wire(seg);
+
+        // g's input is now Floating -> NOT(Floating) = Floating at the output.
+        assert_eq!(app.circuit.read_output(o_key), Value::Floating);
     }
 }

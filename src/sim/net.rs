@@ -9,6 +9,9 @@ new_key_type! {
 #[derive(Debug, Default)]
 pub struct Net {
     pub value: Value,
-    pub source: Option<(CompKey, OutIdx)>,
+    // Every output pin currently driving this net. A well-formed net has at
+    // most one; two or more is a driver conflict (a short) that resolve_net
+    // flags as Value::Invalid, mirroring the width-conflict handling.
+    pub sources: Vec<(CompKey, OutIdx)>,
     pub sinks: Vec<(CompKey, InIdx)>,
 }

@@ -118,6 +118,17 @@ impl Circuit {
 
         self.nets.clear();
         self.dirty.clear();
+        self.queued.clear();
+
+        // Every input pin now reads Floating, so re-evaluate each component to
+        // refresh its out_cache; otherwise a component that just lost its input
+        // driver would keep a stale output (which a subsequent relink would then
+        // read back as a live value). Sources with no inputs (e.g. Input) simply
+        // recompute their own constant.
+        let keys: Vec<CompKey> = self.components.keys().collect();
+        for key in keys {
+            self.eval_component(key);
+        }
     }
 
     fn net_of(&self, comp: CompKey, pin: PinId) -> Option<NetKey> {
@@ -142,7 +153,7 @@ impl Circuit {
         // Attaches a Component pin to a net, and back-links
         match pin {
             PinId::In(i) => self.nets[net].sinks.push((comp, i)),
-            PinId::Out(i) => self.nets[net].source = Some((comp, i)),
+            PinId::Out(i) => self.nets[net].sources.push((comp, i)),
         }
         self.components[comp].set_pin_net(pin, net);
         // If attaching a sink pin, immediately evaluate the component since no Net's have changed
@@ -192,18 +203,12 @@ impl Circuit {
             self.nets[a].sinks.push((comp, i));
         }
 
-        // Handle source pins
-        match (self.nets[a].source, b_net.source) {
-            (Some(_), Some((comp, i))) => {
-                // TODO: Decide how to handle competing source
-                self.components[comp].set_pin_net(PinId::Out(i), a);
-            }
-            (None, Some((comp, i))) => {
-                // Only Net B was driven, so make that Net A's driver
-                self.components[comp].set_pin_net(PinId::Out(i), a);
-                self.nets[a].source = Some((comp, i));
-            }
-            (_, None) => {}
+        // Fold B's drivers into A. If both nets were driven, A ends up with
+        // more than one source and resolve_net will surface it as Invalid
+        // (a driver conflict), rather than silently dropping one.
+        for (comp, i) in b_net.sources {
+            self.components[comp].set_pin_net(PinId::Out(i), a);
+            self.nets[a].sources.push((comp, i));
         }
 
         // Repoint any tunnels attached to the removed net. Same net, new
@@ -466,7 +471,7 @@ impl Circuit {
     fn net_width_conflict(&self, net: NetKey) -> bool {
         let n = &self.nets[net];
         let mut widths = n
-            .source
+            .sources
             .iter()
             .filter_map(|&(comp, i)| self.components[comp].output_width(i))
             .chain(
@@ -480,17 +485,19 @@ impl Circuit {
         widths.any(|w| w != first)
     }
 
-    // Recomputes the Net's Value from it's source. Returns whether the value changed.
-    // TODO: Add functionality for multiple sources and conflict detection.
+    // Recomputes the Net's Value from its source(s). Returns whether the value changed.
+    // A net with two or more drivers is a conflict (a short) and resolves to
+    // Value::Invalid, the same structural signal used for a width mismatch and
+    // handled identically downstream (Invalid stays local, never propagates).
     fn resolve_net(&mut self, net: NetKey) -> bool {
         let old = self.nets[net].value;
 
-        let new = if self.net_width_conflict(net) {
+        let new = if self.net_width_conflict(net) || self.nets[net].sources.len() > 1 {
             Value::Invalid
         } else {
-            match self.nets[net].source {
+            match self.nets[net].sources.first() {
                 // Net takes value from pins.out_cache, which is updated in eval_component
-                Some((comp, i)) => self.components[comp].pins.out_cache[i.0 as usize],
+                Some(&(comp, i)) => self.components[comp].pins.out_cache[i.0 as usize],
                 // A component driver always takes priority; only fall back to a
                 // Feed tunnel's group value when this net has no real driver.
                 None => self.tunnel_feed_value(net),
@@ -578,18 +585,31 @@ impl Circuit {
         // nets keep the removed component's stale value. Collected now, re-run
         // after the dirty/queued reset below so their fresh marks survive.
         let mut affected_sinks: Vec<CompKey> = Vec::new();
+        // Output nets that still have another driver after this component is
+        // gone: kept alive, but re-resolved (a cleared conflict changes their
+        // value). Re-dirtied after the dirty/queued reset below, like the two
+        // lists above.
+        let mut retained_nets: Vec<NetKey> = Vec::new();
 
-        // Remove nets driven by this component; clear each sink's input pin slot
+        // Drop this component's driver entry from each net it feeds. A net that
+        // still has another driver survives (only its value may change); a net
+        // left with no driver is torn down, freeing each sink's input pin slot.
         for net_key in output_nets {
-            if let Some(net) = self.nets.get(net_key) {
-                let sinks = net.sinks.clone();
-                for (sink_comp, sink_pin) in sinks {
-                    if let Some(sc) = self.components.get_mut(sink_comp) {
-                        sc.pins.inputs[sink_pin.0 as usize] = None;
-                    }
-                    if sink_comp != key {
-                        affected_sinks.push(sink_comp);
-                    }
+            let Some(net) = self.nets.get_mut(net_key) else {
+                continue;
+            };
+            net.sources.retain(|&(ck, _)| ck != key);
+            if !net.sources.is_empty() {
+                retained_nets.push(net_key);
+                continue;
+            }
+            let sinks = net.sinks.clone();
+            for (sink_comp, sink_pin) in sinks {
+                if let Some(sc) = self.components.get_mut(sink_comp) {
+                    sc.pins.inputs[sink_pin.0 as usize] = None;
+                }
+                if sink_comp != key {
+                    affected_sinks.push(sink_comp);
                 }
             }
             for t in self.tunnels.values_mut() {
@@ -627,6 +647,12 @@ impl Circuit {
         // already been reset above.
         for label in affected_labels {
             self.dirty_label_feed_nets(&label);
+        }
+
+        // Re-resolve nets that kept another driver (e.g. a two-driver conflict
+        // that just became single-driver).
+        for net_key in retained_nets {
+            self.mark_dirty(net_key);
         }
     }
 }
@@ -702,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn test_link_second_source_overwrites_first() {
+    fn test_link_second_source_yields_invalid() {
         let mut c = Circuit::new();
         let i1 = c.add_component(Component::input(1, 1));
         let i2 = c.add_component(Component::input(0, 1));
@@ -714,12 +740,13 @@ mod tests {
         c.link(i2, PinId::output(0), g2, PinId::input(0));
 
         c.link(g1, PinId::output(0), o, PinId::input(0));
-        // o's input pin already has a net; this attaches g2 as its source,
-        // silently overwriting g1.
+        // o's input pin already has a net driven by g1; adding g2 gives the net
+        // two drivers, which resolve_net reports as a conflict (Invalid) rather
+        // than silently picking one.
         c.link(g2, PinId::output(0), o, PinId::input(0));
 
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::ONE);
+        assert_eq!(c.read_output(o), Value::Invalid);
     }
 
     #[test]
@@ -733,12 +760,10 @@ mod tests {
     }
 
     #[test]
-    fn test_link_merge_keeps_original_source_documents_bug() {
-        // Documents current (unfinished) merge() behavior: when two
-        // already-driven nets are merged, the ORIGINAL net's source silently
-        // wins; the second driver's component is repointed at the merged net
-        // but its value is never read. See merge()'s "TODO: Decide how to
-        // handle competing source". Not necessarily correct, just current.
+    fn test_link_merge_two_drivers_yields_invalid() {
+        // Merging two already-driven nets folds both drivers onto the surviving
+        // net, giving it two sources. resolve_net reports that as a conflict
+        // (Invalid) rather than silently keeping one driver.
         let mut c = Circuit::new();
         let driver1 = c.add_component(Component::input(1, 1));
         let driver2 = c.add_component(Component::input(0, 1));
@@ -748,7 +773,7 @@ mod tests {
         c.link(driver1, PinId::output(0), sink1, PinId::input(0)); // net1, source = driver1
         c.link(driver2, PinId::output(0), sink2, PinId::input(0)); // net2, source = driver2
                                                                    // Resolve both nets before merging: see
-                                                                   // test_link_merge_of_still_dirty_nets_panics_documents_bug for what
+                                                                   // test_link_merge_of_still_dirty_nets_removes_stale_key for what
                                                                    // happens if a merged-away net is still pending in the dirty queue.
         c.settle().unwrap();
         assert_eq!(c.read_output(sink1), Value::ONE);
@@ -758,10 +783,29 @@ mod tests {
         c.link(sink1, PinId::input(0), sink2, PinId::input(0));
 
         c.settle().unwrap();
-        // Both sinks now share one net; merge() keeps net1's original source
-        // (driver1), even though driver2's output pin was repointed at it.
-        assert_eq!(c.read_output(sink1), Value::ONE);
-        assert_eq!(c.read_output(sink2), Value::ONE);
+        // Both sinks now share one net driven by both driver1 and driver2 -> Invalid.
+        assert_eq!(c.read_output(sink1), Value::Invalid);
+        assert_eq!(c.read_output(sink2), Value::Invalid);
+    }
+
+    #[test]
+    fn test_remove_one_of_two_drivers_clears_conflict() {
+        // A net with two drivers is Invalid; removing one driver leaves a
+        // single-driver net that resolves to the survivor's value (the net is
+        // kept, not torn down).
+        let mut c = Circuit::new();
+        let d1 = c.add_component(Component::input(1, 1));
+        let d2 = c.add_component(Component::input(0, 1));
+        let o = c.add_component(Component::output());
+
+        c.link(d1, PinId::output(0), o, PinId::input(0));
+        c.link(d2, PinId::output(0), o, PinId::input(0)); // two drivers -> Invalid
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::Invalid);
+
+        c.remove_component(d2);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::ONE); // only d1 (=1) left
     }
 
     #[test]
@@ -844,7 +888,16 @@ mod tests {
     }
 
     #[test]
-    fn test_settle_ring_oscillator_reports_non_convergence() {
+    fn test_settle_second_driver_into_loop_is_invalid_not_oscillation() {
+        // A NOT-gate ring seeded by a concrete Input used to be forced into a
+        // toggling feedback loop by closing it with a *second* driver on n1's
+        // input net (last-link-wins injecting a stale concrete value). Now that
+        // two drivers resolve to Invalid, that net short-circuits to Invalid
+        // and stays there: settle() converges cleanly instead of oscillating.
+        // (With strict single-driver nets a purely combinational loop can never
+        // bootstrap a concrete value - Floating is absorbing through every gate
+        // - so REVISIT_THRESHOLD is now a defensive backstop, not reachable via
+        // legitimate wiring.)
         let mut c = Circuit::new();
         let seed = c.add_component(Component::input(0, 1));
         let n1 = c.add_component(Component::gate(GateOp::Not, 1, 1));
@@ -856,14 +909,16 @@ mod tests {
         c.link(n2, PinId::output(0), n3, PinId::input(0));
         c.settle().unwrap(); // seeds n1/n2/n3 with concrete alternating values, no loop yet
 
-        // Close the loop: n3's output overwrites n1's input net's source
-        // (last-link-wins, see test_link_second_source_overwrites_first),
-        // injecting a stale concrete value into what is now a genuine
-        // feedback cycle.
+        // Close the loop: n3 becomes a second driver of n1's input net.
         c.link(n3, PinId::output(0), n1, PinId::input(0));
-        // Toggles forever: the same net keeps crossing REVISIT_THRESHOLD,
-        // reported as a clean Err instead of a panic.
-        assert!(c.settle().is_err());
+        assert!(c.settle().is_ok());
+        // n1's input net has two drivers (seed + n3) -> Invalid, which NOT reads
+        // as Floating, so n1's *output* net (a normal single-driver net) settles
+        // to Floating.
+        let o = c.add_component(Component::output());
+        c.link(n1, PinId::output(0), o, PinId::input(0));
+        c.settle().unwrap();
+        assert_eq!(c.read_output(o), Value::Floating);
     }
 
     // ---- Group 3: register / clock behavior ----
@@ -1151,17 +1206,16 @@ mod tests {
     fn test_tunnel_net_repointed_on_merge() {
         let mut c = Circuit::new();
         let driver1 = c.add_component(Component::input(1, 1));
-        let driver2 = c.add_component(Component::input(1, 1));
         let sink1 = c.add_component(Component::output());
         let sink2 = c.add_component(Component::output());
         c.link(driver1, PinId::output(0), sink1, PinId::input(0));
-        c.link(driver2, PinId::output(0), sink2, PinId::input(0));
 
         let pull = c.add_tunnel("X".to_string(), TunnelRole::Pull);
-        c.link_tunnel(pull, sink2, PinId::input(0)); // attaches to sink2's net
+        c.link_tunnel(pull, sink2, PinId::input(0)); // creates + attaches to sink2's net
 
-        // sink1's net and sink2's net both already exist; linking their
-        // already-attached input pins together forces a merge().
+        // sink1's net (driven by driver1) and sink2's net (undriven, only the
+        // tunnel) both already exist; linking their already-attached input pins
+        // together forces a merge() with a single surviving driver.
         c.link(sink1, PinId::input(0), sink2, PinId::input(0));
         c.settle().unwrap();
 

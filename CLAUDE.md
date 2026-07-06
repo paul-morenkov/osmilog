@@ -35,7 +35,8 @@ wasm-bindgen / wasm-bindgen-futures / js-sys / web-sys.
     src/gui/geometry.rs             ComponentDef shape builders (gate_shape, mux_shape, splitter_shape, ...) and geometry constants (GRID_SIZE, COMP_WIDTH, ...)
     src/gui/theme.rs                Theme - canvas + signal colors derived from the ambient egui Visuals (light/dark responsive)
     src/gui/placed_component.rs     PlacedComponent, ComponentDef - visual/construction record for a placed component
-    src/gui/app.rs                  OsmilogApp - eframe/egui GUI (PlacedTunnel, Wire, TunnelWire, Selected, DragSource, InteractionMode)
+    src/gui/wiring.rs               Wiring, WireNode, WireSegment, NodeAttach, Group - GUI wire graph (grid nodes + axis-aligned segments), the source of truth for connectivity
+    src/gui/app.rs                  OsmilogApp - eframe/egui GUI (PlacedTunnel, Selected, InteractionMode)
     src/main.rs                     entry point: native eframe::run_native, plus a wasm_bindgen(start) WASM entry
 
 
@@ -63,15 +64,15 @@ yields `Floating`, so a mismatch stays local to the one net where it occurs.
 
     pub struct Net {
         pub value: Value,
-        pub source: Option<(CompKey, OutIdx)>,  // at most one driver
-        pub sinks:  Vec<(CompKey, InIdx)>,      // zero or more receivers
+        pub sources: Vec<(CompKey, OutIdx)>,    // zero, one, or (conflict) more drivers
+        pub sinks:   Vec<(CompKey, InIdx)>,     // zero or more receivers
     }
 
-Nets are identified by `NetKey` (slotmap generational key). Multiple component sources ending up
-on the same net is still an unresolved case (`merge()` has a documented bug - see the
-`test_link_merge_keeps_original_source_documents_bug` test). Conflicting *tunnel* drivers, and
-now conflicting *pin widths*, are both detected (`SettleError::TunnelConflict`, `Value::Invalid`
-respectively - see Evaluation Model).
+Nets are identified by `NetKey` (slotmap generational key). A well-formed net has at most one
+source; two or more drivers is a conflict (a short) that `resolve_net` reports as `Value::Invalid`
+(so `merge()` and repeated `link()`s just concatenate `sources`, never silently drop a driver).
+Conflicting *tunnel* drivers surface separately as `SettleError::TunnelConflict`; conflicting *pin
+widths* also resolve to `Value::Invalid` (see Evaluation Model).
 
 ### Component (component.rs)
 
@@ -198,16 +199,26 @@ circuit size. Tunnel label-group conflicts return `SettleError::TunnelConflict`.
 
 ### resolve_net() and Value::Invalid
 
-Before pulling a value from the source (or a Feed tunnel), `resolve_net` calls
-`net_width_conflict(net)`: it collects `output_width`/`input_width` from every pin attached to
-the net (the single source, plus all sinks), drops any `None` ("accepts any width") entries, and
-checks whether more than one distinct declared width remains. If so, `net.value` becomes
-`Value::Invalid` - unconditionally, regardless of what the driver's `out_cache` holds or whether
-any attached pin currently carries a concrete value. This is a purely structural/configuration
-check (not runtime-value-based), so a net can read `Invalid` even while every attached pin is
-still `Floating`. It's recomputed fresh on every call rather than cached on `Net`, so it can't go
-stale after a `merge()`, relink, or component reconfigure - whatever last dirtied the net drives
-the next check. As noted under Value above, `Invalid` doesn't cascade past the flagged net.
+`resolve_net` produces `Value::Invalid` for a net in two structural cases; otherwise it reads the
+value from the net's single source's `out_cache` (or, if the net has no source, a Feed tunnel's
+group value). The two conflict cases:
+
+- **Multiple drivers.** `sources.len() > 1` (two or more output pins on the net) is a short - the
+  net resolves to `Invalid` regardless of what any driver's `out_cache` holds. This is what makes
+  `merge()`/repeated `link()` safe: they append to `sources` rather than dropping a driver, and the
+  conflict is surfaced here.
+- **Width mismatch.** `net_width_conflict(net)` collects `output_width`/`input_width` from every
+  pin attached to the net (all sources, plus all sinks), drops any `None` ("accepts any width")
+  entries, and checks whether more than one distinct declared width remains.
+
+Both are purely structural/configuration checks (not runtime-value-based), so a net can read
+`Invalid` even while every attached pin is still `Floating`. They're recomputed fresh on every
+call rather than cached on `Net`, so they can't go stale after a `merge()`, relink, or component
+reconfigure. As noted under Value above, `Invalid` doesn't cascade past the flagged net.
+
+Because a single-driver combinational cycle can never bootstrap a concrete value (`Floating` is
+absorbing through every gate), genuine settle-time oscillation is now unreachable via legitimate
+wiring; `REVISIT_THRESHOLD`/`SettleError::Oscillation` remain as a defensive backstop.
 
 Each `CombLogic::evaluate()` impl also keeps its own runtime width guards (e.g. Mux/Demux
 checking the selector's actual width, Splitter's Left-mode `widths_ok`) even though a
@@ -259,11 +270,10 @@ ambient egui (and OS) light/dark theme live.
     circuit: Circuit                                       simulation graph — source of truth for signal values
     components: SlotMap<PlacedCompKey, PlacedComponent>     visual records: CompKey + ComponentDef + grid_pos
     tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel>          visual records: TunnelKey + label + role + grid_pos
-    wires: Vec<Wire>                                        visual records: src/dst CompKey + pin indices
-    tunnel_wires: Vec<TunnelWire>                           visual records: TunnelKey + CompKey + PinId
-    mode: InteractionMode                                   Idle | Placing | PlacingTunnel | WireDrag | ComponentDrag
+    wiring: Wiring                                          GUI wire graph (nodes + segments) — source of truth for connectivity
+    mode: InteractionMode                                   Idle | Placing | PlacingTunnel | WireDraw | ComponentDrag
     pan: Vec2                                               canvas pan offset in pixels
-    selected: Option<Selected>                              currently selected component or tunnel
+    selected: Option<Selected>                              currently selected component, tunnel, or wire segment
     last_settle_error: Option<String>                       transient status: last settle()/tick_clock() error OR Save/Load I/O error (shown red in the menu bar)
     pending_load: PendingLoad (wasm only)                    slot where an async browser file-load delivers its result, polled each frame
 
@@ -273,14 +283,25 @@ display (`label`, `n_inputs`, `n_outputs`) and construction (`make_component()`)
 
 `components` and `tunnels` are `SlotMap`s keyed by their own generational key types
 (`PlacedCompKey`, `PlacedTunnelKey` — distinct from the circuit's own `CompKey`/
-`TunnelKey`), not a `Vec`. This lets `Selected`, `DragSource`, and
-`InteractionMode::ComponentDrag` hold a stable key directly — `Selected` is
-`Component(PlacedCompKey) | Tunnel(PlacedTunnelKey)` — instead of a `Vec` index
-(which would shift on removal) or a raw `CompKey`/`TunnelKey` that then has to be
-linearly searched for in a `Vec` to find its visual record. The hit-testing
-functions `pin_at_pos`/`tunnel_pin_at_pos` (see Pin positions below) return these
-same `PlacedCompKey`/`PlacedTunnelKey` values, so callers can index straight into
-`self.components`/`self.tunnels` without an extra search.
+`TunnelKey`), not a `Vec`. This lets `Selected` and `InteractionMode::ComponentDrag`
+hold a stable key directly — `Selected` is `Component(PlacedCompKey) |
+Tunnel(PlacedTunnelKey) | Wire(WireSegKey)` — and the `wiring` graph binds its nodes
+to `PlacedCompKey`/`PlacedTunnelKey` (never the ephemeral `CompKey`), so wires survive
+a `reconfigure_component` (which changes the circuit `CompKey`) automatically.
+
+### GUI wiring (wiring.rs)
+
+`Wiring` is a graph of grid `WireNode`s (each `Free`, `Pin(PlacedCompKey, PinId)`, or
+`Tunnel(PlacedTunnelKey)`) joined by axis-aligned `WireSegment`s, kept in two `SlotMap`s
+(`WireNodeKey`, `WireSegKey`). It is the GUI's source of truth for connectivity and knows nothing
+about `Circuit`. Attachment is by *key*, not position — a wire merely crossing a pin/another wire
+does not connect; a junction exists only where a shared node does, created by `resolve_point`
+splitting a segment when a wire starts/ends partway along it. Connectivity is derived on demand:
+`Wiring::groups()` union-finds the segment graph into connected `Group`s, each carrying its pin
+and tunnel endpoints. After any wiring edit the app calls `OsmilogApp::rebuild_circuit`, which
+`circuit.clear_nets()`s and replays `link`/`link_tunnel` for every group's endpoints, then
+`settle()`s — so `Circuit` never learns about geometry. A group with no component pin (tunnels-
+only, or a purely dangling run) has no net and is skipped.
 
 ### Rendering pipeline (each frame)
 
@@ -290,30 +311,37 @@ same `PlacedCompKey`/`PlacedTunnelKey` values, so callers can index straight int
 2. Optional properties side panel for the current `selected` (edits component params or a
    tunnel label — see Properties panel below).
 3. `allocate_painter` fills the remaining area; `Sense::click_and_drag` captures all input.
-4. `draw_grid` — dot grid at GRID_SIZE (20 px) intervals, offset by `pan`.
-5. Wires — L-shaped elbow at the horizontal midpoint; stroke from `value_stroke(theme, value)`
-   (color = signal state, thickness = 1-bit vs multi-bit bus).
+4. `draw_grid` — dot grid at GRID_SIZE (10 px) intervals, offset by `pan`.
+5. Wire segments — each drawn as a straight axis-aligned stroke from `value_stroke(theme, value)`
+   (color = signal state, thickness = 1-bit vs multi-bit bus); the value is the segment's
+   connected group's net value (`wire_node_values`). Junction dots where a node's degree ≥ 3.
 6. Components / tunnels — tessellated bezier shapes with labels; pin circles colored by signal
    value. Shape and pin positions come from `ComponentDef::shape()` (see Component Shape System).
-7. Mode overlay — ghost component/tunnel while placing; rubber-band line while dragging a wire.
+7. Mode overlay — ghost component/tunnel while placing; elbow preview while drawing a wire; a
+   crosshair reticle when hovering over a wire (where a branch would tap it).
 
 ### Interaction modes (`InteractionMode`)
 
-- **Idle**: drag from an output pin (or a Feed tunnel) → enters WireDrag; drag a component/
-  tunnel body → ComponentDrag; click a body → selects it; click an Input component body →
-  toggles its 1-bit value and calls `circuit.set_input` + `circuit.settle`.
+- **Idle**: drag from a pin / tunnel / existing wire → enters `WireDraw`; drag a *selected*
+  component/tunnel body → `ComponentDrag`; click a pin/tunnel → begins a click-polyline wire;
+  click a component/tunnel body → selects it; click a wire segment → selects that segment.
 - **Placing { def }**: shows a ghost at the snapped grid cell; click places the component via
   `place_component`, which calls `circuit.add_component` and inserts into `self.components`.
 - **PlacingTunnel { role }**: same, for a Feed/Pull tunnel via `place_tunnel`.
-- **WireDrag { src, current_end }**: `src` is a `DragSource` (a component output pin or a
-  Feed tunnel). Tracks `current_end`; on `drag_stopped`, if the cursor is within 2 × PIN_RADIUS
-  of a valid input pin (component input pin, or a Pull tunnel), calls `circuit.link` /
-  `circuit.link_tunnel` + `circuit.settle` and records the `Wire`/`TunnelWire`. Escape → Idle.
+- **WireDraw { points, start_attach, cursor, dragging }** (Hybrid drawing): `points` are the
+  committed grid corners (`points[0]` is the anchor). **Dragging** (`dragging == true`, entered on
+  drag): previews a quick L-elbow (`route_elbow`, one horizontal + one vertical run) to the drop
+  point and commits on release. **Click-polyline** (`dragging == false`, entered on a pin/tunnel
+  click): each click drops a corner; clicking a terminal (pin/tunnel/wire), double-click, or Esc
+  finishes (Esc/double-click ending in empty space leaves a dangling run). Any endpoint may be a
+  component pin (in or out), either tunnel role, an existing wire (which is split into a junction),
+  or empty space. On finish it calls `wiring.add_route` + `rebuild_circuit`.
 - **ComponentDrag { key, drag_origin, original_grid_pos }**: moves the selected component or
-  tunnel, re-snapping `grid_pos` as the cursor moves.
+  tunnel, re-snapping `grid_pos` and calling `sync_component_wire_nodes`/`sync_tunnel_wire_nodes`
+  so attached wire anchors follow (segments to them stretch; topology is unchanged, so no rebuild).
 
-Regardless of mode, **Backspace** (when no text field is focused) deletes the current selection
-(see Deleting components and tunnels below).
+Regardless of mode, **Backspace** (when no text field is focused) deletes the current selection —
+a component, a tunnel, or a single wire segment (see Deleting below).
 
 ### Properties panel
 
@@ -322,33 +350,40 @@ When something is selected, a side panel edits it. For a **tunnel** it edits the
 type's parameters via `DragValue`/`ComboBox`/`selectable_value` widgets (e.g. Input bits/width,
 Gate n_inputs/width, Mux/Demux data_width/sel_width, Reg data_width, Splitter width/arms/
 direction and per-bit arm assignment). Any edit calls `reconfigure_component`, which builds a
-new `ComponentDef`, `remove_component`s the old circuit component, and re-places a fresh one
-(the `PlacedCompKey` is stable, so `Selected` doesn't need updating). For Output and Reg, the
+new `ComponentDef`, `remove_component`s the old circuit component, and adds a fresh one under the
+same stable `PlacedCompKey`; because the `wiring` graph binds to that key, attached wires survive
+— `reconfigure_component` only calls `wiring.prune_stale_pins` (dropping nodes for pins the new
+arity lost), `sync_component_wire_nodes` (repositioning surviving anchors), then `rebuild_circuit`.
+A **wire** selection shows a short read-only note (delete it with Backspace/Delete). For Output and Reg, the
 panel also shows the component's current value as text (`"0x{bits:X} ({width}b)"`, `"Floating"`,
 or `"Invalid (width mismatch)"` for `Value::Invalid`). The panel also has a **Delete** button at
 the bottom that removes the selected component/tunnel.
 
-### Deleting components and tunnels
+### Deleting components, tunnels, and wire segments
 
-A selected component or tunnel is removed either via the properties panel's **Delete** button or
-by pressing **Backspace** while it is selected (the Backspace handler, next to the Escape handler
-in the canvas block, is gated on `!ctx.memory(|m| m.focused().is_some())` so a Backspace aimed at
-the tunnel-label text field edits text instead of deleting). Both paths call the App-level
-`delete_component(PlacedCompKey)` / `delete_tunnel(PlacedTunnelKey)`, which invoke
-`circuit.remove_component` / `remove_tunnel` (net/tunnel teardown + downstream re-evaluation),
-then drop the visual records that referenced the removed key (`retain` over `wires`/
-`tunnel_wires`, remove from `components`/`tunnels` — same "touches this key" filter as
-`reconfigure_component`), clear `selected` if it pointed at the removed item, and settle.
+A selected component, tunnel, or wire segment is removed either via the properties panel's
+**Delete** button or by pressing **Backspace** while it is selected (the Backspace handler, next
+to the Escape handler in the canvas block, is gated on `!ctx.memory(|m| m.focused().is_some())` so
+a Backspace aimed at the tunnel-label text field edits text instead of deleting). The paths call
+`delete_component` / `delete_tunnel` / `delete_wire`. `delete_component`/`delete_tunnel` invoke
+`circuit.remove_component`/`remove_tunnel` and `wiring.remove_component_nodes`/`remove_tunnel_nodes`
+(dropping the wire nodes bound to the removed key plus their now-orphaned neighbours); `delete_wire`
+calls `wiring.delete_segment` (which may split a net). All three then clear `selected` if it
+pointed at the removed item and call `rebuild_circuit`.
 
 ### Save / Load (io.rs)
 
 Save/Load serialize the GUI's visual state (not the sim SlotMaps) to a versioned JSON
-`CircuitFile { version, components, tunnels, wires, tunnel_wires }`. Every cross-reference is a
-plain `usize` index into the file's `components`/`tunnels` vectors (slotmap keys are ephemeral
-and not persisted). `OsmilogApp::to_circuit_file` / `load_circuit_file` do the App↔file
-conversion; `CircuitFile::validate()` checks the version and index bounds before a load
-replaces the current circuit. File I/O is split into `io::native` (blocking rfd dialogs +
-`std::fs`) and `io::wasm` (Blob download for save; async `rfd::AsyncFileDialog` for load,
+`CircuitFile { version, components, tunnels, nodes, segments }` (version **2**; v1's pin-to-pin
+`wires`/`tunnel_wires` are gone and v1 files are rejected). `nodes` are the wiring graph's nodes
+(`{ pos, attach }` where `attach` is `Free` / `Pin { comp, is_input, pin_index }` /
+`Tunnel { tunnel }`), and `segments` are `{ a, b }` index pairs into `nodes`. Every cross-reference
+is a plain `usize` index into the file's `components`/`tunnels`/`nodes` vectors (slotmap keys are
+ephemeral and not persisted). `OsmilogApp::to_circuit_file` / `load_circuit_file` do the App↔file
+conversion (load rebuilds `wiring` then `rebuild_circuit`s); `CircuitFile::validate()` checks the
+version and index bounds before a load replaces the current circuit. File I/O is split into
+`io::native` (blocking rfd dialogs + `std::fs`) and `io::wasm` (Blob download for save; async
+`rfd::AsyncFileDialog` for load,
 delivering into `pending_load`, polled each frame by `apply_pending_load`).
 
 ### Component Shape System (shape.rs + app.rs)
@@ -477,9 +512,8 @@ otherwise trigger Apple's crash reporter.
 
 ## Known Limitations / TODOs
 
-- No conflict detection when multiple *component* sources end up on the same net (merge() has a
-  documented bug); tunnel-driver conflicts *are* detected via `SettleError::TunnelConflict`, and
-  Net-level pin-width conflicts *are* detected via `Value::Invalid`
+- Multiple *component* drivers on one net now resolve to `Value::Invalid` (a short), alongside
+  tunnel-driver conflicts (`SettleError::TunnelConflict`) and pin-width conflicts (`Value::Invalid`)
 - `net_width_conflict` only compares each pin's *declared* width; it trusts that every
   `CombLogic::evaluate()` impl actually emits a `Value` whose width matches its own declared
   `output_width` whenever it's `Fixed` - that invariant isn't independently re-verified
@@ -490,17 +524,17 @@ otherwise trigger Apple's crash reporter.
   hand-edited saved file, which `validate()` does not check) can panic downstream
 - Click-to-select uses the bounding rect, not the actual shape polygon (affects triangles/curves)
 - No canvas panning/zooming interaction yet (a `pan` offset field exists but is never mutated)
-- No wire-only delete gesture (components/tunnels can be deleted, but individual wires can only
-  go away by deleting an endpoint or reconfiguring)
-- `Wire`/`TunnelWire` still store raw `CompKey`/`TunnelKey` rather than
-  `PlacedCompKey`/`PlacedTunnelKey`, so drawing a wire still does a linear
-  `.values().find(...)` over `components`/`tunnels` (see FIXME comments in the draw loop)
+- Moving a component stretches attached wire segments (anchor nodes follow the pins, but
+  intermediate corners don't reflow), so a segment can end up momentarily non-orthogonal until
+  re-routed
+- Wire selection/deletion is per-segment; there's no "select the whole connected run/net" gesture
+  yet (the model supports it — `Wiring::groups()` already computes the connected sets)
+- A wire group of only tunnels (no component pin) has no circuit net; it's inert until a pin joins
 
 
 ## Future Directions
 
-- More component types: arithmetic units (adders/ALU), decoders, memories, additional
-  sequential elements
-- Extend the GUI: delete individual wires, canvas pan & zoom, multi-select, undo/redo
+- More component types: decoders, memories, additional sequential elements
+- Extend the GUI: select/delete a whole wire run, canvas pan & zoom, multi-select, undo/redo
 - Subcircuits / hierarchical components
 - Save/load format evolution (bump `CircuitFile` version as its shape changes)
