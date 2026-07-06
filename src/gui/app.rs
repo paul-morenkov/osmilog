@@ -1,6 +1,6 @@
 use eframe;
 use egui::epaint::{PathShape, PathStroke};
-use egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Sense, Stroke, Vec2};
+use egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use slotmap::{new_key_type, SlotMap};
 use std::collections::HashMap;
 
@@ -85,6 +85,15 @@ pub enum InteractionMode {
         drag_origin: Pos2,
         original_grid_pos: GridPos,
     },
+    // Rubber-band multi-select, entered by dragging from an empty region.
+    // `start` is the grid cell the drag began on and `current` tracks the
+    // drag's live corner; on release everything inside the box they trace is
+    // added to `bulk_selection`. Both are GridPos so the box snaps to the grid
+    // like every other placement.
+    BulkSelect {
+        start: GridPos,
+        current: GridPos,
+    },
 }
 
 // ── PinKind ───────────────────────────────────────────────────────────────────
@@ -111,6 +120,11 @@ pub struct OsmilogApp {
     pub mode: InteractionMode,
     pub pan: Vec2,
     pub selected: Option<Selected>,
+    // A multi-item selection produced by BulkSelect. Kept separate from the
+    // single `selected` (which drives the properties panel and body-drag): when
+    // this is non-empty, Backspace/Delete removes the whole set. Cleared by a
+    // click in empty space or Escape.
+    pub bulk_selection: Vec<Selected>,
     // Also surfaces File > Save/Load I/O errors, not just settle() errors -
     // both are transient "something went wrong" status shown in the same
     // red label in the menu bar (see the "Menu bar" section of `ui`).
@@ -136,6 +150,7 @@ impl OsmilogApp {
             mode: InteractionMode::Idle,
             pan: Vec2::ZERO,
             selected: None,
+            bulk_selection: Vec::new(),
             last_settle_error: None,
             #[cfg(target_arch = "wasm32")]
             pending_load: crate::io::wasm::new_pending_load(),
@@ -413,6 +428,7 @@ impl OsmilogApp {
         self.tunnels = SlotMap::default();
         self.wiring = Wiring::new();
         self.selected = None;
+        self.bulk_selection.clear();
         self.mode = InteractionMode::Idle;
         self.last_settle_error = None;
 
@@ -472,7 +488,14 @@ impl OsmilogApp {
     /// cloned. If the user edits a property, call `self.reconfigure_component()` with an updated ComponentDef
     fn show_properties(&mut self, ui: &mut egui::Ui) {
         let Some(sel) = self.selected else {
-            ui.label("Click a component or tunnel to select it.");
+            if !self.bulk_selection.is_empty() {
+                ui.heading("SELECTION");
+                ui.separator();
+                ui.label(format!("{} items selected.", self.bulk_selection.len()));
+                ui.label("Press Backspace or Delete to remove them.");
+            } else {
+                ui.label("Click a component or tunnel to select it.");
+            }
             return;
         };
         match sel {
@@ -905,6 +928,81 @@ impl OsmilogApp {
         self.rebuild_circuit();
     }
 
+    // True if `sel` is either the single selection or part of the bulk
+    // selection, i.e. it should be drawn highlighted.
+    fn is_highlighted(&self, sel: Selected) -> bool {
+        self.selected == Some(sel) || self.bulk_selection.contains(&sel)
+    }
+
+    // Every component, tunnel, and wire segment fully contained in `rect`
+    // (screen space). Used by BulkSelect to turn a rubber-band box into a
+    // selection: a component/tunnel counts when its whole bounding rect is
+    // inside, a wire when both its endpoints are.
+    fn items_in_rect(&self, rect: Rect, pan: Vec2) -> Vec<Selected> {
+        let mut out = Vec::new();
+        for (key, pc) in &self.components {
+            if rect.contains_rect(component_bounding_rect(pc, pan)) {
+                out.push(Selected::Component(key));
+            }
+        }
+        for (key, pt) in &self.tunnels {
+            if rect.contains_rect(tunnel_bounding_rect(pt, pan)) {
+                out.push(Selected::Tunnel(key));
+            }
+        }
+        for (key, seg) in self.wiring.segments.iter() {
+            let a = grid_to_screen(self.wiring.nodes[seg.a].pos, pan);
+            let b = grid_to_screen(self.wiring.nodes[seg.b].pos, pan);
+            if rect.contains(a) && rect.contains(b) {
+                out.push(Selected::Wire(key));
+            }
+        }
+        out
+    }
+
+    // Removes everything in `bulk_selection` in one shot: wire segments first,
+    // then components/tunnels (whose removal also drops their own wire nodes).
+    // Each removal is guarded by an existence check because deleting a component
+    // can take a wire in the same set with it, and rebuilds the circuit once at
+    // the end rather than per item.
+    fn delete_bulk(&mut self) {
+        let items = std::mem::take(&mut self.bulk_selection);
+        for sel in &items {
+            if let Selected::Wire(seg) = *sel {
+                if self.wiring.segments.contains_key(seg) {
+                    self.wiring.delete_segment(seg);
+                }
+            }
+        }
+        for sel in &items {
+            match *sel {
+                Selected::Component(key) => {
+                    if let Some(pc) = self.components.get(key) {
+                        let comp_key = pc.key;
+                        self.circuit.remove_component(comp_key);
+                        self.wiring.remove_component_nodes(key);
+                        self.components.remove(key);
+                    }
+                }
+                Selected::Tunnel(key) => {
+                    if let Some(pt) = self.tunnels.get(key) {
+                        let tunnel_key = pt.key;
+                        self.circuit.remove_tunnel(tunnel_key);
+                        self.wiring.remove_tunnel_nodes(key);
+                        self.tunnels.remove(key);
+                    }
+                }
+                Selected::Wire(_) => {}
+            }
+        }
+        if let Some(sel) = self.selected {
+            if items.contains(&sel) {
+                self.selected = None;
+            }
+        }
+        self.rebuild_circuit();
+    }
+
     // Applies a File > Load result that a spawned WASM load task has
     // delivered into `pending_load`, if any is waiting. No-op most frames.
     #[cfg(target_arch = "wasm32")]
@@ -1164,17 +1262,26 @@ impl eframe::App for OsmilogApp {
                             self.rebuild_circuit();
                         }
                     }
+                    // BulkSelect: Esc cancels the in-progress rubber-band (the
+                    // trailing reset to Idle handles it) alongside clearing any
+                    // existing bulk selection below.
                     _ => {}
                 }
+                self.bulk_selection.clear();
                 self.mode = InteractionMode::Idle;
             }
 
-            // Backspace deletes the current selection. Guard on widget focus so
-            // a Backspace aimed at the tunnel-label text field (or any focused
-            // widget) edits text instead of deleting.
+            // Backspace/Delete removes the current selection. A non-empty bulk
+            // selection takes priority and is removed as a whole. Guard on widget
+            // focus so a Backspace aimed at the tunnel-label text field (or any
+            // focused widget) edits text instead of deleting.
             let editing_text = ctx.memory(|m| m.focused().is_some());
-            if ctx.input(|i| i.key_pressed(egui::Key::Backspace)) && !editing_text {
-                if let Some(sel) = self.selected {
+            let delete_pressed = ctx
+                .input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete));
+            if delete_pressed && !editing_text {
+                if !self.bulk_selection.is_empty() {
+                    self.delete_bulk();
+                } else if let Some(sel) = self.selected {
                     match sel {
                         Selected::Component(k) => self.delete_component(k),
                         Selected::Tunnel(k) => self.delete_tunnel(k),
@@ -1197,7 +1304,7 @@ impl eframe::App for OsmilogApp {
                 let p1 = grid_to_screen(b.pos, pan);
                 let val = node_value.get(&seg.a).copied().unwrap_or(Value::Floating);
                 let mut stroke = value_stroke(theme, val);
-                if self.selected == Some(Selected::Wire(seg_key)) {
+                if self.is_highlighted(Selected::Wire(seg_key)) {
                     stroke.color = theme.outline_selected;
                     stroke.width += 1.5;
                 }
@@ -1218,13 +1325,13 @@ impl eframe::App for OsmilogApp {
 
             // Draw components
             for (pc_key, pc) in &self.components {
-                let is_selected = self.selected == Some(Selected::Component(pc_key));
+                let is_selected = self.is_highlighted(Selected::Component(pc_key));
                 draw_component(&painter, pc, pan, &self.circuit, is_selected, theme);
             }
 
             // Draw tunnels
             for (pt_key, pt) in &self.tunnels {
-                let is_selected = self.selected == Some(Selected::Tunnel(pt_key));
+                let is_selected = self.is_highlighted(Selected::Tunnel(pt_key));
                 draw_tunnel(&painter, pt, pan, &self.circuit, is_selected, theme);
             }
 
@@ -1262,8 +1369,10 @@ impl eframe::App for OsmilogApp {
                                     cursor: pos,
                                     dragging: true,
                                 };
-                            } else if let Some(sel) = self.selected {
-                                // Selected component/tunnel body drag → move it
+                            } else if let Some((sel, grid_pos)) = self.selected.and_then(|sel| {
+                                // Selected component/tunnel body drag → move it,
+                                // but only when the drag actually began inside its
+                                // bounding rect.
                                 let rect_grid = match sel {
                                     Selected::Component(key) => self
                                         .components
@@ -1275,21 +1384,32 @@ impl eframe::App for OsmilogApp {
                                         .map(|pt| (tunnel_bounding_rect(pt, pan), pt.grid_pos)),
                                     Selected::Wire(_) => None,
                                 };
-                                if let Some((rect, grid_pos)) = rect_grid {
-                                    if rect.contains(pos) {
-                                        self.mode = InteractionMode::ComponentDrag {
-                                            key: sel,
-                                            drag_origin: pos,
-                                            original_grid_pos: grid_pos,
-                                        };
-                                    }
-                                }
+                                rect_grid
+                                    .filter(|(rect, _)| rect.contains(pos))
+                                    .map(|(_, grid_pos)| (sel, grid_pos))
+                            }) {
+                                self.mode = InteractionMode::ComponentDrag {
+                                    key: sel,
+                                    drag_origin: pos,
+                                    original_grid_pos: grid_pos,
+                                };
+                            } else {
+                                // Drag from empty space → rubber-band bulk select.
+                                let gp = snap_to_grid(pos, pan);
+                                self.selected = None;
+                                self.bulk_selection.clear();
+                                self.mode = InteractionMode::BulkSelect {
+                                    start: gp,
+                                    current: gp,
+                                };
                             }
                         }
                     }
 
                     if response.clicked() {
                         if let Some(pos) = pointer {
+                            // Any click ends a bulk selection ("click away").
+                            self.bulk_selection.clear();
                             // A click starts a polyline only from a pin/tunnel;
                             // clicking a bare wire selects it instead (branching
                             // off a wire is a drag gesture, handled above).
@@ -1459,6 +1579,29 @@ impl eframe::App for OsmilogApp {
                         self.mode = InteractionMode::Idle;
                     }
                 }
+
+                InteractionMode::BulkSelect { start, current } => {
+                    // Track the live corner, then paint the rubber-band box.
+                    let current = pointer.map(|p| snap_to_grid(p, pan)).unwrap_or(current);
+                    let rect = selection_screen_rect(start, current, pan);
+                    let c = theme.outline_selected;
+                    painter.rect_filled(
+                        rect,
+                        0.0,
+                        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 24),
+                    );
+                    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, c), StrokeKind::Inside);
+
+                    // Finish on release. The `!dragged` guard also recovers from a
+                    // flick released the same frame it started (drag_stopped never
+                    // fires in the BulkSelect arm then), so the mode can't stick.
+                    if response.drag_stopped() || !response.dragged() {
+                        self.bulk_selection = self.items_in_rect(rect, pan);
+                        self.mode = InteractionMode::Idle;
+                    } else {
+                        self.mode = InteractionMode::BulkSelect { start, current };
+                    }
+                }
             }
         }
     }
@@ -1506,6 +1649,12 @@ fn grid_to_screen(gp: GridPos, pan: Vec2) -> Pos2 {
         gp.x as f32 * GRID_SIZE + pan.x,
         gp.y as f32 * GRID_SIZE + pan.y,
     )
+}
+
+// The screen-space rectangle spanned by a BulkSelect drag's two grid corners,
+// normalized so either drag direction yields the same box.
+fn selection_screen_rect(start: GridPos, current: GridPos, pan: Vec2) -> Rect {
+    Rect::from_two_pos(grid_to_screen(start, pan), grid_to_screen(current, pan))
 }
 
 // A quick L-elbow (one horizontal then one vertical run) from `from` to `to`,
@@ -2131,6 +2280,36 @@ mod tests {
             .values()
             .all(|n| !matches!(n.attach, NodeAttach::Tunnel(k) if k == t)));
         assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn test_bulk_select_box_contains_and_delete() {
+        // Two components near the origin and one far away. A box over the origin
+        // cluster selects exactly those two; a bulk delete removes them and
+        // leaves the far one (and clears the selection).
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentDef::Input(Input { bits: 1, width: 1 }));
+        let b = app.place_component(ComponentDef::Output, GridPos::new(2, 2));
+        let far = app.place_component(ComponentDef::Output, GridPos::new(50, 50));
+        connect_pins(&mut app, (a, PinId::output(0)), (b, PinId::input(0)));
+        app.rebuild_circuit();
+
+        let pan = Vec2::ZERO;
+        let rect = selection_screen_rect(GridPos::new(-2, -2), GridPos::new(12, 12), pan);
+        let items = app.items_in_rect(rect, pan);
+        assert!(items.contains(&Selected::Component(a)));
+        assert!(items.contains(&Selected::Component(b)));
+        assert!(!items.contains(&Selected::Component(far)));
+
+        app.bulk_selection = items;
+        app.delete_bulk();
+
+        assert!(!app.components.contains_key(a));
+        assert!(!app.components.contains_key(b));
+        assert!(app.components.contains_key(far));
+        assert!(app.bulk_selection.is_empty());
+        // The wire between a and b went with them.
+        assert_eq!(app.wiring.segments.len(), 0);
     }
 
     #[test]
