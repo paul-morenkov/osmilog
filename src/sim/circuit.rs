@@ -57,7 +57,7 @@ pub struct Circuit {
     pub(crate) nets: SlotMap<NetKey, Net>,
     pub(crate) components: SlotMap<CompKey, Component>,
     pub(crate) dirty: VecDeque<NetKey>,
-    queued: SecondaryMap<NetKey, bool>, // TODO: there might be a nicer way of organizing this
+    queued: SecondaryMap<NetKey, bool>,
     pub(crate) tunnels: SlotMap<TunnelKey, Tunnel>,
     tunnel_labels: HashMap<String, Vec<TunnelKey>>,
 }
@@ -86,7 +86,6 @@ impl Circuit {
     }
 
     pub fn set_input(&mut self, comp: CompKey, bits: u32, width: u8) {
-        // TODO: Should you be able to change width via this function?
         // TODO: Make this return a result
         if let Logic::Comb(LogicComb::Input(Input { bits: b, width: w })) =
             &mut self.components[comp].logic
@@ -97,11 +96,16 @@ impl Circuit {
         }
     }
 
+    /// Returns `Some(value)` if `comp` corresponds to an Output, otherwise returns None.
     pub fn read_output(&self, comp: CompKey) -> Value {
-        // TODO: Handle the component not being Logic::Output
-        match self.components[comp].pins.inputs[0] {
-            Some(net) => self.nets[net].value,
-            None => Value::Floating,
+        let comp = &self.components[comp];
+
+        match comp.logic {
+            Logic::Comb(LogicComb::Output) => match comp.pins.inputs[0] {
+                Some(net) => self.nets[net].value,
+                None => Value::Floating,
+            },
+            _ => Value::Floating,
         }
     }
 

@@ -221,8 +221,7 @@ impl PinId {
 pub struct Pins {
     pub inputs: Vec<Option<NetKey>>,
     pub outputs: Vec<Option<NetKey>>,
-    pub out_cache: Vec<Value>, // TODO: Should this be combined with outputs to enforce the same
-                               // lengths?
+    pub out_cache: Vec<Value>,
 }
 
 impl Pins {

@@ -113,9 +113,6 @@ mod tests {
 
     #[test]
     fn test_mismatched_data_width() {
-        // Documents current lenient/unvalidated behavior: demux does not
-        // check that the data input's width matches data_width (see the
-        // "TODO: check data_width?" above).
         let demux = Demux {
             data_width: 1,
             sel_width: 1,
