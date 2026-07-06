@@ -540,7 +540,6 @@ impl OsmilogApp {
         }
     }
 
-    // TODO: can't this be an index for a PlacedComponent instead?
     fn show_component_properties(&mut self, key: PlacedCompKey, ui: &mut egui::Ui) {
         let pc = &self.components[key];
         let comp_key = pc.key;

@@ -24,9 +24,16 @@ impl CombLogic for Demux {
         let branches = 1 << self.sel_width;
         match inputs[Self::SEL_PIN] {
             Value::Fixed { bits: sel, width } if width == self.sel_width => {
+                let data = inputs[Self::DATA_PIN];
+
+                // Fallback to Floating if data input width is incorrect
+                if let Value::Fixed { width, .. } = data {
+                    if width != self.data_width {
+                        return vec![Value::Floating; branches];
+                    }
+                }
                 let mut values = vec![Value::new(0, self.data_width); branches];
-                // TODO: check data_width?
-                values[sel as usize] = inputs[Self::DATA_PIN];
+                values[sel as usize] = data;
                 values
             }
             _ => vec![Value::Floating; branches],
@@ -105,7 +112,7 @@ mod tests {
     }
 
     #[test]
-    fn test_data_width_mismatch_passes_through_verbatim() {
+    fn test_mismatched_data_width() {
         // Documents current lenient/unvalidated behavior: demux does not
         // check that the data input's width matches data_width (see the
         // "TODO: check data_width?" above).
@@ -114,6 +121,6 @@ mod tests {
             sel_width: 1,
         };
         let out = demux.evaluate(&[Value::new(3, 2), Value::ZERO]);
-        assert_eq!(out[0], Value::new(3, 2));
+        assert_eq!(out[0], Value::Floating);
     }
 }

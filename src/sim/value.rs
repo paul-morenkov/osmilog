@@ -6,7 +6,7 @@ pub enum Value {
     Floating,
     Fixed {
         bits: u32,
-        width: u8, // TODO: Verification of nonzero width
+        width: u8,
     },
     // A Net whose attached pins declare conflicting expected bit widths (e.g. a driver's
     // output width doesn't match a sink's expected input width). Distinct from Floating,
@@ -82,7 +82,6 @@ impl BitXor for Value {
     }
 }
 
-// TODO: Verification of overflow behavior on Add
 impl Add for Value {
     type Output = Self;
 
@@ -99,7 +98,6 @@ impl Add for Value {
     }
 }
 
-// TODO: Verification of overflow behavior on Sub
 impl Sub for Value {
     type Output = Self;
 
