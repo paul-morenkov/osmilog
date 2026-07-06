@@ -15,8 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::gui::geometry::GridPos;
 use crate::gui::placed_component::ComponentDef;
-use crate::gui::wiring::GridPos;
 use crate::sim::circuit::TunnelRole;
 
 // Bumped whenever CircuitFile's shape changes in a way that breaks

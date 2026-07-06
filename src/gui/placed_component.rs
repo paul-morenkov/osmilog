@@ -2,7 +2,6 @@ use egui::Vec2;
 
 use crate::gui::geometry::*;
 use crate::gui::shape::ComponentShape;
-use crate::gui::wiring::GridPos;
 use crate::sim::component::{
     Adder, CombLogic, CompKey, Comparator, Component, Demux, Divider, Encoder, FanDirection, Gate,
     GateOp, Input, Multiplier, Mux, Reg, Subtractor,

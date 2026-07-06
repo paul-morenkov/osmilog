@@ -20,11 +20,10 @@
 use std::collections::HashMap;
 
 use egui::{Pos2, Vec2};
-use serde::{Deserialize, Serialize};
 use slotmap::{new_key_type, SlotMap};
 
 use crate::gui::app::{PlacedCompKey, PlacedTunnelKey};
-use crate::gui::geometry::{snap_to_grid, GRID_SIZE};
+use crate::gui::geometry::{snap_to_grid, GridPos, GRID_SIZE};
 use crate::sim::component::PinId;
 
 new_key_type! {
@@ -43,33 +42,6 @@ pub enum NodeAttach {
     Free,
     Pin(PlacedCompKey, PinId),
     Tunnel(PlacedTunnelKey),
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(from = "[i32; 2]", into = "[i32; 2]")]
-pub struct GridPos {
-    pub x: i32,
-    pub y: i32,
-}
-
-impl GridPos {
-    pub const ZERO: Self = Self { x: 0, y: 0 };
-
-    pub fn new(x: i32, y: i32) -> Self {
-        Self { x, y }
-    }
-}
-
-impl From<[i32; 2]> for GridPos {
-    fn from(p: [i32; 2]) -> Self {
-        Self { x: p[0], y: p[1] }
-    }
-}
-
-impl From<GridPos> for [i32; 2] {
-    fn from(p: GridPos) -> Self {
-        [p.x, p.y]
-    }
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -1,8 +1,8 @@
 use egui::vec2;
 use egui::{Pos2, Vec2};
+use serde::{Deserialize, Serialize};
 
 use crate::gui::shape::{ComponentLabel, ComponentShape, PinAnchor, ShapeCmd};
-use crate::gui::wiring::GridPos;
 use crate::sim::circuit::TunnelRole;
 use crate::sim::component::{FanDirection, GateOp};
 
@@ -57,6 +57,33 @@ const SPLITTER_BODY_X: (f32, f32) = (0.25, 0.60);
 
 // Tunnels have their own width to account for a potentially long label.
 const TUNNEL_W: u32 = 4;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(from = "[i32; 2]", into = "[i32; 2]")]
+pub struct GridPos {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl GridPos {
+    pub const ZERO: Self = Self { x: 0, y: 0 };
+
+    pub fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+}
+
+impl From<[i32; 2]> for GridPos {
+    fn from(p: [i32; 2]) -> Self {
+        Self { x: p[0], y: p[1] }
+    }
+}
+
+impl From<GridPos> for [i32; 2] {
+    fn from(p: GridPos) -> Self {
+        [p.x, p.y]
+    }
+}
 
 // ── Stack geometry (in cells) ─────────────────────────────────────────────────
 

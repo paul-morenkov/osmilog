@@ -4,13 +4,11 @@ use egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Sense, Stroke, Vec
 use slotmap::{new_key_type, SlotMap};
 use std::collections::HashMap;
 
-use crate::gui::geometry::{snap_to_grid, tunnel_shape, GRID_SIZE, LABEL_FONT_SIZE};
+use crate::gui::geometry::{snap_to_grid, tunnel_shape, GridPos, GRID_SIZE, LABEL_FONT_SIZE};
 use crate::gui::placed_component::{ComponentDef, PlacedComponent};
 use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
 use crate::gui::theme::Theme;
-use crate::gui::wiring::{
-    GridPos, NodeAttach, WireNode, WireNodeKey, WireSegKey, WireSegment, Wiring,
-};
+use crate::gui::wiring::{NodeAttach, WireNode, WireNodeKey, WireSegKey, WireSegment, Wiring};
 use crate::io::{
     CircuitFile, ComponentEntry, LoadError, NodeAttachEntry, NodeEntry, SegEntry, TunnelEntry,
     CURRENT_VERSION,
