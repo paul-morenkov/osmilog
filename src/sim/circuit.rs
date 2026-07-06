@@ -1145,11 +1145,10 @@ mod tests {
     // ---- Group 5: error / edge-case behavior ----
 
     #[test]
-    #[should_panic]
-    fn test_read_output_on_input_component_panics() {
+    fn test_read_output_on_non_output_floating() {
         let mut c = Circuit::new();
         let i = c.add_component(Component::input(1, 1));
-        let _ = c.read_output(i); // Input has 0 input pins; indexes out of bounds
+        assert_eq!(c.read_output(i), Value::Floating)
     }
 
     #[test]
