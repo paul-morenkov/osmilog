@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::gui::placed_component::ComponentDef;
+use crate::gui::wiring::GridPos;
 use crate::sim::circuit::TunnelRole;
 
 // Bumped whenever CircuitFile's shape changes in a way that breaks
@@ -36,14 +37,14 @@ pub struct CircuitFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentEntry {
     pub def: ComponentDef,
-    pub grid_pos: [i32; 2],
+    pub grid_pos: GridPos,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelEntry {
     pub label: String,
     pub role: TunnelRole,
-    pub grid_pos: [i32; 2],
+    pub grid_pos: GridPos,
 }
 
 // A wire graph node at a grid position, optionally bound to a component pin or
@@ -52,7 +53,7 @@ pub struct TunnelEntry {
 // sim::component::PinId.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct NodeEntry {
-    pub pos: [i32; 2],
+    pub pos: GridPos,
     pub attach: NodeAttachEntry,
 }
 

@@ -2,6 +2,7 @@ use egui::vec2;
 use egui::{Pos2, Vec2};
 
 use crate::gui::shape::{ComponentLabel, ComponentShape, PinAnchor, ShapeCmd};
+use crate::gui::wiring::GridPos;
 use crate::sim::circuit::TunnelRole;
 use crate::sim::component::{FanDirection, GateOp};
 
@@ -132,11 +133,11 @@ const fn stack_h(k: usize) -> u32 {
     Pitch::Spread.height(k)
 }
 
-pub fn snap_to_grid(pos: Pos2, pan: Vec2) -> [i32; 2] {
-    [
+pub fn snap_to_grid(pos: Pos2, pan: Vec2) -> GridPos {
+    GridPos::new(
         ((pos.x - pan.x) / GRID_SIZE).round() as i32,
         ((pos.y - pan.y) / GRID_SIZE).round() as i32,
-    ]
+    )
 }
 
 pub fn rect_outline() -> Vec<ShapeCmd> {
