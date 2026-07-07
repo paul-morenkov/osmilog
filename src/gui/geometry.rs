@@ -20,8 +20,7 @@ pub const fn px(cells: u32) -> f32 {
     cells as f32 * GRID_SIZE
 }
 
-/// Width of components whose pins sit only on the left/right edges (gates,
-/// register, comparator). Any whole-cell value keeps their pins on-grid.
+/// Width of components whose pins sit only on the left/right edges
 const EDGE_BODY_W: u32 = 2;
 
 /// Half-width of components that ALSO carry a centered top/bottom-edge pin
@@ -57,6 +56,8 @@ const SPLITTER_BODY_X: (f32, f32) = (0.25, 0.60);
 
 // Tunnels have their own width to account for a potentially long label.
 const TUNNEL_W: u32 = 4;
+
+const REG_W: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(from = "[i32; 2]", into = "[i32; 2]")]
@@ -256,32 +257,14 @@ pub const fn splitter_size(arms: u8) -> Vec2 {
 
 pub const fn reg_size() -> Vec2 {
     // D + WE as a 2-pin stack (height 4 cells); the output centers on grid row 2.
-    vec2(px(EDGE_BODY_W), px(stack_h(2)))
+    vec2(px(REG_W), px(stack_h(2)))
 }
 
 // Height accounts only for the two addend pins on the left edge, same formula as a
 // 2-input gate - the carry-in/carry-out pins sit at the bottom/top edges (like
 // encoder's enable_in/enable_out) and don't consume extra vertical space of their own.
-pub const fn adder_size() -> Vec2 {
+pub const fn op2_size() -> Vec2 {
     vec2(px(ARITH_W), px(stack_h(2)))
-}
-
-// Same layout/formula as adder_size(): minuend/subtrahend on the left edge,
-// borrow-in/borrow-out at the bottom/top edges.
-pub const fn subtractor_size() -> Vec2 {
-    adder_size()
-}
-
-// Same layout/formula as adder_size(): multiplicand/multiplier on the left edge,
-// carry-in/carry-out at the bottom/top edges.
-pub const fn multiplier_size() -> Vec2 {
-    adder_size()
-}
-
-// Same layout/formula as adder_size(): dividend/divisor on the left edge,
-// carry-in/remainder at the bottom/top edges.
-pub const fn divider_size() -> Vec2 {
-    adder_size()
 }
 
 // Height scales off the busier side - the 3 comparison outputs on the right,
@@ -410,7 +393,7 @@ pub fn mux_shape(sel_width: u8) -> ComponentShape {
     ];
 
     ComponentShape {
-        size: vec2(px(MUX_W), px(h_cells)),
+        size: mux_size(sel_width),
         outline,
         fill_outline: None,
         input_anchors,
@@ -446,11 +429,11 @@ pub fn reg_shape() -> ComponentShape {
     ];
 
     ComponentShape {
-        size: vec2(px(EDGE_BODY_W), px(h_cells)),
+        size: reg_size(),
         outline: rect_outline(),
         fill_outline: None,
         input_anchors,
-        output_anchors: vec![PinAnchor::right(EDGE_BODY_W, h_cells / 2)],
+        output_anchors: vec![PinAnchor::right(REG_W, h_cells / 2)],
         extra_strokes: vec![],
         output_bubbles: vec![false],
         labels,
@@ -486,7 +469,7 @@ pub fn demux_shape(sel_width: u8) -> ComponentShape {
     ];
 
     ComponentShape {
-        size: vec2(px(MUX_W), px(h_cells)),
+        size: demux_size(sel_width),
         outline,
         fill_outline: None,
         input_anchors: vec![data_anchor, sel_anchor],
@@ -554,7 +537,7 @@ pub fn encoder_shape(sel_width: u8) -> ComponentShape {
     ];
 
     ComponentShape {
-        size: vec2(px(MUX_W), px(h_cells)),
+        size: encoder_size(sel_width),
         outline: rect_outline(),
         fill_outline: None,
         input_anchors,

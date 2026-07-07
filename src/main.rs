@@ -1,5 +1,3 @@
-use osmilog::gui::app::OsmilogApp;
-
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!(
@@ -17,7 +15,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "osmilog",
         options,
-        Box::new(|cc| Ok(Box::new(OsmilogApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(osmilog::gui::app::OsmilogApp::new(cc)))),
     )
 }
 

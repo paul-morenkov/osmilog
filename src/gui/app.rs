@@ -1253,13 +1253,11 @@ impl eframe::App for OsmilogApp {
                         points,
                         start_attach,
                         ..
-                    } => {
-                        if points.len() >= 2 {
-                            let (points, start_attach) = (points.clone(), *start_attach);
-                            self.wiring
-                                .add_route(&points, start_attach, NodeAttach::Free);
-                            self.rebuild_circuit();
-                        }
+                    } if points.len() >= 2 => {
+                        let (points, start_attach) = (points.clone(), *start_attach);
+                        self.wiring
+                            .add_route(&points, start_attach, NodeAttach::Free);
+                        self.rebuild_circuit();
                     }
                     // BulkSelect: Esc cancels the in-progress rubber-band (the
                     // trailing reset to Idle handles it) alongside clearing any
