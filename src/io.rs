@@ -8,7 +8,7 @@
 // `nodes` (position in the Vec, assigned at save time), not a slotmap key.
 //
 // This module is deliberately gui-light: it only depends on the plain-data
-// types (ComponentDef, GateOp, FanDirection, TunnelRole) needed to describe
+// types (ComponentSpec, GateOp, FanDirection, TunnelRole) needed to describe
 // a circuit's shape, not on OsmilogApp itself - the App<->CircuitFile
 // conversion logic (OsmilogApp::to_circuit_file / load_circuit_file) lives
 // in app.rs, which already owns the SlotMaps this format needs to walk.
@@ -16,8 +16,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::gui::geometry::GridPos;
-use crate::gui::placed_component::ComponentDef;
 use crate::sim::circuit::TunnelRole;
+use crate::sim::component::ComponentSpec;
 
 // Bumped whenever CircuitFile's shape changes in a way that breaks
 // compatibility with previously saved files. Checked by `validate()`.
@@ -36,7 +36,7 @@ pub struct CircuitFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentEntry {
-    pub def: ComponentDef,
+    pub def: ComponentSpec,
     pub grid_pos: GridPos,
 }
 

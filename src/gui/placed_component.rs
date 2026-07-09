@@ -2,97 +2,25 @@ use egui::Vec2;
 
 use crate::gui::geometry::*;
 use crate::gui::shape::ComponentShape;
-use crate::sim::component::{
-    Adder, CombLogic, CompKey, Comparator, Component, Demux, Divider, Encoder, FanDirection, Gate,
-    GateOp, Input, Multiplier, Mux, Reg, Subtractor,
-};
+use crate::sim::component::{CompKey, ComponentSpec, FanDirection, GateOp};
 
 // ── PlacedComponent ───────────────────────────────────────────────────────────
 
 pub struct PlacedComponent {
     pub key: CompKey,
-    pub def: ComponentDef,
+    pub def: ComponentSpec,
     pub grid_pos: GridPos,
 }
 
-// ── ComponentDef ──────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum ComponentDef {
-    Input(Input),
-    Output,
-    Gate(Gate),
-    Mux(Mux),
-    Demux(Demux),
-    Reg(Reg),
-    Encoder(Encoder),
-    Adder(Adder),
-    Subtractor(Subtractor),
-    Multiplier(Multiplier),
-    Divider(Divider),
-    Comparator(Comparator),
-    // Kept as its own lightweight, GUI-only shape rather than wrapping the sim's Splitter
-    // struct (method 2 elsewhere in this enum): the sim struct bundles raw params together
-    // with a precomputed routing table cached for evaluate() performance, which the GUI has
-    // no use for and which would go stale whenever the user edits arm_bits here.
-    Splitter {
-        width: u8,
-        arm_bits: Vec<Vec<u8>>,
-        direction: FanDirection,
-    },
-}
-
-impl ComponentDef {
-    pub fn n_inputs(&self) -> usize {
-        match self {
-            Self::Input(_) => 0,
-            Self::Output => 1,
-            Self::Gate(g) => g.n_inputs(),
-            Self::Mux(m) => m.n_inputs(),
-            Self::Demux(d) => d.n_inputs(),
-            Self::Reg(r) => r.n_inputs(),
-            Self::Encoder(e) => e.n_inputs(),
-            Self::Adder(a) => a.n_inputs(),
-            Self::Subtractor(s) => s.n_inputs(),
-            Self::Multiplier(m) => m.n_inputs(),
-            Self::Divider(d) => d.n_inputs(),
-            Self::Comparator(c) => c.n_inputs(),
-            Self::Splitter {
-                arm_bits,
-                direction,
-                ..
-            } => match direction {
-                FanDirection::Right => 1,
-                FanDirection::Left => arm_bits.len(),
-            },
-        }
-    }
-
-    pub fn n_outputs(&self) -> usize {
-        match self {
-            Self::Input(_) => 1,
-            Self::Output => 0,
-            Self::Gate(g) => g.n_outputs(),
-            Self::Mux(m) => m.n_outputs(),
-            Self::Demux(d) => d.n_outputs(),
-            Self::Reg(r) => r.n_outputs(),
-            Self::Encoder(e) => e.n_outputs(),
-            Self::Adder(a) => a.n_outputs(),
-            Self::Subtractor(s) => s.n_outputs(),
-            Self::Multiplier(m) => m.n_outputs(),
-            Self::Divider(d) => d.n_outputs(),
-            Self::Comparator(c) => c.n_outputs(),
-            Self::Splitter {
-                arm_bits,
-                direction,
-                ..
-            } => match direction {
-                FanDirection::Right => arm_bits.len(),
-                FanDirection::Left => 1,
-            },
-        }
-    }
-
+// ── GUI-only visual concerns for ComponentSpec ────────────────────────────────
+//
+// ComponentSpec itself (construction params per component type) lives in
+// sim::component, shared with undo/redo's RestoreComponent snapshot. This impl
+// block adds display-only methods that depend on gui::geometry/gui::shape
+// types the sim layer must not depend on - Rust allows an inherent impl of a
+// crate-local type from any module, so no wrapper/newtype is needed to keep
+// the two concerns apart while still sharing one enum.
+impl ComponentSpec {
     // Zero-allocation bounding-box size, matching shape().size but without
     // building the full ComponentShape (outline/anchors/bubbles Vecs) just
     // to read one field - used by component_bounding_rect, which is called
@@ -140,28 +68,6 @@ impl ComponentDef {
                 FanDirection::Right => "SPLIT",
                 FanDirection::Left => "COMBINE",
             },
-        }
-    }
-
-    pub fn make_component(&self) -> Component {
-        match self {
-            Self::Input(p) => Component::input(p.bits, p.width),
-            Self::Output => Component::output(),
-            Self::Gate(g) => Component::gate(g.op, g.n_inputs, g.width),
-            Self::Mux(m) => Component::mux(m.data_width, m.sel_width),
-            Self::Demux(d) => Component::demux(d.data_width, d.sel_width),
-            Self::Reg(r) => Component::reg(r.data_width),
-            Self::Encoder(e) => Component::priority_encoder(e.sel_width),
-            Self::Adder(a) => Component::adder(a.data_width),
-            Self::Subtractor(s) => Component::subtractor(s.data_width),
-            Self::Multiplier(m) => Component::multiplier(m.data_width),
-            Self::Divider(d) => Component::divider(d.data_width),
-            Self::Comparator(c) => Component::comparator(c.data_width),
-            Self::Splitter {
-                arm_bits,
-                direction,
-                ..
-            } => Component::splitter(arm_bits.clone(), *direction),
         }
     }
 

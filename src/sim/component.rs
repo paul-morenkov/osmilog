@@ -194,6 +194,135 @@ impl Component {
             *output = None;
         }
     }
+
+    // A Clone-able reconstruction record for this component's construction
+    // parameters (not its live pin wiring or persisted sequential state).
+    // Used to snapshot a component before it's removed, so undo can recreate
+    // an equivalent one later; also the GUI's own placed-component record
+    // (see gui::placed_component, which adds GUI-only display methods to
+    // ComponentSpec via a second inherent impl block).
+    pub(crate) fn spec(&self) -> ComponentSpec {
+        match &self.logic {
+            Logic::Comb(LogicComb::Input(p)) => ComponentSpec::Input(p.clone()),
+            Logic::Comb(LogicComb::Output) => ComponentSpec::Output,
+            Logic::Comb(LogicComb::Gate(g)) => ComponentSpec::Gate(g.clone()),
+            Logic::Comb(LogicComb::Mux(m)) => ComponentSpec::Mux(m.clone()),
+            Logic::Comb(LogicComb::Demux(d)) => ComponentSpec::Demux(d.clone()),
+            Logic::Comb(LogicComb::Encoder(e)) => ComponentSpec::Encoder(e.clone()),
+            Logic::Comb(LogicComb::Adder(a)) => ComponentSpec::Adder(a.clone()),
+            Logic::Comb(LogicComb::Subtractor(s)) => ComponentSpec::Subtractor(s.clone()),
+            Logic::Comb(LogicComb::Multiplier(m)) => ComponentSpec::Multiplier(m.clone()),
+            Logic::Comb(LogicComb::Divider(d)) => ComponentSpec::Divider(d.clone()),
+            Logic::Comb(LogicComb::Comparator(c)) => ComponentSpec::Comparator(c.clone()),
+            Logic::Comb(LogicComb::Splitter(s)) => ComponentSpec::Splitter {
+                width: s.data_width(),
+                arm_bits: s.arm_bits(),
+                direction: s.direction(),
+            },
+            Logic::Seq(LogicSeq::Reg { config, .. }) => ComponentSpec::Reg(config.clone()),
+        }
+    }
+}
+
+// The single canonical "construction params" record for a component - one
+// variant per component type, holding just enough to rebuild an equivalent
+// `Component` via `to_component()`. Used both by the sim layer (undo/redo's
+// `Command::RemoveComponent` snapshot, see sim::command::UndoAction::RestoreComponent)
+// and, unmodified, as the GUI's own placed-component record: gui::placed_component
+// adds a second inherent impl block with GUI-only display methods (`size`,
+// `label`, `shape`) that depend on gui::geometry/gui::shape types the sim
+// layer must not depend on - Rust allows an inherent impl of a crate-local
+// type from any module in the crate, so no wrapper/newtype is needed to keep
+// those concerns apart.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ComponentSpec {
+    Input(Input),
+    Output,
+    Gate(Gate),
+    Mux(Mux),
+    Demux(Demux),
+    Reg(Reg),
+    Encoder(Encoder),
+    Adder(Adder),
+    Subtractor(Subtractor),
+    Multiplier(Multiplier),
+    Divider(Divider),
+    Comparator(Comparator),
+    Splitter {
+        // The trunk width currently being edited in the GUI properties
+        // panel, independent of how many bits `arm_bits` actually assigns
+        // (a widened trunk may not yet have every bit routed to an arm).
+        // Splitter::new derives its real data_width from arm_bits alone, so
+        // to_component() never reads this back out - it exists only so the
+        // GUI has somewhere to keep the in-progress width while editing.
+        width: u8,
+        arm_bits: Vec<Vec<u8>>,
+        direction: FanDirection,
+    },
+}
+
+impl ComponentSpec {
+    pub fn n_inputs(&self) -> usize {
+        match self {
+            Self::Input(_) => 0,
+            Self::Output => 1,
+            Self::Gate(g) => g.n_inputs(),
+            Self::Mux(m) => m.n_inputs(),
+            Self::Demux(d) => d.n_inputs(),
+            Self::Reg(r) => r.n_inputs(),
+            Self::Encoder(e) => e.n_inputs(),
+            Self::Adder(a) => a.n_inputs(),
+            Self::Subtractor(s) => s.n_inputs(),
+            Self::Multiplier(m) => m.n_inputs(),
+            Self::Divider(d) => d.n_inputs(),
+            Self::Comparator(c) => c.n_inputs(),
+            Self::Splitter { arm_bits, direction, .. } => match direction {
+                FanDirection::Right => 1,
+                FanDirection::Left => arm_bits.len(),
+            },
+        }
+    }
+
+    pub fn n_outputs(&self) -> usize {
+        match self {
+            Self::Input(_) => 1,
+            Self::Output => 0,
+            Self::Gate(g) => g.n_outputs(),
+            Self::Mux(m) => m.n_outputs(),
+            Self::Demux(d) => d.n_outputs(),
+            Self::Reg(r) => r.n_outputs(),
+            Self::Encoder(e) => e.n_outputs(),
+            Self::Adder(a) => a.n_outputs(),
+            Self::Subtractor(s) => s.n_outputs(),
+            Self::Multiplier(m) => m.n_outputs(),
+            Self::Divider(d) => d.n_outputs(),
+            Self::Comparator(c) => c.n_outputs(),
+            Self::Splitter { arm_bits, direction, .. } => match direction {
+                FanDirection::Right => arm_bits.len(),
+                FanDirection::Left => 1,
+            },
+        }
+    }
+
+    pub(crate) fn to_component(&self) -> Component {
+        match self {
+            Self::Input(p) => Component::input(p.bits, p.width),
+            Self::Output => Component::output(),
+            Self::Gate(g) => Component::gate(g.op, g.n_inputs, g.width),
+            Self::Mux(m) => Component::mux(m.data_width, m.sel_width),
+            Self::Demux(d) => Component::demux(d.data_width, d.sel_width),
+            Self::Reg(r) => Component::reg(r.data_width),
+            Self::Encoder(e) => Component::priority_encoder(e.sel_width),
+            Self::Adder(a) => Component::adder(a.data_width),
+            Self::Subtractor(s) => Component::subtractor(s.data_width),
+            Self::Multiplier(m) => Component::multiplier(m.data_width),
+            Self::Divider(d) => Component::divider(d.data_width),
+            Self::Comparator(c) => Component::comparator(c.data_width),
+            Self::Splitter { arm_bits, direction, .. } => {
+                Component::splitter(arm_bits.clone(), *direction)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -372,6 +501,14 @@ pub enum LogicSeq {
     Reg { config: Reg, value: Value },
 }
 
+// Generic reflection of LogicSeq's persisted state - one arm per LogicSeq
+// variant, colocated here for the same "new variant -> matching arm"
+// locality the tick/observe dispatch above already relies on.
+#[derive(Debug, Clone, Copy)]
+pub enum SeqState {
+    Reg(Value),
+}
+
 impl LogicSeq {
     pub fn n_inputs(&self) -> usize {
         match self {
@@ -404,6 +541,16 @@ impl LogicSeq {
     pub fn observe(&self) -> Vec<Value> {
         match self {
             Self::Reg { value, .. } => vec![*value],
+        }
+    }
+
+    // A Clone-able snapshot of this variant's persisted (non-input-derived)
+    // state, independent of evaluate()/observe()'s input-driven output. Used
+    // to capture a sequential component's state before tick_clock() mutates
+    // it, so undo can restore it directly later.
+    pub(crate) fn snapshot(&self) -> SeqState {
+        match self {
+            Self::Reg { value, .. } => SeqState::Reg(*value),
         }
     }
 

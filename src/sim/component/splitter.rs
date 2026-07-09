@@ -76,6 +76,24 @@ impl Splitter {
     pub fn direction(&self) -> FanDirection {
         self.direction
     }
+
+    // Reconstructs an arm-major arm_bits from routing/arm_width, inverting
+    // the mapping built in new(). Bit-claim collisions were already resolved
+    // at construction time, so this round-trips through Splitter::new() to
+    // an identical routing/arm_width even though it isn't necessarily the
+    // exact Vec<Vec<u8>> originally passed in (e.g. a bit claimed by two
+    // arms only appears under the winning arm here, same as it does in the
+    // live routing table).
+    pub(crate) fn arm_bits(&self) -> Vec<Vec<u8>> {
+        let mut arm_bits: Vec<Vec<u8>> =
+            self.arm_width.iter().map(|&w| vec![0u8; w as usize]).collect();
+        for (bit, routed) in self.routing.iter().enumerate() {
+            if let Some((arm, slot)) = routed {
+                arm_bits[*arm as usize][*slot as usize] = bit as u8;
+            }
+        }
+        arm_bits
+    }
 }
 
 impl CombLogic for Splitter {
@@ -349,5 +367,33 @@ mod tests {
         let s = Splitter::new(vec![], FanDirection::Left);
         assert_eq!(s.n_inputs(), 0);
         assert_eq!(s.evaluate(&[]), vec![Value::new(0, 0)]);
+    }
+
+    #[test]
+    fn test_arm_bits_round_trips_through_new() {
+        // Interleaved mapping (not a trivial contiguous split) exercises
+        // reconstruction across non-adjacent bit indices per arm.
+        let s1 = Splitter::new(vec![vec![0, 2], vec![1, 3]], FanDirection::Right);
+        let reconstructed = s1.arm_bits();
+        let s2 = Splitter::new(reconstructed, FanDirection::Right);
+        assert_eq!(s1.data_width(), s2.data_width());
+        assert_eq!(
+            s1.evaluate(&[Value::new(0b1011, 4)]),
+            s2.evaluate(&[Value::new(0b1011, 4)])
+        );
+    }
+
+    #[test]
+    fn test_arm_bits_round_trips_after_collision_resolution() {
+        // Bit 0 is claimed by both arms; the later arm (arm1) wins per
+        // Splitter::new's documented precedence. arm_bits() must reflect the
+        // already-resolved winner, not the original ambiguous input.
+        let s1 = Splitter::new(vec![vec![0, 1], vec![0]], FanDirection::Right);
+        let reconstructed = s1.arm_bits();
+        let s2 = Splitter::new(reconstructed, FanDirection::Right);
+        assert_eq!(
+            s1.evaluate(&[Value::new(0b11, 2)]),
+            s2.evaluate(&[Value::new(0b11, 2)])
+        );
     }
 }
