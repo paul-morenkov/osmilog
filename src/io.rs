@@ -193,8 +193,8 @@ pub mod native {
     // completed but the write failed.
     pub fn save_dialog(json: &str) -> Option<Result<(), String>> {
         let path = rfd::FileDialog::new()
-            .add_filter("osmilog circuit", &["json"])
-            .set_file_name("circuit.json")
+            .add_filter("osmilog circuit", &["osm"])
+            .set_file_name("circuit.osm")
             .save_file()?;
         Some(std::fs::write(path, json).map_err(|e| e.to_string()))
     }
@@ -203,7 +203,7 @@ pub mod native {
     // chosen file. `None` means the user cancelled.
     pub fn load_dialog() -> Option<Result<CircuitFile, String>> {
         let path = rfd::FileDialog::new()
-            .add_filter("osmilog circuit", &["json"])
+            .add_filter("osmilog circuit", &["osm"])
             .pick_file()?;
         Some((|| {
             let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;

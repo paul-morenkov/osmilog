@@ -1,6 +1,6 @@
 use eframe;
 use egui::epaint::{PathShape, PathStroke};
-use egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use slotmap::{new_key_type, SlotMap};
 use std::collections::HashMap;
 
@@ -207,6 +207,23 @@ impl OsmilogApp {
     // wire group with no component pin (tunnels-only, or purely dangling) has
     // no net to attach to and is skipped. Called after any wiring edit.
     fn rebuild_circuit(&mut self) {
+        // Reconcile each circuit tunnel's label from its GUI record, which is
+        // the source of truth. The properties panel updates PlacedTunnel.label
+        // live but only commits circuit.rename_tunnel on an explicit Enter, so
+        // without this a label changed some other way (clicking away) would
+        // leave the circuit grouping the tunnel under its stale label - and its
+        // Feed/Pull partner would never join the group. rename_tunnel is a
+        // no-op when the label already matches.
+        let renames: Vec<(TunnelKey, String)> = self
+            .tunnels
+            .values()
+            .filter(|pt| self.circuit.tunnel_label(pt.key) != Some(pt.label.as_str()))
+            .map(|pt| (pt.key, pt.label.clone()))
+            .collect();
+        for (key, label) in renames {
+            self.circuit.rename_tunnel(key, label);
+        }
+
         self.circuit.clear_nets();
         for group in self.wiring.groups() {
             // Map GUI PlacedCompKeys to live circuit CompKeys; a stale key
@@ -532,7 +549,12 @@ impl OsmilogApp {
             pt.label = label.clone();
         }
 
-        if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+        // Commit on any focus loss - Enter, Tab, or clicking away - not only
+        // Enter. Committing only on Enter left the GUI label (updated above on
+        // `changed()`) ahead of the circuit's, so a tunnel renamed by clicking
+        // away stayed grouped under its old label and its Feed partner read
+        // Floating. (rebuild_circuit also reconciles as a backstop.)
+        if response.lost_focus() {
             self.circuit.rename_tunnel(pt.key, label.clone());
             pt.label = label;
             let result = self.circuit.settle();
@@ -2277,6 +2299,34 @@ mod tests {
             .values()
             .all(|n| !matches!(n.attach, NodeAttach::Tunnel(k) if k == t)));
         assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn test_rebuild_circuit_reconciles_tunnel_labels() {
+        // Regression for the tunnel-rename bug: if the GUI's PlacedTunnel.label
+        // is changed without a matching circuit.rename_tunnel (e.g. the user
+        // committed the rename by clicking away rather than pressing Enter),
+        // rebuild_circuit must reconcile the circuit's label from the GUI's, so
+        // the renamed Feed/Pull pair form one group and the value propagates.
+        let mut app = OsmilogApp::empty();
+        let inp = place(&mut app, ComponentDef::Input(Input { bits: 1, width: 1 }));
+        let out = place(&mut app, ComponentDef::Output);
+        let pull = app.place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
+        let feed = app.place_tunnel(TunnelRole::Feed, GridPos::new(2, 2));
+
+        connect_pin_tunnel(&mut app, (inp, PinId::output(0)), pull);
+        connect_pin_tunnel(&mut app, (out, PinId::input(0)), feed);
+        app.rebuild_circuit();
+
+        let out_key = app.components[out].key;
+        assert_eq!(app.circuit.read_output(out_key), Value::Floating);
+
+        // GUI label changed only; circuit.rename_tunnel deliberately NOT called.
+        let shared = app.tunnels[pull].label.clone();
+        app.tunnels[feed].label = shared;
+        app.rebuild_circuit();
+
+        assert_eq!(app.circuit.read_output(out_key), Value::ONE);
     }
 
     #[test]
