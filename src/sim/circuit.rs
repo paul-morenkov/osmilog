@@ -287,10 +287,18 @@ impl Circuit {
         self.dirty_label_feed_nets(&t.label);
     }
 
+    /// The current label of a tunnel, or `None` if the key is stale.
+    pub fn tunnel_label(&self, tunnel: TunnelKey) -> Option<&str> {
+        self.tunnels.get(tunnel).map(|t| t.label.as_str())
+    }
+
     pub fn rename_tunnel(&mut self, tunnel: TunnelKey, new_label: String) {
         let Some(t) = self.tunnels.get_mut(tunnel) else {
             return;
         };
+        if t.label == new_label {
+            return; // no-op: label unchanged, don't churn the label group
+        }
         let old_label = std::mem::replace(&mut t.label, new_label.clone());
         let net = t.net;
 
