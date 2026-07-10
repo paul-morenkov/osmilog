@@ -4,6 +4,7 @@ use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, StrokeKi
 use slotmap::{new_key_type, SlotMap};
 use std::collections::HashMap;
 
+use crate::gui::clipboard::Clipboard;
 use crate::gui::geometry::{snap_to_grid, tunnel_shape, GridPos, GRID_SIZE, LABEL_FONT_SIZE};
 use crate::gui::gui_undo::GuiUndoAction;
 use crate::gui::history::{History, HistoryEntry};
@@ -13,7 +14,6 @@ use crate::gui::theme::Theme;
 use crate::gui::wiring::{NodeAttach, WireNode, WireNodeKey, WireSegKey, WireSegment, Wiring};
 use crate::io::{
     CircuitFile, ComponentEntry, LoadError, NodeAttachEntry, NodeEntry, SegEntry, TunnelEntry,
-    CURRENT_VERSION,
 };
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::command::Command;
@@ -92,10 +92,14 @@ pub enum InteractionMode {
         cursor: Pos2,
         dragging: bool,
     },
-    ComponentDrag {
-        key: Selected,
+    // Body-drag of the current selection. `items` pairs each dragged key with
+    // the grid_pos it had at drag-start. `free_nodes` are the Free-attached
+    // WireNodes of any selected wire segment. If not tracked, only wires that are directly
+    // connected between two component pins move.
+    SelectionDrag {
+        items: Vec<(Selected, GridPos)>,
+        free_nodes: Vec<(WireNodeKey, GridPos)>,
         drag_origin: Pos2,
-        original_grid_pos: GridPos,
     },
     // Rubber-band multi-select from dragging an empty region; `start`/`current`
     // are the box corners (GridPos, so it snaps to grid) - on release,
@@ -136,6 +140,10 @@ pub struct OsmilogApp {
     // Some(Bulk): non-empty means Backspace/Delete removes the whole set.
     // Cleared by a click in empty space or Escape.
     pub selected: Option<Selection>,
+    // Snapshot of the last copied selection, decoupled from live SlotMap
+    // keys so it survives undo/redo and further edits to the copied
+    // originals. See gui::clipboard::Clipboard.
+    pub clipboard: Clipboard,
     // Also surfaces File > Save/Load I/O errors, not just settle() errors -
     // both are transient "something went wrong" status shown in the same
     // red label in the menu bar (see the "Menu bar" section of `ui`).
@@ -175,6 +183,7 @@ impl OsmilogApp {
             mode: InteractionMode::Idle,
             pan: Vec2::ZERO,
             selected: None,
+            clipboard: Clipboard::new(),
             last_settle_error: None,
             #[cfg(target_arch = "wasm32")]
             pending_load: crate::io::wasm::new_pending_load(),
@@ -337,15 +346,7 @@ impl OsmilogApp {
     // (fan-out/driver-conflict handling lives in Circuit::link). A group with
     // no component pin is skipped. Called after any wiring edit.
     pub(crate) fn rebuild_circuit(&mut self) {
-        // History-free: this only reconstructs derived net state, which undo
-        // re-derives rather than reverses, so every command here goes through
-        // the untracked `self.circuit.apply(..).0`. A caller's own
-        // authoritative edit is batched outside this method.
-
-        // Reconcile each circuit tunnel's label from its GUI record (source of
-        // truth): the properties panel updates PlacedTunnel.label live but only
-        // commits on Enter, so without this a label changed by clicking away
-        // would leave the tunnel grouped under its stale label.
+        // Reconcile each circuit tunnel's label from its GUI record
         let renames: Vec<(TunnelKey, String)> = self
             .tunnels
             .values()
@@ -572,13 +573,7 @@ impl OsmilogApp {
             })
             .collect();
 
-        CircuitFile {
-            version: CURRENT_VERSION,
-            components,
-            tunnels,
-            nodes,
-            segments,
-        }
+        CircuitFile::new(components, tunnels, nodes, segments)
     }
 
     // Replaces the current circuit with the one described by `file`.
@@ -1158,6 +1153,52 @@ impl OsmilogApp {
         }
     }
 
+    // A selected item's screen-space bounding rect and current grid_pos, for
+    // deciding whether a drag-start point hits it and what "original
+    // position" a ComponentDrag should restore on cancel/undo. `None` for a
+    // Selected::Wire (no draggable body) or a stale key.
+    fn drag_grid_pos(&self, sel: Selected, pan: Vec2) -> Option<(Rect, GridPos)> {
+        match sel {
+            Selected::Component(key) => self
+                .components
+                .get(key)
+                .map(|pc| (component_bounding_rect(pc, pan), pc.grid_pos)),
+            Selected::Tunnel(key) => self
+                .tunnels
+                .get(key)
+                .map(|pt| (tunnel_bounding_rect(pt, pan), pt.grid_pos)),
+            Selected::Wire(_) => None,
+        }
+    }
+
+    // The Free-attached WireNodes belonging to any Selected::Wire in `sels`
+    // (deduped - a route's interior node can be shared by two selected
+    // segments), each paired with its current grid_pos. Pin/Tunnel-attached
+    // nodes are excluded: those follow their owning component/tunnel via
+    // sync_component_wire_nodes/sync_tunnel_wire_nodes instead, and must
+    // stay put if that owner isn't itself part of the drag.
+    fn free_wire_nodes(&self, sels: &[Selected]) -> Vec<(WireNodeKey, GridPos)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for sel in sels {
+            let Selected::Wire(seg) = sel else { continue };
+            let Some(segment) = self.wiring.segments.get(*seg) else {
+                continue;
+            };
+            for node_key in [segment.a, segment.b] {
+                if !seen.insert(node_key) {
+                    continue;
+                }
+                if let Some(node) = self.wiring.nodes.get(node_key) {
+                    if matches!(node.attach, NodeAttach::Free) {
+                        out.push((node_key, node.pos));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     // Every component, tunnel, and wire segment fully contained in `rect`
     // (screen space): a component/tunnel counts when its bounding rect is
     // inside, a wire when both endpoints are.
@@ -1234,6 +1275,84 @@ impl OsmilogApp {
         self.history.end_batch();
     }
 
+    // Snapshots the current selection onto the clipboard. No-op if nothing
+    // is selected. Read-only: never touches history.
+    fn copy_selection(&mut self) {
+        let items: Vec<Selected> = match &self.selected {
+            None => return,
+            Some(Selection::Single(s)) => vec![*s],
+            Some(Selection::Bulk(v)) => v.clone(),
+        };
+        self.clipboard
+            .copy(&self.components, &self.tunnels, &self.wiring, &items);
+    }
+
+    // Materializes the clipboard's (offset) snapshot as new components,
+    // tunnels, and wiring, as one undoable batch; the pasted items become
+    // the new selection. No-op if the clipboard is empty.
+    fn paste_clipboard(&mut self) {
+        let Some(file) = self.clipboard.plan_paste() else {
+            return;
+        };
+        self.history.begin_batch();
+
+        // File indices -> the freshly placed GUI keys, mirroring
+        // load_circuit_file (wiring nodes reference components/tunnels by
+        // these).
+        let comp_keys: Vec<PlacedCompKey> = file
+            .components
+            .iter()
+            .map(|entry| self.place_component(entry.spec.clone(), entry.grid_pos))
+            .collect();
+
+        let tunnel_keys: Vec<PlacedTunnelKey> = file
+            .tunnels
+            .iter()
+            .map(|entry| self.place_tunnel_labeled(entry.label.clone(), entry.role, entry.grid_pos))
+            .collect();
+
+        let nodes: Vec<(GridPos, NodeAttach)> = file
+            .nodes
+            .iter()
+            .map(|entry| {
+                let attach = match entry.attach {
+                    NodeAttachEntry::Free => NodeAttach::Free,
+                    NodeAttachEntry::Pin {
+                        comp,
+                        is_input,
+                        pin_index,
+                    } => {
+                        let pin = if is_input {
+                            PinId::input(pin_index)
+                        } else {
+                            PinId::output(pin_index)
+                        };
+                        NodeAttach::Pin(comp_keys[comp], pin)
+                    }
+                    NodeAttachEntry::Tunnel { tunnel } => NodeAttach::Tunnel(tunnel_keys[tunnel]),
+                };
+                (entry.pos, attach)
+            })
+            .collect();
+        let segments: Vec<(usize, usize)> = file.segments.iter().map(|s| (s.a, s.b)).collect();
+
+        let (_, seg_keys, delta) = self.wiring.add_subgraph(&nodes, &segments);
+        self.edit_wiring(delta);
+        self.rebuild_circuit();
+
+        let mut new_selection: Vec<Selected> = Vec::new();
+        new_selection.extend(comp_keys.into_iter().map(Selected::Component));
+        new_selection.extend(tunnel_keys.into_iter().map(Selected::Tunnel));
+        new_selection.extend(seg_keys.into_iter().map(Selected::Wire));
+        self.selected = match new_selection.len() {
+            0 => None,
+            1 => Some(Selection::Single(new_selection[0])),
+            _ => Some(Selection::Bulk(new_selection)),
+        };
+
+        self.history.end_batch();
+    }
+
     // Applies a File > Load result that a spawned WASM load task has
     // delivered into `pending_load`, if any is waiting. No-op most frames.
     #[cfg(target_arch = "wasm32")]
@@ -1305,6 +1424,21 @@ impl OsmilogApp {
                         .clicked()
                     {
                         self.redo();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(self.selected.is_some(), egui::Button::new("Copy"))
+                        .clicked()
+                    {
+                        self.copy_selection();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(!self.clipboard.is_empty(), egui::Button::new("Paste"))
+                        .clicked()
+                    {
+                        self.paste_clipboard();
                         ui.close();
                     }
                 });
@@ -1507,16 +1641,20 @@ impl OsmilogApp {
     fn handle_canvas_shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             match &self.mode {
-                InteractionMode::ComponentDrag {
-                    key,
-                    original_grid_pos,
-                    ..
+                InteractionMode::SelectionDrag {
+                    items, free_nodes, ..
                 } => {
-                    let (key, original_grid_pos) = (*key, *original_grid_pos);
-                    match key {
-                        Selected::Component(k) => self.components[k].grid_pos = original_grid_pos,
-                        Selected::Tunnel(k) => self.tunnels[k].grid_pos = original_grid_pos,
-                        Selected::Wire(_) => {}
+                    for (key, original_grid_pos) in items {
+                        match key {
+                            Selected::Component(k) => {
+                                self.components[*k].grid_pos = *original_grid_pos
+                            }
+                            Selected::Tunnel(k) => self.tunnels[*k].grid_pos = *original_grid_pos,
+                            Selected::Wire(_) => {}
+                        }
+                    }
+                    for (key, original_pos) in free_nodes {
+                        self.wiring.nodes[*key].pos = *original_pos;
                     }
                 }
                 // Esc while drawing commits the polyline drawn so far as a
@@ -1577,6 +1715,24 @@ impl OsmilogApp {
                 self.redo();
             }
         }
+
+        // Copy (Ctrl/Cmd+C) / Paste (Ctrl/Cmd+V). Same focus guard as
+        // delete/undo/redo so the shortcuts don't fire while typing in the
+        // tunnel-label field (where Ctrl+C/V should edit text).
+        if !editing_text {
+            let (copy, paste) = ctx.input(|i| {
+                let cmd = i.modifiers.command;
+                (
+                    cmd && i.key_pressed(egui::Key::C),
+                    cmd && i.key_pressed(egui::Key::V),
+                )
+            });
+            if copy {
+                self.copy_selection();
+            } else if paste {
+                self.paste_clipboard();
+            }
+        }
     }
 
     // ── Canvas mode dispatch ──────────────────────────────────────────────
@@ -1598,11 +1754,11 @@ impl OsmilogApp {
                 cursor,
                 dragging,
             } => self.interact_wire_draw(cc, pointer, points, start_attach, cursor, dragging),
-            InteractionMode::ComponentDrag {
-                key,
+            InteractionMode::SelectionDrag {
+                items,
+                free_nodes,
                 drag_origin,
-                original_grid_pos,
-            } => self.interact_component_drag(cc, pointer, key, drag_origin, original_grid_pos),
+            } => self.interact_component_drag(cc, pointer, items, free_nodes, drag_origin),
             InteractionMode::BulkSelect { start, current } => {
                 self.interact_bulk_select(cc, pointer, start, current)
             }
@@ -1635,33 +1791,43 @@ impl OsmilogApp {
                         cursor: pos,
                         dragging: true,
                     };
-                } else if let Some((sel, grid_pos)) = match &self.selected {
+                } else if let Some((items, free_nodes)) = match &self.selected {
                     Some(Selection::Single(sel)) => {
                         // Selected component/tunnel body drag → move it,
                         // but only when the drag actually began inside its
-                        // bounding rect.
+                        // bounding rect. A lone selected wire has no body to
+                        // drag (drag_grid_pos returns None for it).
                         let sel = *sel;
-                        let rect_grid = match sel {
-                            Selected::Component(key) => self
-                                .components
-                                .get(key)
-                                .map(|pc| (component_bounding_rect(pc, cc.pan), pc.grid_pos)),
-                            Selected::Tunnel(key) => self
-                                .tunnels
-                                .get(key)
-                                .map(|pt| (tunnel_bounding_rect(pt, cc.pan), pt.grid_pos)),
-                            Selected::Wire(_) => None,
-                        };
-                        rect_grid
+                        self.drag_grid_pos(sel, cc.pan)
                             .filter(|(rect, _)| rect.contains(pos))
-                            .map(|(_, grid_pos)| (sel, grid_pos))
+                            .map(|(_, grid_pos)| (vec![(sel, grid_pos)], Vec::new()))
                     }
-                    _ => None,
+                    Some(Selection::Bulk(sels)) => {
+                        // Bulk body drag → move every selected component/
+                        // tunnel together, plus any Free wire node the
+                        // selection also covers, as long as the drag began
+                        // inside *any one* component/tunnel's bounding rect.
+                        let started_inside = sels.iter().any(|sel| {
+                            self.drag_grid_pos(*sel, cc.pan)
+                                .is_some_and(|(rect, _)| rect.contains(pos))
+                        });
+                        started_inside.then(|| {
+                            let items: Vec<(Selected, GridPos)> = sels
+                                .iter()
+                                .filter_map(|sel| {
+                                    self.drag_grid_pos(*sel, cc.pan).map(|(_, gp)| (*sel, gp))
+                                })
+                                .collect();
+                            let free_nodes = self.free_wire_nodes(sels);
+                            (items, free_nodes)
+                        })
+                    }
+                    None => None,
                 } {
-                    self.mode = InteractionMode::ComponentDrag {
-                        key: sel,
+                    self.mode = InteractionMode::SelectionDrag {
+                        items,
+                        free_nodes,
                         drag_origin: pos,
-                        original_grid_pos: grid_pos,
                     };
                 } else {
                     // Drag from empty space → rubber-band bulk select.
@@ -1831,32 +1997,55 @@ impl OsmilogApp {
         &mut self,
         cc: &CanvasCtx,
         pointer: Option<Pos2>,
-        key: Selected,
+        items: Vec<(Selected, GridPos)>,
+        free_nodes: Vec<(WireNodeKey, GridPos)>,
         drag_origin: Pos2,
-        original_grid_pos: GridPos,
     ) {
         if let Some(pos) = pointer {
             let delta_x = ((pos.x - drag_origin.x) / GRID_SIZE).round() as i32;
             let delta_y = ((pos.y - drag_origin.y) / GRID_SIZE).round() as i32;
-            let new_grid_pos =
-                GridPos::new(original_grid_pos.x + delta_x, original_grid_pos.y + delta_y);
-            // Moving a component/tunnel drags its wire-anchor nodes
-            // along; the rest of each attached segment stretches.
-            // Topology is unchanged, so no circuit rebuild is needed.
-            match key {
-                Selected::Component(k) => {
-                    self.components[k].grid_pos = new_grid_pos;
-                    self.sync_component_wire_nodes(k);
+            // Every dragged item moves by the same delta from its own
+            // drag-start position, so a bulk drag keeps the selection's
+            // relative layout intact.
+            for &(key, original_grid_pos) in &items {
+                let new_grid_pos =
+                    GridPos::new(original_grid_pos.x + delta_x, original_grid_pos.y + delta_y);
+                // Moving a component/tunnel drags its wire-anchor nodes
+                // along; the rest of each attached segment stretches.
+                // Topology is unchanged, so no circuit rebuild is needed.
+                match key {
+                    Selected::Component(k) => {
+                        self.components[k].grid_pos = new_grid_pos;
+                        self.sync_component_wire_nodes(k);
+                    }
+                    Selected::Tunnel(k) => {
+                        self.tunnels[k].grid_pos = new_grid_pos;
+                        self.sync_tunnel_wire_nodes(k);
+                    }
+                    Selected::Wire(_) => {}
                 }
-                Selected::Tunnel(k) => {
-                    self.tunnels[k].grid_pos = new_grid_pos;
-                    self.sync_tunnel_wire_nodes(k);
-                }
-                Selected::Wire(_) => {}
+            }
+            // Free-attached wire-elbow nodes have no owning component/tunnel
+            // to carry them along via sync_*_wire_nodes, so they're moved
+            // directly by the same delta - otherwise a selected wire run
+            // with an interior corner would stay pinned while its ends move.
+            for &(key, original_pos) in &free_nodes {
+                self.wiring.nodes[key].pos =
+                    GridPos::new(original_pos.x + delta_x, original_pos.y + delta_y);
             }
         }
         if cc.response.drag_stopped() {
-            self.commit_move(key, original_grid_pos);
+            // One undo batch restores every moved item's/node's original
+            // position at once, even when only some of them actually moved
+            // (e.g. the pointer didn't clear a whole grid cell).
+            self.history.begin_batch();
+            for (key, original_grid_pos) in items {
+                self.commit_move(key, original_grid_pos);
+            }
+            for (key, original_pos) in free_nodes {
+                self.commit_wire_node_move(key, original_pos);
+            }
+            self.history.end_batch();
             self.mode = InteractionMode::Idle;
         }
     }
@@ -2365,6 +2554,7 @@ fn draw_tunnel_ghost(
 mod tests {
     use super::*;
     use crate::gui::wiring::NodeAttach;
+    use crate::io::CURRENT_VERSION;
     use crate::sim::component::GateOp;
 
     fn place(app: &mut OsmilogApp, spec: ComponentSpec) -> PlacedCompKey {
@@ -2839,6 +3029,164 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_bulk_move_commits_as_one_undo_batch() {
+        let mut app = OsmilogApp::empty();
+        let a = app.place_component(ComponentSpec::Output, GridPos::new(0, 0));
+        let b = app.place_component(ComponentSpec::Output, GridPos::new(10, 0));
+        let orig_a = app.components[a].grid_pos;
+        let orig_b = app.components[b].grid_pos;
+        let stack_before = app.history.len();
+
+        // Mirrors what interact_component_drag's drag_stopped branch does for
+        // a Selection::Bulk: every dragged item already moved (one frame at
+        // a time, by the same pointer delta - simulated here directly since
+        // driving the gesture needs a live egui::Response), then the whole
+        // set is committed inside one begin_batch/end_batch.
+        app.components[a].grid_pos = GridPos::new(orig_a.x + 3, orig_a.y + 2);
+        app.components[b].grid_pos = GridPos::new(orig_b.x + 3, orig_b.y + 2);
+
+        app.history.begin_batch();
+        app.commit_move(Selected::Component(a), orig_a);
+        app.commit_move(Selected::Component(b), orig_b);
+        app.history.end_batch();
+
+        // One batch entry for the whole gesture, not one per item.
+        assert_eq!(app.history.len(), stack_before + 1);
+        assert!(matches!(app.history.last(), Some(HistoryEntry::Batch(_))));
+
+        // One undo restores every item's original position at once.
+        app.undo();
+        assert_eq!(app.components[a].grid_pos, orig_a);
+        assert_eq!(app.components[b].grid_pos, orig_b);
+
+        // One redo replays the whole move again.
+        app.redo();
+        assert_eq!(
+            app.components[a].grid_pos,
+            GridPos::new(orig_a.x + 3, orig_a.y + 2)
+        );
+        assert_eq!(
+            app.components[b].grid_pos,
+            GridPos::new(orig_b.x + 3, orig_b.y + 2)
+        );
+    }
+
+    #[test]
+    fn test_drag_grid_pos_excludes_wire_selection() {
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentSpec::Output);
+        assert!(app
+            .drag_grid_pos(Selected::Wire(Default::default()), Vec2::ZERO)
+            .is_none());
+        assert!(app
+            .drag_grid_pos(Selected::Component(a), Vec2::ZERO)
+            .is_some());
+    }
+
+    // Builds a two-segment route (pin -> Free elbow -> pin) between two
+    // freshly placed components, returning the components, the elbow's
+    // WireNodeKey, and both segment keys.
+    fn place_route_with_elbow(
+        app: &mut OsmilogApp,
+    ) -> (PlacedCompKey, PlacedCompKey, WireNodeKey, Vec<WireSegKey>) {
+        let a = app.place_component(
+            ComponentSpec::Input(Input { bits: 1, width: 1 }),
+            GridPos::new(0, 0),
+        );
+        let b = app.place_component(ComponentSpec::Output, GridPos::new(10, 0));
+        let pa = pin_grid_pos(
+            &app.components[a].spec.shape(),
+            app.components[a].grid_pos,
+            PinId::output(0),
+        );
+        let pb = pin_grid_pos(
+            &app.components[b].spec.shape(),
+            app.components[b].grid_pos,
+            PinId::input(0),
+        );
+        let elbow = GridPos::new(pa.x + 2, pb.y + 4);
+        let delta = app.wiring.add_route(
+            &[pa, elbow, pb],
+            NodeAttach::Pin(a, PinId::output(0)),
+            NodeAttach::Pin(b, PinId::input(0)),
+        );
+        app.edit_wiring(delta);
+        app.rebuild_circuit();
+
+        let elbow_key = app
+            .wiring
+            .active_nodes()
+            .find(|(_, n)| matches!(n.attach, NodeAttach::Free))
+            .map(|(k, _)| k)
+            .unwrap();
+        let seg_keys: Vec<WireSegKey> = app.wiring.active_segments().map(|(k, _)| k).collect();
+        (a, b, elbow_key, seg_keys)
+    }
+
+    #[test]
+    fn test_free_wire_nodes_dedupes_shared_elbow_and_excludes_pin_nodes() {
+        let mut app = OsmilogApp::empty();
+        let (_, _, elbow, segs) = place_route_with_elbow(&mut app);
+        assert_eq!(segs.len(), 2, "pin -> elbow -> pin is two segments");
+
+        let sels: Vec<Selected> = segs.iter().map(|&s| Selected::Wire(s)).collect();
+        let free_nodes = app.free_wire_nodes(&sels);
+
+        // Both segments share the elbow node; it must appear exactly once,
+        // and the two Pin-attached endpoints must not appear at all.
+        assert_eq!(free_nodes.len(), 1);
+        assert_eq!(free_nodes[0].0, elbow);
+        assert_eq!(free_nodes[0].1, app.wiring.nodes[elbow].pos);
+    }
+
+    #[test]
+    fn test_bulk_drag_batch_restores_free_wire_node_alongside_components() {
+        let mut app = OsmilogApp::empty();
+        let (a, b, elbow, _segs) = place_route_with_elbow(&mut app);
+        let orig_a = app.components[a].grid_pos;
+        let orig_b = app.components[b].grid_pos;
+        let orig_elbow = app.wiring.nodes[elbow].pos;
+
+        // What interact_component_drag does for one drag frame of a bulk
+        // selection covering both components and the whole wire run: move
+        // every component (syncing its pin-attached nodes) and every Free
+        // elbow node by the same delta.
+        let new_a = GridPos::new(orig_a.x + 3, orig_a.y + 2);
+        let new_b = GridPos::new(orig_b.x + 3, orig_b.y + 2);
+        let new_elbow = GridPos::new(orig_elbow.x + 3, orig_elbow.y + 2);
+        app.components[a].grid_pos = new_a;
+        app.sync_component_wire_nodes(a);
+        app.components[b].grid_pos = new_b;
+        app.sync_component_wire_nodes(b);
+        app.wiring.nodes[elbow].pos = new_elbow;
+
+        // Wire geometry moved as a whole - the elbow isn't left behind.
+        assert_eq!(app.wiring.nodes[elbow].pos, new_elbow);
+
+        // drag_stopped: commit every moved item and node as one undo batch.
+        let stack_before = app.history.len();
+        app.history.begin_batch();
+        app.commit_move(Selected::Component(a), orig_a);
+        app.commit_move(Selected::Component(b), orig_b);
+        app.commit_wire_node_move(elbow, orig_elbow);
+        app.history.end_batch();
+        assert_eq!(app.history.len(), stack_before + 1);
+        assert!(matches!(app.history.last(), Some(HistoryEntry::Batch(_))));
+
+        // One undo restores the components AND the elbow together.
+        app.undo();
+        assert_eq!(app.components[a].grid_pos, orig_a);
+        assert_eq!(app.components[b].grid_pos, orig_b);
+        assert_eq!(app.wiring.nodes[elbow].pos, orig_elbow);
+
+        // One redo replays the whole move again.
+        app.redo();
+        assert_eq!(app.components[a].grid_pos, new_a);
+        assert_eq!(app.components[b].grid_pos, new_b);
+        assert_eq!(app.wiring.nodes[elbow].pos, new_elbow);
+    }
+
     // ── undo / redo ────────────────────────────────────────────────────────
 
     fn and2() -> ComponentSpec {
@@ -3030,5 +3378,128 @@ mod tests {
         app.redo();
         assert_eq!(app.tunnels[t].label, "RENAMED");
         assert_eq!(app.circuit.tunnels[tunnel_key].label, "RENAMED");
+    }
+
+    #[test]
+    fn test_copy_single_component_then_paste_creates_offset_copy() {
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentSpec::Output);
+        let original = app.components[a].grid_pos;
+
+        app.selected = Some(Selection::Single(Selected::Component(a)));
+        app.copy_selection();
+        assert!(!app.clipboard.is_empty());
+
+        app.paste_clipboard();
+
+        assert_eq!(app.active_components().count(), 2);
+        let pasted = app
+            .active_components()
+            .find(|(k, _)| *k != a)
+            .map(|(k, _)| k)
+            .unwrap();
+        assert_eq!(
+            app.components[pasted].grid_pos,
+            GridPos::new(original.x + 2, original.y + 2)
+        );
+        assert_eq!(
+            app.selected,
+            Some(Selection::Single(Selected::Component(pasted)))
+        );
+    }
+
+    #[test]
+    fn test_paste_after_undo_of_original_still_works() {
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentSpec::Output);
+        app.selected = Some(Selection::Single(Selected::Component(a)));
+        app.copy_selection();
+
+        // Undo the original placement: it's now tombstoned.
+        app.undo();
+        assert!(!app.components[a].active);
+
+        app.paste_clipboard();
+
+        // The paste is independent of the now-tombstoned original.
+        let pasted = app
+            .active_components()
+            .find(|(k, _)| *k != a)
+            .map(|(k, _)| k);
+        assert!(pasted.is_some());
+        assert_eq!(app.active_components().count(), 1);
+    }
+
+    #[test]
+    fn test_paste_after_editing_original_is_unaffected() {
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentSpec::Output);
+        let original_pos = app.components[a].grid_pos;
+        app.selected = Some(Selection::Single(Selected::Component(a)));
+        app.copy_selection();
+
+        // Move the original after copying.
+        app.components[a].grid_pos = GridPos::new(100, 100);
+
+        app.paste_clipboard();
+
+        // The pasted copy reflects the pre-edit snapshot, offset from the
+        // original's position at copy time - not its current position.
+        let pasted = app
+            .active_components()
+            .find(|(k, _)| *k != a)
+            .map(|(k, _)| k)
+            .unwrap();
+        assert_eq!(
+            app.components[pasted].grid_pos,
+            GridPos::new(original_pos.x + 2, original_pos.y + 2)
+        );
+    }
+
+    #[test]
+    fn test_paste_normalizes_selection_to_single_for_one_item() {
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentSpec::Output);
+        app.selected = Some(Selection::Single(Selected::Component(a)));
+        app.copy_selection();
+        app.paste_clipboard();
+        assert!(matches!(app.selected, Some(Selection::Single(_))));
+    }
+
+    #[test]
+    fn test_paste_is_one_undo_batch() {
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let b = place(&mut app, ComponentSpec::Output);
+        connect_pins(&mut app, (a, PinId::output(0)), (b, PinId::input(0)));
+        app.rebuild_circuit();
+        let seg = app.wiring.active_segments().next().unwrap().0;
+
+        app.selected = Some(Selection::Bulk(vec![
+            Selected::Component(a),
+            Selected::Component(b),
+            Selected::Wire(seg),
+        ]));
+        app.copy_selection();
+        app.paste_clipboard();
+        assert_eq!(app.active_components().count(), 4);
+        assert_eq!(app.wiring.active_segments().count(), 2);
+
+        // One undo removes the entire pasted batch (components + wiring).
+        app.undo();
+        assert_eq!(app.active_components().count(), 2);
+        assert_eq!(app.wiring.active_segments().count(), 1);
+    }
+
+    #[test]
+    fn test_paste_noop_when_clipboard_empty() {
+        let mut app = OsmilogApp::empty();
+        place(&mut app, ComponentSpec::Output);
+        assert!(app.clipboard.is_empty());
+
+        let before = app.components.len();
+        app.paste_clipboard();
+        assert_eq!(app.components.len(), before);
+        assert_eq!(app.selected, None);
     }
 }

@@ -1,4 +1,5 @@
 pub mod app;
+pub mod clipboard;
 pub mod geometry;
 pub mod gui_undo;
 pub mod history;
