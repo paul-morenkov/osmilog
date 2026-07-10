@@ -3,28 +3,21 @@ use crate::gui::geometry::GridPos;
 use crate::gui::wiring::{NodeAttach, WiringDelta};
 use crate::sim::component::{CompKey, ComponentSpec};
 
-// Undo data for a GUI-level (Wiring/geometry) edit - the counterpart of
-// sim::command::UndoAction, recorded onto the same gui::history::History
-// stack (as HistoryEntry::Gui) so a GUI edit can share a Batch with the Sim
-// UndoActions it triggers. Kept separate from UndoAction because Wiring/
-// GridPos/PlacedCompKey must never leak into sim.
-//
-// No "GuiCommand" enum: every Wiring mutator's inverse is just "replay this
-// delta backwards", so OsmilogApp calls the Wiring methods directly and
+// Undo data for a GUI-level (Wiring/geometry) edit, recorded onto the same
+// gui::history::History stack. Every Wiring mutator's inverse is just "replay
+// this delta backwards", so OsmilogApp calls the Wiring methods directly and
 // hands the returned WiringDelta to edit_wiring.
 #[derive(Debug)]
 pub enum GuiUndoAction {
-    // Undoes any Wiring-graph edit (add_route/delete_segment/
-    // remove_component_nodes/remove_tunnel_nodes/prune_stale_pins) via the
-    // delta it captured. `forward` picks the replay direction so the same
+    // Undoes any Wiring-graph edit via the delta it captured.
+    // `forward` picks the replay direction so the same
     // delta serves undo (false, runs undo_delta) and redo (true, runs
     // redo_delta) across the two stacks; apply_gui_undo flips it each time.
     WiringDelta {
         delta: WiringDelta,
         forward: bool,
     },
-    // Undoes a component drag-move. Pushed directly from commit_move, not
-    // edit_wiring: grid_pos is overwritten every drag frame, so by drag-end
+    //  `grid_pos` is overwritten every drag frame, so by drag-end
     // there's no "before" state left except the drag-start original_grid_pos.
     MoveComponent {
         key: PlacedCompKey,
@@ -34,25 +27,23 @@ pub enum GuiUndoAction {
         key: PlacedTunnelKey,
         old_pos: GridPos,
     },
-    // GUI-authoritative record deltas the sim-side Command/UndoAction path has
-    // no notion of. All swap-style: carry the value to restore, and
-    // apply_gui_undo returns the value it displaced.
 
-    // Component/tunnel tombstone toggle.
+    // Component tombstone toggle. `active` is the value to restore.
     SetComponentActive {
         key: PlacedCompKey,
         active: bool,
     },
+    // Tunnel tombstone toggle. `active` is the value to restore.
     SetTunnelActive {
         key: PlacedTunnelKey,
         active: bool,
     },
     // reconfigure_component swaps the whole underlying record (a new CompKey and
     // ComponentSpec, keeping grid_pos/active); this restores the old pair.
-    SwapComponentDef {
+    SwapComponentSpec {
         key: PlacedCompKey,
         comp_key: CompKey,
-        def: ComponentSpec,
+        spec: ComponentSpec,
     },
     // Properties-panel tunnel rename edits the record's label field directly.
     SetTunnelLabel {
@@ -122,19 +113,19 @@ impl OsmilogApp {
                     active: current,
                 }
             }
-            GuiUndoAction::SwapComponentDef {
+            GuiUndoAction::SwapComponentSpec {
                 key,
                 comp_key,
-                def,
+                spec,
             } => {
                 let pc = &mut self.components[key];
                 let prev_comp_key = pc.key;
-                let prev_def = std::mem::replace(&mut pc.def, def);
+                let prev_spec = std::mem::replace(&mut pc.spec, spec);
                 pc.key = comp_key;
-                GuiUndoAction::SwapComponentDef {
+                GuiUndoAction::SwapComponentSpec {
                     key,
                     comp_key: prev_comp_key,
-                    def: prev_def,
+                    spec: prev_spec,
                 }
             }
             GuiUndoAction::SetTunnelLabel { key, label } => {
@@ -221,11 +212,9 @@ mod tests {
     fn edit_wiring_pushes_nothing_for_empty_delta() {
         let mut app = OsmilogApp::empty();
         // A sub-two-point route is a no-op, producing an empty delta.
-        let delta = app.wiring.add_route(
-            &[GridPos::new(0, 0)],
-            NodeAttach::Free,
-            NodeAttach::Free,
-        );
+        let delta = app
+            .wiring
+            .add_route(&[GridPos::new(0, 0)], NodeAttach::Free, NodeAttach::Free);
         app.edit_wiring(delta);
         assert_eq!(app.history.len(), 0);
     }

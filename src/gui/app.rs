@@ -18,8 +18,8 @@ use crate::io::{
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::command::Command;
 use crate::sim::component::{
-    Adder, CompKey, Comparator, ComponentSpec, Demux, Divider, Encoder, FanDirection, Gate,
-    GateOp, InIdx, Input, Multiplier, Mux, OutIdx, PinId, Reg, Subtractor,
+    Adder, CompKey, Comparator, ComponentSpec, Demux, Divider, Encoder, FanDirection, Gate, GateOp,
+    InIdx, Input, Multiplier, Mux, OutIdx, PinId, Reg, Subtractor,
 };
 use crate::sim::value::Value;
 
@@ -67,7 +67,7 @@ pub enum Selected {
 pub enum InteractionMode {
     Idle,
     Placing {
-        def: ComponentSpec,
+        spec: ComponentSpec,
     },
     PlacingTunnel {
         role: TunnelRole,
@@ -225,8 +225,7 @@ impl OsmilogApp {
     // clear any selection that may now point at a tombstoned record, then
     // rebuild the circuit's nets + settle.
     fn refresh_after_history(&mut self) {
-        let comp_keys: Vec<PlacedCompKey> =
-            self.active_components().map(|(k, _)| k).collect();
+        let comp_keys: Vec<PlacedCompKey> = self.active_components().map(|(k, _)| k).collect();
         for k in comp_keys {
             self.sync_component_wire_nodes(k);
         }
@@ -239,13 +238,13 @@ impl OsmilogApp {
         self.rebuild_circuit();
     }
 
-    fn place_component(&mut self, def: ComponentSpec, grid_pos: GridPos) -> PlacedCompKey {
+    fn place_component(&mut self, spec: ComponentSpec, grid_pos: GridPos) -> PlacedCompKey {
         self.history.begin_batch();
-        let comp = def.to_component();
+        let comp = spec.to_component();
         let key = self.apply(Command::AddComponent(comp)).unwrap_comp();
         let pc = PlacedComponent {
             key,
-            def,
+            spec,
             grid_pos,
             active: true,
         };
@@ -277,7 +276,10 @@ impl OsmilogApp {
     ) -> PlacedTunnelKey {
         self.history.begin_batch();
         let key = self
-            .apply(Command::AddTunnel { label: label.clone(), role })
+            .apply(Command::AddTunnel {
+                label: label.clone(),
+                role,
+            })
             .unwrap_tunnel();
         let pt = PlacedTunnel {
             key,
@@ -329,8 +331,10 @@ impl OsmilogApp {
             .map(|pt| (pt.key, pt.label.clone()))
             .collect();
         for (key, label) in renames {
-            self.circuit
-                .apply(Command::RenameTunnel { tunnel: key, new_label: label });
+            self.circuit.apply(Command::RenameTunnel {
+                tunnel: key,
+                new_label: label,
+            });
         }
 
         self.circuit.apply(Command::ClearNets);
@@ -378,7 +382,7 @@ impl OsmilogApp {
         let Some(pc) = self.components.get(pck) else {
             return;
         };
-        let shape = pc.def.shape();
+        let shape = pc.spec.shape();
         let grid_pos = pc.grid_pos;
         self.wiring
             .sync_component_nodes(pck, |pin| pin_grid_pos(&shape, grid_pos, pin));
@@ -430,7 +434,7 @@ impl OsmilogApp {
     fn wire_target_at(&self, pos: Pos2, pan: Vec2) -> (NodeAttach, GridPos, bool) {
         if let Some((pck, pin)) = pin_at_pos(self.active_components(), pan, pos, PinKind::Output) {
             let gp = pin_grid_pos(
-                &self.components[pck].def.shape(),
+                &self.components[pck].spec.shape(),
                 self.components[pck].grid_pos,
                 pin,
             );
@@ -438,7 +442,7 @@ impl OsmilogApp {
         }
         if let Some((pck, pin)) = pin_at_pos(self.active_components(), pan, pos, PinKind::Input) {
             let gp = pin_grid_pos(
-                &self.components[pck].def.shape(),
+                &self.components[pck].spec.shape(),
                 self.components[pck].grid_pos,
                 pin,
             );
@@ -481,7 +485,7 @@ impl OsmilogApp {
             .map(|(i, (pck, pc))| {
                 comp_index.insert(pck, i);
                 ComponentEntry {
-                    def: pc.def.clone(),
+                    spec: pc.spec.clone(),
                     grid_pos: pc.grid_pos,
                 }
             })
@@ -575,7 +579,7 @@ impl OsmilogApp {
         let comp_keys: Vec<PlacedCompKey> = file
             .components
             .iter()
-            .map(|entry| self.place_component(entry.def.clone(), entry.grid_pos))
+            .map(|entry| self.place_component(entry.spec.clone(), entry.grid_pos))
             .collect();
 
         let tunnel_keys: Vec<PlacedTunnelKey> = file
@@ -708,11 +712,11 @@ impl OsmilogApp {
         let pc = &self.components[key];
         let comp_key = pc.key;
 
-        ui.heading(pc.def.label());
+        ui.heading(pc.spec.label());
         ui.separator();
 
-        let def = pc.def.clone();
-        match def {
+        let spec = pc.spec.clone();
+        match spec {
             ComponentSpec::Input(Input {
                 mut bits,
                 mut width,
@@ -1030,12 +1034,12 @@ impl OsmilogApp {
     // Swaps a placed component's parameters. PlacedCompKey stays stable, so
     // attached wires survive - we only drop wire nodes for pins the new
     // arity no longer has, re-sync the rest, then rebuild.
-    fn reconfigure_component(&mut self, pc_key: PlacedCompKey, new_def: ComponentSpec) {
+    fn reconfigure_component(&mut self, pc_key: PlacedCompKey, new_spec: ComponentSpec) {
         self.history.begin_batch();
         let old_key = self.components[pc_key].key;
         let grid_pos = self.components[pc_key].grid_pos;
 
-        let new_comp = new_def.to_component();
+        let new_comp = new_spec.to_component();
         let new_n_in = new_comp.pins.inputs.len();
         let new_n_out = new_comp.pins.outputs.len();
 
@@ -1044,20 +1048,20 @@ impl OsmilogApp {
         // Record the record swap's undo before overwriting: restores the old
         // CompKey + def (the Sim actions above reactivate the old circuit comp
         // and deactivate the new one, but the record itself needs restoring).
-        let old_def = std::mem::replace(
+        let old_spec = std::mem::replace(
             &mut self.components[pc_key],
             PlacedComponent {
                 key: new_key,
-                def: new_def,
+                spec: new_spec,
                 grid_pos,
                 active: true,
             },
         )
-        .def;
-        self.history.push_gui(GuiUndoAction::SwapComponentDef {
+        .spec;
+        self.history.push_gui(GuiUndoAction::SwapComponentSpec {
             key: pc_key,
             comp_key: old_key,
-            def: old_def,
+            spec: old_spec,
         });
 
         let delta = self.wiring.prune_stale_pins(pc_key, new_n_in, new_n_out);
@@ -1307,7 +1311,7 @@ impl eframe::App for OsmilogApp {
                         for (name, op, n) in gates {
                             if ui.button(name).clicked() {
                                 self.mode = InteractionMode::Placing {
-                                    def: ComponentSpec::Gate(Gate {
+                                    spec: ComponentSpec::Gate(Gate {
                                         op,
                                         n_inputs: n,
                                         width: 1,
@@ -1319,13 +1323,13 @@ impl eframe::App for OsmilogApp {
                     });
                     if ui.button("Input").clicked() {
                         self.mode = InteractionMode::Placing {
-                            def: ComponentSpec::Input(Input { bits: 0, width: 1 }),
+                            spec: ComponentSpec::Input(Input { bits: 0, width: 1 }),
                         };
                         ui.close();
                     }
                     if ui.button("Output").clicked() {
                         self.mode = InteractionMode::Placing {
-                            def: ComponentSpec::Output,
+                            spec: ComponentSpec::Output,
                         };
                         ui.close();
                     }
@@ -1333,7 +1337,7 @@ impl eframe::App for OsmilogApp {
                     ui.menu_button("Plexers", |ui| {
                         if ui.button("Mux").clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentSpec::Mux(Mux {
+                                spec: ComponentSpec::Mux(Mux {
                                     data_width: 1,
                                     sel_width: 1,
                                 }),
@@ -1342,7 +1346,7 @@ impl eframe::App for OsmilogApp {
                         }
                         if ui.button("Demux").clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentSpec::Demux(Demux {
+                                spec: ComponentSpec::Demux(Demux {
                                     data_width: 1,
                                     sel_width: 1,
                                 }),
@@ -1351,7 +1355,7 @@ impl eframe::App for OsmilogApp {
                         }
                         if ui.button("Splitter").clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentSpec::Splitter {
+                                spec: ComponentSpec::Splitter {
                                     width: 2,
                                     arm_bits: vec![vec![0], vec![1]],
                                     direction: FanDirection::Right,
@@ -1361,7 +1365,7 @@ impl eframe::App for OsmilogApp {
                         }
                         if ui.button("Encoder").clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentSpec::Encoder(Encoder { sel_width: 1 }),
+                                spec: ComponentSpec::Encoder(Encoder { sel_width: 1 }),
                             };
                             ui.close();
                         }
@@ -1369,31 +1373,31 @@ impl eframe::App for OsmilogApp {
                     ui.menu_button("Arithmetic", |ui| {
                         if ui.button("Adder").clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentSpec::Adder(Adder { data_width: 1 }),
+                                spec: ComponentSpec::Adder(Adder { data_width: 1 }),
                             };
                             ui.close();
                         }
                         if ui.button("Subtractor").clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentSpec::Subtractor(Subtractor { data_width: 1 }),
+                                spec: ComponentSpec::Subtractor(Subtractor { data_width: 1 }),
                             };
                             ui.close();
                         }
                         if ui.button("Multiplier").clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentSpec::Multiplier(Multiplier { data_width: 1 }),
+                                spec: ComponentSpec::Multiplier(Multiplier { data_width: 1 }),
                             };
                             ui.close();
                         }
                         if ui.button("Divider").clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentSpec::Divider(Divider { data_width: 1 }),
+                                spec: ComponentSpec::Divider(Divider { data_width: 1 }),
                             };
                             ui.close();
                         }
                         if ui.button("Comparator").clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentSpec::Comparator(Comparator { data_width: 1 }),
+                                spec: ComponentSpec::Comparator(Comparator { data_width: 1 }),
                             };
                             ui.close();
                         }
@@ -1401,7 +1405,7 @@ impl eframe::App for OsmilogApp {
                     ui.menu_button("Memory", |ui| {
                         if ui.button("Register").clicked() {
                             self.mode = InteractionMode::Placing {
-                                def: ComponentSpec::Reg(Reg { data_width: 1 }),
+                                spec: ComponentSpec::Reg(Reg { data_width: 1 }),
                             };
                             ui.close();
                         }
@@ -1682,15 +1686,15 @@ impl eframe::App for OsmilogApp {
                     }
                 }
 
-                InteractionMode::Placing { def } => {
+                InteractionMode::Placing { spec } => {
                     if let Some(pos) = pointer {
                         let gp = snap_to_grid(pos, pan);
-                        draw_ghost(&painter, &def, gp, pan, theme);
+                        draw_ghost(&painter, &spec, gp, pan, theme);
                     }
                     if response.clicked() {
                         if let Some(pos) = pointer {
                             let gp = snap_to_grid(pos, pan);
-                            self.place_component(def, gp);
+                            self.place_component(spec, gp);
                             self.mode = InteractionMode::Idle;
                         }
                     }
@@ -1769,7 +1773,8 @@ impl eframe::App for OsmilogApp {
                             if terminal {
                                 self.history.begin_batch();
                                 let delta =
-                                    self.wiring.add_route(&next_points, start_attach, drop_attach);
+                                    self.wiring
+                                        .add_route(&next_points, start_attach, drop_attach);
                                 self.edit_wiring(delta);
                                 finished = true;
                             }
@@ -1852,7 +1857,7 @@ impl eframe::App for OsmilogApp {
 // ── Geometry ─────────────────────────────────────────────────────────────────
 
 fn component_bounding_rect(pc: &PlacedComponent, pan: Vec2) -> Rect {
-    let size = pc.def.size();
+    let size = pc.spec.size();
     let tl = egui::pos2(
         pc.grid_pos.x as f32 * GRID_SIZE + pan.x,
         pc.grid_pos.y as f32 * GRID_SIZE + pan.y,
@@ -1958,10 +1963,10 @@ fn pin_at_pos<'a>(
 ) -> Option<(PlacedCompKey, PinId)> {
     let hit_r = PIN_RADIUS * 2.0;
     for (key, pc) in components {
-        let shape = pc.def.shape();
+        let shape = pc.spec.shape();
         match kind {
             PinKind::Output => {
-                for i in 0..pc.def.n_outputs() {
+                for i in 0..pc.spec.n_outputs() {
                     let pp = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::output(i as u8));
                     if pos.distance(pp) <= hit_r {
                         return Some((key, PinId::output(i as u8)));
@@ -1969,7 +1974,7 @@ fn pin_at_pos<'a>(
                 }
             }
             PinKind::Input => {
-                for i in 0..pc.def.n_inputs() {
+                for i in 0..pc.spec.n_inputs() {
                     let pp = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::input(i as u8));
                     if pos.distance(pp) <= hit_r {
                         return Some((key, PinId::input(i as u8)));
@@ -2052,7 +2057,7 @@ fn draw_component(
     is_selected: bool,
     theme: Theme,
 ) {
-    let shape = pc.def.shape();
+    let shape = pc.spec.shape();
     let rect = component_bounding_rect(pc, pan);
     let fill = theme.component_fill;
     let (stroke_w, stroke_col) = if is_selected {
@@ -2116,14 +2121,14 @@ fn draw_component(
         );
     }
 
-    for i in 0..pc.def.n_inputs() {
+    for i in 0..pc.spec.n_inputs() {
         let pos = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::input(i as u8));
         let val = circuit.components[pc.key].pins.inputs[i]
             .map(|nk| circuit.nets[nk].value)
             .unwrap_or(Value::Floating);
         painter.circle_filled(pos, PIN_RADIUS, value_stroke(theme, val).color);
     }
-    for i in 0..pc.def.n_outputs() {
+    for i in 0..pc.spec.n_outputs() {
         let pos = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::output(i as u8));
         let val = circuit.components[pc.key].pins.out_cache[i];
         painter.circle_filled(pos, PIN_RADIUS, value_stroke(theme, val).color);
@@ -2190,8 +2195,8 @@ fn draw_tunnel(
     );
 }
 
-fn draw_ghost(painter: &Painter, def: &ComponentSpec, grid_pos: GridPos, pan: Vec2, theme: Theme) {
-    let shape = def.shape();
+fn draw_ghost(painter: &Painter, spec: &ComponentSpec, grid_pos: GridPos, pan: Vec2, theme: Theme) {
+    let shape = spec.shape();
     let tl = egui::pos2(
         grid_pos.x as f32 * GRID_SIZE + pan.x,
         grid_pos.y as f32 * GRID_SIZE + pan.y,
@@ -2276,20 +2281,20 @@ mod tests {
     use crate::gui::wiring::NodeAttach;
     use crate::sim::component::GateOp;
 
-    fn place(app: &mut OsmilogApp, def: ComponentSpec) -> PlacedCompKey {
-        app.place_component(def, GridPos::new(0, 0))
+    fn place(app: &mut OsmilogApp, spec: ComponentSpec) -> PlacedCompKey {
+        app.place_component(spec, GridPos::new(0, 0))
     }
 
     // Insert a wire (one segment) between two component pins, positioned at each
     // pin's grid cell, and return the two node keys.
     fn connect_pins(app: &mut OsmilogApp, a: (PlacedCompKey, PinId), b: (PlacedCompKey, PinId)) {
         let pa = pin_grid_pos(
-            &app.components[a.0].def.shape(),
+            &app.components[a.0].spec.shape(),
             app.components[a.0].grid_pos,
             a.1,
         );
         let pb = pin_grid_pos(
-            &app.components[b.0].def.shape(),
+            &app.components[b.0].spec.shape(),
             app.components[b.0].grid_pos,
             b.1,
         );
@@ -2313,7 +2318,7 @@ mod tests {
     // Insert a wire (one segment) between a component pin and a tunnel.
     fn connect_pin_tunnel(app: &mut OsmilogApp, c: (PlacedCompKey, PinId), ptk: PlacedTunnelKey) {
         let pc = pin_grid_pos(
-            &app.components[c.0].def.shape(),
+            &app.components[c.0].spec.shape(),
             app.components[c.0].grid_pos,
             c.1,
         );
@@ -2373,7 +2378,7 @@ mod tests {
         let loaded_out_key = loaded
             .components
             .values()
-            .find(|pc| matches!(pc.def, ComponentSpec::Output))
+            .find(|pc| matches!(pc.spec, ComponentSpec::Output))
             .unwrap()
             .key;
         assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::ONE);
@@ -2431,7 +2436,10 @@ mod tests {
             loaded.wiring.segments.len(),
             loaded.wiring.active_segments().count()
         );
-        assert_eq!(loaded.wiring.nodes.len(), loaded.wiring.active_nodes().count());
+        assert_eq!(
+            loaded.wiring.nodes.len(),
+            loaded.wiring.active_nodes().count()
+        );
     }
 
     #[test]
@@ -2468,7 +2476,7 @@ mod tests {
         let loaded_out_key = loaded
             .components
             .values()
-            .find(|pc| matches!(pc.def, ComponentSpec::Output))
+            .find(|pc| matches!(pc.spec, ComponentSpec::Output))
             .unwrap()
             .key;
         assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::ONE);
@@ -2479,7 +2487,7 @@ mod tests {
         let file = CircuitFile {
             version: CURRENT_VERSION,
             components: vec![ComponentEntry {
-                def: ComponentSpec::Output,
+                spec: ComponentSpec::Output,
                 grid_pos: GridPos::ZERO,
             }],
             tunnels: vec![],
@@ -2853,13 +2861,16 @@ mod tests {
             }),
         );
         assert!(matches!(
-            app.components[g].def,
-            ComponentSpec::Gate(Gate { op: GateOp::Not, .. })
+            app.components[g].spec,
+            ComponentSpec::Gate(Gate {
+                op: GateOp::Not,
+                ..
+            })
         ));
 
         app.undo();
         assert!(matches!(
-            app.components[g].def,
+            app.components[g].spec,
             ComponentSpec::Gate(Gate {
                 op: GateOp::And,
                 n_inputs: 2,
@@ -2870,8 +2881,11 @@ mod tests {
 
         app.redo();
         assert!(matches!(
-            app.components[g].def,
-            ComponentSpec::Gate(Gate { op: GateOp::Not, .. })
+            app.components[g].spec,
+            ComponentSpec::Gate(Gate {
+                op: GateOp::Not,
+                ..
+            })
         ));
     }
 

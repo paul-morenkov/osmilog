@@ -216,7 +216,7 @@ The `eframe::App` implementation, split into `logic` (pre-frame) and `ui` (paint
   properties panel) and rectangle multi-select, kept separate.
 - `pan: Vec2` - canvas pan offset (present but not yet wired to any interaction - see In-Progress).
 
-`InteractionMode` covers `Idle`, `Placing { def: ComponentSpec }`, `PlacingTunnel`, `WireDraw`
+`InteractionMode` covers `Idle`, `Placing { spec: ComponentSpec }`, `PlacingTunnel`, `WireDraw`
 (hybrid drag-elbow / click-polyline wire drawing), `ComponentDrag`, and `BulkSelect` (rubber-band
 rectangle select, populating `bulk_selection`).
 
@@ -227,7 +227,7 @@ which records it - that's what makes GUI edits undo-recordable in both domains.
 
 ### PlacedComponent / PlacedTunnel (`placed_component.rs`, `app.rs`)
 
-`PlacedComponent { key: CompKey, def: ComponentSpec, grid_pos: GridPos }` and `PlacedTunnel {
+`PlacedComponent { key: CompKey, spec: ComponentSpec, grid_pos: GridPos }` and `PlacedTunnel {
 key: TunnelKey, label: String, role: TunnelRole, grid_pos: GridPos }` are the GUI's visual
 records - a circuit-layer key plus enough to draw and place the thing. `PlacedTunnel` is the one
 entity with a user-editable display label; components only have hardcoded, non-editable

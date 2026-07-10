@@ -31,7 +31,7 @@ pub struct CircuitFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentEntry {
-    pub def: ComponentSpec,
+    pub spec: ComponentSpec,
     pub grid_pos: GridPos,
 }
 

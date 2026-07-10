@@ -8,7 +8,7 @@ use crate::sim::component::{CompKey, ComponentSpec, FanDirection, GateOp};
 
 pub struct PlacedComponent {
     pub key: CompKey,
-    pub def: ComponentSpec,
+    pub spec: ComponentSpec,
     pub grid_pos: GridPos,
     // Tombstone flag, mirroring sim::Component::active and wiring::WireNode::active:
     // a deleted PlacedComponent is flagged inactive rather than removed, so
