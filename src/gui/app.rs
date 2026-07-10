@@ -61,6 +61,17 @@ pub enum Selected {
     Wire(WireSegKey),
 }
 
+// OsmilogApp::selected's payload: one selected item, or a multi-item bulk
+// selection from a rubber-band drag. No `None`/empty variant - that's what
+// `Option<Selection>` is for, so "nothing selected" has exactly one
+// representation rather than two. A `Bulk` is never constructed empty; an
+// empty bulk selection is `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    Single(Selected),
+    Bulk(Vec<Selected>),
+}
+
 // ── InteractionMode ───────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -88,7 +99,7 @@ pub enum InteractionMode {
     },
     // Rubber-band multi-select from dragging an empty region; `start`/`current`
     // are the box corners (GridPos, so it snaps to grid) - on release,
-    // everything inside goes into `bulk_selection`.
+    // everything inside becomes the (bulk) selection.
     BulkSelect {
         start: GridPos,
         current: GridPos,
@@ -121,11 +132,10 @@ pub struct OsmilogApp {
     pub wiring: Wiring,
     pub mode: InteractionMode,
     pub pan: Vec2,
-    pub selected: Option<Selected>,
-    // Multi-item selection from BulkSelect, kept separate from `selected`
-    // (properties panel/body-drag): non-empty means Backspace/Delete removes
-    // the whole set. Cleared by a click in empty space or Escape.
-    pub bulk_selection: Vec<Selected>,
+    // None: nothing selected. Some(Single): properties panel/body-drag target.
+    // Some(Bulk): non-empty means Backspace/Delete removes the whole set.
+    // Cleared by a click in empty space or Escape.
+    pub selected: Option<Selection>,
     // Also surfaces File > Save/Load I/O errors, not just settle() errors -
     // both are transient "something went wrong" status shown in the same
     // red label in the menu bar (see the "Menu bar" section of `ui`).
@@ -165,7 +175,6 @@ impl OsmilogApp {
             mode: InteractionMode::Idle,
             pan: Vec2::ZERO,
             selected: None,
-            bulk_selection: Vec::new(),
             last_settle_error: None,
             #[cfg(target_arch = "wasm32")]
             pending_load: crate::io::wasm::new_pending_load(),
@@ -248,7 +257,6 @@ impl OsmilogApp {
             self.sync_tunnel_wire_nodes(k);
         }
         self.selected = None;
-        self.bulk_selection.clear();
         self.rebuild_circuit();
     }
 
@@ -584,7 +592,6 @@ impl OsmilogApp {
         self.tunnels = SlotMap::default();
         self.wiring = Wiring::new();
         self.selected = None;
-        self.bulk_selection.clear();
         self.mode = InteractionMode::Idle;
         self.last_settle_error = None;
 
@@ -645,16 +652,19 @@ impl OsmilogApp {
     /// Shows the properties panel for the selected item. Edits call
     /// `self.reconfigure_component()` with an updated `ComponentSpec`.
     fn show_properties(&mut self, ui: &mut egui::Ui) {
-        let Some(sel) = self.selected else {
-            if !self.bulk_selection.is_empty() {
+        let sel = match &self.selected {
+            None => {
+                ui.label("Click a component or tunnel to select it.");
+                return;
+            }
+            Some(Selection::Bulk(items)) => {
                 ui.heading("SELECTION");
                 ui.separator();
-                ui.label(format!("{} items selected.", self.bulk_selection.len()));
+                ui.label(format!("{} items selected.", items.len()));
                 ui.label("Press Backspace or Delete to remove them.");
-            } else {
-                ui.label("Click a component or tunnel to select it.");
+                return;
             }
-            return;
+            Some(Selection::Single(sel)) => *sel,
         };
         match sel {
             Selected::Component(key) => self.show_component_properties(key, ui),
@@ -1083,7 +1093,7 @@ impl OsmilogApp {
         self.sync_component_wire_nodes(pc_key);
         self.rebuild_circuit();
         self.history.end_batch();
-        self.selected = Some(Selected::Component(pc_key));
+        self.selected = Some(Selection::Single(Selected::Component(pc_key)));
     }
 
     // Removes a placed component: drop it from the circuit and its wire nodes
@@ -1099,7 +1109,7 @@ impl OsmilogApp {
         self.components[key].active = false;
         self.history
             .push_gui(GuiUndoAction::SetComponentActive { key, active: true });
-        if self.selected == Some(Selected::Component(key)) {
+        if self.selected == Some(Selection::Single(Selected::Component(key))) {
             self.selected = None;
         }
         self.rebuild_circuit();
@@ -1118,7 +1128,7 @@ impl OsmilogApp {
         self.tunnels[key].active = false;
         self.history
             .push_gui(GuiUndoAction::SetTunnelActive { key, active: true });
-        if self.selected == Some(Selected::Tunnel(key)) {
+        if self.selected == Some(Selection::Single(Selected::Tunnel(key))) {
             self.selected = None;
         }
         self.rebuild_circuit();
@@ -1131,7 +1141,7 @@ impl OsmilogApp {
         self.history.begin_batch();
         let delta = self.wiring.delete_segment(seg);
         self.edit_wiring(delta);
-        if self.selected == Some(Selected::Wire(seg)) {
+        if self.selected == Some(Selection::Single(Selected::Wire(seg))) {
             self.selected = None;
         }
         self.rebuild_circuit();
@@ -1141,7 +1151,11 @@ impl OsmilogApp {
     // True if `sel` is either the single selection or part of the bulk
     // selection, i.e. it should be drawn highlighted.
     fn is_highlighted(&self, sel: Selected) -> bool {
-        self.selected == Some(sel) || self.bulk_selection.contains(&sel)
+        match &self.selected {
+            Some(Selection::Single(s)) => *s == sel,
+            Some(Selection::Bulk(items)) => items.contains(&sel),
+            None => false,
+        }
     }
 
     // Every component, tunnel, and wire segment fully contained in `rect`
@@ -1169,13 +1183,15 @@ impl OsmilogApp {
         out
     }
 
-    // Removes everything in `bulk_selection`: wire segments first, then
-    // components/tunnels (which drop their own wire nodes too). Each removal
-    // is existence-checked since deleting a component can take a wire in the
-    // same set with it. Rebuilds once at the end.
+    // Removes everything in the current bulk selection: wire segments first,
+    // then components/tunnels (which drop their own wire nodes too). Each
+    // removal is existence-checked since deleting a component can take a
+    // wire in the same set with it. Rebuilds once at the end.
     fn delete_bulk(&mut self) {
+        let Some(Selection::Bulk(items)) = self.selected.take() else {
+            return;
+        };
         self.history.begin_batch();
-        let items = std::mem::take(&mut self.bulk_selection);
         for sel in &items {
             if let Selected::Wire(seg) = *sel {
                 // delete_segment self-guards: an already-tombstoned segment
@@ -1212,11 +1228,6 @@ impl OsmilogApp {
                     }
                 }
                 Selected::Wire(_) => {}
-            }
-        }
-        if let Some(sel) = self.selected {
-            if items.contains(&sel) {
-                self.selected = None;
             }
         }
         self.rebuild_circuit();
@@ -1524,7 +1535,9 @@ impl OsmilogApp {
                 // existing bulk selection below.
                 _ => {}
             }
-            self.bulk_selection.clear();
+            if matches!(self.selected, Some(Selection::Bulk(_))) {
+                self.selected = None;
+            }
             self.mode = InteractionMode::Idle;
         }
 
@@ -1535,14 +1548,14 @@ impl OsmilogApp {
         let delete_pressed =
             ctx.input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete));
         if delete_pressed && !editing_text {
-            if !self.bulk_selection.is_empty() {
-                self.delete_bulk();
-            } else if let Some(sel) = self.selected {
-                match sel {
+            match &self.selected {
+                Some(Selection::Bulk(_)) => self.delete_bulk(),
+                Some(Selection::Single(sel)) => match *sel {
                     Selected::Component(k) => self.delete_component(k),
                     Selected::Tunnel(k) => self.delete_tunnel(k),
                     Selected::Wire(seg) => self.delete_wire(seg),
-                }
+                },
+                None => {}
             }
         }
 
@@ -1622,25 +1635,29 @@ impl OsmilogApp {
                         cursor: pos,
                         dragging: true,
                     };
-                } else if let Some((sel, grid_pos)) = self.selected.and_then(|sel| {
-                    // Selected component/tunnel body drag → move it,
-                    // but only when the drag actually began inside its
-                    // bounding rect.
-                    let rect_grid = match sel {
-                        Selected::Component(key) => self
-                            .components
-                            .get(key)
-                            .map(|pc| (component_bounding_rect(pc, cc.pan), pc.grid_pos)),
-                        Selected::Tunnel(key) => self
-                            .tunnels
-                            .get(key)
-                            .map(|pt| (tunnel_bounding_rect(pt, cc.pan), pt.grid_pos)),
-                        Selected::Wire(_) => None,
-                    };
-                    rect_grid
-                        .filter(|(rect, _)| rect.contains(pos))
-                        .map(|(_, grid_pos)| (sel, grid_pos))
-                }) {
+                } else if let Some((sel, grid_pos)) = match &self.selected {
+                    Some(Selection::Single(sel)) => {
+                        // Selected component/tunnel body drag → move it,
+                        // but only when the drag actually began inside its
+                        // bounding rect.
+                        let sel = *sel;
+                        let rect_grid = match sel {
+                            Selected::Component(key) => self
+                                .components
+                                .get(key)
+                                .map(|pc| (component_bounding_rect(pc, cc.pan), pc.grid_pos)),
+                            Selected::Tunnel(key) => self
+                                .tunnels
+                                .get(key)
+                                .map(|pt| (tunnel_bounding_rect(pt, cc.pan), pt.grid_pos)),
+                            Selected::Wire(_) => None,
+                        };
+                        rect_grid
+                            .filter(|(rect, _)| rect.contains(pos))
+                            .map(|(_, grid_pos)| (sel, grid_pos))
+                    }
+                    _ => None,
+                } {
                     self.mode = InteractionMode::ComponentDrag {
                         key: sel,
                         drag_origin: pos,
@@ -1650,7 +1667,6 @@ impl OsmilogApp {
                     // Drag from empty space → rubber-band bulk select.
                     let gp = snap_to_grid(pos, cc.pan);
                     self.selected = None;
-                    self.bulk_selection.clear();
                     self.mode = InteractionMode::BulkSelect {
                         start: gp,
                         current: gp,
@@ -1661,8 +1677,6 @@ impl OsmilogApp {
 
         if cc.response.clicked() {
             if let Some(pos) = pointer {
-                // Any click ends a bulk selection ("click away").
-                self.bulk_selection.clear();
                 // A click starts a polyline only from a pin/tunnel;
                 // clicking a bare wire selects it instead (branching
                 // off a wire is a drag gesture, handled above).
@@ -1693,7 +1707,10 @@ impl OsmilogApp {
                         .wiring
                         .segment_at_pos(pos, cc.pan)
                         .map(|(seg, _)| Selected::Wire(seg));
-                    self.selected = maybe_comp.or(maybe_tunnel).or(maybe_wire);
+                    self.selected = maybe_comp
+                        .or(maybe_tunnel)
+                        .or(maybe_wire)
+                        .map(Selection::Single);
                 }
             }
         }
@@ -1869,13 +1886,12 @@ impl OsmilogApp {
         if cc.response.drag_stopped() || !cc.response.dragged() {
             let selected_items = self.items_in_rect(rect, cc.pan);
             // If only one item in bounds, directly select it
-            if selected_items.len() == 1 {
-                self.selected = Some(selected_items[0]);
-                self.mode = InteractionMode::Idle;
-            } else {
-                self.bulk_selection = selected_items;
-                self.mode = InteractionMode::Idle;
-            }
+            self.selected = match selected_items.len() {
+                0 => None,
+                1 => Some(Selection::Single(selected_items[0])),
+                _ => Some(Selection::Bulk(selected_items)),
+            };
+            self.mode = InteractionMode::Idle;
         } else {
             self.mode = InteractionMode::BulkSelect { start, current };
         }
@@ -2623,7 +2639,7 @@ mod tests {
         let g_key = app.components[g].key;
         let o_key = app.components[o].key;
         assert_eq!(app.circuit.read_output(o_key), Value::ZERO); // NOT(1) = 0
-        app.selected = Some(Selected::Component(g));
+        app.selected = Some(Selection::Single(Selected::Component(g)));
 
         app.delete_component(g);
 
@@ -2656,7 +2672,7 @@ mod tests {
         let t_key = app.tunnels[t].key;
         connect_pin_tunnel(&mut app, (a, PinId::output(0)), t);
         app.rebuild_circuit();
-        app.selected = Some(Selected::Tunnel(t));
+        app.selected = Some(Selection::Single(Selected::Tunnel(t)));
 
         app.delete_tunnel(t);
 
@@ -2719,14 +2735,14 @@ mod tests {
         assert!(items.contains(&Selected::Component(b)));
         assert!(!items.contains(&Selected::Component(far)));
 
-        app.bulk_selection = items;
+        app.selected = Some(Selection::Bulk(items));
         app.delete_bulk();
 
         // Deleted records are tombstoned (inactive), the untouched one stays active.
         assert!(!app.components[a].active);
         assert!(!app.components[b].active);
         assert!(app.components[far].active);
-        assert!(app.bulk_selection.is_empty());
+        assert_eq!(app.selected, None);
         // The wire between a and b went with them.
         assert_eq!(app.wiring.active_segments().count(), 0);
     }
