@@ -1842,8 +1842,15 @@ impl eframe::App for OsmilogApp {
                     // flick released the same frame it started (drag_stopped never
                     // fires in the BulkSelect arm then), so the mode can't stick.
                     if response.drag_stopped() || !response.dragged() {
-                        self.bulk_selection = self.items_in_rect(rect, pan);
-                        self.mode = InteractionMode::Idle;
+                        let selected_items = self.items_in_rect(rect, pan);
+                        // If only one item in bounds, directly select it
+                        if selected_items.len() == 1 {
+                            self.selected = Some(selected_items[0]);
+                            self.mode = InteractionMode::Idle;
+                        } else {
+                            self.bulk_selection = selected_items;
+                            self.mode = InteractionMode::Idle;
+                        }
                     } else {
                         self.mode = InteractionMode::BulkSelect { start, current };
                     }
