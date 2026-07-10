@@ -1253,7 +1253,7 @@ impl OsmilogApp {
                                     self.last_settle_error = Some(format!("save failed: {e}"));
                                 }
                                 #[cfg(target_arch = "wasm32")]
-                                crate::io::wasm::trigger_download("circuit.json", &json);
+                                crate::io::wasm::trigger_download(&json);
                             }
                             Err(e) => self.last_settle_error = Some(format!("save failed: {e}")),
                         }
@@ -1503,9 +1503,7 @@ impl OsmilogApp {
                 } => {
                     let (key, original_grid_pos) = (*key, *original_grid_pos);
                     match key {
-                        Selected::Component(k) => {
-                            self.components[k].grid_pos = original_grid_pos
-                        }
+                        Selected::Component(k) => self.components[k].grid_pos = original_grid_pos,
                         Selected::Tunnel(k) => self.tunnels[k].grid_pos = original_grid_pos,
                         Selected::Wire(_) => {}
                     }
@@ -1534,8 +1532,8 @@ impl OsmilogApp {
         // takes priority). Guarded on widget focus so it edits a focused
         // text field instead of deleting.
         let editing_text = ctx.memory(|m| m.focused().is_some());
-        let delete_pressed = ctx
-            .input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete));
+        let delete_pressed =
+            ctx.input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete));
         if delete_pressed && !editing_text {
             if !self.bulk_selection.is_empty() {
                 self.delete_bulk();
@@ -1908,8 +1906,7 @@ impl eframe::App for OsmilogApp {
                 self.show_properties(ui);
             });
 
-        let (response, painter) =
-            ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let clip_rect = painter.clip_rect();
         let pan = self.pan;
 

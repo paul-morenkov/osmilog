@@ -19,6 +19,7 @@ use crate::sim::component::ComponentSpec;
 // v2: wires became a grid segment graph (`nodes` + `segments`), replacing the
 // v1 pin-to-pin `wires`/`tunnel_wires` lists. v1 files are rejected.
 pub const CURRENT_VERSION: u32 = 2;
+pub const CIRCUIT_FILE_EXT: &str = "osm";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitFile {
@@ -177,15 +178,16 @@ impl CircuitFile {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native {
-    use super::CircuitFile;
+
+    use super::{CircuitFile, CIRCUIT_FILE_EXT};
 
     // Opens a native "Save As" dialog and writes `json` to the chosen path.
     // `None` means the user cancelled; `Some(Err(..))` means the dialog
     // completed but the write failed.
     pub fn save_dialog(json: &str) -> Option<Result<(), String>> {
         let path = rfd::FileDialog::new()
-            .add_filter("osmilog circuit", &["osm"])
-            .set_file_name("circuit.osm")
+            .add_filter("osmilog circuit", &[CIRCUIT_FILE_EXT])
+            .set_file_name(format!("circuit.{}", CIRCUIT_FILE_EXT))
             .save_file()?;
         Some(std::fs::write(path, json).map_err(|e| e.to_string()))
     }
@@ -194,7 +196,7 @@ pub mod native {
     // chosen file. `None` means the user cancelled.
     pub fn load_dialog() -> Option<Result<CircuitFile, String>> {
         let path = rfd::FileDialog::new()
-            .add_filter("osmilog circuit", &["osm"])
+            .add_filter("osmilog circuit", &[CIRCUIT_FILE_EXT])
             .pick_file()?;
         Some((|| {
             let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
@@ -213,7 +215,7 @@ pub mod wasm {
     use wasm_bindgen::JsCast;
     use web_sys::{Blob, BlobPropertyBag, HtmlAnchorElement, Url};
 
-    use super::CircuitFile;
+    use super::{CircuitFile, CIRCUIT_FILE_EXT};
 
     // The browser has no synchronous file dialogs, so a spawned load task
     // delivers its outcome into this shared slot instead of returning it;
@@ -227,7 +229,7 @@ pub mod wasm {
     // Triggers a browser download via Blob + object URL + synthetic
     // `<a download>` click, rather than the File System Access API's save
     // picker (which `rfd`'s wasm backend uses) - that API is Chromium-only.
-    pub fn trigger_download(filename: &str, contents: &str) {
+    pub fn trigger_download(contents: &str) {
         let window = web_sys::window().expect("no window");
         let document = window.document().expect("no document");
 
@@ -238,6 +240,7 @@ pub mod wasm {
         let blob =
             Blob::new_with_str_sequence_and_options(&parts, &opts).expect("failed to build blob");
         let url = Url::create_object_url_with_blob(&blob).expect("failed to create object url");
+        let filename = format!("circuit.{}", CIRCUIT_FILE_EXT);
 
         let anchor: HtmlAnchorElement = document
             .create_element("a")
@@ -245,7 +248,7 @@ pub mod wasm {
             .dyn_into()
             .expect("created element is not an anchor");
         anchor.set_href(&url);
-        anchor.set_download(filename);
+        anchor.set_download(&filename);
 
         // Firefox requires the anchor be attached to the document for a
         // synthetic click to trigger a download; attach, click, detach.
@@ -265,7 +268,7 @@ pub mod wasm {
         wasm_bindgen_futures::spawn_local(async move {
             let outcome = async {
                 let handle = rfd::AsyncFileDialog::new()
-                    .add_filter("osmilog circuit", &["json"])
+                    .add_filter("osmilog circuit", &[CIRCUIT_FILE_EXT])
                     .pick_file()
                     .await
                     .ok_or_else(|| "no file selected".to_string())?;
