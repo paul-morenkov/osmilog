@@ -5,7 +5,6 @@ use slotmap::{new_key_type, SlotMap};
 use std::collections::HashMap;
 
 use crate::gui::geometry::{snap_to_grid, tunnel_shape, GridPos, GRID_SIZE, LABEL_FONT_SIZE};
-use crate::gui::gui_command::GuiCommand;
 use crate::gui::history::History;
 use crate::gui::placed_component::PlacedComponent;
 use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
@@ -422,10 +421,12 @@ impl OsmilogApp {
         // WireNodeKey -> position in `nodes`, so segments can reference nodes by
         // index. Built before `segments` reads it.
         let mut node_index: HashMap<crate::gui::wiring::WireNodeKey, usize> = HashMap::new();
+        // Only live nodes/segments are persisted - tombstones (kept for undo)
+        // never reach the save file. Active segments only reference active
+        // nodes, so every SegEntry lookup below resolves.
         let nodes: Vec<NodeEntry> = self
             .wiring
-            .nodes
-            .iter()
+            .active_nodes()
             .enumerate()
             .map(|(i, (nk, node))| {
                 node_index.insert(nk, i);
@@ -455,9 +456,8 @@ impl OsmilogApp {
 
         let segments = self
             .wiring
-            .segments
-            .values()
-            .map(|s| SegEntry {
+            .active_segments()
+            .map(|(_, s)| SegEntry {
                 a: node_index[&s.a],
                 b: node_index[&s.b],
             })
@@ -525,6 +525,7 @@ impl OsmilogApp {
                 self.wiring.nodes.insert(WireNode {
                     pos: entry.pos,
                     attach,
+                    active: true,
                 })
             })
             .collect();
@@ -533,6 +534,7 @@ impl OsmilogApp {
             self.wiring.segments.insert(WireSegment {
                 a: node_keys[s.a],
                 b: node_keys[s.b],
+                active: true,
             });
         }
 
@@ -953,11 +955,8 @@ impl OsmilogApp {
             grid_pos,
         };
 
-        self.apply_gui(GuiCommand::PruneStalePins {
-            key: pc_key,
-            n_inputs: new_n_in,
-            n_outputs: new_n_out,
-        });
+        let delta = self.wiring.prune_stale_pins(pc_key, new_n_in, new_n_out);
+        self.edit_wiring(delta);
         self.sync_component_wire_nodes(pc_key);
         self.rebuild_circuit();
         self.history.end_batch();
@@ -970,7 +969,8 @@ impl OsmilogApp {
         self.history.begin_batch();
         let comp_key = self.components[key].key;
         self.apply(Command::RemoveComponent(comp_key));
-        self.apply_gui(GuiCommand::RemoveComponentNodes(key));
+        let delta = self.wiring.remove_component_nodes(key);
+        self.edit_wiring(delta);
         self.components.remove(key);
         if self.selected == Some(Selected::Component(key)) {
             self.selected = None;
@@ -985,7 +985,8 @@ impl OsmilogApp {
         self.history.begin_batch();
         let tunnel_key = self.tunnels[key].key;
         self.apply(Command::RemoveTunnel(tunnel_key));
-        self.apply_gui(GuiCommand::RemoveTunnelNodes(key));
+        let delta = self.wiring.remove_tunnel_nodes(key);
+        self.edit_wiring(delta);
         self.tunnels.remove(key);
         if self.selected == Some(Selected::Tunnel(key)) {
             self.selected = None;
@@ -998,7 +999,8 @@ impl OsmilogApp {
     // any net split, then the circuit is rebuilt.
     fn delete_wire(&mut self, seg: WireSegKey) {
         self.history.begin_batch();
-        self.apply_gui(GuiCommand::DeleteSegment(seg));
+        let delta = self.wiring.delete_segment(seg);
+        self.edit_wiring(delta);
         if self.selected == Some(Selected::Wire(seg)) {
             self.selected = None;
         }
@@ -1028,7 +1030,7 @@ impl OsmilogApp {
                 out.push(Selected::Tunnel(key));
             }
         }
-        for (key, seg) in self.wiring.segments.iter() {
+        for (key, seg) in self.wiring.active_segments() {
             let a = grid_to_screen(self.wiring.nodes[seg.a].pos, pan);
             let b = grid_to_screen(self.wiring.nodes[seg.b].pos, pan);
             if rect.contains(a) && rect.contains(b) {
@@ -1048,9 +1050,11 @@ impl OsmilogApp {
         let items = std::mem::take(&mut self.bulk_selection);
         for sel in &items {
             if let Selected::Wire(seg) = *sel {
-                if self.wiring.segments.contains_key(seg) {
-                    self.apply_gui(GuiCommand::DeleteSegment(seg));
-                }
+                // delete_segment self-guards: an already-tombstoned segment
+                // (e.g. dropped by a component deletion earlier in this batch)
+                // yields an empty delta, so edit_wiring records nothing.
+                let delta = self.wiring.delete_segment(seg);
+                self.edit_wiring(delta);
             }
         }
         for sel in &items {
@@ -1059,7 +1063,8 @@ impl OsmilogApp {
                     if let Some(pc) = self.components.get(key) {
                         let comp_key = pc.key;
                         self.apply(Command::RemoveComponent(comp_key));
-                        self.apply_gui(GuiCommand::RemoveComponentNodes(key));
+                        let delta = self.wiring.remove_component_nodes(key);
+                        self.edit_wiring(delta);
                         self.components.remove(key);
                     }
                 }
@@ -1067,7 +1072,8 @@ impl OsmilogApp {
                     if let Some(pt) = self.tunnels.get(key) {
                         let tunnel_key = pt.key;
                         self.apply(Command::RemoveTunnel(tunnel_key));
-                        self.apply_gui(GuiCommand::RemoveTunnelNodes(key));
+                        let delta = self.wiring.remove_tunnel_nodes(key);
+                        self.edit_wiring(delta);
                         self.tunnels.remove(key);
                     }
                 }
@@ -1375,7 +1381,7 @@ impl eframe::App for OsmilogApp {
             // value: any component pin / tunnel on the group resolves (live) to
             // that net's Value; a dangling group (no endpoints) is Floating.
             let node_value = self.wire_node_values();
-            for (seg_key, seg) in self.wiring.segments.iter() {
+            for (seg_key, seg) in self.wiring.active_segments() {
                 let a = self.wiring.nodes[seg.a];
                 let b = self.wiring.nodes[seg.b];
                 let p0 = grid_to_screen(a.pos, pan);
@@ -1390,7 +1396,7 @@ impl eframe::App for OsmilogApp {
             }
             // Junction dots where three or more segments meet, so a real branch
             // reads differently from a mere crossing.
-            for (nk, node) in self.wiring.nodes.iter() {
+            for (nk, node) in self.wiring.active_nodes() {
                 if self.wiring.degree(nk) >= 3 {
                     let val = node_value.get(&nk).copied().unwrap_or(Value::Floating);
                     painter.circle_filled(
@@ -1601,21 +1607,18 @@ impl eframe::App for OsmilogApp {
                         if response.double_clicked() {
                             next_points.extend(pending.clone());
                             self.history.begin_batch();
-                            self.apply_gui(GuiCommand::AddRoute {
-                                points: next_points.clone(),
-                                start_attach,
-                                end_attach: NodeAttach::Free,
-                            });
+                            let delta =
+                                self.wiring
+                                    .add_route(&next_points, start_attach, NodeAttach::Free);
+                            self.edit_wiring(delta);
                             finished = true;
                         } else if response.clicked() {
                             next_points.extend(pending.clone());
                             if terminal {
                                 self.history.begin_batch();
-                                self.apply_gui(GuiCommand::AddRoute {
-                                    points: next_points.clone(),
-                                    start_attach,
-                                    end_attach: drop_attach,
-                                });
+                                let delta =
+                                    self.wiring.add_route(&next_points, start_attach, drop_attach);
+                                self.edit_wiring(delta);
                                 finished = true;
                             }
                         }
@@ -2121,7 +2124,7 @@ fn draw_tunnel_ghost(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gui::gui_command::GuiUndoAction;
+    use crate::gui::gui_undo::GuiUndoAction;
     use crate::gui::history::HistoryEntry;
     use crate::gui::wiring::NodeAttach;
     use crate::sim::component::GateOp;
@@ -2146,12 +2149,18 @@ mod tests {
         let na = app.wiring.nodes.insert(WireNode {
             pos: pa,
             attach: NodeAttach::Pin(a.0, a.1),
+            active: true,
         });
         let nb = app.wiring.nodes.insert(WireNode {
             pos: pb,
             attach: NodeAttach::Pin(b.0, b.1),
+            active: true,
         });
-        app.wiring.segments.insert(WireSegment { a: na, b: nb });
+        app.wiring.segments.insert(WireSegment {
+            a: na,
+            b: nb,
+            active: true,
+        });
     }
 
     // Insert a wire (one segment) between a component pin and a tunnel.
@@ -2165,12 +2174,18 @@ mod tests {
         let nc = app.wiring.nodes.insert(WireNode {
             pos: pc,
             attach: NodeAttach::Pin(c.0, c.1),
+            active: true,
         });
         let nt = app.wiring.nodes.insert(WireNode {
             pos: pt,
             attach: NodeAttach::Tunnel(ptk),
+            active: true,
         });
-        app.wiring.segments.insert(WireSegment { a: nc, b: nt });
+        app.wiring.segments.insert(WireSegment {
+            a: nc,
+            b: nt,
+            active: true,
+        });
     }
 
     #[test]
@@ -2215,6 +2230,61 @@ mod tests {
             .unwrap()
             .key;
         assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::ONE);
+    }
+
+    #[test]
+    fn test_circuit_file_save_excludes_tombstones() {
+        // After a wiring edit leaves tombstones behind, the save file must
+        // reflect only the live graph - tombstones never reach disk.
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let g = place(
+            &mut app,
+            ComponentSpec::Gate(Gate {
+                op: GateOp::Not,
+                n_inputs: 1,
+                width: 1,
+            }),
+        );
+        let o = place(&mut app, ComponentSpec::Output);
+        connect_pins(&mut app, (a, PinId::output(0)), (g, PinId::input(0)));
+        connect_pins(&mut app, (g, PinId::output(0)), (o, PinId::input(0)));
+        app.rebuild_circuit();
+
+        // Delete the a->g wire; its nodes/segment become tombstones still held
+        // in the SlotMaps.
+        let seg = app
+            .wiring
+            .active_segments()
+            .find(|(_, s)| {
+                matches!(app.wiring.nodes[s.a].attach, NodeAttach::Pin(k, _) if k == a)
+                    || matches!(app.wiring.nodes[s.b].attach, NodeAttach::Pin(k, _) if k == a)
+            })
+            .map(|(k, _)| k)
+            .unwrap();
+        app.delete_wire(seg);
+        assert!(app.wiring.segments.len() > app.wiring.active_segments().count());
+
+        // The file carries only live entries, and the reload matches the live
+        // graph exactly.
+        let file = app.to_circuit_file();
+        assert_eq!(file.segments.len(), app.wiring.active_segments().count());
+        assert_eq!(file.nodes.len(), app.wiring.active_nodes().count());
+
+        let json = file.to_json().unwrap();
+        let file2 = CircuitFile::from_json(&json).unwrap();
+        let mut loaded = OsmilogApp::empty();
+        loaded.load_circuit_file(&file2).unwrap();
+        assert_eq!(
+            loaded.wiring.active_segments().count(),
+            app.wiring.active_segments().count()
+        );
+        // A fresh load has no tombstones: every stored entry is live.
+        assert_eq!(
+            loaded.wiring.segments.len(),
+            loaded.wiring.active_segments().count()
+        );
+        assert_eq!(loaded.wiring.nodes.len(), loaded.wiring.active_nodes().count());
     }
 
     #[test]
@@ -2338,10 +2408,9 @@ mod tests {
         // cleaned up too, leaving no segments.
         assert!(app
             .wiring
-            .nodes
-            .values()
-            .all(|n| !matches!(n.attach, NodeAttach::Pin(k, _) if k == g)));
-        assert_eq!(app.wiring.segments.len(), 0);
+            .active_nodes()
+            .all(|(_, n)| !matches!(n.attach, NodeAttach::Pin(k, _) if k == g)));
+        assert_eq!(app.wiring.active_segments().count(), 0);
         assert_eq!(app.selected, None);
         // Output's input pin is now Floating.
         assert_eq!(app.circuit.read_output(o_key), Value::Floating);
@@ -2365,9 +2434,8 @@ mod tests {
         assert!(app.circuit.tunnels.get(t_key).is_none());
         assert!(app
             .wiring
-            .nodes
-            .values()
-            .all(|n| !matches!(n.attach, NodeAttach::Tunnel(k) if k == t)));
+            .active_nodes()
+            .all(|(_, n)| !matches!(n.attach, NodeAttach::Tunnel(k) if k == t)));
         assert_eq!(app.selected, None);
     }
 
@@ -2426,7 +2494,7 @@ mod tests {
         assert!(app.components.contains_key(far));
         assert!(app.bulk_selection.is_empty());
         // The wire between a and b went with them.
-        assert_eq!(app.wiring.segments.len(), 0);
+        assert_eq!(app.wiring.active_segments().count(), 0);
     }
 
     #[test]

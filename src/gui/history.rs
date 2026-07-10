@@ -1,8 +1,11 @@
-use crate::gui::gui_command::GuiUndoAction;
+use std::collections::HashSet;
+
+use crate::gui::gui_undo::GuiUndoAction;
+use crate::gui::wiring::{WireNodeKey, WireSegKey};
 use crate::sim::command::UndoAction;
 
 // One entry in the undo history: either a Circuit-level UndoAction (from
-// OsmilogApp::apply()), a GUI-level GuiUndoAction (from OsmilogApp::apply_gui()
+// OsmilogApp::apply()), a GUI-level GuiUndoAction (from OsmilogApp::edit_wiring()
 // or a direct push after a drag-move), or a Batch of either/both collapsed
 // into one user-visible step. Sim and GUI actions are deliberately two
 // separate types - Circuit has no notion of grid_pos/Wiring - but they share
@@ -15,13 +18,13 @@ pub enum HistoryEntry {
     Batch(Vec<HistoryEntry>),
 }
 
-// Accumulates HistoryEntrys from every OsmilogApp::apply()/apply_gui() call
+// Accumulates HistoryEntrys from every OsmilogApp::apply()/edit_wiring() call
 // (see app.rs). Lives on the GUI side, not on Circuit, since batching
 // boundaries ("this delete is one undo step") are a GUI-level concept
 // Circuit has no visibility into.
 //
 // begin_batch/end_batch use a depth counter rather than a single flag
-// because top-level App methods that issue multiple apply()/apply_gui() calls
+// because top-level App methods that issue multiple apply()/edit_wiring() calls
 // (e.g. rebuild_circuit) are themselves called from inside other top-level
 // methods that issue their own apply() calls first (e.g. delete_component
 // calls apply(RemoveComponent) then rebuild_circuit()) - without
@@ -76,6 +79,34 @@ impl History {
                 HistoryEntry::Batch(batch)
             });
         }
+    }
+
+    /// The union of every wire node/segment key referenced by any WiringDelta
+    /// anywhere in the history (recursing into Batches, and including a pending
+    /// open batch). This is the keep-set a tombstone GC pass consumes - see
+    /// `Wiring::remove_unreferenced_tombstones`. Unwired for now, alongside the
+    /// GC it feeds.
+    #[allow(dead_code)]
+    pub fn referenced_wire_keys(&self) -> (HashSet<WireNodeKey>, HashSet<WireSegKey>) {
+        let mut nodes = HashSet::new();
+        let mut segs = HashSet::new();
+        fn walk(entry: &HistoryEntry, nodes: &mut HashSet<WireNodeKey>, segs: &mut HashSet<WireSegKey>) {
+            match entry {
+                HistoryEntry::Gui(GuiUndoAction::WiringDelta(delta)) => {
+                    delta.collect_keys(nodes, segs);
+                }
+                HistoryEntry::Batch(entries) => {
+                    for e in entries {
+                        walk(e, nodes, segs);
+                    }
+                }
+                HistoryEntry::Sim(_) | HistoryEntry::Gui(_) => {}
+            }
+        }
+        for entry in self.stack.iter().chain(self.pending.iter()) {
+            walk(entry, &mut nodes, &mut segs);
+        }
+        (nodes, segs)
     }
 
     #[cfg(test)]
