@@ -36,6 +36,12 @@ new_key_type! {
 pub struct Component {
     pub pins: Pins,
     pub logic: Logic,
+    // `false` marks a tombstone - a component the circuit keeps (so its CompKey
+    // stays valid, and a Reg's latched state survives) but that undo has
+    // logically removed. Skipped by the engine's whole-component sweeps
+    // (tick_clock, clear_nets re-eval); reactivated by undo. See
+    // sim::command::UndoAction and Circuit::remove_component/reactivate_component.
+    pub(crate) active: bool,
 }
 
 impl Component {
@@ -44,6 +50,7 @@ impl Component {
         Self {
             pins,
             logic: Logic::Comb(logic),
+            active: true,
         }
     }
 
@@ -52,6 +59,7 @@ impl Component {
         Self {
             pins,
             logic: Logic::Seq(logic),
+            active: true,
         }
     }
 
@@ -196,11 +204,14 @@ impl Component {
     }
 
     // A Clone-able reconstruction record for this component's construction
-    // parameters (not its live pin wiring or persisted sequential state).
-    // Used to snapshot a component before it's removed, so undo can recreate
-    // an equivalent one later; also the GUI's own placed-component record
-    // (see gui::placed_component, which adds GUI-only display methods to
-    // ComponentSpec via a second inherent impl block).
+    // parameters (not its live pin wiring or persisted sequential state) - the
+    // inverse of `ComponentSpec::to_component`. No production caller since undo
+    // stopped snapshotting removed components into specs (removal now
+    // tombstones the live Component in place - see sim::command::UndoAction);
+    // retained, with `test_component_spec_round_trips_pin_arity`, to guard the
+    // ComponentSpec<->Component arity invariant the GUI's PlacedComponent.def
+    // relies on.
+    #[allow(dead_code)]
     pub(crate) fn spec(&self) -> ComponentSpec {
         match &self.logic {
             Logic::Comb(LogicComb::Input(p)) => ComponentSpec::Input(p.clone()),
@@ -226,9 +237,8 @@ impl Component {
 
 // The single canonical "construction params" record for a component - one
 // variant per component type, holding just enough to rebuild an equivalent
-// `Component` via `to_component()`. Used both by the sim layer (undo/redo's
-// `Command::RemoveComponent` snapshot, see sim::command::UndoAction::RestoreComponent)
-// and, unmodified, as the GUI's own placed-component record: gui::placed_component
+// `Component` via `to_component()` (the inverse being `Component::spec`). Used
+// unmodified as the GUI's own placed-component record: gui::placed_component
 // adds a second inherent impl block with GUI-only display methods (`size`,
 // `label`, `shape`) that depend on gui::geometry/gui::shape types the sim
 // layer must not depend on - Rust allows an inherent impl of a crate-local

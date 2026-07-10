@@ -64,19 +64,23 @@ never learns about signal values.
 Two things deliberately cross the boundary, and both do it by depending on `sim`, never the
 reverse:
 
-- **`sim::component::ComponentSpec`** is a plain construction-params enum, defined and used by
-  `sim` (it's what undo/redo snapshots a removed component into - see `sim::command::UndoAction`).
-  The GUI reuses this *exact* enum, unmodified, as `PlacedComponent`'s own record of "what to
-  construct" - `gui::placed_component` adds a second `impl ComponentSpec` block with GUI-only
+- **`sim::component::ComponentSpec`** is a plain construction-params enum, defined by `sim` as the
+  inverse of `to_component()` (`Component::spec()`; the GUI's `PlacedComponent` uses it as its
+  "what to construct" record). The GUI reuses this *exact* enum, unmodified, as `PlacedComponent`'s
+  own record - `gui::placed_component` adds a second `impl ComponentSpec` block with GUI-only
   display methods (`size`, `label`, `shape`) that depend on `gui::geometry`/`gui::shape` types
   `sim` must never depend on. Rust allows an inherent impl of a crate-local type from any module
   in the crate, so this needs no wrapper/newtype - one enum, one save-file representation, two
   impl blocks in two layers.
 - **`sim::command::Command`** is how the GUI mutates the circuit at all. `OsmilogApp` never calls
-  `Circuit::add_component`/`link`/`remove_component`/etc. directly; every edit goes through
-  `OsmilogApp::apply(Command) -> CommandOutput`, which calls `Circuit::apply_tracked` and pushes
-  the resulting `UndoAction` onto `gui::history::History`. This makes every GUI-issued mutation
-  automatically undo-recordable without the GUI needing to know how to reverse anything itself.
+  `Circuit::add_component`/`link`/`remove_component`/etc. directly; every *authoritative* edit goes
+  through `OsmilogApp::apply(Command) -> CommandOutput`, which calls `Circuit::apply` (returning
+  `(CommandOutput, UndoAction)`) and pushes the `UndoAction` onto `gui::history::History`. Edits
+  that only reconstruct *derived* net state (`ClearNets`/`Link`/`LinkTunnel`, all issued from
+  `rebuild_circuit`) bypass that wrapper and call `self.circuit.apply(..).0` untracked - undo
+  re-derives the nets rather than reversing them (see the Command layer section below). This makes
+  every GUI-issued authoritative mutation undo-recordable without the GUI needing to know how to
+  reverse anything itself.
   `gui::gui_undo::GuiUndoAction` is the GUI-only undo counterpart for edits `Command` has no
   notion of (wiring-graph changes, component/tunnel moves) - a wholly separate type since
   `Wiring`/`GridPos`/`PlacedCompKey` must stay out of `sim`, but recorded onto the *same*
@@ -136,13 +140,27 @@ them itself (see Simulator/GUI separation above).
 ### Command layer (`command.rs`)
 
     pub enum Command { AddComponent(Component), Link { .. }, RemoveComponent(CompKey), .. }
-    fn Circuit::apply(&mut self, command: Command) -> CommandOutput
-    fn Circuit::apply_tracked(&mut self, command: Command) -> (CommandOutput, UndoAction)
+    fn Circuit::apply(&mut self, command: Command) -> (CommandOutput, UndoAction)
 
-One `Command` variant per structural mutation `Circuit` supports. `apply` is a plain dispatch;
-`apply_tracked` additionally captures an `UndoAction` - enough pre-state to reverse that one
-command later. This is the seam the GUI's undo/redo is built on (see History below); nothing yet
-*consumes* an `UndoAction` to replay it (see In-Progress below).
+One `Command` variant per structural mutation `Circuit` supports. `apply` dispatches to the
+matching `Circuit` method and returns both the output and the `UndoAction` that reverses that one
+command (callers that don't want the undo take `.0`). This is the seam the GUI's undo/redo is built
+on (see History below); nothing yet *consumes* an `UndoAction` to replay it (see In-Progress below).
+
+The `UndoAction`s are deliberately minimal, because **the circuit's net structure is derived
+state**: the GUI rebuilds every net from its authoritative `Wiring`/component/tunnel records after
+any edit (`gui::app::rebuild_circuit`), so undo restores those records and re-derives the nets
+rather than reversing net mutations. Hence `ClearNets`/`Link`/`LinkTunnel`/`DetachTunnel` capture
+`NoOp` (no net snapshots, no `NetKey`s), and only the *authoritative* commands capture a real
+inverse. Component and tunnel removal **tombstones** (an `active: bool` on `Component`/`Tunnel`,
+mirroring `Wiring`) rather than deleting: `remove_component`/`remove_tunnel` flip `active` off (the
+engine's whole-component sweeps - `tick_clock`, `clear_nets`'s re-eval - skip inactive), and undo is
+a stable-key `reactivate_component`/`reactivate_tunnel` (`ReactivateComponent`/`ReactivateTunnel`).
+This keeps `CompKey`/`TunnelKey`s stable across undo (nothing else in the history needs remapping)
+and preserves a removed `Reg`'s latched state for reactivation - which a spec-based re-creation
+could not. `remove_unreferenced_tombstones` (unwired) reclaims tombstones no history entry
+references. The remaining real inverses: `DeactivateComponent`/`DeactivateTunnel` (undo of an add),
+`SetInput`, `RenameTunnel`, `RestoreSeqState` (undo of `TickClock`).
 
 ### Component model (`component.rs` + `component/*.rs`)
 
@@ -173,9 +191,11 @@ sit out of `settle()`'s propagation and only change state via `tick_clock()`. Se
 
 The canonical "construction params" record - everything needed to build an equivalent
 `Component`, without any live wiring or runtime state (a `Reg`'s latched value, a live
-`Component`'s `NetKey`s, are never part of a `ComponentSpec`). Shared, unmodified, between
-undo/redo (`sim::command::UndoAction::RestoreComponent`) and the GUI's `PlacedComponent` (see
-Simulator/GUI separation above for how the GUI attaches its own methods to this same type).
+`Component`'s `NetKey`s, are never part of a `ComponentSpec`). It's the GUI's `PlacedComponent`
+record (see Simulator/GUI separation above for how the GUI attaches its own methods to this same
+type). `Component::spec()` (the inverse of `to_component()`) has no production caller now that undo
+tombstones live components rather than snapshotting them into specs; it's retained, guarded by
+`test_component_spec_round_trips_pin_arity`, for the arity invariant the GUI relies on.
 
 ## GUI (`src/gui/`)
 
@@ -240,9 +260,10 @@ size); `Wiring::remove_unreferenced_tombstones` reclaims any not referenced by t
 Accumulates `HistoryEntry`s from every `OsmilogApp::apply()` (Circuit mutations, via `push_sim`)
 and `OsmilogApp::edit_wiring()` (`Wiring`-graph mutations, via `push_gui`) call, onto one
 interleaved stack. `begin_batch`/`end_batch` collapse a multi-step GUI operation (e.g. deleting a
-component, which issues both a `Command::RemoveComponent` and a `Wiring::remove_component_nodes`,
-then `rebuild_circuit`'s own `Command`s) into one `HistoryEntry` - a `Batch` when it's more than
-one sub-entry, unwrapped to the bare entry when it's exactly one.
+component, which issues both a tracked `Command::RemoveComponent` and a
+`Wiring::remove_component_nodes`) into one `HistoryEntry` - a `Batch` when it's more than one
+sub-entry, unwrapped to the bare entry when it's exactly one. `rebuild_circuit` is history-free, so
+it contributes nothing to a batch (its net reconstruction is untracked derived state).
 
 The `Wiring` mutators (`add_route`, `delete_segment`, `remove_component_nodes`,
 `remove_tunnel_nodes`, `prune_stale_pins`) each **return** a `gui::wiring::WiringDelta` - an ordered
@@ -284,14 +305,24 @@ app state).
 
 ## In-Progress / Not Yet Implemented
 
-- **Undo/redo**: recording is fully wired for both domains (every `Command` produces an
-  `UndoAction`, every `Wiring` edit produces a `WiringDelta`/`GuiUndoAction` and every drag-move a
-  `GuiUndoAction`, all batched by `History` into one interleaved `HistoryEntry` stack), but nothing
-  consumes the stack yet - there's no `undo()`/`redo()` method and no keybinding/menu entry. The
-  `Wiring`-side replay primitives already exist and are tested (`Wiring::undo_delta`/`redo_delta`);
-  the sim-side replay (`UndoAction` → `Circuit` calls) and the top-level stack traversal are
-  unbuilt. Tombstone GC (`Wiring::remove_unreferenced_tombstones` + `History::referenced_wire_keys`)
-  is defined but not yet called anywhere.
+- **Undo/redo**: recording is fully wired for both domains (every authoritative `Command` produces
+  an `UndoAction`, every `Wiring` edit produces a `WiringDelta`/`GuiUndoAction` and every drag-move
+  a `GuiUndoAction`, all batched by `History` into one interleaved `HistoryEntry` stack), but
+  nothing consumes the stack yet - there's no `undo()`/`redo()` method and no keybinding/menu entry.
+  The `Wiring`-side replay primitives exist and are tested (`Wiring::undo_delta`/`redo_delta`), and
+  the sim-side reactivation primitives exist and are tested (`Circuit::reactivate_component`/
+  `reactivate_tunnel`); the top-level stack traversal is unbuilt. The GUI's `PlacedComponent`/
+  `PlacedTunnel` now **tombstone** on delete too (an `active: bool` mirroring `Wiring`/`Component`):
+  `delete_component`/`delete_tunnel`/`delete_bulk` flip `active` off instead of removing from the
+  `SlotMap`, keeping the `PlacedCompKey`/`PlacedTunnelKey` valid so a future undo can reactivate the
+  record. Every read that must not see a deleted record iterates `OsmilogApp::active_components`/
+  `active_tunnels` (drawing, hit-testing, `items_in_rect`, `rebuild_circuit`, `wire_node_values`,
+  `to_circuit_file`); raw indexing `components[k]`/`tunnels[k]` on a known-live key stays fine. Save
+  persists only active records. What still blocks consuming undo: (a) the top-level stack traversal
+  itself; (b) param-edit undo (reconfigure def / tunnel rename)
+  interacts with `rebuild_circuit`'s label reconcile and wants GUI-authoritative record deltas.
+  Tombstone GC (`Wiring::remove_unreferenced_tombstones`, `Circuit::remove_unreferenced_tombstones`,
+  `History::referenced_wire_keys`) is defined but not yet called anywhere.
 - **Canvas pan/zoom**: `OsmilogApp::pan` exists and is read everywhere geometry is drawn, but
   nothing currently mutates it - there's no pan gesture, and no zoom at all.
 - **Whole-wire-run selection**: selecting/deleting a wire is still per-segment. `Wiring::groups()`

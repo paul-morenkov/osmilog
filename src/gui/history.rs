@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn push_sim_unbatched_produces_one_entry() {
         let mut h = History::default();
-        h.push_sim(UndoAction::RemoveComponent(comp_key()));
+        h.push_sim(UndoAction::DeactivateComponent(comp_key()));
         assert_eq!(h.len(), 1);
         assert!(matches!(h.last(), Some(HistoryEntry::Sim(_))));
     }
@@ -168,7 +168,7 @@ mod tests {
     fn batch_with_mixed_pushes_collapses_to_one_batch_entry() {
         let mut h = History::default();
         h.begin_batch();
-        h.push_sim(UndoAction::RemoveComponent(comp_key()));
+        h.push_sim(UndoAction::DeactivateComponent(comp_key()));
         h.push_gui(GuiUndoAction::MoveComponent {
             key: placed_comp_key(),
             old_pos: GridPos::new(0, 0),
@@ -189,7 +189,7 @@ mod tests {
     fn nested_batches_collapse_to_one_entry() {
         let mut h = History::default();
         h.begin_batch();
-        h.push_sim(UndoAction::RemoveComponent(comp_key()));
+        h.push_sim(UndoAction::DeactivateComponent(comp_key()));
         h.begin_batch();
         h.push_gui(GuiUndoAction::MoveComponent {
             key: placed_comp_key(),
@@ -205,7 +205,7 @@ mod tests {
     fn single_push_batch_unwraps_to_bare_entry() {
         let mut h = History::default();
         h.begin_batch();
-        h.push_sim(UndoAction::RemoveComponent(comp_key()));
+        h.push_sim(UndoAction::DeactivateComponent(comp_key()));
         h.end_batch();
         assert_eq!(h.len(), 1);
         assert!(matches!(h.last(), Some(HistoryEntry::Sim(_))));

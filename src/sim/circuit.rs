@@ -25,6 +25,11 @@ pub struct Tunnel {
     pub label: String,
     pub role: TunnelRole,
     pub net: Option<NetKey>,
+    // `false` marks a tombstone (see Component::active): a tunnel undo has
+    // logically removed but the circuit keeps so its TunnelKey stays valid for
+    // reactivation. An inactive tunnel is dropped from `tunnel_labels`, so it
+    // contributes to no label group until reactivated.
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,7 +134,12 @@ impl Circuit {
         // driver would keep a stale output (which a subsequent relink would then
         // read back as a live value). Sources with no inputs (e.g. Input) simply
         // recompute their own constant.
-        let keys: Vec<CompKey> = self.components.keys().collect();
+        let keys: Vec<CompKey> = self
+            .components
+            .iter()
+            .filter(|(_, c)| c.active)
+            .map(|(k, _)| k)
+            .collect();
         for key in keys {
             self.eval_component(key);
         }
@@ -232,6 +242,7 @@ impl Circuit {
             label: label.clone(),
             role,
             net: None,
+            active: true,
         });
         self.tunnel_labels.entry(label).or_default().push(key);
         key
@@ -272,19 +283,78 @@ impl Circuit {
     }
 
     pub fn remove_tunnel(&mut self, tunnel: TunnelKey) {
-        let Some(t) = self.tunnels.remove(tunnel) else {
+        // Tombstone rather than remove, mirroring remove_component: the
+        // TunnelKey survives for undo. An inactive tunnel is dropped from its
+        // label group and its net binding cleared, so it contributes nothing
+        // until reactivated.
+        let Some(t) = self.tunnels.get_mut(tunnel) else {
             return;
         };
-        if let Some(keys) = self.tunnel_labels.get_mut(&t.label) {
+        if !t.active {
+            return;
+        }
+        t.active = false;
+        let label = t.label.clone();
+        let net = t.net.take();
+        if let Some(keys) = self.tunnel_labels.get_mut(&label) {
             keys.retain(|&k| k != tunnel);
             if keys.is_empty() {
-                self.tunnel_labels.remove(&t.label);
+                self.tunnel_labels.remove(&label);
             }
         }
-        if let Some(net) = t.net {
+        if let Some(net) = net {
             self.mark_dirty(net);
         }
-        self.dirty_label_feed_nets(&t.label);
+        self.dirty_label_feed_nets(&label);
+    }
+
+    // Undo of remove_component: flip the tombstone back. The component's pins
+    // were nulled on removal, so it currently drives/reads nothing; the caller
+    // re-establishes its nets (the GUI via rebuild_circuit, a sim caller via
+    // link()) and settle()s. A Reg's latched state was preserved untouched, so
+    // it returns exactly as it was before removal.
+    // Unwired until undo()/redo() consumes the history (see UndoAction).
+    #[allow(dead_code)]
+    pub(crate) fn reactivate_component(&mut self, key: CompKey) {
+        if let Some(c) = self.components.get_mut(key) {
+            c.active = true;
+            self.eval_component(key);
+        }
+    }
+
+    // Undo of remove_tunnel: flip the tombstone back and rejoin its label
+    // group. Its net binding is re-established by the caller's relink.
+    #[allow(dead_code)]
+    pub(crate) fn reactivate_tunnel(&mut self, tunnel: TunnelKey) {
+        let Some(t) = self.tunnels.get_mut(tunnel) else {
+            return;
+        };
+        if t.active {
+            return;
+        }
+        t.active = true;
+        let label = t.label.clone();
+        self.tunnel_labels
+            .entry(label.clone())
+            .or_default()
+            .push(tunnel);
+        self.dirty_label_feed_nets(&label);
+    }
+
+    // Reclaim tombstones: permanently remove any inactive component/tunnel whose
+    // key is in neither keep set (the keys still referenced by the undo
+    // history). Unwired for now, the sim-side counterpart of
+    // Wiring::remove_unreferenced_tombstones - meant to run periodically or when
+    // history is cleared/branched.
+    pub fn remove_unreferenced_tombstones(
+        &mut self,
+        keep_components: &std::collections::HashSet<CompKey>,
+        keep_tunnels: &std::collections::HashSet<TunnelKey>,
+    ) {
+        self.components
+            .retain(|k, c| c.active || keep_components.contains(&k));
+        self.tunnels
+            .retain(|k, t| t.active || keep_tunnels.contains(&k));
     }
 
     /// The current label of a tunnel, or `None` if the key is stale.
@@ -560,7 +630,7 @@ impl Circuit {
         let seq_comps: Vec<CompKey> = self
             .components
             .iter()
-            .filter(|(_, c)| c.is_sequential())
+            .filter(|(_, c)| c.active && c.is_sequential())
             .map(|(key, _)| key)
             .collect();
 
@@ -644,7 +714,16 @@ impl Circuit {
         self.dirty.clear();
         self.queued.clear();
 
-        self.components.remove(key);
+        // Tombstone rather than remove: the CompKey (and, for a Reg, its latched
+        // state) must survive so undo can reactivate it in place. Its own pins
+        // are nulled here so it holds no dangling NetKeys; the engine's
+        // whole-component sweeps skip it via the `active` filter. A GC pass
+        // (remove_unreferenced_tombstones) reclaims it once no undo entry needs
+        // it.
+        if let Some(c) = self.components.get_mut(key) {
+            c.active = false;
+            c.clear_pins();
+        }
 
         // Re-evaluate sinks that lost their driver so their now-Floating input
         // propagates: eval_component recomputes out_cache and marks any changed

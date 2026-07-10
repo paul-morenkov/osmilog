@@ -10,13 +10,21 @@ pub struct PlacedComponent {
     pub key: CompKey,
     pub def: ComponentSpec,
     pub grid_pos: GridPos,
+    // Tombstone flag, mirroring sim::Component::active and wiring::WireNode::active:
+    // a deleted PlacedComponent is flagged inactive rather than removed from the
+    // SlotMap, so its PlacedCompKey stays valid for undo to restore (Wiring node
+    // bindings, selection, and drag state all reference this key and must not
+    // dangle). Every read that must not see a deleted record iterates through
+    // OsmilogApp::active_components; raw indexing components[k] on a known-live key
+    // is still fine.
+    pub active: bool,
 }
 
 // ── GUI-only visual concerns for ComponentSpec ────────────────────────────────
 //
 // ComponentSpec itself (construction params per component type) lives in
-// sim::component, shared with undo/redo's RestoreComponent snapshot. This impl
-// block adds display-only methods that depend on gui::geometry/gui::shape
+// sim::component. This impl block adds display-only methods that depend on
+// gui::geometry/gui::shape
 // types the sim layer must not depend on - Rust allows an inherent impl of a
 // crate-local type from any module, so no wrapper/newtype is needed to keep
 // the two concerns apart while still sharing one enum.

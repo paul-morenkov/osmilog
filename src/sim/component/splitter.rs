@@ -84,6 +84,9 @@ impl Splitter {
     // exact Vec<Vec<u8>> originally passed in (e.g. a bit claimed by two
     // arms only appears under the winning arm here, same as it does in the
     // live routing table).
+    // Only production caller is Component::spec (now itself unused outside
+    // tests); retained for spec()'s round-trip and this module's own tests.
+    #[allow(dead_code)]
     pub(crate) fn arm_bits(&self) -> Vec<Vec<u8>> {
         let mut arm_bits: Vec<Vec<u8>> =
             self.arm_width.iter().map(|&w| vec![0u8; w as usize]).collect();

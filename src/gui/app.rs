@@ -46,6 +46,9 @@ pub struct PlacedTunnel {
     pub label: String,
     pub role: TunnelRole,
     pub grid_pos: GridPos,
+    // Tombstone flag; see PlacedComponent::active. A deleted tunnel is flagged
+    // inactive rather than removed so its PlacedTunnelKey survives for undo.
+    pub active: bool,
 }
 
 // ── Selected ──────────────────────────────────────────────────────────────────
@@ -179,7 +182,7 @@ impl OsmilogApp {
     // circuit.apply() (same CommandOutput, same unwrap_* chaining), never
     // needing to look at the undo data themselves.
     fn apply(&mut self, command: Command) -> crate::sim::command::CommandOutput {
-        let (output, undo) = self.circuit.apply_tracked(command);
+        let (output, undo) = self.circuit.apply(command);
         self.history.push_sim(undo);
         output
     }
@@ -189,7 +192,12 @@ impl OsmilogApp {
         let comp = def.to_component();
         let key = self.apply(Command::AddComponent(comp)).unwrap_comp();
         self.history.end_batch();
-        let pc = PlacedComponent { key, def, grid_pos };
+        let pc = PlacedComponent {
+            key,
+            def,
+            grid_pos,
+            active: true,
+        };
         self.components.insert(pc)
     }
 
@@ -217,8 +225,21 @@ impl OsmilogApp {
             label,
             role,
             grid_pos,
+            active: true,
         };
         self.tunnels.insert(pt)
+    }
+
+    // Live (non-tombstoned) placed components / tunnels. Every read that must
+    // not see a deleted-but-retained record iterates through these, mirroring
+    // Wiring::active_nodes/active_segments; raw indexing components[k]/tunnels[k]
+    // on a known-live key stays fine (a tombstone is simply never iterated).
+    fn active_components(&self) -> impl Iterator<Item = (PlacedCompKey, &PlacedComponent)> {
+        self.components.iter().filter(|(_, pc)| pc.active)
+    }
+
+    fn active_tunnels(&self) -> impl Iterator<Item = (PlacedTunnelKey, &PlacedTunnel)> {
+        self.tunnels.iter().filter(|(_, pt)| pt.active)
     }
 
     // Rebuilds every circuit net from the GUI wiring graph. clear_nets() drops
@@ -229,11 +250,12 @@ impl OsmilogApp {
     // wire group with no component pin (tunnels-only, or purely dangling) has
     // no net to attach to and is skipped. Called after any wiring edit.
     pub(crate) fn rebuild_circuit(&mut self) {
-        // Nested: a caller (delete_component, reconfigure_component, ...)
-        // may already have an outer batch open for its own apply() calls
-        // before reaching here; History's depth counter collapses the whole
-        // sequence into one undo entry either way.
-        self.history.begin_batch();
+        // History-free: this only reconstructs *derived* net state (labels,
+        // nets), which undo re-derives rather than reverses - so every command
+        // issued here goes through the untracked `self.circuit.apply(..).0`,
+        // records nothing, and needs no batch of its own. A caller's own
+        // authoritative edit (e.g. delete_component's RemoveComponent) is what
+        // it batches, and that happens outside this method.
 
         // Reconcile each circuit tunnel's label from its GUI record, which is
         // the source of truth. The properties panel updates PlacedTunnel.label
@@ -249,23 +271,29 @@ impl OsmilogApp {
             .map(|pt| (pt.key, pt.label.clone()))
             .collect();
         for (key, label) in renames {
-            self.apply(Command::RenameTunnel { tunnel: key, new_label: label });
+            self.circuit
+                .apply(Command::RenameTunnel { tunnel: key, new_label: label });
         }
 
-        self.apply(Command::ClearNets);
+        self.circuit.apply(Command::ClearNets);
         for group in self.wiring.groups() {
             // Map GUI PlacedCompKeys to live circuit CompKeys; a stale key
             // (component already gone) is dropped.
             let pins: Vec<(CompKey, PinId)> = group
                 .pins
                 .iter()
-                .filter_map(|&(pck, pin)| self.components.get(pck).map(|pc| (pc.key, pin)))
+                .filter_map(|&(pck, pin)| {
+                    self.components
+                        .get(pck)
+                        .filter(|pc| pc.active)
+                        .map(|pc| (pc.key, pin))
+                })
                 .collect();
             let Some(&(anchor_comp, anchor_pin)) = pins.first() else {
                 continue; // no component pin: nothing to drive a net
             };
             for &(comp, pin) in &pins[1..] {
-                self.apply(Command::Link {
+                self.circuit.apply(Command::Link {
                     a: anchor_comp,
                     a_pin: anchor_pin,
                     b: comp,
@@ -273,8 +301,8 @@ impl OsmilogApp {
                 });
             }
             for &ptk in &group.tunnels {
-                if let Some(pt) = self.tunnels.get(ptk) {
-                    self.apply(Command::LinkTunnel {
+                if let Some(pt) = self.tunnels.get(ptk).filter(|pt| pt.active) {
+                    self.circuit.apply(Command::LinkTunnel {
                         tunnel: pt.key,
                         comp: anchor_comp,
                         pin: anchor_pin,
@@ -282,7 +310,6 @@ impl OsmilogApp {
                 }
             }
         }
-        self.history.end_batch();
         let result = self.circuit.settle();
         self.record_settle_result(result);
     }
@@ -314,7 +341,7 @@ impl OsmilogApp {
         for group in self.wiring.groups() {
             let mut val = Value::Floating;
             for &(pck, pin) in &group.pins {
-                if let Some(pc) = self.components.get(pck) {
+                if let Some(pc) = self.components.get(pck).filter(|pc| pc.active) {
                     if let Some(nk) = self.circuit.components[pc.key].net_of(pin) {
                         val = self.circuit.nets[nk].value;
                         break;
@@ -323,7 +350,7 @@ impl OsmilogApp {
             }
             if val == Value::Floating {
                 for &ptk in &group.tunnels {
-                    if let Some(pt) = self.tunnels.get(ptk) {
+                    if let Some(pt) = self.tunnels.get(ptk).filter(|pt| pt.active) {
                         if let Some(nk) = self.circuit.tunnels.get(pt.key).and_then(|t| t.net) {
                             val = self.circuit.nets[nk].value;
                             break;
@@ -344,7 +371,7 @@ impl OsmilogApp {
     // component pin (out, then in), tunnel pin, existing wire node, wire segment,
     // else the snapped cursor cell (empty space, not a terminal).
     fn wire_target_at(&self, pos: Pos2, pan: Vec2) -> (NodeAttach, GridPos, bool) {
-        if let Some((pck, pin)) = pin_at_pos(self.components.iter(), pan, pos, PinKind::Output) {
+        if let Some((pck, pin)) = pin_at_pos(self.active_components(), pan, pos, PinKind::Output) {
             let gp = pin_grid_pos(
                 &self.components[pck].def.shape(),
                 self.components[pck].grid_pos,
@@ -352,7 +379,7 @@ impl OsmilogApp {
             );
             return (NodeAttach::Pin(pck, pin), gp, true);
         }
-        if let Some((pck, pin)) = pin_at_pos(self.components.iter(), pan, pos, PinKind::Input) {
+        if let Some((pck, pin)) = pin_at_pos(self.active_components(), pan, pos, PinKind::Input) {
             let gp = pin_grid_pos(
                 &self.components[pck].def.shape(),
                 self.components[pck].grid_pos,
@@ -360,7 +387,7 @@ impl OsmilogApp {
             );
             return (NodeAttach::Pin(pck, pin), gp, true);
         }
-        if let Some(ptk) = tunnel_pin_at_pos(self.tunnels.iter(), pan, pos) {
+        if let Some(ptk) = tunnel_pin_at_pos(self.active_tunnels(), pan, pos) {
             return (
                 NodeAttach::Tunnel(ptk),
                 tunnel_pin_grid(&self.tunnels[ptk]),
@@ -389,10 +416,13 @@ impl OsmilogApp {
         // PlacedCompKey/PlacedTunnelKey -> position in the Vec being emitted,
         // so wire nodes can reference components/tunnels by index instead of a
         // slotmap key. Built here, then read when emitting `nodes` below.
+        // Only live components/tunnels are persisted - tombstones (kept for undo)
+        // never reach the save file, matching active_nodes/active_segments below.
+        // Active wire nodes only attach to active components/tunnels, so every
+        // comp_index/tunnel_index lookup emitted below resolves.
         let mut comp_index: HashMap<PlacedCompKey, usize> = HashMap::new();
         let components: Vec<ComponentEntry> = self
-            .components
-            .iter()
+            .active_components()
             .enumerate()
             .map(|(i, (pck, pc))| {
                 comp_index.insert(pck, i);
@@ -405,8 +435,7 @@ impl OsmilogApp {
 
         let mut tunnel_index: HashMap<PlacedTunnelKey, usize> = HashMap::new();
         let tunnels: Vec<TunnelEntry> = self
-            .tunnels
-            .iter()
+            .active_tunnels()
             .enumerate()
             .map(|(i, (ptk, pt))| {
                 tunnel_index.insert(ptk, i);
@@ -953,6 +982,7 @@ impl OsmilogApp {
             key: new_key,
             def: new_def,
             grid_pos,
+            active: true,
         };
 
         let delta = self.wiring.prune_stale_pins(pc_key, new_n_in, new_n_out);
@@ -971,7 +1001,9 @@ impl OsmilogApp {
         self.apply(Command::RemoveComponent(comp_key));
         let delta = self.wiring.remove_component_nodes(key);
         self.edit_wiring(delta);
-        self.components.remove(key);
+        // Tombstone rather than remove: keeps the PlacedCompKey valid so undo can
+        // reactivate this record (see PlacedComponent::active).
+        self.components[key].active = false;
         if self.selected == Some(Selected::Component(key)) {
             self.selected = None;
         }
@@ -987,7 +1019,8 @@ impl OsmilogApp {
         self.apply(Command::RemoveTunnel(tunnel_key));
         let delta = self.wiring.remove_tunnel_nodes(key);
         self.edit_wiring(delta);
-        self.tunnels.remove(key);
+        // Tombstone rather than remove (see delete_component).
+        self.tunnels[key].active = false;
         if self.selected == Some(Selected::Tunnel(key)) {
             self.selected = None;
         }
@@ -1020,12 +1053,12 @@ impl OsmilogApp {
     // inside, a wire when both its endpoints are.
     fn items_in_rect(&self, rect: Rect, pan: Vec2) -> Vec<Selected> {
         let mut out = Vec::new();
-        for (key, pc) in &self.components {
+        for (key, pc) in self.active_components() {
             if rect.contains_rect(component_bounding_rect(pc, pan)) {
                 out.push(Selected::Component(key));
             }
         }
-        for (key, pt) in &self.tunnels {
+        for (key, pt) in self.active_tunnels() {
             if rect.contains_rect(tunnel_bounding_rect(pt, pan)) {
                 out.push(Selected::Tunnel(key));
             }
@@ -1060,21 +1093,23 @@ impl OsmilogApp {
         for sel in &items {
             match *sel {
                 Selected::Component(key) => {
-                    if let Some(pc) = self.components.get(key) {
+                    // Guard on active, not just presence: a tombstoned record
+                    // (deleted earlier in this same batch) must not be redeleted.
+                    if let Some(pc) = self.components.get(key).filter(|pc| pc.active) {
                         let comp_key = pc.key;
                         self.apply(Command::RemoveComponent(comp_key));
                         let delta = self.wiring.remove_component_nodes(key);
                         self.edit_wiring(delta);
-                        self.components.remove(key);
+                        self.components[key].active = false;
                     }
                 }
                 Selected::Tunnel(key) => {
-                    if let Some(pt) = self.tunnels.get(key) {
+                    if let Some(pt) = self.tunnels.get(key).filter(|pt| pt.active) {
                         let tunnel_key = pt.key;
                         self.apply(Command::RemoveTunnel(tunnel_key));
                         let delta = self.wiring.remove_tunnel_nodes(key);
                         self.edit_wiring(delta);
-                        self.tunnels.remove(key);
+                        self.tunnels[key].active = false;
                     }
                 }
                 Selected::Wire(_) => {}
@@ -1408,13 +1443,13 @@ impl eframe::App for OsmilogApp {
             }
 
             // Draw components
-            for (pc_key, pc) in &self.components {
+            for (pc_key, pc) in self.active_components() {
                 let is_selected = self.is_highlighted(Selected::Component(pc_key));
                 draw_component(&painter, pc, pan, &self.circuit, is_selected, theme);
             }
 
             // Draw tunnels
-            for (pt_key, pt) in &self.tunnels {
+            for (pt_key, pt) in self.active_tunnels() {
                 let is_selected = self.is_highlighted(Selected::Tunnel(pt_key));
                 draw_tunnel(&painter, pt, pan, &self.circuit, is_selected, theme);
             }
@@ -1430,10 +1465,10 @@ impl eframe::App for OsmilogApp {
                     // Hover reticle: hovering over a wire (but not a pin) shows
                     // where a branch would tap the wire.
                     if let Some(pos) = pointer {
-                        if pin_at_pos(self.components.iter(), pan, pos, PinKind::Output).is_none()
-                            && pin_at_pos(self.components.iter(), pan, pos, PinKind::Input)
+                        if pin_at_pos(self.active_components(), pan, pos, PinKind::Output).is_none()
+                            && pin_at_pos(self.active_components(), pan, pos, PinKind::Input)
                                 .is_none()
-                            && tunnel_pin_at_pos(self.tunnels.iter(), pan, pos).is_none()
+                            && tunnel_pin_at_pos(self.active_tunnels(), pan, pos).is_none()
                         {
                             if let Some((_, gp)) = self.wiring.segment_at_pos(pos, pan) {
                                 draw_reticle(&painter, grid_to_screen(gp, pan), theme);
@@ -2402,8 +2437,13 @@ mod tests {
 
         app.delete_component(g);
 
-        assert!(!app.components.contains_key(g));
-        assert!(app.circuit.components.get(g_key).is_none());
+        // The placed record is tombstoned (kept for undo), so its key stays
+        // valid but the record is inactive rather than gone.
+        assert!(app.components.contains_key(g));
+        assert!(!app.components[g].active);
+        // Circuit-side removal tombstones (keeps the CompKey for undo), so the
+        // component is inactive rather than gone.
+        assert!(app.circuit.components.get(g_key).is_some_and(|c| !c.active));
         // No wire node references the deleted component; orphan neighbours were
         // cleaned up too, leaving no segments.
         assert!(app
@@ -2430,8 +2470,11 @@ mod tests {
 
         app.delete_tunnel(t);
 
-        assert!(!app.tunnels.contains_key(t));
-        assert!(app.circuit.tunnels.get(t_key).is_none());
+        // Placed record tombstoned (kept for undo): key valid, record inactive.
+        assert!(app.tunnels.contains_key(t));
+        assert!(!app.tunnels[t].active);
+        // Tombstoned circuit-side (TunnelKey kept for undo): inactive, not gone.
+        assert!(app.circuit.tunnels.get(t_key).is_some_and(|t| !t.active));
         assert!(app
             .wiring
             .active_nodes()
@@ -2489,9 +2532,10 @@ mod tests {
         app.bulk_selection = items;
         app.delete_bulk();
 
-        assert!(!app.components.contains_key(a));
-        assert!(!app.components.contains_key(b));
-        assert!(app.components.contains_key(far));
+        // Deleted records are tombstoned (inactive), the untouched one stays active.
+        assert!(!app.components[a].active);
+        assert!(!app.components[b].active);
+        assert!(app.components[far].active);
         assert!(app.bulk_selection.is_empty());
         // The wire between a and b went with them.
         assert_eq!(app.wiring.active_segments().count(), 0);
@@ -2536,11 +2580,11 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_wire_collapses_gui_and_sim_undo_into_one_batch() {
-        // delete_wire didn't open its own history batch before this change, so
-        // its GuiUndoAction (wiring-graph restore) and the Sim UndoActions from
-        // the rebuild_circuit() net relink landed as two separate stack
-        // entries instead of one. Confirm they now collapse into one Batch.
+    fn test_delete_wire_records_only_the_wiring_delta() {
+        // rebuild_circuit is history-free: its ClearNets/Link net reconstruction
+        // is *derived* state that records nothing. So deleting a wire produces
+        // exactly one entry - the Gui WiringDelta - with no Sim entries from the
+        // relink (which used to pad the batch with RelinkAll + per-link undos).
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let g = place(
@@ -2554,18 +2598,15 @@ mod tests {
         connect_pins(&mut app, (a, PinId::output(0)), (g, PinId::input(0)));
         app.rebuild_circuit();
 
-        let seg = app.wiring.segments.keys().next().unwrap();
+        let seg = app.wiring.active_segments().next().map(|(k, _)| k).unwrap();
         let stack_before = app.history.len();
         app.delete_wire(seg);
 
         assert_eq!(app.history.len(), stack_before + 1);
-        match app.history.last() {
-            Some(HistoryEntry::Batch(entries)) => {
-                assert!(entries.iter().any(|e| matches!(e, HistoryEntry::Gui(_))));
-                assert!(entries.iter().any(|e| matches!(e, HistoryEntry::Sim(_))));
-            }
-            other => panic!("expected Batch mixing Gui and Sim entries, got {other:?}"),
-        }
+        assert!(matches!(
+            app.history.last(),
+            Some(HistoryEntry::Gui(GuiUndoAction::WiringDelta(_)))
+        ));
     }
 
     #[test]
