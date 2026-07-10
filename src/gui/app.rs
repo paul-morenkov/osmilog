@@ -137,6 +137,20 @@ pub struct OsmilogApp {
     pending_load: crate::io::wasm::PendingLoad,
 }
 
+// ── CanvasCtx ─────────────────────────────────────────────────────────────────
+
+// Ambient egui/render handles used by the canvas-interaction dispatch and its
+// per-mode methods. Built fresh each frame in `ui()`, never stored on
+// OsmilogApp - just a bundle of the 5 values `handle_canvas_interaction` and
+// its 6 `interact_*` methods would otherwise all repeat individually.
+struct CanvasCtx<'a> {
+    response: &'a egui::Response,
+    painter: &'a Painter,
+    ctx: &'a egui::Context,
+    pan: Vec2,
+    theme: Theme,
+}
+
 impl OsmilogApp {
     // Split out from `new` so tests (and `load_circuit_file`) can construct
     // a fresh app without an eframe::CreationContext, which isn't
@@ -1225,24 +1239,9 @@ impl OsmilogApp {
             Err(e) => self.last_settle_error = Some(format!("load failed: {e}")),
         }
     }
-}
 
-impl eframe::App for OsmilogApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        #[cfg(target_arch = "wasm32")]
-        self.apply_pending_load();
-
-        if ctx.input(|i| i.viewport().close_requested()) {
-            #[cfg(not(target_arch = "wasm32"))]
-            std::process::exit(0);
-        }
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        let theme = Theme::from_visuals(ui.visuals());
-
-        // ── Menu bar ──────────────────────────────────────────────────────
+    // ── Menu bar ──────────────────────────────────────────────────────────
+    fn show_menu_bar(&mut self, ui: &mut egui::Ui, theme: Theme) {
         egui::Panel::top("menu_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.menu_button("File", |ui| {
@@ -1440,8 +1439,468 @@ impl eframe::App for OsmilogApp {
                 });
             })
         });
+    }
 
-        // ── Properties panel ──────────────────────────────────────────────
+    // ── Canvas drawing ────────────────────────────────────────────────────
+    fn draw_canvas(&self, painter: &Painter, clip_rect: Rect, pan: Vec2, theme: Theme) {
+        painter.rect_filled(clip_rect, 0.0, theme.canvas_bg);
+        draw_grid(painter, clip_rect, pan, theme);
+
+        // Draw wire segments. Colour comes from each connected group's net
+        // value: any component pin / tunnel on the group resolves (live) to
+        // that net's Value; a dangling group (no endpoints) is Floating.
+        let node_value = self.wire_node_values();
+        for (seg_key, seg) in self.wiring.active_segments() {
+            let a = self.wiring.nodes[seg.a];
+            let b = self.wiring.nodes[seg.b];
+            let p0 = grid_to_screen(a.pos, pan);
+            let p1 = grid_to_screen(b.pos, pan);
+            let val = node_value.get(&seg.a).copied().unwrap_or(Value::Floating);
+            let mut stroke = value_stroke(theme, val);
+            if self.is_highlighted(Selected::Wire(seg_key)) {
+                stroke.color = theme.outline_selected;
+                stroke.width += 1.5;
+            }
+            painter.line_segment([p0, p1], stroke);
+        }
+        // Junction dots where three or more segments meet, so a real branch
+        // reads differently from a mere crossing.
+        for (nk, node) in self.wiring.active_nodes() {
+            if self.wiring.degree(nk) >= 3 {
+                let val = node_value.get(&nk).copied().unwrap_or(Value::Floating);
+                painter.circle_filled(
+                    grid_to_screen(node.pos, pan),
+                    PIN_RADIUS,
+                    value_stroke(theme, val).color,
+                );
+            }
+        }
+
+        // Draw components
+        for (pc_key, pc) in self.active_components() {
+            let is_selected = self.is_highlighted(Selected::Component(pc_key));
+            draw_component(painter, pc, pan, &self.circuit, is_selected, theme);
+        }
+
+        // Draw tunnels
+        for (pt_key, pt) in self.active_tunnels() {
+            let is_selected = self.is_highlighted(Selected::Tunnel(pt_key));
+            draw_tunnel(painter, pt, pan, &self.circuit, is_selected, theme);
+        }
+    }
+
+    // ── Global canvas keyboard shortcuts ─────────────────────────────────
+    // Escape (cancel drag/wire-draw, clear selection), Delete/Backspace, and
+    // Undo/Redo. Must run before `handle_canvas_interaction` reads `self.mode`
+    // in the same frame, since Escape can reset it to Idle.
+    fn handle_canvas_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            match &self.mode {
+                InteractionMode::ComponentDrag {
+                    key,
+                    original_grid_pos,
+                    ..
+                } => {
+                    let (key, original_grid_pos) = (*key, *original_grid_pos);
+                    match key {
+                        Selected::Component(k) => {
+                            self.components[k].grid_pos = original_grid_pos
+                        }
+                        Selected::Tunnel(k) => self.tunnels[k].grid_pos = original_grid_pos,
+                        Selected::Wire(_) => {}
+                    }
+                }
+                // Esc while drawing commits the polyline drawn so far as a
+                // dangling run (end in empty space), matching the double-click
+                // finish; nothing to commit if only the anchor exists.
+                InteractionMode::WireDraw {
+                    points,
+                    start_attach,
+                    ..
+                } if points.len() >= 2 => {
+                    let (points, start_attach) = (points.clone(), *start_attach);
+                    self.commit_wire_route(points, start_attach, NodeAttach::Free);
+                }
+                // BulkSelect: Esc cancels the in-progress rubber-band (the
+                // trailing reset to Idle handles it) alongside clearing any
+                // existing bulk selection below.
+                _ => {}
+            }
+            self.bulk_selection.clear();
+            self.mode = InteractionMode::Idle;
+        }
+
+        // Backspace/Delete removes the current selection (bulk selection
+        // takes priority). Guarded on widget focus so it edits a focused
+        // text field instead of deleting.
+        let editing_text = ctx.memory(|m| m.focused().is_some());
+        let delete_pressed = ctx
+            .input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete));
+        if delete_pressed && !editing_text {
+            if !self.bulk_selection.is_empty() {
+                self.delete_bulk();
+            } else if let Some(sel) = self.selected {
+                match sel {
+                    Selected::Component(k) => self.delete_component(k),
+                    Selected::Tunnel(k) => self.delete_tunnel(k),
+                    Selected::Wire(seg) => self.delete_wire(seg),
+                }
+            }
+        }
+
+        // Undo (Ctrl/Cmd+Z) / redo (Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z). Same
+        // focus guard as delete so the shortcuts don't fire while typing in
+        // the tunnel-label field (where Ctrl+Z should edit text).
+        if !editing_text {
+            let (undo, redo) = ctx.input(|i| {
+                let cmd = i.modifiers.command;
+                let z = i.key_pressed(egui::Key::Z);
+                let y = i.key_pressed(egui::Key::Y);
+                let undo = cmd && !i.modifiers.shift && z;
+                let redo = cmd && (y || (i.modifiers.shift && z));
+                (undo, redo)
+            });
+            if undo {
+                self.undo();
+            } else if redo {
+                self.redo();
+            }
+        }
+    }
+
+    // ── Canvas mode dispatch ──────────────────────────────────────────────
+    fn handle_canvas_interaction(&mut self, cc: &CanvasCtx) {
+        let pointer = cc
+            .response
+            .interact_pointer_pos()
+            .or_else(|| cc.ctx.pointer_hover_pos());
+        let mode = self.mode.clone();
+        match mode {
+            InteractionMode::Idle => self.interact_idle(cc, pointer),
+            InteractionMode::Placing { spec } => self.interact_placing(cc, pointer, spec),
+            InteractionMode::PlacingTunnel { role } => {
+                self.interact_placing_tunnel(cc, pointer, role)
+            }
+            InteractionMode::WireDraw {
+                points,
+                start_attach,
+                cursor,
+                dragging,
+            } => self.interact_wire_draw(cc, pointer, points, start_attach, cursor, dragging),
+            InteractionMode::ComponentDrag {
+                key,
+                drag_origin,
+                original_grid_pos,
+            } => self.interact_component_drag(cc, pointer, key, drag_origin, original_grid_pos),
+            InteractionMode::BulkSelect { start, current } => {
+                self.interact_bulk_select(cc, pointer, start, current)
+            }
+        }
+    }
+
+    fn interact_idle(&mut self, cc: &CanvasCtx, pointer: Option<Pos2>) {
+        // Hover reticle: hovering over a wire (but not a pin) shows
+        // where a branch would tap the wire.
+        if let Some(pos) = pointer {
+            if pin_at_pos(self.active_components(), cc.pan, pos, PinKind::Output).is_none()
+                && pin_at_pos(self.active_components(), cc.pan, pos, PinKind::Input).is_none()
+                && tunnel_pin_at_pos(self.active_tunnels(), cc.pan, pos).is_none()
+            {
+                if let Some((_, gp)) = self.wiring.segment_at_pos(pos, cc.pan) {
+                    draw_reticle(cc.painter, grid_to_screen(gp, cc.pan), cc.theme);
+                }
+            }
+        }
+
+        if cc.response.drag_started() {
+            let origin = cc.ctx.input(|i| i.pointer.press_origin());
+            if let Some(pos) = origin {
+                if let Some((attach, gp)) = self.wire_start_at(pos, cc.pan) {
+                    // Drag from a pin / tunnel / existing wire → draw
+                    // a wire (quick elbow, committed on release).
+                    self.mode = InteractionMode::WireDraw {
+                        points: vec![gp],
+                        start_attach: attach,
+                        cursor: pos,
+                        dragging: true,
+                    };
+                } else if let Some((sel, grid_pos)) = self.selected.and_then(|sel| {
+                    // Selected component/tunnel body drag → move it,
+                    // but only when the drag actually began inside its
+                    // bounding rect.
+                    let rect_grid = match sel {
+                        Selected::Component(key) => self
+                            .components
+                            .get(key)
+                            .map(|pc| (component_bounding_rect(pc, cc.pan), pc.grid_pos)),
+                        Selected::Tunnel(key) => self
+                            .tunnels
+                            .get(key)
+                            .map(|pt| (tunnel_bounding_rect(pt, cc.pan), pt.grid_pos)),
+                        Selected::Wire(_) => None,
+                    };
+                    rect_grid
+                        .filter(|(rect, _)| rect.contains(pos))
+                        .map(|(_, grid_pos)| (sel, grid_pos))
+                }) {
+                    self.mode = InteractionMode::ComponentDrag {
+                        key: sel,
+                        drag_origin: pos,
+                        original_grid_pos: grid_pos,
+                    };
+                } else {
+                    // Drag from empty space → rubber-band bulk select.
+                    let gp = snap_to_grid(pos, cc.pan);
+                    self.selected = None;
+                    self.bulk_selection.clear();
+                    self.mode = InteractionMode::BulkSelect {
+                        start: gp,
+                        current: gp,
+                    };
+                }
+            }
+        }
+
+        if cc.response.clicked() {
+            if let Some(pos) = pointer {
+                // Any click ends a bulk selection ("click away").
+                self.bulk_selection.clear();
+                // A click starts a polyline only from a pin/tunnel;
+                // clicking a bare wire selects it instead (branching
+                // off a wire is a drag gesture, handled above).
+                let pin_start = self
+                    .wire_start_at(pos, cc.pan)
+                    .filter(|(a, _)| matches!(a, NodeAttach::Pin(..) | NodeAttach::Tunnel(_)));
+                if let Some((attach, gp)) = pin_start {
+                    self.mode = InteractionMode::WireDraw {
+                        points: vec![gp],
+                        start_attach: attach,
+                        cursor: pos,
+                        dragging: false,
+                    };
+                } else {
+                    // Click a component/tunnel body (components take
+                    // priority), then a wire segment, else deselect.
+                    let maybe_comp = self
+                        .components
+                        .iter()
+                        .find(|(_k, pc)| component_bounding_rect(pc, cc.pan).contains(pos))
+                        .map(|(k, _)| Selected::Component(k));
+                    let maybe_tunnel = self
+                        .tunnels
+                        .iter()
+                        .find(|(_k, pt)| tunnel_bounding_rect(pt, cc.pan).contains(pos))
+                        .map(|(k, _)| Selected::Tunnel(k));
+                    let maybe_wire = self
+                        .wiring
+                        .segment_at_pos(pos, cc.pan)
+                        .map(|(seg, _)| Selected::Wire(seg));
+                    self.selected = maybe_comp.or(maybe_tunnel).or(maybe_wire);
+                }
+            }
+        }
+    }
+
+    fn interact_placing(&mut self, cc: &CanvasCtx, pointer: Option<Pos2>, spec: ComponentSpec) {
+        if let Some(pos) = pointer {
+            let gp = snap_to_grid(pos, cc.pan);
+            draw_ghost(cc.painter, &spec, gp, cc.pan, cc.theme);
+        }
+        if cc.response.clicked() {
+            if let Some(pos) = pointer {
+                let gp = snap_to_grid(pos, cc.pan);
+                self.place_component(spec, gp);
+                self.mode = InteractionMode::Idle;
+            }
+        }
+    }
+
+    fn interact_placing_tunnel(&mut self, cc: &CanvasCtx, pointer: Option<Pos2>, role: TunnelRole) {
+        if let Some(pos) = pointer {
+            let gp = snap_to_grid(pos, cc.pan);
+            draw_tunnel_ghost(cc.painter, role, gp, cc.pan, cc.theme);
+        }
+        if cc.response.clicked() {
+            if let Some(pos) = pointer {
+                let gp = snap_to_grid(pos, cc.pan);
+                self.place_tunnel(role, gp);
+                self.mode = InteractionMode::Idle;
+            }
+        }
+    }
+
+    fn interact_wire_draw(
+        &mut self,
+        cc: &CanvasCtx,
+        pointer: Option<Pos2>,
+        points: Vec<GridPos>,
+        start_attach: NodeAttach,
+        cursor: Pos2,
+        dragging: bool,
+    ) {
+        let end = pointer.unwrap_or(cursor);
+        let (drop_attach, drop_gp, terminal) = self.wire_target_at(end, cc.pan);
+
+        // Preview: committed segments, then the pending elbow from the
+        // last committed corner to the (snapped) drop point.
+        let preview = Stroke::new(WIRE_THICKNESS_THIN, cc.theme.wire_drag_preview);
+        for w in points.windows(2) {
+            cc.painter.line_segment(
+                [grid_to_screen(w[0], cc.pan), grid_to_screen(w[1], cc.pan)],
+                preview,
+            );
+        }
+        let pending = route_elbow(*points.last().unwrap(), drop_gp);
+        let mut prev = *points.last().unwrap();
+        for p in &pending {
+            cc.painter.line_segment(
+                [grid_to_screen(prev, cc.pan), grid_to_screen(*p, cc.pan)],
+                preview,
+            );
+            prev = *p;
+        }
+
+        if dragging {
+            self.mode = InteractionMode::WireDraw {
+                points: points.clone(),
+                start_attach,
+                cursor: end,
+                dragging,
+            };
+            if cc.response.drag_stopped() {
+                let mut route = points.clone();
+                route.extend(pending);
+                self.commit_wire_route(route, start_attach, drop_attach);
+                self.mode = InteractionMode::Idle;
+            }
+        } else {
+            // Click-polyline: a click on a terminal (or a double-click)
+            // finishes; any other click drops a corner and continues.
+            let mut next_points = points.clone();
+            let mut finished = false;
+            if cc.response.double_clicked() {
+                next_points.extend(pending.clone());
+                self.history.begin_batch();
+                let delta = self
+                    .wiring
+                    .add_route(&next_points, start_attach, NodeAttach::Free);
+                self.edit_wiring(delta);
+                finished = true;
+            } else if cc.response.clicked() {
+                next_points.extend(pending.clone());
+                if terminal {
+                    self.history.begin_batch();
+                    let delta = self
+                        .wiring
+                        .add_route(&next_points, start_attach, drop_attach);
+                    self.edit_wiring(delta);
+                    finished = true;
+                }
+            }
+            if finished {
+                self.rebuild_circuit();
+                self.history.end_batch();
+                self.mode = InteractionMode::Idle;
+            } else {
+                self.mode = InteractionMode::WireDraw {
+                    points: next_points,
+                    start_attach,
+                    cursor: end,
+                    dragging,
+                };
+            }
+        }
+    }
+
+    fn interact_component_drag(
+        &mut self,
+        cc: &CanvasCtx,
+        pointer: Option<Pos2>,
+        key: Selected,
+        drag_origin: Pos2,
+        original_grid_pos: GridPos,
+    ) {
+        if let Some(pos) = pointer {
+            let delta_x = ((pos.x - drag_origin.x) / GRID_SIZE).round() as i32;
+            let delta_y = ((pos.y - drag_origin.y) / GRID_SIZE).round() as i32;
+            let new_grid_pos =
+                GridPos::new(original_grid_pos.x + delta_x, original_grid_pos.y + delta_y);
+            // Moving a component/tunnel drags its wire-anchor nodes
+            // along; the rest of each attached segment stretches.
+            // Topology is unchanged, so no circuit rebuild is needed.
+            match key {
+                Selected::Component(k) => {
+                    self.components[k].grid_pos = new_grid_pos;
+                    self.sync_component_wire_nodes(k);
+                }
+                Selected::Tunnel(k) => {
+                    self.tunnels[k].grid_pos = new_grid_pos;
+                    self.sync_tunnel_wire_nodes(k);
+                }
+                Selected::Wire(_) => {}
+            }
+        }
+        if cc.response.drag_stopped() {
+            self.commit_move(key, original_grid_pos);
+            self.mode = InteractionMode::Idle;
+        }
+    }
+
+    fn interact_bulk_select(
+        &mut self,
+        cc: &CanvasCtx,
+        pointer: Option<Pos2>,
+        start: GridPos,
+        current: GridPos,
+    ) {
+        // Track the live corner, then paint the rubber-band box.
+        let current = pointer.map(|p| snap_to_grid(p, cc.pan)).unwrap_or(current);
+        let rect = selection_screen_rect(start, current, cc.pan);
+        let c = cc.theme.outline_selected;
+        cc.painter.rect_filled(
+            rect,
+            0.0,
+            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 24),
+        );
+        cc.painter
+            .rect_stroke(rect, 0.0, Stroke::new(1.0, c), StrokeKind::Inside);
+
+        // Finish on release. The `!dragged` guard also recovers from a
+        // flick released the same frame it started (drag_stopped never
+        // fires in the BulkSelect arm then), so the mode can't stick.
+        if cc.response.drag_stopped() || !cc.response.dragged() {
+            let selected_items = self.items_in_rect(rect, cc.pan);
+            // If only one item in bounds, directly select it
+            if selected_items.len() == 1 {
+                self.selected = Some(selected_items[0]);
+                self.mode = InteractionMode::Idle;
+            } else {
+                self.bulk_selection = selected_items;
+                self.mode = InteractionMode::Idle;
+            }
+        } else {
+            self.mode = InteractionMode::BulkSelect { start, current };
+        }
+    }
+}
+
+impl eframe::App for OsmilogApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_arch = "wasm32")]
+        self.apply_pending_load();
+
+        if ctx.input(|i| i.viewport().close_requested()) {
+            #[cfg(not(target_arch = "wasm32"))]
+            std::process::exit(0);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let theme = Theme::from_visuals(ui.visuals());
+
+        self.show_menu_bar(ui, theme);
+
         egui::Panel::left("properties")
             .min_size(200.0)
             .resizable(true)
@@ -1449,414 +1908,22 @@ impl eframe::App for OsmilogApp {
                 self.show_properties(ui);
             });
 
-        // ── Canvas ────────────────────────────────────────────────────────
-        {
-            let (response, painter) =
-                ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
-            let clip_rect = painter.clip_rect();
-            let pan = self.pan;
+        let (response, painter) =
+            ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+        let clip_rect = painter.clip_rect();
+        let pan = self.pan;
 
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                match &self.mode {
-                    InteractionMode::ComponentDrag {
-                        key,
-                        original_grid_pos,
-                        ..
-                    } => {
-                        let (key, original_grid_pos) = (*key, *original_grid_pos);
-                        match key {
-                            Selected::Component(k) => {
-                                self.components[k].grid_pos = original_grid_pos
-                            }
-                            Selected::Tunnel(k) => self.tunnels[k].grid_pos = original_grid_pos,
-                            Selected::Wire(_) => {}
-                        }
-                    }
-                    // Esc while drawing commits the polyline drawn so far as a
-                    // dangling run (end in empty space), matching the double-click
-                    // finish; nothing to commit if only the anchor exists.
-                    InteractionMode::WireDraw {
-                        points,
-                        start_attach,
-                        ..
-                    } if points.len() >= 2 => {
-                        let (points, start_attach) = (points.clone(), *start_attach);
-                        self.commit_wire_route(points, start_attach, NodeAttach::Free);
-                    }
-                    // BulkSelect: Esc cancels the in-progress rubber-band (the
-                    // trailing reset to Idle handles it) alongside clearing any
-                    // existing bulk selection below.
-                    _ => {}
-                }
-                self.bulk_selection.clear();
-                self.mode = InteractionMode::Idle;
-            }
+        self.handle_canvas_shortcuts(&ctx);
+        self.draw_canvas(&painter, clip_rect, pan, theme);
 
-            // Backspace/Delete removes the current selection (bulk selection
-            // takes priority). Guarded on widget focus so it edits a focused
-            // text field instead of deleting.
-            let editing_text = ctx.memory(|m| m.focused().is_some());
-            let delete_pressed = ctx
-                .input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete));
-            if delete_pressed && !editing_text {
-                if !self.bulk_selection.is_empty() {
-                    self.delete_bulk();
-                } else if let Some(sel) = self.selected {
-                    match sel {
-                        Selected::Component(k) => self.delete_component(k),
-                        Selected::Tunnel(k) => self.delete_tunnel(k),
-                        Selected::Wire(seg) => self.delete_wire(seg),
-                    }
-                }
-            }
-
-            // Undo (Ctrl/Cmd+Z) / redo (Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z). Same
-            // focus guard as delete so the shortcuts don't fire while typing in
-            // the tunnel-label field (where Ctrl+Z should edit text).
-            if !editing_text {
-                let (undo, redo) = ctx.input(|i| {
-                    let cmd = i.modifiers.command;
-                    let z = i.key_pressed(egui::Key::Z);
-                    let y = i.key_pressed(egui::Key::Y);
-                    let undo = cmd && !i.modifiers.shift && z;
-                    let redo = cmd && (y || (i.modifiers.shift && z));
-                    (undo, redo)
-                });
-                if undo {
-                    self.undo();
-                } else if redo {
-                    self.redo();
-                }
-            }
-
-            painter.rect_filled(clip_rect, 0.0, theme.canvas_bg);
-            draw_grid(&painter, clip_rect, pan, theme);
-
-            // Draw wire segments. Colour comes from each connected group's net
-            // value: any component pin / tunnel on the group resolves (live) to
-            // that net's Value; a dangling group (no endpoints) is Floating.
-            let node_value = self.wire_node_values();
-            for (seg_key, seg) in self.wiring.active_segments() {
-                let a = self.wiring.nodes[seg.a];
-                let b = self.wiring.nodes[seg.b];
-                let p0 = grid_to_screen(a.pos, pan);
-                let p1 = grid_to_screen(b.pos, pan);
-                let val = node_value.get(&seg.a).copied().unwrap_or(Value::Floating);
-                let mut stroke = value_stroke(theme, val);
-                if self.is_highlighted(Selected::Wire(seg_key)) {
-                    stroke.color = theme.outline_selected;
-                    stroke.width += 1.5;
-                }
-                painter.line_segment([p0, p1], stroke);
-            }
-            // Junction dots where three or more segments meet, so a real branch
-            // reads differently from a mere crossing.
-            for (nk, node) in self.wiring.active_nodes() {
-                if self.wiring.degree(nk) >= 3 {
-                    let val = node_value.get(&nk).copied().unwrap_or(Value::Floating);
-                    painter.circle_filled(
-                        grid_to_screen(node.pos, pan),
-                        PIN_RADIUS,
-                        value_stroke(theme, val).color,
-                    );
-                }
-            }
-
-            // Draw components
-            for (pc_key, pc) in self.active_components() {
-                let is_selected = self.is_highlighted(Selected::Component(pc_key));
-                draw_component(&painter, pc, pan, &self.circuit, is_selected, theme);
-            }
-
-            // Draw tunnels
-            for (pt_key, pt) in self.active_tunnels() {
-                let is_selected = self.is_highlighted(Selected::Tunnel(pt_key));
-                draw_tunnel(&painter, pt, pan, &self.circuit, is_selected, theme);
-            }
-
-            let pointer = response
-                .interact_pointer_pos()
-                .or_else(|| ctx.pointer_hover_pos());
-
-            // Mode-specific interaction
-            let mode = self.mode.clone();
-            match mode {
-                InteractionMode::Idle => {
-                    // Hover reticle: hovering over a wire (but not a pin) shows
-                    // where a branch would tap the wire.
-                    if let Some(pos) = pointer {
-                        if pin_at_pos(self.active_components(), pan, pos, PinKind::Output).is_none()
-                            && pin_at_pos(self.active_components(), pan, pos, PinKind::Input)
-                                .is_none()
-                            && tunnel_pin_at_pos(self.active_tunnels(), pan, pos).is_none()
-                        {
-                            if let Some((_, gp)) = self.wiring.segment_at_pos(pos, pan) {
-                                draw_reticle(&painter, grid_to_screen(gp, pan), theme);
-                            }
-                        }
-                    }
-
-                    if response.drag_started() {
-                        let origin = ctx.input(|i| i.pointer.press_origin());
-                        if let Some(pos) = origin {
-                            if let Some((attach, gp)) = self.wire_start_at(pos, pan) {
-                                // Drag from a pin / tunnel / existing wire → draw
-                                // a wire (quick elbow, committed on release).
-                                self.mode = InteractionMode::WireDraw {
-                                    points: vec![gp],
-                                    start_attach: attach,
-                                    cursor: pos,
-                                    dragging: true,
-                                };
-                            } else if let Some((sel, grid_pos)) = self.selected.and_then(|sel| {
-                                // Selected component/tunnel body drag → move it,
-                                // but only when the drag actually began inside its
-                                // bounding rect.
-                                let rect_grid = match sel {
-                                    Selected::Component(key) => self
-                                        .components
-                                        .get(key)
-                                        .map(|pc| (component_bounding_rect(pc, pan), pc.grid_pos)),
-                                    Selected::Tunnel(key) => self
-                                        .tunnels
-                                        .get(key)
-                                        .map(|pt| (tunnel_bounding_rect(pt, pan), pt.grid_pos)),
-                                    Selected::Wire(_) => None,
-                                };
-                                rect_grid
-                                    .filter(|(rect, _)| rect.contains(pos))
-                                    .map(|(_, grid_pos)| (sel, grid_pos))
-                            }) {
-                                self.mode = InteractionMode::ComponentDrag {
-                                    key: sel,
-                                    drag_origin: pos,
-                                    original_grid_pos: grid_pos,
-                                };
-                            } else {
-                                // Drag from empty space → rubber-band bulk select.
-                                let gp = snap_to_grid(pos, pan);
-                                self.selected = None;
-                                self.bulk_selection.clear();
-                                self.mode = InteractionMode::BulkSelect {
-                                    start: gp,
-                                    current: gp,
-                                };
-                            }
-                        }
-                    }
-
-                    if response.clicked() {
-                        if let Some(pos) = pointer {
-                            // Any click ends a bulk selection ("click away").
-                            self.bulk_selection.clear();
-                            // A click starts a polyline only from a pin/tunnel;
-                            // clicking a bare wire selects it instead (branching
-                            // off a wire is a drag gesture, handled above).
-                            let pin_start = self.wire_start_at(pos, pan).filter(|(a, _)| {
-                                matches!(a, NodeAttach::Pin(..) | NodeAttach::Tunnel(_))
-                            });
-                            if let Some((attach, gp)) = pin_start {
-                                self.mode = InteractionMode::WireDraw {
-                                    points: vec![gp],
-                                    start_attach: attach,
-                                    cursor: pos,
-                                    dragging: false,
-                                };
-                            } else {
-                                // Click a component/tunnel body (components take
-                                // priority), then a wire segment, else deselect.
-                                let maybe_comp = self
-                                    .components
-                                    .iter()
-                                    .find(|(_k, pc)| component_bounding_rect(pc, pan).contains(pos))
-                                    .map(|(k, _)| Selected::Component(k));
-                                let maybe_tunnel = self
-                                    .tunnels
-                                    .iter()
-                                    .find(|(_k, pt)| tunnel_bounding_rect(pt, pan).contains(pos))
-                                    .map(|(k, _)| Selected::Tunnel(k));
-                                let maybe_wire = self
-                                    .wiring
-                                    .segment_at_pos(pos, pan)
-                                    .map(|(seg, _)| Selected::Wire(seg));
-                                self.selected = maybe_comp.or(maybe_tunnel).or(maybe_wire);
-                            }
-                        }
-                    }
-                }
-
-                InteractionMode::Placing { spec } => {
-                    if let Some(pos) = pointer {
-                        let gp = snap_to_grid(pos, pan);
-                        draw_ghost(&painter, &spec, gp, pan, theme);
-                    }
-                    if response.clicked() {
-                        if let Some(pos) = pointer {
-                            let gp = snap_to_grid(pos, pan);
-                            self.place_component(spec, gp);
-                            self.mode = InteractionMode::Idle;
-                        }
-                    }
-                }
-
-                InteractionMode::PlacingTunnel { role } => {
-                    if let Some(pos) = pointer {
-                        let gp = snap_to_grid(pos, pan);
-                        draw_tunnel_ghost(&painter, role, gp, pan, theme);
-                    }
-                    if response.clicked() {
-                        if let Some(pos) = pointer {
-                            let gp = snap_to_grid(pos, pan);
-                            self.place_tunnel(role, gp);
-                            self.mode = InteractionMode::Idle;
-                        }
-                    }
-                }
-
-                InteractionMode::WireDraw {
-                    points,
-                    start_attach,
-                    cursor,
-                    dragging,
-                } => {
-                    let end = pointer.unwrap_or(cursor);
-                    let (drop_attach, drop_gp, terminal) = self.wire_target_at(end, pan);
-
-                    // Preview: committed segments, then the pending elbow from the
-                    // last committed corner to the (snapped) drop point.
-                    let preview = Stroke::new(WIRE_THICKNESS_THIN, theme.wire_drag_preview);
-                    for w in points.windows(2) {
-                        painter.line_segment(
-                            [grid_to_screen(w[0], pan), grid_to_screen(w[1], pan)],
-                            preview,
-                        );
-                    }
-                    let pending = route_elbow(*points.last().unwrap(), drop_gp);
-                    let mut prev = *points.last().unwrap();
-                    for p in &pending {
-                        painter.line_segment(
-                            [grid_to_screen(prev, pan), grid_to_screen(*p, pan)],
-                            preview,
-                        );
-                        prev = *p;
-                    }
-
-                    if dragging {
-                        self.mode = InteractionMode::WireDraw {
-                            points: points.clone(),
-                            start_attach,
-                            cursor: end,
-                            dragging,
-                        };
-                        if response.drag_stopped() {
-                            let mut route = points.clone();
-                            route.extend(pending);
-                            self.commit_wire_route(route, start_attach, drop_attach);
-                            self.mode = InteractionMode::Idle;
-                        }
-                    } else {
-                        // Click-polyline: a click on a terminal (or a double-click)
-                        // finishes; any other click drops a corner and continues.
-                        let mut next_points = points.clone();
-                        let mut finished = false;
-                        if response.double_clicked() {
-                            next_points.extend(pending.clone());
-                            self.history.begin_batch();
-                            let delta =
-                                self.wiring
-                                    .add_route(&next_points, start_attach, NodeAttach::Free);
-                            self.edit_wiring(delta);
-                            finished = true;
-                        } else if response.clicked() {
-                            next_points.extend(pending.clone());
-                            if terminal {
-                                self.history.begin_batch();
-                                let delta =
-                                    self.wiring
-                                        .add_route(&next_points, start_attach, drop_attach);
-                                self.edit_wiring(delta);
-                                finished = true;
-                            }
-                        }
-                        if finished {
-                            self.rebuild_circuit();
-                            self.history.end_batch();
-                            self.mode = InteractionMode::Idle;
-                        } else {
-                            self.mode = InteractionMode::WireDraw {
-                                points: next_points,
-                                start_attach,
-                                cursor: end,
-                                dragging,
-                            };
-                        }
-                    }
-                }
-
-                InteractionMode::ComponentDrag {
-                    key,
-                    drag_origin,
-                    original_grid_pos,
-                } => {
-                    if let Some(pos) = pointer {
-                        let delta_x = ((pos.x - drag_origin.x) / GRID_SIZE).round() as i32;
-                        let delta_y = ((pos.y - drag_origin.y) / GRID_SIZE).round() as i32;
-                        let new_grid_pos = GridPos::new(
-                            original_grid_pos.x + delta_x,
-                            original_grid_pos.y + delta_y,
-                        );
-                        // Moving a component/tunnel drags its wire-anchor nodes
-                        // along; the rest of each attached segment stretches.
-                        // Topology is unchanged, so no circuit rebuild is needed.
-                        match key {
-                            Selected::Component(k) => {
-                                self.components[k].grid_pos = new_grid_pos;
-                                self.sync_component_wire_nodes(k);
-                            }
-                            Selected::Tunnel(k) => {
-                                self.tunnels[k].grid_pos = new_grid_pos;
-                                self.sync_tunnel_wire_nodes(k);
-                            }
-                            Selected::Wire(_) => {}
-                        }
-                    }
-                    if response.drag_stopped() {
-                        self.commit_move(key, original_grid_pos);
-                        self.mode = InteractionMode::Idle;
-                    }
-                }
-
-                InteractionMode::BulkSelect { start, current } => {
-                    // Track the live corner, then paint the rubber-band box.
-                    let current = pointer.map(|p| snap_to_grid(p, pan)).unwrap_or(current);
-                    let rect = selection_screen_rect(start, current, pan);
-                    let c = theme.outline_selected;
-                    painter.rect_filled(
-                        rect,
-                        0.0,
-                        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 24),
-                    );
-                    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, c), StrokeKind::Inside);
-
-                    // Finish on release. The `!dragged` guard also recovers from a
-                    // flick released the same frame it started (drag_stopped never
-                    // fires in the BulkSelect arm then), so the mode can't stick.
-                    if response.drag_stopped() || !response.dragged() {
-                        let selected_items = self.items_in_rect(rect, pan);
-                        // If only one item in bounds, directly select it
-                        if selected_items.len() == 1 {
-                            self.selected = Some(selected_items[0]);
-                            self.mode = InteractionMode::Idle;
-                        } else {
-                            self.bulk_selection = selected_items;
-                            self.mode = InteractionMode::Idle;
-                        }
-                    } else {
-                        self.mode = InteractionMode::BulkSelect { start, current };
-                    }
-                }
-            }
-        }
+        let cc = CanvasCtx {
+            response: &response,
+            painter: &painter,
+            ctx: &ctx,
+            pan,
+            theme,
+        };
+        self.handle_canvas_interaction(&cc);
     }
 }
 
