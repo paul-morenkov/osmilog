@@ -1,6 +1,6 @@
 use crate::gui::app::{OsmilogApp, PlacedCompKey, PlacedTunnelKey};
 use crate::gui::geometry::GridPos;
-use crate::gui::wiring::{NodeAttach, WiringDelta};
+use crate::gui::wiring::{NodeAttach, WireNodeKey, WiringDelta};
 use crate::sim::component::{CompKey, ComponentSpec};
 
 // Undo data for a GUI-level (Wiring/geometry) edit, recorded onto the same
@@ -25,6 +25,13 @@ pub enum GuiUndoAction {
     },
     MoveTunnel {
         key: PlacedTunnelKey,
+        old_pos: GridPos,
+    },
+    // Free-attached wire node dragged along with a bulk selection (see
+    // OsmilogApp::free_wire_nodes/interact_component_drag) - same
+    // overwritten-every-frame rationale as MoveComponent/MoveTunnel above.
+    MoveWireNode {
+        key: WireNodeKey,
         old_pos: GridPos,
     },
 
@@ -97,6 +104,14 @@ impl OsmilogApp {
                     old_pos: current,
                 }
             }
+            GuiUndoAction::MoveWireNode { key, old_pos } => {
+                let current = self.wiring.nodes[key].pos;
+                self.wiring.nodes[key].pos = old_pos;
+                GuiUndoAction::MoveWireNode {
+                    key,
+                    old_pos: current,
+                }
+            }
             GuiUndoAction::SetComponentActive { key, active } => {
                 let current = self.components[key].active;
                 self.components[key].active = active;
@@ -158,6 +173,16 @@ impl OsmilogApp {
                 }
             }
             Selected::Wire(_) => {}
+        }
+    }
+
+    // Records a completed Free-wire-node drag-move, if it actually moved.
+    // The wire-node counterpart of commit_move, for the Free elbow nodes
+    // interact_component_drag carries along with a bulk selection.
+    pub(crate) fn commit_wire_node_move(&mut self, key: WireNodeKey, old_pos: GridPos) {
+        if self.wiring.nodes[key].pos != old_pos {
+            self.history
+                .push_gui(GuiUndoAction::MoveWireNode { key, old_pos });
         }
     }
 

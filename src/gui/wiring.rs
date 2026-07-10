@@ -81,8 +81,14 @@ pub struct Group {
 #[derive(Clone, Debug)]
 pub enum WiringOp {
     /// Covers both creation (`false`->`true`) and deletion (`true`->`false`).
-    NodeActive { key: WireNodeKey, active: bool },
-    SegActive { key: WireSegKey, active: bool },
+    NodeActive {
+        key: WireNodeKey,
+        active: bool,
+    },
+    SegActive {
+        key: WireSegKey,
+        active: bool,
+    },
     SetAttach {
         node: WireNodeKey,
         old: NodeAttach,
@@ -102,11 +108,7 @@ impl WiringDelta {
 
     /// Add every key this delta references into the given sets (used by
     /// [`Wiring::remove_unreferenced_tombstones`] to decide what to keep).
-    pub fn collect_keys(
-        &self,
-        nodes: &mut HashSet<WireNodeKey>,
-        segs: &mut HashSet<WireSegKey>,
-    ) {
+    pub fn collect_keys(&self, nodes: &mut HashSet<WireNodeKey>, segs: &mut HashSet<WireSegKey>) {
         for op in &self.0 {
             match op {
                 WiringOp::NodeActive { key, .. } => {
@@ -156,7 +158,9 @@ impl Wiring {
     }
 
     fn node_at_grid(&self, gp: GridPos) -> Option<WireNodeKey> {
-        self.active_nodes().find(|(_, n)| n.pos == gp).map(|(k, _)| k)
+        self.active_nodes()
+            .find(|(_, n)| n.pos == gp)
+            .map(|(k, _)| k)
     }
 
     // Count of active segments incident on a node (its degree). Used both for
@@ -201,11 +205,7 @@ impl Wiring {
             .active_segments()
             .any(|(_, s)| (s.a == a && s.b == b) || (s.a == b && s.b == a));
         if !exists {
-            let key = self.segments.insert(WireSegment {
-                a,
-                b,
-                active: true,
-            });
+            let key = self.segments.insert(WireSegment { a, b, active: true });
             ops.push(WiringOp::SegActive { key, active: true });
         }
     }
@@ -248,7 +248,12 @@ impl Wiring {
 
     // Only sets an attachment onto a node that is still Free, so a wire ending
     // on a pin binds that pin without clobbering an already-bound node.
-    fn set_attach_if_free(&mut self, node: WireNodeKey, attach: NodeAttach, ops: &mut Vec<WiringOp>) {
+    fn set_attach_if_free(
+        &mut self,
+        node: WireNodeKey,
+        attach: NodeAttach,
+        ops: &mut Vec<WiringOp>,
+    ) {
         if attach != NodeAttach::Free {
             let n = &mut self.nodes[node];
             if n.attach == NodeAttach::Free {
@@ -284,6 +289,39 @@ impl Wiring {
             self.add_segment(w[0], w[1], &mut ops);
         }
         WiringDelta(ops)
+    }
+
+    /// Insert a wholly new, disjoint node/segment subgraph.
+    /// Unlike `add_route`, this never merges with existing geometry at a
+    /// shared `GridPos`. `segments` are index pairs into `nodes`. Returns the
+    /// fresh node keys, the fresh segment keys, and the undo delta.
+    pub fn add_subgraph(
+        &mut self,
+        nodes: &[(GridPos, NodeAttach)],
+        segments: &[(usize, usize)],
+    ) -> (Vec<WireNodeKey>, Vec<WireSegKey>, WiringDelta) {
+        let mut ops = Vec::new();
+        let mut keys = Vec::with_capacity(nodes.len());
+        for &(pos, attach) in nodes {
+            let key = self.nodes.insert(WireNode {
+                pos,
+                attach,
+                active: true,
+            });
+            ops.push(WiringOp::NodeActive { key, active: true });
+            keys.push(key);
+        }
+        let mut seg_keys = Vec::with_capacity(segments.len());
+        for &(a, b) in segments {
+            let key = self.segments.insert(WireSegment {
+                a: keys[a],
+                b: keys[b],
+                active: true,
+            });
+            ops.push(WiringOp::SegActive { key, active: true });
+            seg_keys.push(key);
+        }
+        (keys, seg_keys, WiringDelta(ops))
     }
 
     /// Tombstone a segment, then any node left with no active segments.
@@ -491,7 +529,8 @@ impl Wiring {
     ) {
         self.segments
             .retain(|k, s| s.active || keep_segs.contains(&k));
-        self.nodes.retain(|k, n| n.active || keep_nodes.contains(&k));
+        self.nodes
+            .retain(|k, n| n.active || keep_nodes.contains(&k));
     }
 
     // ── Connectivity ────────────────────────────────────────────────────────
@@ -778,6 +817,71 @@ mod tests {
         assert!(!w.delete_segment(seg).is_empty());
         // Deleting the same (now tombstoned) segment again changes nothing.
         assert!(w.delete_segment(seg).is_empty());
+    }
+
+    #[test]
+    fn test_add_subgraph_creates_disjoint_graph() {
+        let mut w = Wiring::new();
+        let c = comp_keys(2);
+        let (keys, seg_keys, _delta) = w.add_subgraph(
+            &[
+                (GridPos::new(0, 0), NodeAttach::Pin(c[0], PinId::output(0))),
+                (GridPos::new(10, 0), NodeAttach::Pin(c[1], PinId::input(0))),
+            ],
+            &[(0, 1)],
+        );
+        assert_eq!(keys.len(), 2);
+        assert_eq!(seg_keys.len(), 1);
+        assert_eq!(w.active_nodes().count(), 2);
+        assert_eq!(w.active_segments().count(), 1);
+        let groups = w.groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].pins.len(), 2);
+    }
+
+    #[test]
+    fn test_add_subgraph_delta_round_trips() {
+        let mut w = Wiring::new();
+        let c = comp_keys(3);
+        w.add_route(
+            &[GridPos::new(0, 0), GridPos::new(10, 0)],
+            NodeAttach::Pin(c[0], PinId::output(0)),
+            NodeAttach::Pin(c[1], PinId::input(0)),
+        );
+        let before = snapshot(&w);
+
+        let (_, _, delta) = w.add_subgraph(
+            &[
+                (GridPos::new(20, 0), NodeAttach::Pin(c[2], PinId::output(0))),
+                (GridPos::new(30, 0), NodeAttach::Free),
+            ],
+            &[(0, 1)],
+        );
+        let after = snapshot(&w);
+        assert_ne!(before, after);
+
+        w.undo_delta(&delta);
+        assert_eq!(snapshot(&w), before);
+        w.redo_delta(&delta);
+        assert_eq!(snapshot(&w), after);
+    }
+
+    #[test]
+    fn test_add_subgraph_does_not_merge_with_coincident_existing_node() {
+        let mut w = Wiring::new();
+        let c = comp_keys(2);
+        w.add_route(
+            &[GridPos::new(0, 0), GridPos::new(10, 0)],
+            NodeAttach::Pin(c[0], PinId::output(0)),
+            NodeAttach::Pin(c[1], PinId::input(0)),
+        );
+        let before_nodes = w.active_nodes().count();
+
+        // A subgraph node landing on an already-occupied GridPos must not be
+        // deduped/spliced into the existing node there (unlike add_route's
+        // resolve_point) - it's an independent copy.
+        w.add_subgraph(&[(GridPos::new(0, 0), NodeAttach::Free)], &[]);
+        assert_eq!(w.active_nodes().count(), before_nodes + 1);
     }
 
     #[test]

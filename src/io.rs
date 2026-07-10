@@ -107,6 +107,20 @@ impl std::fmt::Display for LoadError {
 impl std::error::Error for LoadError {}
 
 impl CircuitFile {
+    pub fn new(
+        components: Vec<ComponentEntry>,
+        tunnels: Vec<TunnelEntry>,
+        nodes: Vec<NodeEntry>,
+        segments: Vec<SegEntry>,
+    ) -> Self {
+        Self {
+            version: CURRENT_VERSION,
+            components,
+            tunnels,
+            nodes,
+            segments,
+        }
+    }
     pub fn to_json(&self) -> serde_json::Result<String> {
         serde_json::to_string_pretty(self)
     }
