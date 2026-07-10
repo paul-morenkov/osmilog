@@ -9,8 +9,8 @@
     <link rel="apple-touch-icon" href="apple-touch-icon.png" />
     
 <script type="module">
-import init, * as bindings from './osmilog-dfe63c5db3533aa0.js';
-const wasm = await init({ module_or_path: './osmilog-dfe63c5db3533aa0_bg.wasm' });
+import init, * as bindings from './osmilog-d07b8ba7a9d90b5e.js';
+const wasm = await init({ module_or_path: './osmilog-d07b8ba7a9d90b5e_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -34,7 +34,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             height: 100%;
         }
     </style>
-<link rel="modulepreload" href="./osmilog-dfe63c5db3533aa0.js" crossorigin="anonymous" integrity="sha384-QHG6KhwXYGxNdgVJxl+/5YliFGoQfjxf3VgTEmPdTzQtPx+ApmeCnyuHty3/UauV"><link rel="preload" href="./osmilog-dfe63c5db3533aa0_bg.wasm" crossorigin="anonymous" integrity="sha384-4v4l1Wu9Wpd0aJETAh706Q8SBnAJvcXaxtjkdzQ69VP4eQUGEf/TiJ+B8PIlMNf/" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="./osmilog-d07b8ba7a9d90b5e.js" crossorigin="anonymous" integrity="sha384-QHG6KhwXYGxNdgVJxl+/5YliFGoQfjxf3VgTEmPdTzQtPx+ApmeCnyuHty3/UauV"><link rel="preload" href="./osmilog-d07b8ba7a9d90b5e_bg.wasm" crossorigin="anonymous" integrity="sha384-anbTgHUPcFHL97sDHQb9AHDN9Ob6LJljwdt+maiqEN2MTSV61BewGsk00D+wPTqB" as="fetch" type="application/wasm"></head>
 <body>
     <canvas id="the_canvas_id"></canvas>
 </body>
