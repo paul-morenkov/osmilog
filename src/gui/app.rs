@@ -5,7 +5,8 @@ use slotmap::{new_key_type, SlotMap};
 use std::collections::HashMap;
 
 use crate::gui::geometry::{snap_to_grid, tunnel_shape, GridPos, GRID_SIZE, LABEL_FONT_SIZE};
-use crate::gui::history::History;
+use crate::gui::gui_undo::GuiUndoAction;
+use crate::gui::history::{History, HistoryEntry};
 use crate::gui::placed_component::PlacedComponent;
 use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
 use crate::gui::theme::Theme;
@@ -187,18 +188,91 @@ impl OsmilogApp {
         output
     }
 
+    // ── Undo / redo ───────────────────────────────────────────────────────────
+
+    // Applies one history entry (reversing what it recorded) and returns the
+    // entry that reverses *this* application - the value to record on the
+    // opposite stack. Undo and redo are the same operation in opposite
+    // directions, so both go through here (see undo/redo below).
+    //
+    // A Batch is applied child-last-first (its sub-edits recorded in the order
+    // they happened); the collected inverses, when the resulting Batch is later
+    // applied the same way, reproduce the original order - so redo of an undone
+    // batch replays it forward.
+    fn apply_entry(&mut self, entry: HistoryEntry) -> HistoryEntry {
+        match entry {
+            HistoryEntry::Sim(action) => HistoryEntry::Sim(self.circuit.apply_undo(action)),
+            HistoryEntry::Gui(action) => HistoryEntry::Gui(self.apply_gui_undo(action)),
+            HistoryEntry::Batch(entries) => {
+                let inverses = entries
+                    .into_iter()
+                    .rev()
+                    .map(|e| self.apply_entry(e))
+                    .collect();
+                HistoryEntry::Batch(inverses)
+            }
+        }
+    }
+
+    // Reverses the most recent edit, moving its inverse onto the redo stack.
+    pub(crate) fn undo(&mut self) {
+        if let Some(entry) = self.history.pop_undo() {
+            let inverse = self.apply_entry(entry);
+            self.history.push_redo(inverse);
+            self.refresh_after_history();
+        }
+    }
+
+    // Re-applies the most recently undone edit, moving its inverse back onto the
+    // undo stack.
+    pub(crate) fn redo(&mut self) {
+        if let Some(entry) = self.history.pop_redo() {
+            let inverse = self.apply_entry(entry);
+            self.history.push_undo(inverse);
+            self.refresh_after_history();
+        }
+    }
+
+    // Restores derived state after an undo/redo: re-sync every live record's
+    // wire-node geometry (required for a move-undo, whose MoveComponent carries
+    // no wiring delta - only the grid_pos was restored, so the pin nodes must be
+    // repositioned to match), clear any selection that may now point at a
+    // tombstoned record, then rebuild the circuit's nets + settle.
+    fn refresh_after_history(&mut self) {
+        let comp_keys: Vec<PlacedCompKey> =
+            self.active_components().map(|(k, _)| k).collect();
+        for k in comp_keys {
+            self.sync_component_wire_nodes(k);
+        }
+        let tunnel_keys: Vec<PlacedTunnelKey> = self.active_tunnels().map(|(k, _)| k).collect();
+        for k in tunnel_keys {
+            self.sync_tunnel_wire_nodes(k);
+        }
+        self.selected = None;
+        self.bulk_selection.clear();
+        self.rebuild_circuit();
+    }
+
     fn place_component(&mut self, def: ComponentSpec, grid_pos: GridPos) -> PlacedCompKey {
         self.history.begin_batch();
         let comp = def.to_component();
         let key = self.apply(Command::AddComponent(comp)).unwrap_comp();
-        self.history.end_batch();
         let pc = PlacedComponent {
             key,
             def,
             grid_pos,
             active: true,
         };
-        self.components.insert(pc)
+        let pc_key = self.components.insert(pc);
+        // Record the placement's undo: tombstone this record. Paired with the
+        // Sim DeactivateComponent already recorded by apply() above, so undo
+        // both drops the circuit component and hides the visual record.
+        self.history.push_gui(GuiUndoAction::SetComponentActive {
+            key: pc_key,
+            active: false,
+        });
+        self.history.end_batch();
+        pc_key
     }
 
     fn place_tunnel(&mut self, role: TunnelRole, grid_pos: GridPos) -> PlacedTunnelKey {
@@ -219,7 +293,6 @@ impl OsmilogApp {
         let key = self
             .apply(Command::AddTunnel { label: label.clone(), role })
             .unwrap_tunnel();
-        self.history.end_batch();
         let pt = PlacedTunnel {
             key,
             label,
@@ -227,7 +300,15 @@ impl OsmilogApp {
             grid_pos,
             active: true,
         };
-        self.tunnels.insert(pt)
+        let pt_key = self.tunnels.insert(pt);
+        // Record the placement's undo: tombstone this record (paired with the
+        // Sim DeactivateTunnel from apply() above).
+        self.history.push_gui(GuiUndoAction::SetTunnelActive {
+            key: pt_key,
+            active: false,
+        });
+        self.history.end_batch();
+        pt_key
     }
 
     // Live (non-tombstoned) placed components / tunnels. Every read that must
@@ -625,16 +706,33 @@ impl OsmilogApp {
         // `changed()`) ahead of the circuit's, so a tunnel renamed by clicking
         // away stayed grouped under its old label and its Feed partner read
         // Floating. (rebuild_circuit also reconciles as a backstop.)
+        // The record label is already updated live (on `changed()` above), so
+        // the pre-edit label survives only in the circuit, which RenameTunnel
+        // hasn't committed yet - read it there to both detect a real change and
+        // capture the undo's restore value.
         if response.lost_focus() {
-            self.history.begin_batch();
-            self.apply(Command::RenameTunnel {
-                tunnel: tunnel_key,
-                new_label: label.clone(),
-            });
-            self.history.end_batch();
-            self.tunnels[key].label = label;
-            let result = self.circuit.settle();
-            self.record_settle_result(result);
+            let old_label = self
+                .circuit
+                .tunnels
+                .get(tunnel_key)
+                .map(|t| t.label.clone());
+            if old_label.as_deref() != Some(label.as_str()) {
+                self.history.begin_batch();
+                self.apply(Command::RenameTunnel {
+                    tunnel: tunnel_key,
+                    new_label: label.clone(),
+                });
+                // Record the record-side label change's undo (the Sim
+                // RenameTunnel above only reverses the circuit's copy).
+                if let Some(old) = old_label {
+                    self.history
+                        .push_gui(GuiUndoAction::SetTunnelLabel { key, label: old });
+                }
+                self.tunnels[key].label = label;
+                self.history.end_batch();
+                let result = self.circuit.settle();
+                self.record_settle_result(result);
+            }
         }
     }
 
@@ -978,12 +1076,24 @@ impl OsmilogApp {
 
         self.apply(Command::RemoveComponent(old_key));
         let new_key = self.apply(Command::AddComponent(new_comp)).unwrap_comp();
-        self.components[pc_key] = PlacedComponent {
-            key: new_key,
-            def: new_def,
-            grid_pos,
-            active: true,
-        };
+        // Record the record swap's undo before overwriting: restores the old
+        // CompKey + def (the Sim actions above reactivate the old circuit comp
+        // and deactivate the new one, but the record itself needs restoring).
+        let old_def = std::mem::replace(
+            &mut self.components[pc_key],
+            PlacedComponent {
+                key: new_key,
+                def: new_def,
+                grid_pos,
+                active: true,
+            },
+        )
+        .def;
+        self.history.push_gui(GuiUndoAction::SwapComponentDef {
+            key: pc_key,
+            comp_key: old_key,
+            def: old_def,
+        });
 
         let delta = self.wiring.prune_stale_pins(pc_key, new_n_in, new_n_out);
         self.edit_wiring(delta);
@@ -1004,6 +1114,8 @@ impl OsmilogApp {
         // Tombstone rather than remove: keeps the PlacedCompKey valid so undo can
         // reactivate this record (see PlacedComponent::active).
         self.components[key].active = false;
+        self.history
+            .push_gui(GuiUndoAction::SetComponentActive { key, active: true });
         if self.selected == Some(Selected::Component(key)) {
             self.selected = None;
         }
@@ -1021,6 +1133,8 @@ impl OsmilogApp {
         self.edit_wiring(delta);
         // Tombstone rather than remove (see delete_component).
         self.tunnels[key].active = false;
+        self.history
+            .push_gui(GuiUndoAction::SetTunnelActive { key, active: true });
         if self.selected == Some(Selected::Tunnel(key)) {
             self.selected = None;
         }
@@ -1101,6 +1215,8 @@ impl OsmilogApp {
                         let delta = self.wiring.remove_component_nodes(key);
                         self.edit_wiring(delta);
                         self.components[key].active = false;
+                        self.history
+                            .push_gui(GuiUndoAction::SetComponentActive { key, active: true });
                     }
                 }
                 Selected::Tunnel(key) => {
@@ -1110,6 +1226,8 @@ impl OsmilogApp {
                         let delta = self.wiring.remove_tunnel_nodes(key);
                         self.edit_wiring(delta);
                         self.tunnels[key].active = false;
+                        self.history
+                            .push_gui(GuiUndoAction::SetTunnelActive { key, active: true });
                     }
                 }
                 Selected::Wire(_) => {}
@@ -1194,6 +1312,22 @@ impl eframe::App for OsmilogApp {
                         // applied by apply_pending_load on a later frame.
                         #[cfg(target_arch = "wasm32")]
                         crate::io::wasm::spawn_load_dialog(self.pending_load.clone());
+                        ui.close();
+                    }
+                });
+                ui.menu_button("Edit", |ui| {
+                    if ui
+                        .add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
+                        .clicked()
+                    {
+                        self.undo();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
+                        .clicked()
+                    {
+                        self.redo();
                         ui.close();
                     }
                 });
@@ -1325,9 +1459,11 @@ impl eframe::App for OsmilogApp {
                     });
                 });
                 if ui.button("Tick Clock").clicked() {
-                    self.history.begin_batch();
-                    let result = self.apply(Command::TickClock).unwrap_settle();
-                    self.history.end_batch();
+                    // A clock tick is a simulation step, not an edit - issue it
+                    // untracked (bypassing self.apply) so it never lands on the
+                    // undo stack. Its RestoreSeqState replay isn't implemented,
+                    // and undo is scoped to structural edits only.
+                    let result = self.circuit.apply(Command::TickClock).0.unwrap_settle();
                     self.record_settle_result(result);
                 }
                 if let Some(err) = &self.last_settle_error {
@@ -1406,6 +1542,26 @@ impl eframe::App for OsmilogApp {
                         Selected::Tunnel(k) => self.delete_tunnel(k),
                         Selected::Wire(seg) => self.delete_wire(seg),
                     }
+                }
+            }
+
+            // Undo (Ctrl/Cmd+Z) / redo (Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z). Same
+            // focus guard as delete so the shortcuts don't fire while typing in
+            // the tunnel-label field (where Ctrl+Z should edit text).
+            if !editing_text {
+                let (undo, redo) = ctx.input(|i| {
+                    let cmd = i.modifiers.command;
+                    let undo = cmd && !i.modifiers.shift && i.key_pressed(egui::Key::Z);
+                    let redo = cmd
+                        && (i.key_pressed(egui::Key::Y)
+                            || (i.modifiers.shift && i.key_pressed(egui::Key::Z)));
+                    (undo, redo)
+                });
+                if undo {
+                    self.undo();
+                }
+                if redo {
+                    self.redo();
                 }
             }
 
@@ -2159,8 +2315,6 @@ fn draw_tunnel_ghost(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gui::gui_undo::GuiUndoAction;
-    use crate::gui::history::HistoryEntry;
     use crate::gui::wiring::NodeAttach;
     use crate::sim::component::GateOp;
 
@@ -2605,7 +2759,7 @@ mod tests {
         assert_eq!(app.history.len(), stack_before + 1);
         assert!(matches!(
             app.history.last(),
-            Some(HistoryEntry::Gui(GuiUndoAction::WiringDelta(_)))
+            Some(HistoryEntry::Gui(GuiUndoAction::WiringDelta { .. }))
         ));
     }
 
@@ -2631,5 +2785,192 @@ mod tests {
             }
             other => panic!("expected Gui(MoveComponent), got {other:?}"),
         }
+    }
+
+    // ── undo / redo ────────────────────────────────────────────────────────
+
+    fn and2() -> ComponentSpec {
+        ComponentSpec::Gate(Gate {
+            op: GateOp::And,
+            n_inputs: 2,
+            width: 1,
+        })
+    }
+
+    #[test]
+    fn undo_redo_place_component_toggles_both_records() {
+        let mut app = OsmilogApp::empty();
+        let g = place(&mut app, and2());
+        let comp_key = app.components[g].key;
+        assert!(app.history.can_undo());
+        assert!(!app.history.can_redo());
+        assert!(app.components[g].active);
+        assert!(app.circuit.components[comp_key].active);
+
+        app.undo();
+        assert!(!app.components[g].active, "record tombstoned by undo");
+        assert!(
+            !app.circuit.components[comp_key].active,
+            "circuit component deactivated by undo"
+        );
+        assert!(app.history.can_redo());
+        assert!(!app.history.can_undo());
+
+        app.redo();
+        assert!(app.components[g].active);
+        assert!(app.circuit.components[comp_key].active);
+        assert!(app.history.can_undo());
+        assert!(!app.history.can_redo());
+    }
+
+    #[test]
+    fn undo_redo_wire_draw_round_trips_connectivity() {
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let o = place(&mut app, ComponentSpec::Output);
+        app.commit_wire_route(
+            vec![GridPos::new(0, 0), GridPos::new(10, 0)],
+            NodeAttach::Pin(a, PinId::output(0)),
+            NodeAttach::Pin(o, PinId::input(0)),
+        );
+        let o_key = app.components[o].key;
+        assert_eq!(app.circuit.read_output(o_key), Value::ONE);
+        assert_eq!(app.wiring.groups().len(), 1);
+
+        app.undo();
+        assert!(
+            app.wiring.groups().iter().all(|grp| grp.pins.len() < 2),
+            "wire removed: no group ties both pins together"
+        );
+        assert_eq!(app.circuit.read_output(o_key), Value::Floating);
+
+        app.redo();
+        assert_eq!(app.wiring.groups().len(), 1);
+        assert_eq!(app.circuit.read_output(o_key), Value::ONE);
+    }
+
+    #[test]
+    fn undo_redo_delete_component_restores_wire_and_value() {
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let o = place(&mut app, ComponentSpec::Output);
+        app.commit_wire_route(
+            vec![GridPos::new(0, 0), GridPos::new(10, 0)],
+            NodeAttach::Pin(a, PinId::output(0)),
+            NodeAttach::Pin(o, PinId::input(0)),
+        );
+        let o_key = app.components[o].key;
+        assert_eq!(app.circuit.read_output(o_key), Value::ONE);
+
+        app.delete_component(a);
+        assert!(!app.components[a].active);
+        assert_eq!(app.circuit.read_output(o_key), Value::Floating);
+
+        app.undo();
+        assert!(app.components[a].active);
+        let a_key = app.components[a].key;
+        assert!(app.circuit.components[a_key].active);
+        assert_eq!(
+            app.circuit.read_output(o_key),
+            Value::ONE,
+            "wire nodes and driving input restored"
+        );
+
+        app.redo();
+        assert!(!app.components[a].active);
+        assert_eq!(app.circuit.read_output(o_key), Value::Floating);
+    }
+
+    #[test]
+    fn undo_redo_reconfigure_restores_def_and_key() {
+        let mut app = OsmilogApp::empty();
+        let g = place(&mut app, and2());
+        let old_key = app.components[g].key;
+        app.reconfigure_component(
+            g,
+            ComponentSpec::Gate(Gate {
+                op: GateOp::Not,
+                n_inputs: 1,
+                width: 1,
+            }),
+        );
+        assert!(matches!(
+            app.components[g].def,
+            ComponentSpec::Gate(Gate { op: GateOp::Not, .. })
+        ));
+
+        app.undo();
+        assert!(matches!(
+            app.components[g].def,
+            ComponentSpec::Gate(Gate {
+                op: GateOp::And,
+                n_inputs: 2,
+                ..
+            })
+        ));
+        assert_eq!(app.components[g].key, old_key, "old CompKey restored");
+
+        app.redo();
+        assert!(matches!(
+            app.components[g].def,
+            ComponentSpec::Gate(Gate { op: GateOp::Not, .. })
+        ));
+    }
+
+    #[test]
+    fn undo_redo_move_restores_grid_pos() {
+        let mut app = OsmilogApp::empty();
+        let a = place(&mut app, and2());
+        let original = app.components[a].grid_pos;
+        let moved = GridPos::new(original.x + 4, original.y + 2);
+        app.components[a].grid_pos = moved;
+        app.commit_move(Selected::Component(a), original);
+
+        app.undo();
+        assert_eq!(app.components[a].grid_pos, original);
+
+        app.redo();
+        assert_eq!(app.components[a].grid_pos, moved);
+    }
+
+    #[test]
+    fn new_edit_after_undo_clears_redo() {
+        let mut app = OsmilogApp::empty();
+        place(&mut app, and2());
+        app.undo();
+        assert!(app.history.can_redo());
+        // A fresh edit invalidates the redo branch.
+        place(&mut app, ComponentSpec::Output);
+        assert!(!app.history.can_redo());
+    }
+
+    #[test]
+    fn undo_redo_tunnel_rename_restores_label() {
+        let mut app = OsmilogApp::empty();
+        let t = app.place_tunnel(TunnelRole::Feed, GridPos::new(0, 0));
+        let tunnel_key = app.tunnels[t].key;
+        let original = app.tunnels[t].label.clone();
+
+        // Simulate a rename commit: record label change live, then the batched
+        // Sim rename + record-label undo (mirrors show_tunnel_properties).
+        app.tunnels[t].label = "RENAMED".to_string();
+        app.history.begin_batch();
+        app.apply(Command::RenameTunnel {
+            tunnel: tunnel_key,
+            new_label: "RENAMED".to_string(),
+        });
+        app.history.push_gui(GuiUndoAction::SetTunnelLabel {
+            key: t,
+            label: original.clone(),
+        });
+        app.history.end_batch();
+
+        app.undo();
+        assert_eq!(app.tunnels[t].label, original);
+        assert_eq!(app.circuit.tunnels[tunnel_key].label, original);
+
+        app.redo();
+        assert_eq!(app.tunnels[t].label, "RENAMED");
+        assert_eq!(app.circuit.tunnels[tunnel_key].label, "RENAMED");
     }
 }

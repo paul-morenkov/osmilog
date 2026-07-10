@@ -145,7 +145,8 @@ them itself (see Simulator/GUI separation above).
 One `Command` variant per structural mutation `Circuit` supports. `apply` dispatches to the
 matching `Circuit` method and returns both the output and the `UndoAction` that reverses that one
 command (callers that don't want the undo take `.0`). This is the seam the GUI's undo/redo is built
-on (see History below); nothing yet *consumes* an `UndoAction` to replay it (see In-Progress below).
+on (see History below); `Circuit::apply_undo(UndoAction) -> UndoAction` is what *consumes* one -
+applying it reverses the recorded command and returns the inverse to record on the opposite stack.
 
 The `UndoAction`s are deliberately minimal, because **the circuit's net structure is derived
 state**: the GUI rebuilds every net from its authoritative `Wiring`/component/tunnel records after
@@ -256,14 +257,20 @@ size); `Wiring::remove_unreferenced_tombstones` reclaims any not referenced by t
     pub fn History::push_sim(&mut self, action: UndoAction)
     pub fn History::push_gui(&mut self, action: GuiUndoAction)
     pub fn History::begin_batch(&mut self) / fn end_batch(&mut self)
+    pub fn History::pop_undo/pop_redo/push_undo/push_redo/can_undo/can_redo
+    fn OsmilogApp::undo(&mut self) / fn redo(&mut self)
 
-Accumulates `HistoryEntry`s from every `OsmilogApp::apply()` (Circuit mutations, via `push_sim`)
-and `OsmilogApp::edit_wiring()` (`Wiring`-graph mutations, via `push_gui`) call, onto one
-interleaved stack. `begin_batch`/`end_batch` collapse a multi-step GUI operation (e.g. deleting a
-component, which issues both a tracked `Command::RemoveComponent` and a
-`Wiring::remove_component_nodes`) into one `HistoryEntry` - a `Batch` when it's more than one
-sub-entry, unwrapped to the bare entry when it's exactly one. `rebuild_circuit` is history-free, so
-it contributes nothing to a batch (its net reconstruction is untracked derived state).
+`History` holds **two** stacks: `undo_stack` grows as edits are recorded (via `push_sim`/`push_gui`/
+`end_batch`), `redo_stack` holds entries popped by `undo` so `redo` can replay them. Recording
+accumulates one `HistoryEntry` per user gesture from every `OsmilogApp::apply()` (Circuit mutations,
+via `push_sim`) and `OsmilogApp::edit_wiring()` (`Wiring`-graph mutations, via `push_gui`) call.
+`begin_batch`/`end_batch` collapse a multi-step GUI operation (e.g. deleting a component, which
+issues both a tracked `Command::RemoveComponent` and a `Wiring::remove_component_nodes`) into one
+`HistoryEntry` - a `Batch` when it's more than one sub-entry, unwrapped to the bare entry when it's
+exactly one. Every *fresh* edit funnels through `History::commit`, which also clears `redo_stack`
+(the standard branch-invalidation); `pop_*`/`push_*` are the engine's stack moves and deliberately
+do **not** clear the opposite stack. `rebuild_circuit` is history-free, so it contributes nothing to
+a batch (its net reconstruction is untracked derived state).
 
 The `Wiring` mutators (`add_route`, `delete_segment`, `remove_component_nodes`,
 `remove_tunnel_nodes`, `prune_stale_pins`) each **return** a `gui::wiring::WiringDelta` - an ordered
@@ -272,14 +279,31 @@ size is proportional to the entries that edit touched, not the whole graph. Beca
 tombstone rather than remove, undo/redo are just `Wiring::undo_delta`/`redo_delta` replaying those
 flips (keys never move, so `add_route`'s mid-wire split - which the old whole-graph snapshot existed
 to sidestep - is captured precisely). `OsmilogApp::edit_wiring(delta)` records a non-empty delta as
-`GuiUndoAction::WiringDelta`; there is no "GuiCommand" enum, since unlike `sim::command::Command`
-every `Wiring` edit's inverse is uniform. Component/tunnel drag-moves
-(`GuiUndoAction::MoveComponent`/`MoveTunnel`) are recorded directly (`OsmilogApp::commit_move`),
-bypassing `edit_wiring`, because `grid_pos` is written every drag frame for live visual feedback -
-by the time the drag ends there's no "before" state left in the field to read, only the
-`original_grid_pos` captured once at drag-start.
+`GuiUndoAction::WiringDelta { delta, forward: false }` (the `forward` flag picks `undo_delta` vs
+`redo_delta` so one delta serves both directions across the two stacks); there is no "GuiCommand"
+enum, since unlike `sim::command::Command` every `Wiring` edit's inverse is uniform. Component/tunnel
+drag-moves (`GuiUndoAction::MoveComponent`/`MoveTunnel`) are recorded directly
+(`OsmilogApp::commit_move`), bypassing `edit_wiring`, because `grid_pos` is written every drag frame
+for live visual feedback - by the time the drag ends there's no "before" state left in the field to
+read, only the `original_grid_pos` captured once at drag-start. `GuiUndoAction` additionally carries
+the **GUI-authoritative record deltas** the sim-side `Command`/`UndoAction` path has no notion of:
+`SetComponentActive`/`SetTunnelActive` (place/delete tombstone toggle), `SwapComponentDef`
+(reconfigure's whole-record swap), `SetTunnelLabel` (properties-panel rename) - all swap-style, i.e.
+they store the value to restore and return the value they displaced.
 
-See In-Progress below for what's still missing to make this a working undo/redo feature.
+**Consuming the stack.** `OsmilogApp::undo`/`redo` are one symmetric operation in opposite
+directions, built on `apply_entry(entry) -> HistoryEntry`: applying an entry performs the reversal
+*and returns the entry that reverses that* (pushed onto the opposite stack). It dispatches
+`Sim(a) -> Sim(circuit.apply_undo(a))`, `Gui(a) -> Gui(self.apply_gui_undo(a))`, and a `Batch` by
+applying its children last-first and collecting their inverses (so redo of an undone batch replays
+it forward). `Circuit::apply_undo` and `OsmilogApp::apply_gui_undo` only touch authoritative state
+(active flags, input values, tunnel labels, records) - never nets; afterward
+`OsmilogApp::refresh_after_history` re-syncs every live record's wire-node geometry (needed for a
+move-undo, which carries no wiring delta), clears the selection, and `rebuild_circuit`s (re-deriving
+nets + settling). Exposed as an Edit menu (Undo / Redo, the latter `add_enabled`-gated on
+`can_redo`) and `Ctrl/Cmd+Z` (undo) / `Ctrl/Cmd+Y` / `Ctrl/Cmd+Shift+Z` (redo), all guarded by the
+same widget-focus check as Delete so the shortcuts don't fire while editing a text field. Clock
+ticks are excluded (see In-Progress below).
 
 ### Shape / geometry / theme (`shape.rs`, `geometry.rs`, `theme.rs`)
 
@@ -305,24 +329,18 @@ app state).
 
 ## In-Progress / Not Yet Implemented
 
-- **Undo/redo**: recording is fully wired for both domains (every authoritative `Command` produces
-  an `UndoAction`, every `Wiring` edit produces a `WiringDelta`/`GuiUndoAction` and every drag-move
-  a `GuiUndoAction`, all batched by `History` into one interleaved `HistoryEntry` stack), but
-  nothing consumes the stack yet - there's no `undo()`/`redo()` method and no keybinding/menu entry.
-  The `Wiring`-side replay primitives exist and are tested (`Wiring::undo_delta`/`redo_delta`), and
-  the sim-side reactivation primitives exist and are tested (`Circuit::reactivate_component`/
-  `reactivate_tunnel`); the top-level stack traversal is unbuilt. The GUI's `PlacedComponent`/
-  `PlacedTunnel` now **tombstone** on delete too (an `active: bool` mirroring `Wiring`/`Component`):
-  `delete_component`/`delete_tunnel`/`delete_bulk` flip `active` off instead of removing from the
-  `SlotMap`, keeping the `PlacedCompKey`/`PlacedTunnelKey` valid so a future undo can reactivate the
-  record. Every read that must not see a deleted record iterates `OsmilogApp::active_components`/
-  `active_tunnels` (drawing, hit-testing, `items_in_rect`, `rebuild_circuit`, `wire_node_values`,
-  `to_circuit_file`); raw indexing `components[k]`/`tunnels[k]` on a known-live key stays fine. Save
-  persists only active records. What still blocks consuming undo: (a) the top-level stack traversal
-  itself; (b) param-edit undo (reconfigure def / tunnel rename)
-  interacts with `rebuild_circuit`'s label reconcile and wants GUI-authoritative record deltas.
-  Tombstone GC (`Wiring::remove_unreferenced_tombstones`, `Circuit::remove_unreferenced_tombstones`,
-  `History::referenced_wire_keys`) is defined but not yet called anywhere.
+- **Undo/redo tombstone GC**: undo/redo itself is **implemented and wired** (see the "History / GUI
+  undo" section under GUI for the full mechanism) - `OsmilogApp::undo`/`redo` consume the two-stack
+  `History` via a symmetric `apply_entry`, exposed as an Edit menu (Undo / Redo, the latter
+  `add_enabled`-gated on `can_redo`) and `Ctrl/Cmd+Z` / `Ctrl/Cmd+Y` / `Ctrl/Cmd+Shift+Z`. What
+  remains here is only the **tombstone garbage collection**: deletes and wiring edits tombstone
+  (`active: bool`) rather than remove, so tombstones accumulate with cumulative edit count. The GC
+  primitives (`Wiring::remove_unreferenced_tombstones`, `Circuit::remove_unreferenced_tombstones`,
+  fed by `History::referenced_wire_keys`) exist and are tested but are **still not called anywhere** -
+  nothing prunes tombstones the live history no longer references. Two deliberate scope limits, not
+  gaps: **clock ticks are excluded from undo** (`Command::TickClock` is issued untracked, bypassing
+  `apply`, since its `RestoreSeqState` replay is unimplemented), and undo/redo re-derives nets via
+  `rebuild_circuit` rather than reversing net mutations.
 - **Canvas pan/zoom**: `OsmilogApp::pan` exists and is read everywhere geometry is drawn, but
   nothing currently mutates it - there's no pan gesture, and no zoom at all.
 - **Whole-wire-run selection**: selecting/deleting a wire is still per-segment. `Wiring::groups()`

@@ -34,12 +34,17 @@ pub enum HistoryEntry {
 // uniformly: a single-call method wrapped in begin_batch/end_batch produces
 // the same one stack entry as not wrapping it at all.
 //
-// Track-only for now: nothing reads `stack` back yet (that's the next
-// step's undo()/redo(), which will consume it).
+// Two stacks: `undo_stack` grows as edits are recorded (push_sim/push_gui/
+// end_batch), `redo_stack` holds entries popped by undo() so redo() can replay
+// them. Any *fresh* edit clears redo_stack (the standard branch-invalidation:
+// once you edit after undoing, the undone future is gone). The undo/redo engine
+// (OsmilogApp::undo/redo) moves entries between the two stacks via pop_undo/
+// pop_redo + push_redo/push_undo, which deliberately do NOT clear the opposite
+// stack.
 #[derive(Default)]
-#[allow(dead_code)]
 pub struct History {
-    stack: Vec<HistoryEntry>,
+    undo_stack: Vec<HistoryEntry>,
+    redo_stack: Vec<HistoryEntry>,
     pending: Vec<HistoryEntry>,
     depth: u32,
 }
@@ -60,8 +65,17 @@ impl History {
         if self.depth > 0 {
             self.pending.push(entry);
         } else {
-            self.stack.push(entry);
+            self.commit(entry);
         }
+    }
+
+    // Commits one finished top-level entry onto the undo stack and invalidates
+    // any pending redo branch. Every new edit funnels through here (directly, or
+    // via end_batch's collapse), so this is the single place redo_stack is
+    // cleared.
+    fn commit(&mut self, entry: HistoryEntry) {
+        self.undo_stack.push(entry);
+        self.redo_stack.clear();
     }
 
     pub fn begin_batch(&mut self) {
@@ -73,12 +87,39 @@ impl History {
         self.depth = self.depth.saturating_sub(1);
         if self.depth == 0 && !self.pending.is_empty() {
             let batch = std::mem::take(&mut self.pending);
-            self.stack.push(if batch.len() == 1 {
+            self.commit(if batch.len() == 1 {
                 batch.into_iter().next().unwrap()
             } else {
                 HistoryEntry::Batch(batch)
             });
         }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    pub fn pop_undo(&mut self) -> Option<HistoryEntry> {
+        self.undo_stack.pop()
+    }
+
+    pub fn pop_redo(&mut self) -> Option<HistoryEntry> {
+        self.redo_stack.pop()
+    }
+
+    // Pushes an entry produced by the undo/redo engine onto the opposite stack.
+    // Unlike a fresh edit, these must NOT clear the other stack - undoing must
+    // leave the rest of the redo branch intact, and vice versa.
+    pub fn push_redo(&mut self, entry: HistoryEntry) {
+        self.redo_stack.push(entry);
+    }
+
+    pub fn push_undo(&mut self, entry: HistoryEntry) {
+        self.undo_stack.push(entry);
     }
 
     /// The union of every wire node/segment key referenced by any WiringDelta
@@ -92,7 +133,7 @@ impl History {
         let mut segs = HashSet::new();
         fn walk(entry: &HistoryEntry, nodes: &mut HashSet<WireNodeKey>, segs: &mut HashSet<WireSegKey>) {
             match entry {
-                HistoryEntry::Gui(GuiUndoAction::WiringDelta(delta)) => {
+                HistoryEntry::Gui(GuiUndoAction::WiringDelta { delta, .. }) => {
                     delta.collect_keys(nodes, segs);
                 }
                 HistoryEntry::Batch(entries) => {
@@ -103,7 +144,12 @@ impl History {
                 HistoryEntry::Sim(_) | HistoryEntry::Gui(_) => {}
             }
         }
-        for entry in self.stack.iter().chain(self.pending.iter()) {
+        for entry in self
+            .undo_stack
+            .iter()
+            .chain(self.redo_stack.iter())
+            .chain(self.pending.iter())
+        {
             walk(entry, &mut nodes, &mut segs);
         }
         (nodes, segs)
@@ -111,12 +157,12 @@ impl History {
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.stack.len()
+        self.undo_stack.len()
     }
 
     #[cfg(test)]
     pub(crate) fn last(&self) -> Option<&HistoryEntry> {
-        self.stack.last()
+        self.undo_stack.last()
     }
 }
 

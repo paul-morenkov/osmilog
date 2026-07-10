@@ -241,6 +241,73 @@ impl Circuit {
             }
         }
     }
+
+    /// Applies an `UndoAction` (reversing the `Command` that produced it) and
+    /// returns the `UndoAction` that reverses *this* application - i.e. the entry
+    /// to record on the opposite (redo/undo) stack. This makes undo and redo one
+    /// symmetric operation: applying an action yields its own inverse.
+    ///
+    /// Only authoritative state is touched here (active flags, input values,
+    /// tunnel labels). Net structure is derived - the GUI rebuilds it from its
+    /// Wiring records afterward (`OsmilogApp::refresh_after_history`) - so this
+    /// neither relinks nets nor settles.
+    pub fn apply_undo(&mut self, action: UndoAction) -> UndoAction {
+        match action {
+            UndoAction::NoOp => UndoAction::NoOp,
+            UndoAction::DeactivateComponent(key) => {
+                self.remove_component(key);
+                UndoAction::ReactivateComponent(key)
+            }
+            UndoAction::ReactivateComponent(key) => {
+                self.reactivate_component(key);
+                UndoAction::DeactivateComponent(key)
+            }
+            UndoAction::DeactivateTunnel(key) => {
+                self.remove_tunnel(key);
+                UndoAction::ReactivateTunnel(key)
+            }
+            UndoAction::ReactivateTunnel(key) => {
+                self.reactivate_tunnel(key);
+                UndoAction::DeactivateTunnel(key)
+            }
+            UndoAction::SetInput {
+                comp,
+                old_bits,
+                old_width,
+            } => {
+                // Capture the current value first so the returned inverse can
+                // restore it on redo.
+                let current = match &self.components[comp].logic {
+                    Logic::Comb(LogicComb::Input(Input { bits, width })) => (*bits, *width),
+                    _ => (old_bits, old_width),
+                };
+                self.set_input(comp, old_bits, old_width);
+                UndoAction::SetInput {
+                    comp,
+                    old_bits: current.0,
+                    old_width: current.1,
+                }
+            }
+            UndoAction::RenameTunnel { tunnel, old_label } => {
+                let current = self
+                    .tunnels
+                    .get(tunnel)
+                    .map(|t| t.label.clone())
+                    .unwrap_or_else(|| old_label.clone());
+                self.rename_tunnel(tunnel, old_label);
+                UndoAction::RenameTunnel {
+                    tunnel,
+                    old_label: current,
+                }
+            }
+            // Clock ticks are issued untracked (see OsmilogApp's Tick Clock
+            // handler), so a RestoreSeqState should never reach the history.
+            UndoAction::RestoreSeqState { .. } => {
+                debug_assert!(false, "RestoreSeqState reached apply_undo: clock ticks must be untracked");
+                UndoAction::NoOp
+            }
+        }
+    }
 }
 
 #[cfg(test)]

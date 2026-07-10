@@ -313,8 +313,6 @@ impl Circuit {
     // re-establishes its nets (the GUI via rebuild_circuit, a sim caller via
     // link()) and settle()s. A Reg's latched state was preserved untouched, so
     // it returns exactly as it was before removal.
-    // Unwired until undo()/redo() consumes the history (see UndoAction).
-    #[allow(dead_code)]
     pub(crate) fn reactivate_component(&mut self, key: CompKey) {
         if let Some(c) = self.components.get_mut(key) {
             c.active = true;
@@ -324,7 +322,6 @@ impl Circuit {
 
     // Undo of remove_tunnel: flip the tombstone back and rejoin its label
     // group. Its net binding is re-established by the caller's relink.
-    #[allow(dead_code)]
     pub(crate) fn reactivate_tunnel(&mut self, tunnel: TunnelKey) {
         let Some(t) = self.tunnels.get_mut(tunnel) else {
             return;
