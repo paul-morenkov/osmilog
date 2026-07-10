@@ -40,10 +40,9 @@ impl CombLogic for Subtractor {
                     width: bw_in,
                 },
             ) if aw == width && bw == width && bw_in == 1 => {
-                // a - b - bin mod 2^32, masked down to `width` bits: since 2^width
-                // divides 2^32 (width <= 32), this equals a - b - bin mod 2^width -
-                // no signed/widened intermediate needed, unlike the borrow-out check
-                // below where b + bin can itself overflow u32.
+                // Wraps mod 2^32 then masks to `width` bits, which equals mod
+                // 2^width since 2^width divides 2^32 - no signed/widened
+                // intermediate needed, unlike the borrow-out check below.
                 let diff = a.wrapping_sub(b).wrapping_sub(bin) & Value::mask(width);
                 let borrow = ((a as u64) < (b as u64 + bin as u64)) as u32;
                 vec![Value::new(diff, width), Value::new(borrow, 1)]

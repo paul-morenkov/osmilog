@@ -1,33 +1,22 @@
-//! GUI-side wiring: a geometry + topology netlist, kept deliberately separate
-//! from the simulation `Circuit`.
+//! GUI-side wiring: a geometry + topology graph, kept separate from the
+//! simulation `Circuit`. Wires are grid-aligned `WireNode`s joined by
+//! axis-aligned `WireSegment`s; connectivity is *derived* via union-find
+//! (`groups`), and `OsmilogApp::rebuild_circuit` is the only place that turns
+//! a group into `Circuit::link`/`link_tunnel` calls.
 //!
-//! Wires are a graph of grid-aligned `WireNode`s connected by axis-aligned
-//! `WireSegment`s. Unlike the old pin-to-pin `Wire` record, a wire here can run
-//! into empty space, branch off another wire at any point, and be selected and
-//! deleted a segment at a time. Connectivity is *derived* from the segment
-//! graph (union-find), and each connected group of nodes maps to one circuit
-//! net: the app replays `Circuit::link`/`link_tunnel` for a group's endpoints
-//! after any edit (see `groups`, and `OsmilogApp::rebuild_circuit`). This module
-//! therefore never touches `Circuit` directly - it only knows the GUI's own
-//! `PlacedCompKey`/`PlacedTunnelKey` and `PinId`, so the two systems meet only
-//! through that replay step.
+//! Attachment is by *key*, not position: a wire merely crossing a pin or
+//! another wire does not connect. `resolve_point` creates a junction by
+//! splitting a segment when a route starts/ends partway along it.
 //!
-//! Attachment is by *key*, not position: a wire merely crossing a pin or another
-//! wire does not connect. A junction exists only where a shared node does - which
-//! `resolve_point` creates explicitly by splitting a segment when a new wire
-//! starts or ends partway along it.
+//! ## Tombstoning
 //!
-//! ## Tombstoning (undo deltas)
-//!
-//! Editing never `remove()`s from the `SlotMap`s. A "deleted" node/segment is
-//! instead flagged `active = false`, so its key stays valid forever and every
-//! edit can be recorded as a compact, invertible [`WiringDelta`] of bit flips
-//! (see [`WiringOp`]) rather than a whole-graph snapshot. Undo/redo just flip
-//! `active` back and forth, which is why keys must never move. Every
-//! connectivity/hit/drawing read therefore iterates through [`active_nodes`]/
-//! [`active_segments`], never the raw maps. Tombstones accumulate with
-//! cumulative edits (not circuit size); [`remove_unreferenced_tombstones`]
-//! reclaims them once no history entry references them.
+//! Editing never `remove()`s from the `SlotMap`s - a "deleted" node/segment
+//! is flagged `active = false` instead, so keys stay valid and every edit is
+//! a compact, invertible [`WiringDelta`] of bit flips ([`WiringOp`]) rather
+//! than a whole-graph snapshot. Every connectivity/hit/drawing read must go
+//! through [`active_nodes`]/[`active_segments`], never the raw maps.
+//! [`remove_unreferenced_tombstones`] reclaims tombstones no history entry
+//! references, but nothing calls it yet.
 //!
 //! [`active_nodes`]: Wiring::active_nodes
 //! [`active_segments`]: Wiring::active_segments
@@ -51,8 +40,7 @@ new_key_type! {
 const HIT_RADIUS: f32 = 5.0;
 
 /// What a wire node is bound to. `Free` nodes are corners, junctions, or
-/// dangling endpoints in empty space; the other two tie a node to a component
-/// pin or a tunnel's single pin.
+/// dangling endpoints; the other two tie a node to a pin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeAttach {
     Free,
@@ -65,9 +53,7 @@ pub struct WireNode {
     /// Grid coordinates (same convention as `PlacedComponent::grid_pos`).
     pub pos: GridPos,
     pub attach: NodeAttach,
-    /// `false` marks a tombstone - a node kept in the map (so its key stays
-    /// valid for undo) but excluded from every connectivity/drawing read. See
-    /// the module-level "Tombstoning" note.
+    /// `false` marks a tombstone. See the module-level "Tombstoning" note.
     pub active: bool,
 }
 
@@ -81,28 +67,22 @@ pub struct WireSegment {
     pub active: bool,
 }
 
-/// The endpoints of one connected group of wire, in GUI keys. `pins` and
-/// `tunnels` are what the app links into a single circuit net; `nodes` is the
-/// full node set (used to colour every segment in the group).
+/// One connected group of wire nodes. `pins`/`tunnels` are what gets linked
+/// into a circuit net; `nodes` is the full set (used for colouring).
 pub struct Group {
     pub nodes: Vec<WireNodeKey>,
     pub pins: Vec<(PlacedCompKey, PinId)>,
     pub tunnels: Vec<PlacedTunnelKey>,
 }
 
-/// One primitive, invertible change to a [`Wiring`]. A [`WiringDelta`] is an
-/// ordered list of these, recorded by the editing methods and consumed by
-/// `undo_delta`/`redo_delta`. Because edits never remove keys (they tombstone),
-/// every change reduces to flipping an `active` bit or swapping a node's attach
-/// - each trivially reversible from the data it carries.
+/// One invertible change to a [`Wiring`], recorded into a [`WiringDelta`] and
+/// consumed by `undo_delta`/`redo_delta`. Since edits tombstone rather than
+/// remove, every change is just a bit flip or attach swap.
 #[derive(Clone, Debug)]
 pub enum WiringOp {
-    /// A node's `active` flag was set to `active` (from `!active`). Covers both
-    /// creation (`false`->`true`) and deletion (`true`->`false`).
+    /// Covers both creation (`false`->`true`) and deletion (`true`->`false`).
     NodeActive { key: WireNodeKey, active: bool },
-    /// A segment's `active` flag was set to `active` (from `!active`).
     SegActive { key: WireSegKey, active: bool },
-    /// A node's attachment changed from `old` to `new`.
     SetAttach {
         node: WireNodeKey,
         old: NodeAttach,
@@ -110,9 +90,8 @@ pub enum WiringOp {
     },
 }
 
-/// The recorded effect of one wiring edit, enough to reverse or replay it. Its
-/// stored size is proportional to the entries the edit touched, never the whole
-/// graph. An empty delta means the edit changed nothing.
+/// The recorded effect of one wiring edit. Size is proportional to what the
+/// edit touched, never the whole graph. Empty means nothing changed.
 #[derive(Clone, Debug, Default)]
 pub struct WiringDelta(Vec<WiringOp>);
 
@@ -121,9 +100,8 @@ impl WiringDelta {
         self.0.is_empty()
     }
 
-    /// Add every node/segment key this delta references into the given sets -
-    /// used to decide which tombstones a GC pass must keep alive (see
-    /// [`Wiring::remove_unreferenced_tombstones`]).
+    /// Add every key this delta references into the given sets (used by
+    /// [`Wiring::remove_unreferenced_tombstones`] to decide what to keep).
     pub fn collect_keys(
         &self,
         nodes: &mut HashSet<WireNodeKey>,
@@ -160,12 +138,10 @@ impl Wiring {
     // Every connectivity/hit/drawing read must go through these two, never the
     // raw `nodes`/`segments` maps, so tombstones stay invisible.
 
-    /// Iterate live (non-tombstoned) nodes.
     pub fn active_nodes(&self) -> impl Iterator<Item = (WireNodeKey, &WireNode)> {
         self.nodes.iter().filter(|(_, n)| n.active)
     }
 
-    /// Iterate live (non-tombstoned) segments.
     pub fn active_segments(&self) -> impl Iterator<Item = (WireSegKey, &WireSegment)> {
         self.segments.iter().filter(|(_, s)| s.active)
     }
@@ -287,9 +263,7 @@ impl Wiring {
     }
 
     /// Add a polyline wire through `points` (grid coords, each adjacent pair
-    /// axis-aligned). `start_attach`/`end_attach` bind the first/last node to a
-    /// pin or tunnel when the route lands on one; interior points stay `Free`.
-    /// Returns the delta of everything created/split.
+    /// axis-aligned), binding the first/last node to `start_attach`/`end_attach`.
     pub fn add_route(
         &mut self,
         points: &[GridPos],
@@ -380,8 +354,8 @@ impl Wiring {
         WiringDelta(ops)
     }
 
-    /// After a component is reconfigured to fewer pins, drop wire nodes bound to
-    /// pins that no longer exist.
+    /// After a reconfigure drops pins, remove wire nodes bound to pins that no
+    /// longer exist.
     pub fn prune_stale_pins(
         &mut self,
         pck: PlacedCompKey,
@@ -405,9 +379,8 @@ impl Wiring {
         WiringDelta(ops)
     }
 
-    /// Reposition every node bound to `pck`'s pins to that pin's current grid
-    /// position (called after a component moves or is reconfigured). Attached
-    /// segments simply stretch to follow.
+    /// Reposition every node bound to `pck`'s pins (called after a move or
+    /// reconfigure); attached segments simply stretch to follow.
     pub fn sync_component_nodes(
         &mut self,
         pck: PlacedCompKey,
@@ -422,8 +395,7 @@ impl Wiring {
         }
     }
 
-    /// Reposition every node bound to `ptk` to the tunnel's current pin grid
-    /// position.
+    /// Reposition every node bound to `ptk` to the tunnel's current position.
     pub fn sync_tunnel_nodes(&mut self, ptk: PlacedTunnelKey, gp: GridPos) {
         for n in self.nodes.values_mut() {
             if let NodeAttach::Tunnel(k) = n.attach {
@@ -452,8 +424,6 @@ impl Wiring {
     }
 
     // ── Undo / redo replay ──────────────────────────────────────────────────
-    // Representation is complete and tested, but nothing wires these to a UI
-    // gesture yet (see the crate's undo/redo In-Progress note).
 
     fn apply_op(&mut self, op: &WiringOp) {
         match op {
@@ -495,27 +465,25 @@ impl Wiring {
         }
     }
 
-    /// Re-apply a delta (redo). Ops run in recorded order, which always creates
-    /// nodes before the segments that reference them.
+    /// Re-apply a delta (redo). Ops run in recorded order, so nodes are
+    /// created before segments that reference them.
     pub fn redo_delta(&mut self, delta: &WiringDelta) {
         for op in &delta.0 {
             self.apply_op(op);
         }
     }
 
-    /// Reverse a delta (undo). Ops run in reverse order, which always restores
-    /// nodes before the segments that reference them.
+    /// Reverse a delta (undo). Ops run in reverse order, so nodes are
+    /// restored before segments that reference them.
     pub fn undo_delta(&mut self, delta: &WiringDelta) {
         for op in delta.0.iter().rev() {
             self.revert_op(op);
         }
     }
 
-    /// Reclaim tombstones: permanently `remove()` any inactive node/segment
-    /// whose key is in neither keep set. Callers pass the union of keys still
-    /// referenced by the undo history (see `History::referenced_wire_keys`), so
-    /// only genuinely unreachable tombstones are dropped. Unwired for now -
-    /// meant to run periodically or when history is cleared/branched.
+    /// Permanently remove any inactive node/segment not in `keep_nodes`/
+    /// `keep_segs` (the keys still referenced by undo history, see
+    /// `History::referenced_wire_keys`). Not yet called anywhere.
     pub fn remove_unreferenced_tombstones(
         &mut self,
         keep_nodes: &HashSet<WireNodeKey>,
@@ -528,10 +496,9 @@ impl Wiring {
 
     // ── Connectivity ────────────────────────────────────────────────────────
 
-    /// Connected groups of the active segment graph, each carrying its node keys
-    /// and the component/tunnel endpoints on it. Isolated nodes (no active
-    /// segments) are skipped. Drives both the circuit rebuild and per-segment
-    /// colouring.
+    /// Connected groups of the active segment graph. Isolated nodes (no
+    /// active segments) are skipped. Drives both the circuit rebuild and
+    /// per-segment colouring.
     pub fn groups(&self) -> Vec<Group> {
         // Union-find over active node keys, unioning the two ends of every
         // active segment.

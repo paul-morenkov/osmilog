@@ -11,11 +11,9 @@ pub enum FanDirection {
 pub struct Splitter {
     arms: u8,
     direction: FanDirection,
-    // routing[i] = Some((arm, slot)) => the i'th data bit is arm `arm`'s
-    // `slot`-th bit; None => unrouted (dropped in Right mode, always 0 in
-    // the merged Left-mode trunk). Only constructible via Splitter::new(),
-    // which builds this from an arm-major Vec<Vec<u8>> so every arm index
-    // here is guaranteed valid.
+    // routing[i] = Some((arm, slot)) => data bit i is arm `arm`'s `slot`-th
+    // bit; None => unrouted (dropped in Right mode, always 0 in the merged
+    // Left-mode trunk).
     routing: Vec<Option<(u8, u8)>>,
     // arm_width[j] = number of data bits owned by arm j. In Right mode this
     // is the width evaluate() gives that arm's output; in Left mode it's
@@ -25,13 +23,10 @@ pub struct Splitter {
 
 impl Splitter {
     // arm_bits[j] lists the data-bit indices routed to arm j, e.g.
-    // arm_bits = [[0, 2], [1, 3]] sends bits 0,2 to arm0 and bits 1,3 to arm1.
-    // Arm indices are just positions in `arm_bits`, so an out-of-range arm
-    // reference isn't representable. If a bit index is listed in more than one
-    // arm, the later arm (by position in `arm_bits`) wins. `direction` picks
-    // which side of this bit-to-arm mapping is the input: Right keeps the
-    // classic splitter shape (1 input bus -> arms outputs); Left inverts it
-    // into a combiner (arms inputs -> 1 output bus), using the same mapping.
+    // [[0, 2], [1, 3]] sends bits 0,2 to arm0 and bits 1,3 to arm1. A bit
+    // listed in more than one arm goes to the later arm. `direction` picks
+    // which side is the input: Right is the classic splitter (1 bus -> arms
+    // outputs); Left inverts it into a combiner (arms inputs -> 1 bus).
     pub fn new(arm_bits: Vec<Vec<u8>>, direction: FanDirection) -> Self {
         let arms = arm_bits.len() as u8;
         let width = arm_bits
@@ -46,10 +41,8 @@ impl Splitter {
                 owner[bit as usize] = Some(arm as u8);
             }
         }
-        // routing[i] = Some((arm, slot)) => data bit i is arm `arm`'s `slot`-th
-        // bit (0 = LSB of that arm's Value), in ascending data-bit order per
-        // arm. Precomputed once here (rather than recounted on every
-        // evaluate() call) since it depends only on arm_bits' structure.
+        // Precomputed once here (not recounted per evaluate() call) since it
+        // depends only on arm_bits' structure; slot 0 = LSB of that arm.
         let mut arm_width = vec![0u8; arms as usize];
         let routing: Vec<Option<(u8, u8)>> = owner
             .into_iter()
@@ -78,14 +71,11 @@ impl Splitter {
     }
 
     // Reconstructs an arm-major arm_bits from routing/arm_width, inverting
-    // the mapping built in new(). Bit-claim collisions were already resolved
-    // at construction time, so this round-trips through Splitter::new() to
-    // an identical routing/arm_width even though it isn't necessarily the
-    // exact Vec<Vec<u8>> originally passed in (e.g. a bit claimed by two
-    // arms only appears under the winning arm here, same as it does in the
-    // live routing table).
-    // Only production caller is Component::spec (now itself unused outside
-    // tests); retained for spec()'s round-trip and this module's own tests.
+    // new(). Round-trips through Splitter::new() to an identical
+    // routing/arm_width, though not necessarily the exact input Vec<Vec<u8>>
+    // (a bit claimed by two arms only appears under the winning arm here).
+    // Only caller is Component::spec (unused outside tests); retained for
+    // its round-trip test and this module's own.
     #[allow(dead_code)]
     pub(crate) fn arm_bits(&self) -> Vec<Vec<u8>> {
         let mut arm_bits: Vec<Vec<u8>> =
@@ -132,11 +122,9 @@ impl CombLogic for Splitter {
             },
             FanDirection::Left => {
                 let arm_vals: Vec<Value> = (0..self.arms as usize).map(|i| inputs[i]).collect();
-                // Every arm that owns >=1 bit must be driven at exactly the
-                // width it owns; Floating or a width mismatch poisons the
-                // whole merged output, mirroring Value's own bitwise-op
-                // width-mismatch convention rather than silently
-                // truncating/zero-extending.
+                // Every arm owning >=1 bit must be driven at exactly that
+                // width; Floating or a mismatch poisons the whole merged
+                // output rather than truncating/zero-extending.
                 let widths_ok = (0..self.arms as usize).all(|arm| {
                     self.arm_width[arm] == 0
                         || matches!(arm_vals[arm], Value::Fixed { width, .. } if width == self.arm_width[arm])

@@ -23,14 +23,12 @@ pub const fn px(cells: u32) -> f32 {
 /// Width of components whose pins sit only on the left/right edges
 const EDGE_BODY_W: u32 = 2;
 
-/// Half-width of components that ALSO carry a centered top/bottom-edge pin
-/// (mux/demux selector, arithmetic carry, encoder enable). The full width is
-/// `2 * CENTER_HALF_W`, so it is always even and its center column
-/// (`CENTER_COL`) is a whole cell - the property that keeps those pins on-grid.
+/// Half-width of components that also carry a centered top/bottom-edge pin
+/// (mux/demux selector, arithmetic carry, encoder enable). Kept even so
+/// `MUX_CENTER_COL` lands on a whole cell.
 const MUX_HALF_W: u32 = 1;
 const MUX_W: u32 = 2 * MUX_HALF_W;
-/// center column of a `CENTERED_BODY_W`-wide body. Read this instead of dividing
-/// a width, so the "is it whole?" question never comes up.
+/// Center column of a `MUX_W`-wide body.
 const MUX_CENTER_COL: u32 = MUX_HALF_W;
 
 /// Similar strategy as `MUX_HALF_W` for arithmetic components, but wider.
@@ -46,12 +44,9 @@ const IO_W: u32 = 2;
 // left/right-edge pins, so any whole-cell width is on-grid. See splitter_shape()
 // for the comb-shaped body this pairs with.
 const SPLITTER_W: u32 = 2;
-// Normalized x-band (relative to the splitter width) of the thin "spine"
-// rectangle; the comb's trunk/teeth strokes extend from here out to x=0.0/x=1.0
-// to reach the pins. Kept narrow (a thin rod, not a block) so most of the width
-// is free for trunk/tooth length - each side needs to clear the ~3px pin dot
-// radius drawn at its far end, plus some margin, or the teeth end up fully
-// hidden under the pin dots.
+// Normalized x-band of the thin "spine" rectangle; trunk/teeth strokes
+// extend from here out to x=0.0/x=1.0 to reach the pins. Kept narrow so each
+// side clears the ~3px pin dot radius, or teeth end up hidden under it.
 const SPLITTER_BODY_X: (f32, f32) = (0.25, 0.60);
 
 // Tunnels have their own width to account for a potentially long label.
@@ -88,18 +83,15 @@ impl From<GridPos> for [i32; 2] {
 
 // ── Stack geometry (in cells) ─────────────────────────────────────────────────
 
-/// How a stack of pins is distributed along a component edge. Both layouts keep
-/// every pin on a whole grid row and keep the stack's centre row whole (height
-/// is always even), so an opposite centred pin (a gate's output, a comparator's
-/// inputs) always has a definite row to line up with.
+/// How a stack of pins is distributed along a component edge. Both layouts
+/// keep the stack's centre row whole (height is always even), so an
+/// opposite centred pin always has a definite row to line up with.
 #[derive(Clone, Copy)]
 enum Pitch {
     /// 2 cells per pin: rows 1, 3, 5, … A roomy, Logisim-style stack.
     Spread,
-    /// 1 cell per pin: rows 1, 2, 3, … For an *even* pin count a 2-cell gap
-    /// straddles the centre, leaving the centre row empty so it can still serve
-    /// as the definite central row. (An odd count keeps its middle pin there,
-    /// so no gap is needed.)
+    /// 1 cell per pin. An even pin count leaves the centre row empty (a
+    /// 2-cell gap) so it stays whole; an odd count's middle pin sits there.
     Tight,
 }
 
@@ -118,8 +110,8 @@ impl Pitch {
         }
     }
 
-    /// Height (in cells) of an edge carrying `k` pins (k>=1). Always even, so the
-    /// stack's centre row is `height / 2` (a whole cell) in either layout.
+    /// Height (in cells) of an edge with `k` pins (k>=1). Always even, so
+    /// `height / 2` is a whole centre row.
     const fn height(self, k: usize) -> u32 {
         let k = if k == 0 { 1 } else { k };
         match self {
@@ -131,8 +123,8 @@ impl Pitch {
     }
 }
 
-/// Gates pack their inputs tightly once there are enough of them that the roomy
-/// spread would make the body needlessly tall; below that they stay spread.
+/// Gates pack inputs tightly once there are enough that a roomy spread would
+/// make the body needlessly tall.
 const fn gate_pitch(n_inputs: usize) -> Pitch {
     if n_inputs > 3 {
         Pitch::Tight
@@ -141,9 +133,9 @@ const fn gate_pitch(n_inputs: usize) -> Pitch {
     }
 }
 
-/// Mux/demux data branches and encoder arms pack tightly once there are enough of
-/// them (sel_width >= 2, i.e. >= 4 branches) that the roomy spread would make the
-/// body needlessly tall; below that they stay spread.
+/// Mux/demux/encoder branches pack tightly once there are enough of them
+/// (sel_width >= 2, i.e. >= 4 branches) that a roomy spread would make the
+/// body needlessly tall.
 const fn sel_pitch(sel_width: u8) -> Pitch {
     if sel_width >= 2 {
         Pitch::Tight
@@ -227,10 +219,10 @@ fn xor_extra_arc() -> Vec<ShapeCmd> {
 
 // ── Bounding-box sizes ────────────────────────────────────────────────────────
 //
-// Zero-allocation size queries, kept as the single source of truth for the
-// width/height formulas - the corresponding *_shape() functions call the same
-// cell helpers (EDGE_BODY_W/CENTERED_BODY_W, stack_h), so a bounding box
-// (e.g. component_bounding_rect) needn't build and discard a full ComponentShape.
+// Zero-allocation size queries, the single source of truth for the
+// width/height formulas - the *_shape() functions call the same cell
+// helpers, so callers like component_bounding_rect needn't build a full
+// ComponentShape just to read its size.
 
 pub const fn gate_size(op: GateOp, n_inputs: usize) -> Vec2 {
     let n = if matches!(op, GateOp::Not) {
@@ -682,13 +674,10 @@ pub fn comparator_shape() -> ComponentShape {
     }
 }
 
-// direction == Right draws the classic splitter: a single trunk pin on the
-// left (input), teeth fanning out to arm pins on the right (outputs). Left
-// mirrors the whole shape horizontally (x -> 1-x) via `mx` and swaps which
-// anchor list holds the trunk vs. the arms, turning it into a combiner: arm
-// pins on the left (inputs), single trunk pin on the right (output) - this
-// must match Component::splitter's Left-mode pin order (arm index ==
-// input pin index, ascending).
+// Right draws the classic splitter (trunk in on the left, arms fanning out
+// on the right); Left mirrors it horizontally via `mx` and swaps trunk/arm
+// anchor lists into a combiner - must match Component::splitter's Left-mode
+// pin order (arm index == input pin index, ascending).
 pub fn splitter_shape(arms: u8, direction: FanDirection) -> ComponentShape {
     let n = arms as usize;
     let pitch = Pitch::Tight; // arms pack tightly

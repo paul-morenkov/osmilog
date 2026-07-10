@@ -11,28 +11,21 @@ pub struct PlacedComponent {
     pub def: ComponentSpec,
     pub grid_pos: GridPos,
     // Tombstone flag, mirroring sim::Component::active and wiring::WireNode::active:
-    // a deleted PlacedComponent is flagged inactive rather than removed from the
-    // SlotMap, so its PlacedCompKey stays valid for undo to restore (Wiring node
-    // bindings, selection, and drag state all reference this key and must not
-    // dangle). Every read that must not see a deleted record iterates through
-    // OsmilogApp::active_components; raw indexing components[k] on a known-live key
-    // is still fine.
+    // a deleted PlacedComponent is flagged inactive rather than removed, so
+    // its PlacedCompKey stays valid for Wiring/selection/drag state that
+    // reference it. Reads iterate OsmilogApp::active_components.
     pub active: bool,
 }
 
 // ── GUI-only visual concerns for ComponentSpec ────────────────────────────────
 //
 // ComponentSpec itself (construction params per component type) lives in
-// sim::component. This impl block adds display-only methods that depend on
-// gui::geometry/gui::shape
-// types the sim layer must not depend on - Rust allows an inherent impl of a
-// crate-local type from any module, so no wrapper/newtype is needed to keep
-// the two concerns apart while still sharing one enum.
+// sim::component. This impl block adds display-only methods depending on
+// gui::geometry/gui::shape types the sim layer must not depend on - a plain
+// second inherent impl, no wrapper/newtype needed.
 impl ComponentSpec {
-    // Zero-allocation bounding-box size, matching shape().size but without
-    // building the full ComponentShape (outline/anchors/bubbles Vecs) just
-    // to read one field - used by component_bounding_rect, which is called
-    // every frame for hit-testing/selection.
+    // Zero-allocation bounding-box size, matching shape().size without
+    // building the full ComponentShape - used every frame for hit-testing.
     pub fn size(&self) -> Vec2 {
         match self {
             Self::Input(_) | Self::Output => io_size(),

@@ -2,10 +2,9 @@ use crate::sim::circuit::{Circuit, SettleError, TunnelKey, TunnelRole};
 use crate::sim::component::{CompKey, Component, Input, Logic, LogicComb, PinId, SeqState};
 use crate::sim::net::NetKey;
 
-// A single structural mutation to a Circuit, expressed as data rather than a
-// direct method call. This is the seam the GUI's undo/redo records against:
-// every Circuit edit goes through Circuit::apply, which returns both the
-// command's output and the UndoAction that reverses it.
+// A single structural mutation to a Circuit, expressed as data so
+// Circuit::apply can dispatch it and return the UndoAction that reverses it -
+// the seam the GUI's undo/redo records against.
 #[derive(Debug)]
 pub enum Command {
     AddComponent(Component),
@@ -86,27 +85,18 @@ impl CommandOutput {
     }
 }
 
-// Enough pre-state to reverse a single applied Command later, captured by
-// Circuit::apply. Every variant is a stable key or a small value - there are
-// no net-structure snapshots and no NetKeys, because the circuit's net
-// structure is *derived* state that the GUI reconstructs from its authoritative
-// Wiring/component/tunnel records after any undo (see
-// gui::app::rebuild_circuit). So the commands that only rebuild nets
-// (`ClearNets`, `Link`, `LinkTunnel`, `DetachTunnel`) capture `NoOp`; only the
-// commands that change authoritative circuit state (component/tunnel existence,
-// input params, tunnel labels, sequential latching) capture a real inverse.
+// Enough pre-state to reverse one applied Command, captured by Circuit::apply.
+// Net structure is *derived* (the GUI rebuilds it from Wiring records after
+// any edit, see gui::app::rebuild_circuit), so commands that only rebuild nets
+// (ClearNets/Link/LinkTunnel/DetachTunnel) capture NoOp; only commands that
+// change authoritative state capture a real inverse.
 //
-// Component/tunnel removal is a tombstone (see Circuit::remove_component), so
-// its inverse is a stable-key reactivation rather than a spec-based
-// re-creation - no new keys (nothing else in the history needs remapping), and
-// a removed Reg's latched state is preserved for the reactivation to restore.
-//
-// Nothing consumes an UndoAction yet: this step records them, a later step
-// (undo()/redo()) will replay them.
+// Component/tunnel removal tombstones (see Circuit::remove_component) rather
+// than deletes, so its inverse is a stable-key reactivation - no new keys, and
+// a removed Reg's latched state is preserved for reactivation to restore.
 #[derive(Debug)]
 pub enum UndoAction {
-    /// Nothing to undo (the forward Command was itself a no-op, or was a
-    /// derived-net reconstruction command that undo re-derives instead).
+    /// No-op, or a derived-net command that undo re-derives instead.
     NoOp,
     /// Undoes `Command::AddComponent`: tombstone the component that was added.
     DeactivateComponent(CompKey),
@@ -129,21 +119,16 @@ pub enum UndoAction {
         tunnel: TunnelKey,
         old_label: String,
     },
-    /// Undoes `Command::TickClock`: restore every sequential component's
-    /// pre-tick persisted state directly. Replaying this needs a new
-    /// `LogicSeq::restore` (the write-side counterpart of `snapshot`) to set
-    /// state without going through `tick()`'s write-enable gating.
+    /// Would undo `Command::TickClock`, but ticks are issued untracked (see
+    /// `apply_undo`), so this variant is never actually reached.
     RestoreSeqState { snapshots: Vec<(CompKey, SeqState)> },
 }
 
 impl Circuit {
-    /// Applies a single structural `Command`, returning its output and the
-    /// `UndoAction` that reverses it. Pre-state is read *before* the delegating
-    /// mutation below where needed (`SetInput`/`RenameTunnel` read the old
-    /// value; `RemoveComponent`/`RemoveTunnel` check "was it active" before
-    /// tombstoning). Does NOT call settle() - callers remain responsible for
-    /// that afterward (`TickClock` excepted, which settles internally).
-    /// Callers that don't need the undo take `.0`.
+    /// Applies a `Command`, returning its output and the `UndoAction` that
+    /// reverses it. Does NOT call `settle()` (callers are responsible, except
+    /// `TickClock` which settles internally). Callers that don't need the
+    /// undo take `.0`.
     pub fn apply(&mut self, command: Command) -> (CommandOutput, UndoAction) {
         match command {
             Command::AddComponent(comp) => {
@@ -242,15 +227,10 @@ impl Circuit {
         }
     }
 
-    /// Applies an `UndoAction` (reversing the `Command` that produced it) and
-    /// returns the `UndoAction` that reverses *this* application - i.e. the entry
-    /// to record on the opposite (redo/undo) stack. This makes undo and redo one
-    /// symmetric operation: applying an action yields its own inverse.
-    ///
-    /// Only authoritative state is touched here (active flags, input values,
-    /// tunnel labels). Net structure is derived - the GUI rebuilds it from its
-    /// Wiring records afterward (`OsmilogApp::refresh_after_history`) - so this
-    /// neither relinks nets nor settles.
+    /// Reverses the `Command` that produced `action`, and returns the
+    /// `UndoAction` that reverses *this* application - so undo/redo is one
+    /// symmetric operation. Touches only authoritative state; net structure
+    /// is derived and rebuilt separately by the GUI.
     pub fn apply_undo(&mut self, action: UndoAction) -> UndoAction {
         match action {
             UndoAction::NoOp => UndoAction::NoOp,

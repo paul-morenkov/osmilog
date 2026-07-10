@@ -35,13 +35,10 @@ const GIT_SHA: &str = env!("OSMILOG_GIT_SHA");
 
 // ── PlacedTunnel ──────────────────────────────────────────────────────────────
 
-// Visual record for a Tunnel (net label / off-page connector). Tunnel lives at the Circuit
-// level as its own SlotMap, tied to a net directly rather than via Component
-// pins. `label` mirrors circuit::Tunnel.label directly (editing it both
-// updates the displayed text and calls circuit.rename_tunnel). Components,
-// by contrast, show only hardcoded, non-editable per-type/pin labels (see
-// ComponentShape::labels) - Tunnels are the only entity with a user-editable
-// label.
+// Visual record for a Tunnel (net label / off-page connector). `label`
+// mirrors circuit::Tunnel.label (editing it updates the text and calls
+// circuit.rename_tunnel) - Tunnels are the only entity with a user-editable
+// label; Components only show hardcoded per-type/pin labels.
 pub struct PlacedTunnel {
     pub key: TunnelKey,
     pub label: String,
@@ -75,11 +72,9 @@ pub enum InteractionMode {
     PlacingTunnel {
         role: TunnelRole,
     },
-    // Drawing a wire (Hybrid: drag = quick elbow, click = add a corner). `points`
-    // are the committed grid corners (points[0] is the anchor); `start_attach`
-    // binds the anchor to a pin/tunnel when the draw began on one; `dragging`
-    // distinguishes a drag (finish on release) from a click-polyline (finish on
-    // clicking a target, double-click, or Esc).
+    // Drawing a wire (drag = quick elbow, click = add a corner). `points` are
+    // the committed grid corners (points[0] = anchor); `dragging` distinguishes
+    // finish-on-release from finish-on-click/double-click/Esc.
     WireDraw {
         points: Vec<GridPos>,
         start_attach: NodeAttach,
@@ -91,11 +86,9 @@ pub enum InteractionMode {
         drag_origin: Pos2,
         original_grid_pos: GridPos,
     },
-    // Rubber-band multi-select, entered by dragging from an empty region.
-    // `start` is the grid cell the drag began on and `current` tracks the
-    // drag's live corner; on release everything inside the box they trace is
-    // added to `bulk_selection`. Both are GridPos so the box snaps to the grid
-    // like every other placement.
+    // Rubber-band multi-select from dragging an empty region; `start`/`current`
+    // are the box corners (GridPos, so it snaps to grid) - on release,
+    // everything inside goes into `bulk_selection`.
     BulkSelect {
         start: GridPos,
         current: GridPos,
@@ -129,19 +122,17 @@ pub struct OsmilogApp {
     pub mode: InteractionMode,
     pub pan: Vec2,
     pub selected: Option<Selected>,
-    // A multi-item selection produced by BulkSelect. Kept separate from the
-    // single `selected` (which drives the properties panel and body-drag): when
-    // this is non-empty, Backspace/Delete removes the whole set. Cleared by a
-    // click in empty space or Escape.
+    // Multi-item selection from BulkSelect, kept separate from `selected`
+    // (properties panel/body-drag): non-empty means Backspace/Delete removes
+    // the whole set. Cleared by a click in empty space or Escape.
     pub bulk_selection: Vec<Selected>,
     // Also surfaces File > Save/Load I/O errors, not just settle() errors -
     // both are transient "something went wrong" status shown in the same
     // red label in the menu bar (see the "Menu bar" section of `ui`).
     pub last_settle_error: Option<String>,
-    // WASM has no synchronous file dialogs (picking/reading a file is
-    // Promise-based), so a load kicked off from the File menu delivers its
-    // result here on some later frame instead of returning directly to the
-    // click handler that started it - see `apply_pending_load`.
+    // WASM file dialogs are Promise-based, so a load kicked off from the File
+    // menu delivers its result here on a later frame, not synchronously - see
+    // `apply_pending_load`.
     #[cfg(target_arch = "wasm32")]
     pending_load: crate::io::wasm::PendingLoad,
 }
@@ -178,10 +169,9 @@ impl OsmilogApp {
         }
     }
 
-    // Applies a Command to the circuit and records its UndoAction into
-    // history, in one place - callers use this exactly like
-    // circuit.apply() (same CommandOutput, same unwrap_* chaining), never
-    // needing to look at the undo data themselves.
+    // Applies a Command and records its UndoAction into history in one place;
+    // callers use it exactly like circuit.apply() (same CommandOutput/unwrap_*
+    // chaining) without touching the undo data themselves.
     fn apply(&mut self, command: Command) -> crate::sim::command::CommandOutput {
         let (output, undo) = self.circuit.apply(command);
         self.history.push_sim(undo);
@@ -191,14 +181,11 @@ impl OsmilogApp {
     // ── Undo / redo ───────────────────────────────────────────────────────────
 
     // Applies one history entry (reversing what it recorded) and returns the
-    // entry that reverses *this* application - the value to record on the
-    // opposite stack. Undo and redo are the same operation in opposite
-    // directions, so both go through here (see undo/redo below).
+    // entry that reverses *this* application, for the opposite stack - undo
+    // and redo are the same operation in opposite directions.
     //
-    // A Batch is applied child-last-first (its sub-edits recorded in the order
-    // they happened); the collected inverses, when the resulting Batch is later
-    // applied the same way, reproduce the original order - so redo of an undone
-    // batch replays it forward.
+    // A Batch applies child-last-first; the collected inverses reproduce the
+    // original order, so redo of an undone batch replays it forward.
     fn apply_entry(&mut self, entry: HistoryEntry) -> HistoryEntry {
         match entry {
             HistoryEntry::Sim(action) => HistoryEntry::Sim(self.circuit.apply_undo(action)),
@@ -233,11 +220,10 @@ impl OsmilogApp {
         }
     }
 
-    // Restores derived state after an undo/redo: re-sync every live record's
-    // wire-node geometry (required for a move-undo, whose MoveComponent carries
-    // no wiring delta - only the grid_pos was restored, so the pin nodes must be
-    // repositioned to match), clear any selection that may now point at a
-    // tombstoned record, then rebuild the circuit's nets + settle.
+    // Restores derived state after an undo/redo: re-sync wire-node geometry
+    // (needed for a move-undo, whose MoveComponent carries no wiring delta),
+    // clear any selection that may now point at a tombstoned record, then
+    // rebuild the circuit's nets + settle.
     fn refresh_after_history(&mut self) {
         let comp_keys: Vec<PlacedCompKey> =
             self.active_components().map(|(k, _)| k).collect();
@@ -311,10 +297,9 @@ impl OsmilogApp {
         pt_key
     }
 
-    // Live (non-tombstoned) placed components / tunnels. Every read that must
-    // not see a deleted-but-retained record iterates through these, mirroring
-    // Wiring::active_nodes/active_segments; raw indexing components[k]/tunnels[k]
-    // on a known-live key stays fine (a tombstone is simply never iterated).
+    // Live (non-tombstoned) placed components/tunnels, mirroring
+    // Wiring::active_nodes/active_segments. Raw indexing on a known-live key
+    // is still fine - a tombstone is simply never iterated.
     fn active_components(&self) -> impl Iterator<Item = (PlacedCompKey, &PlacedComponent)> {
         self.components.iter().filter(|(_, pc)| pc.active)
     }
@@ -323,28 +308,20 @@ impl OsmilogApp {
         self.tunnels.iter().filter(|(_, pt)| pt.active)
     }
 
-    // Rebuilds every circuit net from the GUI wiring graph. clear_nets() drops
-    // all nets while keeping components/tunnels in place, then each connected
-    // wire group is replayed as circuit links: its component pins are linked
-    // together (fan-out and driver-conflict handling live in Circuit::link /
-    // resolve_net) and each tunnel in the group is attached to that net. A
-    // wire group with no component pin (tunnels-only, or purely dangling) has
-    // no net to attach to and is skipped. Called after any wiring edit.
+    // Rebuilds every circuit net from the GUI wiring graph: clear_nets() drops
+    // all nets, then each connected wire group is replayed as circuit links
+    // (fan-out/driver-conflict handling lives in Circuit::link). A group with
+    // no component pin is skipped. Called after any wiring edit.
     pub(crate) fn rebuild_circuit(&mut self) {
-        // History-free: this only reconstructs *derived* net state (labels,
-        // nets), which undo re-derives rather than reverses - so every command
-        // issued here goes through the untracked `self.circuit.apply(..).0`,
-        // records nothing, and needs no batch of its own. A caller's own
-        // authoritative edit (e.g. delete_component's RemoveComponent) is what
-        // it batches, and that happens outside this method.
+        // History-free: this only reconstructs derived net state, which undo
+        // re-derives rather than reverses, so every command here goes through
+        // the untracked `self.circuit.apply(..).0`. A caller's own
+        // authoritative edit is batched outside this method.
 
-        // Reconcile each circuit tunnel's label from its GUI record, which is
-        // the source of truth. The properties panel updates PlacedTunnel.label
-        // live but only commits circuit.rename_tunnel on an explicit Enter, so
-        // without this a label changed some other way (clicking away) would
-        // leave the circuit grouping the tunnel under its stale label - and its
-        // Feed/Pull partner would never join the group. rename_tunnel is a
-        // no-op when the label already matches.
+        // Reconcile each circuit tunnel's label from its GUI record (source of
+        // truth): the properties panel updates PlacedTunnel.label live but only
+        // commits on Enter, so without this a label changed by clicking away
+        // would leave the tunnel grouped under its stale label.
         let renames: Vec<(TunnelKey, String)> = self
             .tunnels
             .values()
@@ -446,11 +423,10 @@ impl OsmilogApp {
         out
     }
 
-    // Resolves what lies under a screen position for wiring purposes: the
-    // attachment to bind (pin/tunnel/free), the on-grid point to route to, and
-    // whether it is a real terminal (pin/tunnel/wire) vs. empty space. Priority:
-    // component pin (out, then in), tunnel pin, existing wire node, wire segment,
-    // else the snapped cursor cell (empty space, not a terminal).
+    // Resolves what lies under a screen position for wiring: the attachment
+    // to bind, the on-grid point to route to, and whether it's a real
+    // terminal vs. empty space. Priority: pin (out, then in), tunnel, wire
+    // node, wire segment, else the snapped cursor cell.
     fn wire_target_at(&self, pos: Pos2, pan: Vec2) -> (NodeAttach, GridPos, bool) {
         if let Some((pck, pin)) = pin_at_pos(self.active_components(), pan, pos, PinKind::Output) {
             let gp = pin_grid_pos(
@@ -494,13 +470,10 @@ impl OsmilogApp {
     // ── Save / load ──────────────────────────────────────────────────────
 
     pub fn to_circuit_file(&self) -> CircuitFile {
-        // PlacedCompKey/PlacedTunnelKey -> position in the Vec being emitted,
-        // so wire nodes can reference components/tunnels by index instead of a
-        // slotmap key. Built here, then read when emitting `nodes` below.
-        // Only live components/tunnels are persisted - tombstones (kept for undo)
-        // never reach the save file, matching active_nodes/active_segments below.
-        // Active wire nodes only attach to active components/tunnels, so every
-        // comp_index/tunnel_index lookup emitted below resolves.
+        // PlacedCompKey/PlacedTunnelKey -> position in the emitted Vec, so
+        // wire nodes reference components/tunnels by index instead of a
+        // slotmap key. Only live records are persisted - tombstones never
+        // reach the save file.
         let mut comp_index: HashMap<PlacedCompKey, usize> = HashMap::new();
         let components: Vec<ComponentEntry> = self
             .active_components()
@@ -582,10 +555,9 @@ impl OsmilogApp {
         }
     }
 
-    // Replaces the current circuit entirely with the one described by
-    // `file`. Validates first so a malformed file (e.g. hand-edited with a
-    // bad index) is rejected before any existing state is touched, rather
-    // than leaving `self` half-overwritten.
+    // Replaces the current circuit with the one described by `file`.
+    // Validates first so a malformed file is rejected before any existing
+    // state is touched.
     pub fn load_circuit_file(&mut self, file: &CircuitFile) -> Result<(), LoadError> {
         file.validate()?;
 
@@ -652,8 +624,8 @@ impl OsmilogApp {
         Ok(())
     }
 
-    /// Shows property menu for the currently selected item. ComponentSpec for the UI element is
-    /// cloned. If the user edits a property, call `self.reconfigure_component()` with an updated ComponentSpec
+    /// Shows the properties panel for the selected item. Edits call
+    /// `self.reconfigure_component()` with an updated `ComponentSpec`.
     fn show_properties(&mut self, ui: &mut egui::Ui) {
         let Some(sel) = self.selected else {
             if !self.bulk_selection.is_empty() {
@@ -701,15 +673,11 @@ impl OsmilogApp {
             self.tunnels[key].label = label.clone();
         }
 
-        // Commit on any focus loss - Enter, Tab, or clicking away - not only
-        // Enter. Committing only on Enter left the GUI label (updated above on
-        // `changed()`) ahead of the circuit's, so a tunnel renamed by clicking
-        // away stayed grouped under its old label and its Feed partner read
-        // Floating. (rebuild_circuit also reconciles as a backstop.)
-        // The record label is already updated live (on `changed()` above), so
-        // the pre-edit label survives only in the circuit, which RenameTunnel
-        // hasn't committed yet - read it there to both detect a real change and
-        // capture the undo's restore value.
+        // Commit on any focus loss (Enter/Tab/click-away), not just Enter: the
+        // record label is already updated live above (on `changed()`), but the
+        // circuit's hasn't committed yet, so read the old label from the
+        // circuit to both detect a real change and capture undo's restore
+        // value. (rebuild_circuit also reconciles as a backstop.)
         if response.lost_focus() {
             let old_label = self
                 .circuit
@@ -1002,11 +970,9 @@ impl OsmilogApp {
                         .changed();
                 });
 
-                // Apply width/arms bookkeeping before rendering bit rows below, so a
-                // shrink is reflected in the same frame. Truncating arm_bits below
-                // `arms` correctly drops any bits assigned to a removed arm - nothing
-                // else references that arm index, since arm-major storage has nothing
-                // else to clean up.
+                // Apply width/arms bookkeeping before rendering bit rows below,
+                // so a shrink is reflected the same frame; truncating drops
+                // any bits assigned to a removed arm.
                 arm_bits.resize_with(arms as usize, Vec::new);
                 for list in &mut arm_bits {
                     list.retain(|&b| b < width);
@@ -1061,10 +1027,9 @@ impl OsmilogApp {
         }
     }
 
-    // Swaps a placed component's parameters. The PlacedCompKey is stable and the
-    // wiring binds to it, so attached wires survive automatically - we only drop
-    // wire nodes for pins the new arity no longer has, re-sync the surviving
-    // anchors to the new pin positions, then rebuild the circuit from the wiring.
+    // Swaps a placed component's parameters. PlacedCompKey stays stable, so
+    // attached wires survive - we only drop wire nodes for pins the new
+    // arity no longer has, re-sync the rest, then rebuild.
     fn reconfigure_component(&mut self, pc_key: PlacedCompKey, new_def: ComponentSpec) {
         self.history.begin_batch();
         let old_key = self.components[pc_key].key;
@@ -1162,9 +1127,8 @@ impl OsmilogApp {
     }
 
     // Every component, tunnel, and wire segment fully contained in `rect`
-    // (screen space). Used by BulkSelect to turn a rubber-band box into a
-    // selection: a component/tunnel counts when its whole bounding rect is
-    // inside, a wire when both its endpoints are.
+    // (screen space): a component/tunnel counts when its bounding rect is
+    // inside, a wire when both endpoints are.
     fn items_in_rect(&self, rect: Rect, pan: Vec2) -> Vec<Selected> {
         let mut out = Vec::new();
         for (key, pc) in self.active_components() {
@@ -1187,11 +1151,10 @@ impl OsmilogApp {
         out
     }
 
-    // Removes everything in `bulk_selection` in one shot: wire segments first,
-    // then components/tunnels (whose removal also drops their own wire nodes).
-    // Each removal is guarded by an existence check because deleting a component
-    // can take a wire in the same set with it, and rebuilds the circuit once at
-    // the end rather than per item.
+    // Removes everything in `bulk_selection`: wire segments first, then
+    // components/tunnels (which drop their own wire nodes too). Each removal
+    // is existence-checked since deleting a component can take a wire in the
+    // same set with it. Rebuilds once at the end.
     fn delete_bulk(&mut self) {
         self.history.begin_batch();
         let items = std::mem::take(&mut self.bulk_selection);
@@ -1461,8 +1424,7 @@ impl eframe::App for OsmilogApp {
                 if ui.button("Tick Clock").clicked() {
                     // A clock tick is a simulation step, not an edit - issue it
                     // untracked (bypassing self.apply) so it never lands on the
-                    // undo stack. Its RestoreSeqState replay isn't implemented,
-                    // and undo is scoped to structural edits only.
+                    // undo stack (undo is scoped to structural edits only).
                     let result = self.circuit.apply(Command::TickClock).0.unwrap_settle();
                     self.record_settle_result(result);
                 }
@@ -1526,10 +1488,9 @@ impl eframe::App for OsmilogApp {
                 self.mode = InteractionMode::Idle;
             }
 
-            // Backspace/Delete removes the current selection. A non-empty bulk
-            // selection takes priority and is removed as a whole. Guard on widget
-            // focus so a Backspace aimed at the tunnel-label text field (or any
-            // focused widget) edits text instead of deleting.
+            // Backspace/Delete removes the current selection (bulk selection
+            // takes priority). Guarded on widget focus so it edits a focused
+            // text field instead of deleting.
             let editing_text = ctx.memory(|m| m.focused().is_some());
             let delete_pressed = ctx
                 .input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete));
@@ -1951,11 +1912,8 @@ fn route_elbow(from: GridPos, to: GridPos) -> Vec<GridPos> {
     }
 }
 
-// Takes an already-computed ComponentShape rather than a &PlacedComponent so
-// callers that need multiple pins from the same component (draw_component,
-// pin_at_pos) compute shape() once and reuse it, instead of each call
-// redundantly rebuilding the whole shape (outline/anchors/bubbles Vecs)
-// just to read one anchor.
+// Takes an already-computed ComponentShape (not &PlacedComponent) so callers
+// needing multiple pins from one component compute shape() once and reuse it.
 fn comp_pin_pos(shape: &ComponentShape, grid_pos: GridPos, pan: Vec2, pin: PinId) -> Pos2 {
     let tl = egui::pos2(
         grid_pos.x as f32 * GRID_SIZE + pan.x,

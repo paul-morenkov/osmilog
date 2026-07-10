@@ -4,41 +4,28 @@ use crate::gui::wiring::{NodeAttach, WiringDelta};
 use crate::sim::component::{CompKey, ComponentSpec};
 
 // Undo data for a GUI-level (Wiring/geometry) edit - the counterpart of
-// sim::command::UndoAction, but recorded onto the same gui::history::History
+// sim::command::UndoAction, recorded onto the same gui::history::History
 // stack (as HistoryEntry::Gui) so a GUI edit can share a Batch with the Sim
-// UndoActions it triggers (e.g. a wiring edit followed by rebuild_circuit's
-// net relink). Deliberately separate from UndoAction because Wiring/GridPos/
-// PlacedCompKey are GUI-only types that must never leak into sim.
+// UndoActions it triggers. Kept separate from UndoAction because Wiring/
+// GridPos/PlacedCompKey must never leak into sim.
 //
-// There is no "GuiCommand" enum: unlike the sim side, where each Command
-// variant produces a genuinely different fine-grained inverse, every Wiring
-// mutator's inverse is just "replay this delta backwards". So OsmilogApp calls
-// the Wiring methods directly and hands the WiringDelta they return to
-// edit_wiring - no command-as-data indirection to re-select a method the
-// caller already chose.
+// No "GuiCommand" enum: every Wiring mutator's inverse is just "replay this
+// delta backwards", so OsmilogApp calls the Wiring methods directly and
+// hands the returned WiringDelta to edit_wiring.
 #[derive(Debug)]
 pub enum GuiUndoAction {
-    // Undoes any Wiring-graph edit (add_route / delete_segment /
-    // remove_component_nodes / remove_tunnel_nodes / prune_stale_pins): the
-    // compact, invertible op list that edit captured. Its stored size is
-    // proportional to the entries the edit touched, not the whole graph - see
-    // gui::wiring::WiringDelta.
-    //
-    // `forward` picks the replay direction so the *same* delta serves both undo
-    // and redo across the two history stacks: applying it with forward=false
-    // runs `undo_delta` (revert), with forward=true runs `redo_delta` (re-apply);
-    // apply_gui_undo returns the variant with `forward` flipped. Recorded as
-    // forward=false by edit_wiring, since the first application of a recorded
-    // edit is always its undo.
+    // Undoes any Wiring-graph edit (add_route/delete_segment/
+    // remove_component_nodes/remove_tunnel_nodes/prune_stale_pins) via the
+    // delta it captured. `forward` picks the replay direction so the same
+    // delta serves undo (false, runs undo_delta) and redo (true, runs
+    // redo_delta) across the two stacks; apply_gui_undo flips it each time.
     WiringDelta {
         delta: WiringDelta,
         forward: bool,
     },
-    // Undoes a component drag-move. Pushed directly (not via edit_wiring) from
-    // OsmilogApp::commit_move: grid_pos is written every drag frame for live
-    // visual feedback, so by the time the drag ends there's no "before"
-    // state left to read - only the original_grid_pos captured at drag-start
-    // (already needed for Escape-cancel) still has it.
+    // Undoes a component drag-move. Pushed directly from commit_move, not
+    // edit_wiring: grid_pos is overwritten every drag frame, so by drag-end
+    // there's no "before" state left except the drag-start original_grid_pos.
     MoveComponent {
         key: PlacedCompKey,
         old_pos: GridPos,
@@ -47,13 +34,11 @@ pub enum GuiUndoAction {
         key: PlacedTunnelKey,
         old_pos: GridPos,
     },
-    // GUI-authoritative record deltas: these cover record mutations the sim-side
-    // Command/UndoAction path has no notion of. All swap-style - they carry the
-    // value to restore, and apply_gui_undo returns the variant carrying the
-    // value it displaced, so undo and redo are one symmetric operation.
-    //
-    // Component/tunnel tombstone toggle (place records active=true then undo
-    // sets it false; delete sets false then undo restores true).
+    // GUI-authoritative record deltas the sim-side Command/UndoAction path has
+    // no notion of. All swap-style: carry the value to restore, and
+    // apply_gui_undo returns the value it displaced.
+
+    // Component/tunnel tombstone toggle.
     SetComponentActive {
         key: PlacedCompKey,
         active: bool,
@@ -78,10 +63,7 @@ pub enum GuiUndoAction {
 
 impl OsmilogApp {
     // Records a Wiring edit's delta into history, iff it changed anything.
-    // The GUI counterpart of OsmilogApp::apply() for the Command/UndoAction
-    // path: the Wiring mutators already return the WiringDelta (see
-    // gui::wiring), so this is a plain pusher - callers do
-    // `let delta = self.wiring.<edit>(..); self.edit_wiring(delta);`.
+    // The GUI counterpart of OsmilogApp::apply() for the Command path.
     pub(crate) fn edit_wiring(&mut self, delta: WiringDelta) {
         if !delta.is_empty() {
             self.history.push_gui(GuiUndoAction::WiringDelta {
@@ -91,11 +73,10 @@ impl OsmilogApp {
         }
     }
 
-    // Applies one GUI undo action to the records/wiring and returns the action
-    // that reverses *this* application (to record on the opposite history stack).
-    // The GUI counterpart of Circuit::apply_undo; see GuiUndoAction for the
-    // swap-style contract. Does not settle or rebuild nets - the undo/redo engine
-    // (refresh_after_history) does that once after the whole entry is applied.
+    // Applies one GUI undo action and returns the action that reverses *this*
+    // application (recorded on the opposite stack) - the GUI counterpart of
+    // Circuit::apply_undo. Does not settle or rebuild nets; refresh_after_history
+    // does that once after the whole entry is applied.
     pub(crate) fn apply_gui_undo(&mut self, action: GuiUndoAction) -> GuiUndoAction {
         match action {
             GuiUndoAction::WiringDelta { delta, forward } => {
@@ -189,11 +170,9 @@ impl OsmilogApp {
         }
     }
 
-    // Draws a wire route and relinks the circuit as one undo entry: the
-    // Wiring-graph change and rebuild_circuit's resulting net relink are
-    // batched together so they collapse into one HistoryEntry::Batch mixing
-    // a Gui(WiringDelta) with the Sim(_) entries from ClearNets/Link/
-    // LinkTunnel, rather than landing as two separate stack entries.
+    // Draws a wire route and relinks the circuit as one undo entry: batches
+    // the Wiring-graph change with rebuild_circuit's net relink into one
+    // HistoryEntry::Batch instead of two separate entries.
     pub(crate) fn commit_wire_route(
         &mut self,
         points: Vec<GridPos>,

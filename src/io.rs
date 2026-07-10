@@ -1,17 +1,12 @@
-// Save/load format for whole circuits, meant to be shared as a plain JSON
-// file (readable, diffable in git, hand-editable). `CircuitFile` mirrors the
-// GUI's visual state (PlacedComponent/PlacedTunnel + the wiring graph in
-// src/gui/app.rs / src/gui/wiring.rs), not the sim `Circuit`'s internal
-// SlotMaps directly - CompKey/TunnelKey/NetKey are ephemeral generational-arena
-// identifiers assigned at runtime, not stable identity worth persisting. Every
-// cross-reference here is a plain `usize` index into `components`/`tunnels`/
-// `nodes` (position in the Vec, assigned at save time), not a slotmap key.
+// Save/load format for whole circuits, shared as a plain JSON file. Mirrors
+// the GUI's visual state (PlacedComponent/PlacedTunnel + the wiring graph),
+// not sim `Circuit`'s SlotMaps directly - slotmap keys are ephemeral, so
+// every cross-reference here is a plain `usize` index into
+// `components`/`tunnels`/`nodes` instead.
 //
-// This module is deliberately gui-light: it only depends on the plain-data
-// types (ComponentSpec, GateOp, FanDirection, TunnelRole) needed to describe
-// a circuit's shape, not on OsmilogApp itself - the App<->CircuitFile
-// conversion logic (OsmilogApp::to_circuit_file / load_circuit_file) lives
-// in app.rs, which already owns the SlotMaps this format needs to walk.
+// Deliberately gui-light: depends only on plain-data types (ComponentSpec,
+// GateOp, FanDirection, TunnelRole), not OsmilogApp itself - the
+// App<->CircuitFile conversion lives in app.rs, which owns the SlotMaps.
 
 use serde::{Deserialize, Serialize};
 
@@ -120,12 +115,10 @@ impl CircuitFile {
     }
 
     // Checks the version and every cross-reference's bounds without
-    // touching any app state, so a caller (e.g. OsmilogApp::load_circuit_file)
-    // can validate a file - possibly hand-edited - before committing to
-    // replacing the current circuit. Does not check that a node's pin index
-    // is within the referenced component's actual pin count; the sim layer
-    // doesn't validate that either yet (see Circuit::link's pin-index
-    // TODOs), so an out-of-range pin index can still panic downstream.
+    // touching app state, so a caller can validate a possibly hand-edited
+    // file before committing to it. Does NOT check a node's pin index
+    // against the component's actual arity - out-of-range can still panic
+    // downstream (see Circuit::link's pin-index TODOs).
     pub fn validate(&self) -> Result<(), LoadError> {
         if self.version != CURRENT_VERSION {
             return Err(LoadError::UnsupportedVersion {
@@ -177,12 +170,10 @@ impl CircuitFile {
 
 // ── File I/O ──────────────────────────────────────────────────────────────
 //
-// Native and WASM need genuinely different mechanics here (blocking OS
-// dialogs + a real filesystem vs. Promise-based browser APIs with no
-// filesystem at all), so each gets its own submodule rather than one
-// function with `#[cfg]`s sprinkled through its body. Both stay
-// OsmilogApp-agnostic: they take/return `CircuitFile`/`String`, not app
-// state, so the GUI's menu handlers (src/gui/app.rs) are thin callers.
+// Native and WASM need genuinely different mechanics (blocking OS dialogs
+// vs. Promise-based browser APIs), so each gets its own submodule instead of
+// one function full of `#[cfg]`s. Both stay OsmilogApp-agnostic, taking/
+// returning `CircuitFile`/`String` only.
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native {
@@ -224,23 +215,18 @@ pub mod wasm {
 
     use super::CircuitFile;
 
-    // The browser has no synchronous file dialogs - picking and reading a
-    // file are both Promise-based, so a spawned load task can't just
-    // `return` its result to the button click handler that started it.
-    // Instead it delivers the outcome into this shared slot, which the host
-    // app polls once per frame (see OsmilogApp::logic).
+    // The browser has no synchronous file dialogs, so a spawned load task
+    // delivers its outcome into this shared slot instead of returning it;
+    // the host app polls it once per frame (see OsmilogApp::logic).
     pub type PendingLoad = Rc<RefCell<Option<Result<CircuitFile, String>>>>;
 
     pub fn new_pending_load() -> PendingLoad {
         Rc::new(RefCell::new(None))
     }
 
-    // Triggers a browser download of `contents` as `filename` via the
-    // classic Blob + object URL + synthetic `<a download>` click. Chosen
-    // over the File System Access API's save picker (which `rfd`'s wasm
-    // backend uses) because that API is Chromium-only; this works in every
-    // browser and matches "save downloads a file" rather than "save opens a
-    // dialog", per the differing native/WASM save UX.
+    // Triggers a browser download via Blob + object URL + synthetic
+    // `<a download>` click, rather than the File System Access API's save
+    // picker (which `rfd`'s wasm backend uses) - that API is Chromium-only.
     pub fn trigger_download(filename: &str, contents: &str) {
         let window = web_sys::window().expect("no window");
         let document = window.document().expect("no document");

@@ -4,13 +4,11 @@ use crate::gui::gui_undo::GuiUndoAction;
 use crate::gui::wiring::{WireNodeKey, WireSegKey};
 use crate::sim::command::UndoAction;
 
-// One entry in the undo history: either a Circuit-level UndoAction (from
-// OsmilogApp::apply()), a GUI-level GuiUndoAction (from OsmilogApp::edit_wiring()
-// or a direct push after a drag-move), or a Batch of either/both collapsed
-// into one user-visible step. Sim and GUI actions are deliberately two
-// separate types - Circuit has no notion of grid_pos/Wiring - but they share
-// one interleaved stack so a single user gesture that touches both (e.g.
-// drawing a wire also relinks nets) stays one entry instead of two.
+// One entry in the undo history: a Circuit-level UndoAction, a GUI-level
+// GuiUndoAction, or a Batch of either/both collapsed into one user-visible
+// step. Sim and GUI actions stay separate types (Circuit has no notion of
+// grid_pos/Wiring) but share one interleaved stack, so a gesture touching
+// both (e.g. drawing a wire also relinks nets) stays one entry.
 #[derive(Debug)]
 pub enum HistoryEntry {
     Sim(UndoAction),
@@ -18,29 +16,21 @@ pub enum HistoryEntry {
     Batch(Vec<HistoryEntry>),
 }
 
-// Accumulates HistoryEntrys from every OsmilogApp::apply()/edit_wiring() call
-// (see app.rs). Lives on the GUI side, not on Circuit, since batching
-// boundaries ("this delete is one undo step") are a GUI-level concept
-// Circuit has no visibility into.
+// Accumulates HistoryEntrys from every OsmilogApp::apply()/edit_wiring() call.
+// Lives on the GUI side, not Circuit, since batching boundaries ("this delete
+// is one undo step") are a GUI-level concept.
 //
-// begin_batch/end_batch use a depth counter rather than a single flag
-// because top-level App methods that issue multiple apply()/edit_wiring() calls
-// (e.g. rebuild_circuit) are themselves called from inside other top-level
-// methods that issue their own apply() calls first (e.g. delete_component
-// calls apply(RemoveComponent) then rebuild_circuit()) - without
-// depth-counting, a batch opened only inside the inner call would close
-// before the outer method's own edit was accounted for, splitting one
-// user-visible action into two undo entries. Nesting is safe to do
-// uniformly: a single-call method wrapped in begin_batch/end_batch produces
-// the same one stack entry as not wrapping it at all.
+// begin_batch/end_batch use a depth counter, not a flag, because top-level
+// methods that issue multiple apply()/edit_wiring() calls can themselves be
+// called from inside other such methods (e.g. delete_component calls
+// apply(RemoveComponent) then rebuild_circuit()) - without depth-counting, an
+// inner batch would close before the outer edit was accounted for, splitting
+// one user gesture into two undo entries.
 //
-// Two stacks: `undo_stack` grows as edits are recorded (push_sim/push_gui/
-// end_batch), `redo_stack` holds entries popped by undo() so redo() can replay
-// them. Any *fresh* edit clears redo_stack (the standard branch-invalidation:
-// once you edit after undoing, the undone future is gone). The undo/redo engine
-// (OsmilogApp::undo/redo) moves entries between the two stacks via pop_undo/
-// pop_redo + push_redo/push_undo, which deliberately do NOT clear the opposite
-// stack.
+// Two stacks: `undo_stack` grows via push_sim/push_gui/end_batch; `redo_stack`
+// holds entries popped by undo() so redo() can replay them. Any fresh edit
+// clears redo_stack (standard branch-invalidation). pop_*/push_* deliberately
+// do NOT clear the opposite stack.
 #[derive(Default)]
 pub struct History {
     undo_stack: Vec<HistoryEntry>,
@@ -122,11 +112,9 @@ impl History {
         self.undo_stack.push(entry);
     }
 
-    /// The union of every wire node/segment key referenced by any WiringDelta
-    /// anywhere in the history (recursing into Batches, and including a pending
-    /// open batch). This is the keep-set a tombstone GC pass consumes - see
-    /// `Wiring::remove_unreferenced_tombstones`. Unwired for now, alongside the
-    /// GC it feeds.
+    /// Keep-set for tombstone GC: every wire node/segment key referenced by
+    /// any WiringDelta in the history, including a pending open batch. See
+    /// `Wiring::remove_unreferenced_tombstones`. Not yet called anywhere.
     #[allow(dead_code)]
     pub fn referenced_wire_keys(&self) -> (HashSet<WireNodeKey>, HashSet<WireSegKey>) {
         let mut nodes = HashSet::new();

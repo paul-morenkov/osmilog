@@ -36,11 +36,9 @@ new_key_type! {
 pub struct Component {
     pub pins: Pins,
     pub logic: Logic,
-    // `false` marks a tombstone - a component the circuit keeps (so its CompKey
-    // stays valid, and a Reg's latched state survives) but that undo has
-    // logically removed. Skipped by the engine's whole-component sweeps
-    // (tick_clock, clear_nets re-eval); reactivated by undo. See
-    // sim::command::UndoAction and Circuit::remove_component/reactivate_component.
+    // `false` marks a tombstone: kept so CompKey stays valid and a Reg's
+    // latched state survives, but skipped by whole-component sweeps
+    // (tick_clock, clear_nets). See Circuit::remove_component/reactivate_component.
     pub(crate) active: bool,
 }
 
@@ -144,10 +142,9 @@ impl Component {
         let inputs = self.read_inputs(nets);
         match &self.logic {
             Logic::Comb(comb) => comb.evaluate(&inputs),
-            // Sequential components never mutate state or recompute outputs via the
-            // combinational path (add_component / attach / neighboring net changes) -
-            // they just report their currently latched value(s). State only changes
-            // via tick().
+            // Sequential components never recompute via the combinational
+            // path - they just report their latched value(s). State only
+            // changes via tick().
             Logic::Seq(seq) => seq.observe(),
         }
     }
@@ -203,14 +200,12 @@ impl Component {
         }
     }
 
-    // A Clone-able reconstruction record for this component's construction
-    // parameters (not its live pin wiring or persisted sequential state) - the
-    // inverse of `ComponentSpec::to_component`. No production caller since undo
-    // stopped snapshotting removed components into specs (removal now
-    // tombstones the live Component in place - see sim::command::UndoAction);
-    // retained, with `test_component_spec_round_trips_pin_arity`, to guard the
-    // ComponentSpec<->Component arity invariant the GUI's PlacedComponent.def
-    // relies on.
+    // Reconstruction record for this component's construction parameters
+    // (not live wiring or persisted state) - the inverse of
+    // `ComponentSpec::to_component`. No production caller now that undo
+    // tombstones removed components instead of snapshotting them; retained
+    // (with `test_component_spec_round_trips_pin_arity`) to guard the arity
+    // invariant PlacedComponent.def relies on.
     #[allow(dead_code)]
     pub(crate) fn spec(&self) -> ComponentSpec {
         match &self.logic {
@@ -235,15 +230,11 @@ impl Component {
     }
 }
 
-// The single canonical "construction params" record for a component - one
-// variant per component type, holding just enough to rebuild an equivalent
-// `Component` via `to_component()` (the inverse being `Component::spec`). Used
-// unmodified as the GUI's own placed-component record: gui::placed_component
-// adds a second inherent impl block with GUI-only display methods (`size`,
-// `label`, `shape`) that depend on gui::geometry/gui::shape types the sim
-// layer must not depend on - Rust allows an inherent impl of a crate-local
-// type from any module in the crate, so no wrapper/newtype is needed to keep
-// those concerns apart.
+// The canonical "construction params" record for a component - one variant
+// per type, holding just enough to rebuild an equivalent `Component` via
+// `to_component()` (inverse: `Component::spec`). Reused unmodified as the
+// GUI's placed-component record: gui::placed_component adds a second
+// inherent impl with GUI-only display methods, no wrapper/newtype needed.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ComponentSpec {
     Input(Input),
@@ -259,12 +250,10 @@ pub enum ComponentSpec {
     Divider(Divider),
     Comparator(Comparator),
     Splitter {
-        // The trunk width currently being edited in the GUI properties
-        // panel, independent of how many bits `arm_bits` actually assigns
-        // (a widened trunk may not yet have every bit routed to an arm).
-        // Splitter::new derives its real data_width from arm_bits alone, so
-        // to_component() never reads this back out - it exists only so the
-        // GUI has somewhere to keep the in-progress width while editing.
+        // The trunk width being edited in the GUI properties panel,
+        // independent of how many bits `arm_bits` actually assigns.
+        // to_component() never reads this back - Splitter::new derives the
+        // real data_width from arm_bits alone.
         width: u8,
         arm_bits: Vec<Vec<u8>>,
         direction: FanDirection,
@@ -379,22 +368,18 @@ pub enum Logic {
     Seq(LogicSeq),
 }
 
-// Each LogicComb variant (other than the parameterless Output) wraps a struct, named after the
-// component itself, that implements CombLogic: its construction parameters, its own pin arity
-// (n_inputs/n_outputs), and its own evaluate() live together in one place, so a component's
-// declared pin count and what evaluate() actually reads/returns can't drift apart the way a
-// separate constructor and evaluate() match arm could. The trait (rather than separate inherent
-// impls) makes that trio a compiler-checked contract: forgetting evaluate() on a new component
-// struct is a "trait not implemented" error, not a silent gap only caught when some match arm
-// tries to call it. Pins::new() in Component::from_comb() is sized directly from these methods.
+// Each LogicComb variant (besides Output) wraps a struct implementing
+// CombLogic: construction params, pin arity, and evaluate() live together so
+// they can't drift apart. The trait makes that a compiler-checked contract -
+// forgetting evaluate() on a new type is a "trait not implemented" error,
+// not a silent gap. Pins::new() sizes directly from these methods.
 pub trait CombLogic {
     fn n_inputs(&self) -> usize;
     fn n_outputs(&self) -> usize;
     fn evaluate(&self, inputs: &[Value]) -> Vec<Value>;
-    // Expected bit width of input/output pin `i`, from this component's own construction
-    // parameters (not from any Value currently on a net). None means the pin accepts/produces
-    // any width (currently only Output). Used by Circuit::resolve_net() to flag a Net whose
-    // attached pins disagree on width, independent of whether a concrete Value is present.
+    // Expected bit width of pin `i`, from construction params (not any live
+    // Value). None means any width (currently only Output). Used by
+    // Circuit::resolve_net() to flag width-disagreeing nets.
     fn input_width(&self, i: usize) -> Option<u8>;
     fn output_width(&self, i: usize) -> Option<u8>;
 }
@@ -502,10 +487,9 @@ impl LogicComb {
     }
 }
 
-// LogicSeq mirrors LogicComb, except its config struct (Reg) holds only static construction
-// parameters - the mutable latched `value` lives alongside it in the enum variant, not inside
-// the struct, so ComponentDef (a visual *construction* record) can embed the config struct
-// directly without also carrying simulated runtime state around (see gui/placed_component.rs).
+// LogicSeq mirrors LogicComb, except its config struct (Reg) holds only
+// static params - the mutable latched `value` lives in the enum variant, not
+// the struct, so a construction record can embed Reg without runtime state.
 #[derive(Debug)]
 pub enum LogicSeq {
     Reg { config: Reg, value: Value },
