@@ -11,7 +11,11 @@ use crate::sim::net::NetKey;
 #[derive(Debug)]
 pub enum Command {
     AddComponent(Component),
-    SetInput { comp: CompKey, bits: u32, width: u8 },
+    SetInput {
+        comp: CompKey,
+        bits: u32,
+        width: u8,
+    },
     ClearNets,
     Link {
         a: CompKey,
@@ -19,7 +23,10 @@ pub enum Command {
         b: CompKey,
         b_pin: PinId,
     },
-    AddTunnel { label: String, role: TunnelRole },
+    AddTunnel {
+        label: String,
+        role: TunnelRole,
+    },
     LinkTunnel {
         tunnel: TunnelKey,
         comp: CompKey,
@@ -27,7 +34,10 @@ pub enum Command {
     },
     DetachTunnel(TunnelKey),
     RemoveTunnel(TunnelKey),
-    RenameTunnel { tunnel: TunnelKey, new_label: String },
+    RenameTunnel {
+        tunnel: TunnelKey,
+        new_label: String,
+    },
     TickClock,
     RemoveComponent(CompKey),
 }
@@ -92,11 +102,16 @@ impl CommandOutput {
 pub enum UndoAction {
     /// Nothing to undo (the forward Command was itself a no-op, e.g.
     /// SetInput on a non-Input component, or a rename to an identical label).
-    Noop,
-    /// Several UndoActions that together undo one logical GUI-level edit;
-    /// undoing must replay them in reverse order. Never produced by
-    /// `apply_tracked` itself - assembled by whatever groups a batch of
-    /// `apply_tracked` calls together (see gui::history::History).
+    NoOp,
+    /// Several UndoActions that together undo one logical edit; undoing must
+    /// replay them in reverse order. Never produced by `apply_tracked`
+    /// itself - a caller that wants to batch several `apply_tracked` calls
+    /// into one entry would assemble this directly. `gui::history::History`
+    /// does its own batching one level up instead (its stack holds
+    /// `HistoryEntry::Batch`, which can mix this Sim-only `UndoAction` with
+    /// GUI-only `GuiUndoAction`s), so this variant is currently unused by the
+    /// GUI - it remains as the primitive for any future non-GUI caller that
+    /// batches `apply_tracked` calls directly.
     Batch(Vec<UndoAction>),
 
     /// Undoes `Command::AddComponent`: just remove the component that was
@@ -143,7 +158,10 @@ pub enum UndoAction {
         net: Option<NetKey>,
     },
     /// Undoes `Command::RenameTunnel`.
-    RenameTunnel { tunnel: TunnelKey, old_label: String },
+    RenameTunnel {
+        tunnel: TunnelKey,
+        old_label: String,
+    },
     /// Undoes `Command::TickClock`: restore every sequential component's
     /// pre-tick persisted state directly. Replaying this needs a new
     /// `LogicSeq::restore` (the write-side counterpart of `snapshot`) to set
@@ -167,7 +185,7 @@ pub enum UndoAction {
 #[derive(Debug)]
 pub enum LinkUndo {
     /// The two pins were already on the same net (link is idempotent).
-    Noop,
+    NoOp,
     /// A brand-new net was created for both pins (neither had one before):
     /// undo by detaching both. Replaying this needs a new primitive to
     /// detach a single pin without removing the whole component.
@@ -218,10 +236,7 @@ impl Circuit {
             }
             Command::SetInput { comp, bits, width } => {
                 let old = match &self.components[comp].logic {
-                    Logic::Comb(LogicComb::Input(Input {
-                        bits: b,
-                        width: w,
-                    })) => Some((*b, *w)),
+                    Logic::Comb(LogicComb::Input(Input { bits: b, width: w })) => Some((*b, *w)),
                     _ => None,
                 };
                 self.set_input(comp, bits, width);
@@ -231,7 +246,7 @@ impl Circuit {
                         old_bits,
                         old_width,
                     },
-                    None => UndoAction::Noop,
+                    None => UndoAction::NoOp,
                 };
                 (CommandOutput::None, undo)
             }
@@ -289,9 +304,15 @@ impl Circuit {
                 let net = self.link(a, a_pin, b, b_pin);
                 let link_undo = match (net_a, net_b) {
                     (None, None) => LinkUndo::DetachBoth { a, a_pin, b, b_pin },
-                    (Some(_), None) => LinkUndo::DetachOne { comp: b, pin: b_pin },
-                    (None, Some(_)) => LinkUndo::DetachOne { comp: a, pin: a_pin },
-                    (Some(na), Some(nb)) if na == nb => LinkUndo::Noop,
+                    (Some(_), None) => LinkUndo::DetachOne {
+                        comp: b,
+                        pin: b_pin,
+                    },
+                    (None, Some(_)) => LinkUndo::DetachOne {
+                        comp: a,
+                        pin: a_pin,
+                    },
+                    (Some(na), Some(nb)) if na == nb => LinkUndo::NoOp,
                     (Some(_), Some(_)) => {
                         let (
                             surviving_net,
@@ -346,7 +367,7 @@ impl Circuit {
                         role: t.role,
                         net: t.net,
                     },
-                    None => UndoAction::Noop,
+                    None => UndoAction::NoOp,
                 };
                 (CommandOutput::None, undo)
             }
@@ -354,10 +375,11 @@ impl Circuit {
                 let old_label = self.tunnels.get(tunnel).map(|t| t.label.clone());
                 self.rename_tunnel(tunnel, new_label.clone());
                 let undo = match old_label {
-                    Some(old) if old != new_label => {
-                        UndoAction::RenameTunnel { tunnel, old_label: old }
-                    }
-                    _ => UndoAction::Noop,
+                    Some(old) if old != new_label => UndoAction::RenameTunnel {
+                        tunnel,
+                        old_label: old,
+                    },
+                    _ => UndoAction::NoOp,
                 };
                 (CommandOutput::None, undo)
             }
@@ -462,8 +484,12 @@ mod tests {
     #[test]
     fn test_apply_set_input_updates_value() {
         let mut c = Circuit::new();
-        let i = c.apply(Command::AddComponent(Component::input(0, 4))).unwrap_comp();
-        let o = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
+        let i = c
+            .apply(Command::AddComponent(Component::input(0, 4)))
+            .unwrap_comp();
+        let o = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
         c.apply(Command::Link {
             a: i,
             a_pin: PinId::output(0),
@@ -473,7 +499,11 @@ mod tests {
         c.settle().unwrap();
         assert_eq!(c.read_output(o), Value::new(0, 4));
 
-        c.apply(Command::SetInput { comp: i, bits: 7, width: 4 });
+        c.apply(Command::SetInput {
+            comp: i,
+            bits: 7,
+            width: 4,
+        });
         c.settle().unwrap();
         assert_eq!(c.read_output(o), Value::new(7, 4));
     }
@@ -481,8 +511,12 @@ mod tests {
     #[test]
     fn test_apply_link_returns_net_key_and_wires_components() {
         let mut c = Circuit::new();
-        let i = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let o = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
+        let i = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let o = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
         let net = c
             .apply(Command::Link {
                 a: i,
@@ -499,13 +533,27 @@ mod tests {
     #[test]
     fn test_apply_link_idempotent_returns_same_net() {
         let mut c = Circuit::new();
-        let a = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let b = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
+        let a = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let b = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
         let net1 = c
-            .apply(Command::Link { a, a_pin: PinId::output(0), b, b_pin: PinId::input(0) })
+            .apply(Command::Link {
+                a,
+                a_pin: PinId::output(0),
+                b,
+                b_pin: PinId::input(0),
+            })
             .unwrap_net();
         let net2 = c
-            .apply(Command::Link { a, a_pin: PinId::output(0), b, b_pin: PinId::input(0) })
+            .apply(Command::Link {
+                a,
+                a_pin: PinId::output(0),
+                b,
+                b_pin: PinId::input(0),
+            })
             .unwrap_net();
         assert_eq!(net1, net2);
     }
@@ -513,14 +561,23 @@ mod tests {
     #[test]
     fn test_apply_add_tunnel_and_link_tunnel_return_correct_keys() {
         let mut c = Circuit::new();
-        let driver = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
+        let driver = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
         let tunnel = c
-            .apply(Command::AddTunnel { label: "CLK".to_string(), role: TunnelRole::Pull })
+            .apply(Command::AddTunnel {
+                label: "CLK".to_string(),
+                role: TunnelRole::Pull,
+            })
             .unwrap_tunnel();
         assert_eq!(c.tunnel_label(tunnel), Some("CLK"));
 
         let net = c
-            .apply(Command::LinkTunnel { tunnel, comp: driver, pin: PinId::output(0) })
+            .apply(Command::LinkTunnel {
+                tunnel,
+                comp: driver,
+                pin: PinId::output(0),
+            })
             .unwrap_net();
         assert!(c.nets.contains_key(net));
     }
@@ -528,11 +585,20 @@ mod tests {
     #[test]
     fn test_apply_detach_tunnel_clears_net() {
         let mut c = Circuit::new();
-        let driver = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
+        let driver = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
         let pull = c
-            .apply(Command::AddTunnel { label: "Y".to_string(), role: TunnelRole::Pull })
+            .apply(Command::AddTunnel {
+                label: "Y".to_string(),
+                role: TunnelRole::Pull,
+            })
             .unwrap_tunnel();
-        c.apply(Command::LinkTunnel { tunnel: pull, comp: driver, pin: PinId::output(0) });
+        c.apply(Command::LinkTunnel {
+            tunnel: pull,
+            comp: driver,
+            pin: PinId::output(0),
+        });
         c.settle().unwrap();
 
         c.apply(Command::DetachTunnel(pull));
@@ -540,10 +606,19 @@ mod tests {
         // group now empty of Pull contributions.
         c.settle().unwrap();
         let feed = c
-            .apply(Command::AddTunnel { label: "Y".to_string(), role: TunnelRole::Feed })
+            .apply(Command::AddTunnel {
+                label: "Y".to_string(),
+                role: TunnelRole::Feed,
+            })
             .unwrap_tunnel();
-        let out = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
-        c.apply(Command::LinkTunnel { tunnel: feed, comp: out, pin: PinId::input(0) });
+        let out = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
+        c.apply(Command::LinkTunnel {
+            tunnel: feed,
+            comp: out,
+            pin: PinId::input(0),
+        });
         c.settle().unwrap();
         assert_eq!(c.read_output(out), Value::Floating);
     }
@@ -552,9 +627,15 @@ mod tests {
     fn test_apply_rename_tunnel_updates_label() {
         let mut c = Circuit::new();
         let tunnel = c
-            .apply(Command::AddTunnel { label: "OLD".to_string(), role: TunnelRole::Pull })
+            .apply(Command::AddTunnel {
+                label: "OLD".to_string(),
+                role: TunnelRole::Pull,
+            })
             .unwrap_tunnel();
-        c.apply(Command::RenameTunnel { tunnel, new_label: "NEW".to_string() });
+        c.apply(Command::RenameTunnel {
+            tunnel,
+            new_label: "NEW".to_string(),
+        });
         assert_eq!(c.tunnel_label(tunnel), Some("NEW"));
     }
 
@@ -562,7 +643,10 @@ mod tests {
     fn test_apply_remove_tunnel() {
         let mut c = Circuit::new();
         let tunnel = c
-            .apply(Command::AddTunnel { label: "Z".to_string(), role: TunnelRole::Pull })
+            .apply(Command::AddTunnel {
+                label: "Z".to_string(),
+                role: TunnelRole::Pull,
+            })
             .unwrap_tunnel();
         c.apply(Command::RemoveTunnel(tunnel));
         assert_eq!(c.tunnel_label(tunnel), None);
@@ -571,11 +655,27 @@ mod tests {
     #[test]
     fn test_apply_remove_component_tears_down_conflict() {
         let mut c = Circuit::new();
-        let d1 = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let d2 = c.apply(Command::AddComponent(Component::input(0, 1))).unwrap_comp();
-        let o = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
-        c.apply(Command::Link { a: d1, a_pin: PinId::output(0), b: o, b_pin: PinId::input(0) });
-        c.apply(Command::Link { a: d2, a_pin: PinId::output(0), b: o, b_pin: PinId::input(0) });
+        let d1 = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let d2 = c
+            .apply(Command::AddComponent(Component::input(0, 1)))
+            .unwrap_comp();
+        let o = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
+        c.apply(Command::Link {
+            a: d1,
+            a_pin: PinId::output(0),
+            b: o,
+            b_pin: PinId::input(0),
+        });
+        c.apply(Command::Link {
+            a: d2,
+            a_pin: PinId::output(0),
+            b: o,
+            b_pin: PinId::input(0),
+        });
         c.settle().unwrap();
         assert_eq!(c.read_output(o), Value::Invalid);
 
@@ -587,13 +687,36 @@ mod tests {
     #[test]
     fn test_apply_tick_clock_returns_settle_result_and_latches() {
         let mut c = Circuit::new();
-        let data = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let we = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let reg = c.apply(Command::AddComponent(Component::reg(1))).unwrap_comp();
-        let out = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
-        c.apply(Command::Link { a: data, a_pin: PinId::output(0), b: reg, b_pin: PinId::input(0) });
-        c.apply(Command::Link { a: we, a_pin: PinId::output(0), b: reg, b_pin: PinId::input(1) });
-        c.apply(Command::Link { a: reg, a_pin: PinId::output(0), b: out, b_pin: PinId::input(0) });
+        let data = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let we = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let reg = c
+            .apply(Command::AddComponent(Component::reg(1)))
+            .unwrap_comp();
+        let out = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
+        c.apply(Command::Link {
+            a: data,
+            a_pin: PinId::output(0),
+            b: reg,
+            b_pin: PinId::input(0),
+        });
+        c.apply(Command::Link {
+            a: we,
+            a_pin: PinId::output(0),
+            b: reg,
+            b_pin: PinId::input(1),
+        });
+        c.apply(Command::Link {
+            a: reg,
+            a_pin: PinId::output(0),
+            b: out,
+            b_pin: PinId::input(0),
+        });
         c.settle().unwrap();
         assert_eq!(c.read_output(out), Value::ZERO);
 
@@ -605,11 +728,18 @@ mod tests {
     #[test]
     fn test_apply_clear_nets_removes_all_nets() {
         let mut c = Circuit::new();
-        let a = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
+        let a = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
         let g = c
             .apply(Command::AddComponent(Component::gate(GateOp::Not, 1, 1)))
             .unwrap_comp();
-        c.apply(Command::Link { a, a_pin: PinId::output(0), b: g, b_pin: PinId::input(0) });
+        c.apply(Command::Link {
+            a,
+            a_pin: PinId::output(0),
+            b: g,
+            b_pin: PinId::input(0),
+        });
         c.settle().unwrap();
         assert!(!c.nets.is_empty());
 
@@ -623,7 +753,9 @@ mod tests {
     #[should_panic(expected = "expected CommandOutput::Comp")]
     fn test_command_output_unwrap_wrong_variant_panics() {
         let mut c = Circuit::new();
-        let key = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
+        let key = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
         c.apply(Command::RemoveComponent(key)).unwrap_comp();
     }
 
@@ -640,11 +772,21 @@ mod tests {
     #[test]
     fn test_apply_tracked_set_input_captures_old_value() {
         let mut c = Circuit::new();
-        let i = c.apply(Command::AddComponent(Component::input(3, 4))).unwrap_comp();
+        let i = c
+            .apply(Command::AddComponent(Component::input(3, 4)))
+            .unwrap_comp();
 
-        let (_output, undo) = c.apply_tracked(Command::SetInput { comp: i, bits: 9, width: 4 });
+        let (_output, undo) = c.apply_tracked(Command::SetInput {
+            comp: i,
+            bits: 9,
+            width: 4,
+        });
         match undo {
-            UndoAction::SetInput { comp, old_bits, old_width } => {
+            UndoAction::SetInput {
+                comp,
+                old_bits,
+                old_width,
+            } => {
                 assert_eq!(comp, i);
                 assert_eq!(old_bits, 3);
                 assert_eq!(old_width, 4);
@@ -660,24 +802,47 @@ mod tests {
             .apply(Command::AddComponent(Component::gate(GateOp::Not, 1, 1)))
             .unwrap_comp();
 
-        let (_output, undo) = c.apply_tracked(Command::SetInput { comp: g, bits: 1, width: 1 });
-        assert!(matches!(undo, UndoAction::Noop));
+        let (_output, undo) = c.apply_tracked(Command::SetInput {
+            comp: g,
+            bits: 1,
+            width: 1,
+        });
+        assert!(matches!(undo, UndoAction::NoOp));
     }
 
     #[test]
     fn test_apply_tracked_clear_nets_captures_relink_recipe() {
         let mut c = Circuit::new();
-        let a = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let b = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
-        c.apply(Command::Link { a, a_pin: PinId::output(0), b, b_pin: PinId::input(0) });
+        let a = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let b = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
+        c.apply(Command::Link {
+            a,
+            a_pin: PinId::output(0),
+            b,
+            b_pin: PinId::input(0),
+        });
         let tunnel = c
-            .apply(Command::AddTunnel { label: "X".to_string(), role: TunnelRole::Pull })
+            .apply(Command::AddTunnel {
+                label: "X".to_string(),
+                role: TunnelRole::Pull,
+            })
             .unwrap_tunnel();
-        c.apply(Command::LinkTunnel { tunnel, comp: a, pin: PinId::output(0) });
+        c.apply(Command::LinkTunnel {
+            tunnel,
+            comp: a,
+            pin: PinId::output(0),
+        });
 
         let (_output, undo) = c.apply_tracked(Command::ClearNets);
         match undo {
-            UndoAction::RelinkAll { links, tunnel_links } => {
+            UndoAction::RelinkAll {
+                links,
+                tunnel_links,
+            } => {
                 // The net has one source (a,out0) and one sink (b,in0);
                 // sources are always walked before sinks, so the anchor is
                 // deterministically (a, out0).
@@ -692,8 +857,12 @@ mod tests {
     #[test]
     fn test_apply_tracked_link_new_net_captures_detach_both() {
         let mut c = Circuit::new();
-        let a = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let b = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
+        let a = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let b = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
 
         let (_output, undo) = c.apply_tracked(Command::Link {
             a,
@@ -708,7 +877,10 @@ mod tests {
                 b: cb,
                 b_pin,
             }) => {
-                assert_eq!((ca, a_pin, cb, b_pin), (a, PinId::output(0), b, PinId::input(0)));
+                assert_eq!(
+                    (ca, a_pin, cb, b_pin),
+                    (a, PinId::output(0), b, PinId::input(0))
+                );
             }
             other => panic!("expected DetachBoth, got {other:?}"),
         }
@@ -717,10 +889,21 @@ mod tests {
     #[test]
     fn test_apply_tracked_link_attach_to_existing_captures_detach_one() {
         let mut c = Circuit::new();
-        let a = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let b = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
-        let b2 = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
-        c.apply(Command::Link { a, a_pin: PinId::output(0), b, b_pin: PinId::input(0) });
+        let a = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let b = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
+        let b2 = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
+        c.apply(Command::Link {
+            a,
+            a_pin: PinId::output(0),
+            b,
+            b_pin: PinId::input(0),
+        });
 
         let (_output, undo) = c.apply_tracked(Command::Link {
             a,
@@ -739,9 +922,18 @@ mod tests {
     #[test]
     fn test_apply_tracked_link_idempotent_is_noop() {
         let mut c = Circuit::new();
-        let a = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let b = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
-        c.apply(Command::Link { a, a_pin: PinId::output(0), b, b_pin: PinId::input(0) });
+        let a = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let b = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
+        c.apply(Command::Link {
+            a,
+            a_pin: PinId::output(0),
+            b,
+            b_pin: PinId::input(0),
+        });
 
         let (_output, undo) = c.apply_tracked(Command::Link {
             a,
@@ -749,16 +941,24 @@ mod tests {
             b,
             b_pin: PinId::input(0),
         });
-        assert!(matches!(undo, UndoAction::Link(LinkUndo::Noop)));
+        assert!(matches!(undo, UndoAction::Link(LinkUndo::NoOp)));
     }
 
     #[test]
     fn test_apply_tracked_link_split_captures_losing_net_state() {
         let mut c = Circuit::new();
-        let driver1 = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let driver2 = c.apply(Command::AddComponent(Component::input(0, 1))).unwrap_comp();
-        let sink1 = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
-        let sink2 = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
+        let driver1 = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let driver2 = c
+            .apply(Command::AddComponent(Component::input(0, 1)))
+            .unwrap_comp();
+        let sink1 = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
+        let sink2 = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
         c.apply(Command::Link {
             a: driver1,
             a_pin: PinId::output(0),
@@ -803,13 +1003,21 @@ mod tests {
     #[test]
     fn test_apply_tracked_link_tunnel_captures_prior_net() {
         let mut c = Circuit::new();
-        let driver = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
+        let driver = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
         let tunnel = c
-            .apply(Command::AddTunnel { label: "A".to_string(), role: TunnelRole::Pull })
+            .apply(Command::AddTunnel {
+                label: "A".to_string(),
+                role: TunnelRole::Pull,
+            })
             .unwrap_tunnel();
 
-        let (_output, undo) =
-            c.apply_tracked(Command::LinkTunnel { tunnel, comp: driver, pin: PinId::output(0) });
+        let (_output, undo) = c.apply_tracked(Command::LinkTunnel {
+            tunnel,
+            comp: driver,
+            pin: PinId::output(0),
+        });
         match undo {
             UndoAction::RestoreTunnelNet { tunnel: t, net } => {
                 assert_eq!(t, tunnel);
@@ -822,11 +1030,20 @@ mod tests {
     #[test]
     fn test_apply_tracked_detach_tunnel_captures_prior_net() {
         let mut c = Circuit::new();
-        let driver = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
+        let driver = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
         let tunnel = c
-            .apply(Command::AddTunnel { label: "B".to_string(), role: TunnelRole::Pull })
+            .apply(Command::AddTunnel {
+                label: "B".to_string(),
+                role: TunnelRole::Pull,
+            })
             .unwrap_tunnel();
-        c.apply(Command::LinkTunnel { tunnel, comp: driver, pin: PinId::output(0) });
+        c.apply(Command::LinkTunnel {
+            tunnel,
+            comp: driver,
+            pin: PinId::output(0),
+        });
         let prior_net = c.tunnels[tunnel].net;
         assert!(prior_net.is_some());
 
@@ -843,11 +1060,20 @@ mod tests {
     #[test]
     fn test_apply_tracked_remove_tunnel_captures_full_snapshot() {
         let mut c = Circuit::new();
-        let driver = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
+        let driver = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
         let tunnel = c
-            .apply(Command::AddTunnel { label: "C".to_string(), role: TunnelRole::Feed })
+            .apply(Command::AddTunnel {
+                label: "C".to_string(),
+                role: TunnelRole::Feed,
+            })
             .unwrap_tunnel();
-        c.apply(Command::LinkTunnel { tunnel, comp: driver, pin: PinId::output(0) });
+        c.apply(Command::LinkTunnel {
+            tunnel,
+            comp: driver,
+            pin: PinId::output(0),
+        });
         let expected_net = c.tunnels[tunnel].net;
 
         let (_output, undo) = c.apply_tracked(Command::RemoveTunnel(tunnel));
@@ -865,13 +1091,21 @@ mod tests {
     fn test_apply_tracked_rename_tunnel_captures_old_label() {
         let mut c = Circuit::new();
         let tunnel = c
-            .apply(Command::AddTunnel { label: "OLD".to_string(), role: TunnelRole::Pull })
+            .apply(Command::AddTunnel {
+                label: "OLD".to_string(),
+                role: TunnelRole::Pull,
+            })
             .unwrap_tunnel();
 
-        let (_output, undo) =
-            c.apply_tracked(Command::RenameTunnel { tunnel, new_label: "NEW".to_string() });
+        let (_output, undo) = c.apply_tracked(Command::RenameTunnel {
+            tunnel,
+            new_label: "NEW".to_string(),
+        });
         match undo {
-            UndoAction::RenameTunnel { tunnel: t, old_label } => {
+            UndoAction::RenameTunnel {
+                tunnel: t,
+                old_label,
+            } => {
                 assert_eq!(t, tunnel);
                 assert_eq!(old_label, "OLD");
             }
@@ -883,24 +1117,52 @@ mod tests {
     fn test_apply_tracked_rename_tunnel_same_label_is_noop() {
         let mut c = Circuit::new();
         let tunnel = c
-            .apply(Command::AddTunnel { label: "SAME".to_string(), role: TunnelRole::Pull })
+            .apply(Command::AddTunnel {
+                label: "SAME".to_string(),
+                role: TunnelRole::Pull,
+            })
             .unwrap_tunnel();
 
-        let (_output, undo) =
-            c.apply_tracked(Command::RenameTunnel { tunnel, new_label: "SAME".to_string() });
-        assert!(matches!(undo, UndoAction::Noop));
+        let (_output, undo) = c.apply_tracked(Command::RenameTunnel {
+            tunnel,
+            new_label: "SAME".to_string(),
+        });
+        assert!(matches!(undo, UndoAction::NoOp));
     }
 
     #[test]
     fn test_apply_tracked_tick_clock_captures_pre_tick_value() {
         let mut c = Circuit::new();
-        let data = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let we = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let reg = c.apply(Command::AddComponent(Component::reg(1))).unwrap_comp();
-        let out = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
-        c.apply(Command::Link { a: data, a_pin: PinId::output(0), b: reg, b_pin: PinId::input(0) });
-        c.apply(Command::Link { a: we, a_pin: PinId::output(0), b: reg, b_pin: PinId::input(1) });
-        c.apply(Command::Link { a: reg, a_pin: PinId::output(0), b: out, b_pin: PinId::input(0) });
+        let data = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let we = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let reg = c
+            .apply(Command::AddComponent(Component::reg(1)))
+            .unwrap_comp();
+        let out = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
+        c.apply(Command::Link {
+            a: data,
+            a_pin: PinId::output(0),
+            b: reg,
+            b_pin: PinId::input(0),
+        });
+        c.apply(Command::Link {
+            a: we,
+            a_pin: PinId::output(0),
+            b: reg,
+            b_pin: PinId::input(1),
+        });
+        c.apply(Command::Link {
+            a: reg,
+            a_pin: PinId::output(0),
+            b: out,
+            b_pin: PinId::input(0),
+        });
         c.settle().unwrap();
         assert_eq!(c.read_output(out), Value::ZERO); // settle() never latches
 
@@ -921,8 +1183,12 @@ mod tests {
     #[test]
     fn test_apply_tracked_remove_component_sole_driver_captures_sinks_and_tunnel() {
         let mut c = Circuit::new();
-        let driver = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let sink = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
+        let driver = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let sink = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
         c.apply(Command::Link {
             a: driver,
             a_pin: PinId::output(0),
@@ -930,13 +1196,24 @@ mod tests {
             b_pin: PinId::input(0),
         });
         let tunnel = c
-            .apply(Command::AddTunnel { label: "T".to_string(), role: TunnelRole::Pull })
+            .apply(Command::AddTunnel {
+                label: "T".to_string(),
+                role: TunnelRole::Pull,
+            })
             .unwrap_tunnel();
-        c.apply(Command::LinkTunnel { tunnel, comp: driver, pin: PinId::output(0) });
+        c.apply(Command::LinkTunnel {
+            tunnel,
+            comp: driver,
+            pin: PinId::output(0),
+        });
 
         let (_output, undo) = c.apply_tracked(Command::RemoveComponent(driver));
         match undo {
-            UndoAction::RestoreComponent { links, tunnel_links, .. } => {
+            UndoAction::RestoreComponent {
+                links,
+                tunnel_links,
+                ..
+            } => {
                 assert_eq!(links, vec![(PinId::output(0), sink, PinId::input(0))]);
                 assert_eq!(tunnel_links, vec![(PinId::output(0), tunnel)]);
             }
@@ -947,15 +1224,35 @@ mod tests {
     #[test]
     fn test_apply_tracked_remove_component_one_of_two_drivers_captures_other_participants() {
         let mut c = Circuit::new();
-        let d1 = c.apply(Command::AddComponent(Component::input(1, 1))).unwrap_comp();
-        let d2 = c.apply(Command::AddComponent(Component::input(0, 1))).unwrap_comp();
-        let o = c.apply(Command::AddComponent(Component::output())).unwrap_comp();
-        c.apply(Command::Link { a: d1, a_pin: PinId::output(0), b: o, b_pin: PinId::input(0) });
-        c.apply(Command::Link { a: d2, a_pin: PinId::output(0), b: o, b_pin: PinId::input(0) });
+        let d1 = c
+            .apply(Command::AddComponent(Component::input(1, 1)))
+            .unwrap_comp();
+        let d2 = c
+            .apply(Command::AddComponent(Component::input(0, 1)))
+            .unwrap_comp();
+        let o = c
+            .apply(Command::AddComponent(Component::output()))
+            .unwrap_comp();
+        c.apply(Command::Link {
+            a: d1,
+            a_pin: PinId::output(0),
+            b: o,
+            b_pin: PinId::input(0),
+        });
+        c.apply(Command::Link {
+            a: d2,
+            a_pin: PinId::output(0),
+            b: o,
+            b_pin: PinId::input(0),
+        });
 
         let (_output, undo) = c.apply_tracked(Command::RemoveComponent(d2));
         match undo {
-            UndoAction::RestoreComponent { links, tunnel_links, .. } => {
+            UndoAction::RestoreComponent {
+                links,
+                tunnel_links,
+                ..
+            } => {
                 assert_eq!(links.len(), 2);
                 assert!(links.contains(&(PinId::output(0), d1, PinId::output(0))));
                 assert!(links.contains(&(PinId::output(0), o, PinId::input(0))));

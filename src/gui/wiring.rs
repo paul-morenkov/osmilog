@@ -68,7 +68,7 @@ pub struct Group {
     pub tunnels: Vec<PlacedTunnelKey>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 pub struct Wiring {
     pub nodes: SlotMap<WireNodeKey, WireNode>,
     pub segments: SlotMap<WireSegKey, WireSegment>,
