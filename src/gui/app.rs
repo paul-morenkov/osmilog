@@ -1516,16 +1516,15 @@ impl eframe::App for OsmilogApp {
             if !editing_text {
                 let (undo, redo) = ctx.input(|i| {
                     let cmd = i.modifiers.command;
-                    let undo = cmd && !i.modifiers.shift && i.key_pressed(egui::Key::Z);
-                    let redo = cmd
-                        && (i.key_pressed(egui::Key::Y)
-                            || (i.modifiers.shift && i.key_pressed(egui::Key::Z)));
+                    let z = i.key_pressed(egui::Key::Z);
+                    let y = i.key_pressed(egui::Key::Y);
+                    let undo = cmd && !i.modifiers.shift && z;
+                    let redo = cmd && (y || (i.modifiers.shift && z));
                     (undo, redo)
                 });
                 if undo {
                     self.undo();
-                }
-                if redo {
+                } else if redo {
                     self.redo();
                 }
             }
