@@ -8,13 +8,11 @@ pub enum Value {
         bits: u32,
         width: u8,
     },
-    // A Net whose attached pins declare conflicting expected bit widths (e.g. a driver's
-    // output width doesn't match a sink's expected input width). Distinct from Floating,
-    // which just means "no concrete value yet" - Invalid means the wiring itself is wrong,
-    // and holds regardless of whether any attached pin currently carries a real value. Set
-    // only by Circuit::resolve_net(); CombLogic::evaluate() never produces it directly, and
-    // an Invalid operand falls through the same catch-all arms as any other non-Fixed value
-    // below, so it does not propagate past the one component reading it.
+    // Wiring itself is wrong (e.g. a short, or a width mismatch) - distinct
+    // from Floating ("no value yet"). Set only by Circuit::resolve_net();
+    // never produced by CombLogic::evaluate(), and falls through the same
+    // catch-all arms as any non-Fixed value, so it never propagates past the
+    // one net where it's flagged.
     Invalid,
 }
 

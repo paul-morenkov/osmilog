@@ -10,10 +10,8 @@ pub enum ShapeCmd {
     CubicTo(Vec2, Vec2, Vec2),
 }
 
-/// A pin's location, expressed as an integer grid-cell offset from the
-/// component's top-left corner (which is itself always grid-aligned). Because
-/// `cell` is whole grid cells, every pin lands exactly on a grid intersection
-/// by construction - the invariant the wire-routing rework relies on.
+/// A pin's location as an integer grid-cell offset from the component's
+/// top-left corner - guarantees every pin lands on a grid intersection.
 #[derive(Clone)]
 pub struct PinAnchor {
     /// Grid-cell offset from the component's top-left (in cells, not pixels).
@@ -80,19 +78,17 @@ pub struct ComponentShape {
     pub size: Vec2,
     /// Full outline used for the stroke (may be concave).
     pub outline: Vec<ShapeCmd>,
-    /// Convex-only outline used for the fill. When `None`, `outline` is used for both.
-    /// Required for shapes whose outline is concave, because epaint's fill tessellator
-    /// assumes a convex polygon (triangle fan + feathering with inward normals).
+    /// Convex-only outline for the fill (epaint's fill tessellator requires
+    /// convexity even when `outline` is concave). `None` reuses `outline`.
     pub fill_outline: Option<Vec<ShapeCmd>>,
     pub input_anchors: Vec<PinAnchor>,
     pub output_anchors: Vec<PinAnchor>,
     pub extra_strokes: Vec<Vec<ShapeCmd>>,
     pub output_bubbles: Vec<bool>,
-    /// Hardcoded pin/section labels, positioned per component type/parameters. Empty for
-    /// component types with nothing non-obvious to annotate.
+    /// Hardcoded pin/section labels; empty when nothing needs annotating.
     pub labels: Vec<ComponentLabel>,
-    /// Position for a single externally-supplied, editable label string. Only meaningful for
-    /// Tunnels (see PlacedTunnel.label) - unused (left at the type's default) by Components.
+    /// Position for a tunnel's user-editable label (`PlacedTunnel.label`);
+    /// unused by Components.
     pub dynamic_label_pos: Vec2,
 }
 

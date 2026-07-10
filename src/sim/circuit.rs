@@ -9,11 +9,10 @@ new_key_type! {
     pub struct TunnelKey;
 }
 
-// A Tunnel ties together all Tunnels sharing the same Label into one virtual
-// net, without a drawn wire between them (a schematic "net label" / off-page
-// connector). Feed tunnels drive their attached net FROM the shared label
-// group's resolved value; Pull tunnels read their attached net's value and
-// contribute it TO the group. See Circuit::settle()/resolve_net().
+// Ties all Tunnels sharing a Label into one virtual net without a drawn wire
+// (a schematic "net label" / off-page connector). Feed tunnels drive their
+// net FROM the group's resolved value; Pull tunnels contribute their net's
+// value TO the group. See Circuit::settle()/resolve_net().
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TunnelRole {
     Feed,
@@ -25,6 +24,10 @@ pub struct Tunnel {
     pub label: String,
     pub role: TunnelRole,
     pub net: Option<NetKey>,
+    // `false` marks a tombstone (see Component::active). Dropped from
+    // `tunnel_labels` while inactive, so it joins no label group until
+    // reactivated.
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,15 +67,12 @@ pub struct Circuit {
 
 impl Circuit {
     // How many times a single net may change value within one settle() call
-    // before it's considered a combinational oscillation. Bounded by
-    // reconvergent fan-in depth in legitimate circuits (small, independent
-    // of circuit size), not by circuit size itself.
+    // before it's a combinational oscillation - bounded by reconvergent
+    // fan-in depth, not circuit size.
     const REVISIT_THRESHOLD: usize = 16;
-    // Defensive backstop on total net-pops across the whole call, in case
-    // many different nets are oscillating simultaneously. Scaled to circuit
-    // size so it doesn't false-positive on large-but-legitimate circuits;
-    // should essentially never trigger if the per-net check above is doing
-    // its job.
+    // Defensive backstop on total net-pops, in case many nets oscillate at
+    // once. Scaled to circuit size to avoid false positives; should rarely
+    // trigger if the per-net check above is doing its job.
     const ITERATION_BUDGET_PER_NET: usize = 64;
 
     pub fn new() -> Self {
@@ -96,7 +96,8 @@ impl Circuit {
         }
     }
 
-    /// Returns `Some(value)` if `comp` corresponds to an Output, otherwise returns None.
+    /// The current value on `comp`'s input, if it's an Output component;
+    /// `Value::Floating` otherwise.
     pub fn read_output(&self, comp: CompKey) -> Value {
         let comp = &self.components[comp];
 
@@ -125,11 +126,14 @@ impl Circuit {
         self.queued.clear();
 
         // Every input pin now reads Floating, so re-evaluate each component to
-        // refresh its out_cache; otherwise a component that just lost its input
-        // driver would keep a stale output (which a subsequent relink would then
-        // read back as a live value). Sources with no inputs (e.g. Input) simply
-        // recompute their own constant.
-        let keys: Vec<CompKey> = self.components.keys().collect();
+        // refresh its out_cache - otherwise a component would keep a stale
+        // output that a subsequent relink could read back as live.
+        let keys: Vec<CompKey> = self
+            .components
+            .iter()
+            .filter(|(_, c)| c.active)
+            .map(|(k, _)| k)
+            .collect();
         for key in keys {
             self.eval_component(key);
         }
@@ -232,6 +236,7 @@ impl Circuit {
             label: label.clone(),
             role,
             net: None,
+            active: true,
         });
         self.tunnel_labels.entry(label).or_default().push(key);
         key
@@ -272,19 +277,71 @@ impl Circuit {
     }
 
     pub fn remove_tunnel(&mut self, tunnel: TunnelKey) {
-        let Some(t) = self.tunnels.remove(tunnel) else {
+        // Tombstone rather than remove, mirroring remove_component: dropped
+        // from its label group with its net binding cleared, so it
+        // contributes nothing until reactivated.
+        let Some(t) = self.tunnels.get_mut(tunnel) else {
             return;
         };
-        if let Some(keys) = self.tunnel_labels.get_mut(&t.label) {
+        if !t.active {
+            return;
+        }
+        t.active = false;
+        let label = t.label.clone();
+        let net = t.net.take();
+        if let Some(keys) = self.tunnel_labels.get_mut(&label) {
             keys.retain(|&k| k != tunnel);
             if keys.is_empty() {
-                self.tunnel_labels.remove(&t.label);
+                self.tunnel_labels.remove(&label);
             }
         }
-        if let Some(net) = t.net {
+        if let Some(net) = net {
             self.mark_dirty(net);
         }
-        self.dirty_label_feed_nets(&t.label);
+        self.dirty_label_feed_nets(&label);
+    }
+
+    // Undo of remove_component: flip the tombstone back. Pins were nulled on
+    // removal, so the caller must re-establish nets and settle(); a Reg's
+    // latched state was preserved untouched, so it returns exactly as before.
+    pub(crate) fn reactivate_component(&mut self, key: CompKey) {
+        if let Some(c) = self.components.get_mut(key) {
+            c.active = true;
+            self.eval_component(key);
+        }
+    }
+
+    // Undo of remove_tunnel: flip the tombstone back and rejoin its label
+    // group. Its net binding is re-established by the caller's relink.
+    pub(crate) fn reactivate_tunnel(&mut self, tunnel: TunnelKey) {
+        let Some(t) = self.tunnels.get_mut(tunnel) else {
+            return;
+        };
+        if t.active {
+            return;
+        }
+        t.active = true;
+        let label = t.label.clone();
+        self.tunnel_labels
+            .entry(label.clone())
+            .or_default()
+            .push(tunnel);
+        self.dirty_label_feed_nets(&label);
+    }
+
+    // Reclaim tombstones: remove any inactive component/tunnel not in
+    // `keep_components`/`keep_tunnels` (keys still referenced by undo
+    // history). The sim-side counterpart of
+    // Wiring::remove_unreferenced_tombstones; not yet called anywhere.
+    pub fn remove_unreferenced_tombstones(
+        &mut self,
+        keep_components: &std::collections::HashSet<CompKey>,
+        keep_tunnels: &std::collections::HashSet<TunnelKey>,
+    ) {
+        self.components
+            .retain(|k, c| c.active || keep_components.contains(&k));
+        self.tunnels
+            .retain(|k, t| t.active || keep_tunnels.contains(&k));
     }
 
     /// The current label of a tunnel, or `None` if the key is stale.
@@ -347,13 +404,10 @@ impl Circuit {
     }
 
     // Aggregates a label group's value from its Pull-role tunnels' net
-    // values. `strict` controls what happens when two Pull tunnels disagree
-    // (non-Floating, differing values): lenient (false) deterministically
-    // takes the last such value in tunnel_labels order and never errors,
-    // safe to call mid-convergence in resolve_net(); strict (true) returns
-    // TunnelConflict, meant to be called exactly once after settle()'s
-    // dirty-queue loop has fully drained, when disagreement is genuine
-    // rather than an evaluation-order artifact.
+    // values. `strict` controls disagreement handling: lenient (false) takes
+    // the last differing value and never errors (safe mid-convergence in
+    // resolve_net()); strict (true) returns TunnelConflict, meant to be
+    // called once settle()'s dirty-queue loop has fully drained.
     fn tunnel_group_value(&self, label: &str, strict: bool) -> Result<Value, SettleError> {
         let Some(keys) = self.tunnel_labels.get(label) else {
             return Ok(Value::Floating);
@@ -475,11 +529,9 @@ impl Circuit {
         Ok(())
     }
 
-    // True if this net's attached pins (source + sinks) declare conflicting expected bit
-    // widths, per each component's own configuration (Component::input_width/output_width) -
-    // independent of any Value currently on the net, so a mismatch is flagged even when every
-    // attached pin is presently Floating. A single pin (or zero pins with a declared width -
-    // e.g. an Output, which accepts any width) can't conflict with itself.
+    // True if this net's attached pins declare conflicting expected bit
+    // widths (Component::input_width/output_width) - independent of the
+    // net's current Value, so a mismatch is flagged even while Floating.
     fn net_width_conflict(&self, net: NetKey) -> bool {
         let n = &self.nets[net];
         let mut widths = n
@@ -548,19 +600,17 @@ impl Circuit {
         }
     }
 
-    // Advances the clock by one tick for all sequential components:
-    //   1. Collect every sequential component's current input Values from net state
-    //      (a snapshot, taken before any state mutation).
-    //   2. Compute each sequential component's next state via Component::tick, updating
-    //      out_cache and persisted state, and marking changed output nets dirty.
-    //   3. Call settle() to propagate the changes through the combinational circuit.
-    // Generic over LogicSeq variants: adding a new sequential component type only needs
-    // new match arms in Component::evaluate/Component::tick, not changes here.
+    // Advances the clock by one tick: snapshot every sequential component's
+    // current inputs, compute each one's next state via Component::tick
+    // (updating out_cache/persisted state and dirtying changed nets), then
+    // settle() to propagate through the combinational circuit. Generic over
+    // LogicSeq variants - a new sequential type only needs new match arms in
+    // Component::evaluate/tick, not changes here.
     pub fn tick_clock(&mut self) -> Result<(), SettleError> {
         let seq_comps: Vec<CompKey> = self
             .components
             .iter()
-            .filter(|(_, c)| c.is_sequential())
+            .filter(|(_, c)| c.active && c.is_sequential())
             .map(|(key, _)| key)
             .collect();
 
@@ -587,25 +637,18 @@ impl Circuit {
         let output_nets: Vec<NetKey> = comp.pins.outputs.iter().filter_map(|&n| n).collect();
         let input_nets: Vec<NetKey> = comp.pins.inputs.iter().filter_map(|&n| n).collect();
 
-        // Tunnels attached to nets that are about to be deleted must be
-        // detached (their NetKey would otherwise dangle). Their sibling
-        // nets need re-dirtying too, but only after the trailing
-        // dirty/queued clear below, or the marks would be wiped.
+        // Collected now, acted on after the dirty/queued reset below (so the
+        // fresh marks survive): tunnels whose net is about to vanish
+        // (detached, sibling nets re-dirtied), sink components that lose
+        // their driver (re-evaluated so Floating propagates), and surviving
+        // nets whose value may change (re-resolved).
         let mut affected_labels: Vec<String> = Vec::new();
-        // Sink components that lose an input driver here must be re-evaluated
-        // (their nulled pin now reads Floating), or their out_cache/output
-        // nets keep the removed component's stale value. Collected now, re-run
-        // after the dirty/queued reset below so their fresh marks survive.
         let mut affected_sinks: Vec<CompKey> = Vec::new();
-        // Output nets that still have another driver after this component is
-        // gone: kept alive, but re-resolved (a cleared conflict changes their
-        // value). Re-dirtied after the dirty/queued reset below, like the two
-        // lists above.
         let mut retained_nets: Vec<NetKey> = Vec::new();
 
-        // Drop this component's driver entry from each net it feeds. A net that
-        // still has another driver survives (only its value may change); a net
-        // left with no driver is torn down, freeing each sink's input pin slot.
+        // Drop this component's driver entry from each net it feeds. A net
+        // with another driver survives; one left driverless is torn down,
+        // freeing each sink's input pin slot.
         for net_key in output_nets {
             let Some(net) = self.nets.get_mut(net_key) else {
                 continue;
@@ -644,7 +687,14 @@ impl Circuit {
         self.dirty.clear();
         self.queued.clear();
 
-        self.components.remove(key);
+        // Tombstone rather than remove: the CompKey (and a Reg's latched
+        // state) survives for undo to reactivate. Pins are nulled here so it
+        // holds no dangling NetKeys; whole-component sweeps skip it via
+        // `active`. remove_unreferenced_tombstones reclaims it later.
+        if let Some(c) = self.components.get_mut(key) {
+            c.active = false;
+            c.clear_pins();
+        }
 
         // Re-evaluate sinks that lost their driver so their now-Floating input
         // propagates: eval_component recomputes out_cache and marks any changed
