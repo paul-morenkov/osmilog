@@ -166,6 +166,10 @@ impl SeqLogic for Counter {
         vec![self.value, self.carry]
     }
 
+    // The counter has no asynchronous inputs, so there's nothing to apply
+    // during settle - its state only changes on a clock tick.
+    fn apply_async(&mut self, _inputs: &[Value]) {}
+
     fn observe(&self) -> Vec<Value> {
         vec![self.value, self.carry]
     }

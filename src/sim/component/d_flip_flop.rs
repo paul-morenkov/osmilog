@@ -8,11 +8,15 @@ pub struct DFlipFlopConf;
 impl DFlipFlopConf {
     pub const DATA_PIN: usize = 0;
     pub const WRITE_EN_PIN: usize = 1;
+    // Asynchronous reset: forces Q to zero the instant it's held (via
+    // observe), and clears the latched value on the next tick so the reset
+    // sticks. Active only on exactly Value::ONE.
+    pub const RESET_PIN: usize = 2;
 }
 
 impl DFlipFlopConf {
     pub fn n_inputs(&self) -> usize {
-        2
+        3
     }
 
     pub fn n_outputs(&self) -> usize {
@@ -23,6 +27,7 @@ impl DFlipFlopConf {
         match i {
             DFlipFlopConf::DATA_PIN => Some(1),     // data
             DFlipFlopConf::WRITE_EN_PIN => Some(1), // write_enable
+            DFlipFlopConf::RESET_PIN => Some(1),    // async reset
             _ => None,
         }
     }
@@ -66,12 +71,27 @@ impl SeqLogic for DFlipFlop {
     }
 
     fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
-        let data = inputs[DFlipFlopConf::DATA_PIN];
-        let write_enable = inputs[DFlipFlopConf::WRITE_EN_PIN];
-        if matches!(write_enable, Value::ONE | Value::Floating) {
-            self.value = data;
+        // Async reset dominates the clocked write and destroys the latched
+        // value so the clear persists after the reset pin is released.
+        if matches!(inputs[DFlipFlopConf::RESET_PIN], Value::ONE) {
+            self.value = Value::ZERO;
+        } else {
+            let data = inputs[DFlipFlopConf::DATA_PIN];
+            let write_enable = inputs[DFlipFlopConf::WRITE_EN_PIN];
+            if matches!(write_enable, Value::ONE | Value::Floating) {
+                self.value = data;
+            }
         }
         vec![self.value]
+    }
+
+    fn apply_async(&mut self, inputs: &[Value]) {
+        // Async reset: while held (exactly ONE) it destroys the latched value,
+        // so the clear takes effect during settle() with no clock tick and
+        // persists after the pin is released. Idempotent.
+        if matches!(inputs[DFlipFlopConf::RESET_PIN], Value::ONE) {
+            self.value = Value::ZERO;
+        }
     }
 
     fn observe(&self) -> Vec<Value> {
@@ -106,6 +126,9 @@ mod tests {
         LogicSeq::DFlipFlop(DFlipFlop::new())
     }
 
+    // No async reset asserted (the common case in these tests).
+    const NO_RST: Value = Value::ZERO;
+
     #[test]
     fn test_initial_value_before_any_tick() {
         let ff = new_d_flip_flop();
@@ -120,17 +143,51 @@ mod tests {
         assert_eq!(ff.observe(), vec![Value::ZERO]);
 
         // write_enable=1, tick: latches data.
-        assert_eq!(ff.tick(&[Value::ONE, we]), vec![Value::ONE]);
+        assert_eq!(ff.tick(&[Value::ONE, we, NO_RST]), vec![Value::ONE]);
 
         // write_enable=0, data changes, tick: holds previous value.
-        assert_eq!(ff.tick(&[Value::ZERO, Value::ZERO]), vec![Value::ONE]);
+        assert_eq!(
+            ff.tick(&[Value::ZERO, Value::ZERO, NO_RST]),
+            vec![Value::ONE]
+        );
     }
 
     #[test_case(Value::new(1, 2); "write_enable wrong width (bits=1, width=2)")]
     #[test_case(Value::ZERO; "write_enable exactly zero")]
     fn test_write_enable_non_latching_cases(we: Value) {
         let mut ff = new_d_flip_flop();
-        assert_eq!(ff.tick(&[Value::ONE, we]), vec![Value::ZERO]);
+        assert_eq!(ff.tick(&[Value::ONE, we, NO_RST]), vec![Value::ZERO]);
+    }
+
+    #[test]
+    fn test_apply_async_reset_clears_state_destructively() {
+        let mut ff = new_d_flip_flop();
+        ff.tick(&[Value::ONE, Value::ONE, NO_RST]); // latch 1
+                                                    // Reset held: apply_async clears Q, no tick.
+        ff.apply_async(&[Value::Floating, Value::Floating, Value::ONE]);
+        assert_eq!(ff.observe(), vec![Value::ZERO]);
+        // Reset released: stays 0 (destroyed, not restored).
+        ff.apply_async(&[Value::ONE, Value::ONE, Value::ZERO]);
+        assert_eq!(ff.observe(), vec![Value::ZERO]);
+    }
+
+    #[test]
+    fn test_async_reset_dominates_on_tick() {
+        let mut ff = new_d_flip_flop();
+        ff.tick(&[Value::ONE, Value::ONE, NO_RST]); // latch 1
+                                                    // reset=1 dominates write_enable=1/data=1: latches 0.
+        assert_eq!(ff.tick(&[Value::ONE, Value::ONE, Value::ONE]), vec![Value::ZERO]);
+    }
+
+    #[test_case(Value::ZERO; "reset exactly zero")]
+    #[test_case(Value::Floating; "reset floating")]
+    #[test_case(Value::new(1, 2); "reset wrong width")]
+    fn test_reset_only_activates_on_exactly_one(rst: Value) {
+        let mut ff = new_d_flip_flop();
+        ff.tick(&[Value::ONE, Value::ONE, NO_RST]); // latch 1
+                                                    // reset not exactly ONE: apply_async leaves state alone.
+        ff.apply_async(&[Value::ZERO, Value::ONE, rst]);
+        assert_eq!(ff.observe(), vec![Value::ONE]);
     }
 
     #[test]
@@ -138,12 +195,18 @@ mod tests {
         let mut ff = new_d_flip_flop();
 
         // tick 1: we=1, data=1 -> latches 1.
-        assert_eq!(ff.tick(&[Value::ONE, Value::ONE]), vec![Value::ONE]);
+        assert_eq!(ff.tick(&[Value::ONE, Value::ONE, NO_RST]), vec![Value::ONE]);
 
         // tick 2: we=0, data=0 -> holds 1.
-        assert_eq!(ff.tick(&[Value::ZERO, Value::ZERO]), vec![Value::ONE]);
+        assert_eq!(
+            ff.tick(&[Value::ZERO, Value::ZERO, NO_RST]),
+            vec![Value::ONE]
+        );
 
         // tick 3: we=1, data=0 -> latches 0.
-        assert_eq!(ff.tick(&[Value::ZERO, Value::ONE]), vec![Value::ZERO]);
+        assert_eq!(
+            ff.tick(&[Value::ZERO, Value::ONE, NO_RST]),
+            vec![Value::ZERO]
+        );
     }
 }
