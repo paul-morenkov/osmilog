@@ -69,16 +69,16 @@ impl SeqLogic for SRFlipFlop {
     }
 
     fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
-        let s = inputs[SRFlipFlopConf::S_PIN] == Value::ONE;
-        let r = inputs[SRFlipFlopConf::R_PIN] == Value::ONE;
+        let s = inputs[SRFlipFlopConf::S_PIN];
+        let r = inputs[SRFlipFlopConf::R_PIN];
         let write_enable = inputs[SRFlipFlopConf::WRITE_EN_PIN];
 
         if matches!(write_enable, Value::ONE | Value::Floating) {
             self.value = match (s, r) {
-                (false, false) => self.value,  // hold
-                (false, true) => Value::ZERO,  // reset
-                (true, false) => Value::ONE,   // set
-                (true, true) => Value::Floating, // forbidden state
+                (Value::ZERO, Value::ZERO) => self.value, // hold
+                (Value::ZERO, Value::ONE) => Value::ZERO, // reset
+                (Value::ONE, Value::ZERO) => Value::ONE,  // set
+                _ => Value::Floating,                     // forbidden state
             };
         }
         vec![self.value]
@@ -133,7 +133,10 @@ mod tests {
     #[test]
     fn test_hold_when_s_and_r_both_zero() {
         let mut ff = new_sr_flip_flop();
-        assert_eq!(ff.tick(&[Value::ONE, Value::ZERO, Value::ONE]), vec![Value::ONE]);
+        assert_eq!(
+            ff.tick(&[Value::ONE, Value::ZERO, Value::ONE]),
+            vec![Value::ONE]
+        );
         assert_eq!(
             ff.tick(&[Value::ZERO, Value::ZERO, Value::ONE]),
             vec![Value::ONE]
@@ -143,7 +146,10 @@ mod tests {
     #[test]
     fn test_forbidden_state_floats_output() {
         let mut ff = new_sr_flip_flop();
-        assert_eq!(ff.tick(&[Value::ONE, Value::ZERO, Value::ONE]), vec![Value::ONE]);
+        assert_eq!(
+            ff.tick(&[Value::ONE, Value::ZERO, Value::ONE]),
+            vec![Value::ONE]
+        );
 
         // S=1, R=1: forbidden -> floats.
         assert_eq!(

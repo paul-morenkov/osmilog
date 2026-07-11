@@ -36,6 +36,7 @@ impl ComponentSpec {
             Self::DFlipFlop(_) | Self::TFlipFlop(_) | Self::JKFlipFlop(_) | Self::SRFlipFlop(_) => {
                 flip_flop_size()
             }
+            Self::Counter(_) => counter_size(),
             Self::Encoder(e) => encoder_size(e.sel_width),
             Self::Adder(_) => op2_size(),
             Self::Subtractor(_) => op2_size(),
@@ -66,6 +67,7 @@ impl ComponentSpec {
             Self::TFlipFlop(_) => "T-FF",
             Self::JKFlipFlop(_) => "JK-FF",
             Self::SRFlipFlop(_) => "SR-FF",
+            Self::Counter(_) => "CTR",
             Self::Encoder(_) => "ENC",
             Self::Adder(_) => "ADD",
             Self::Subtractor(_) => "SUB",
@@ -92,6 +94,7 @@ impl ComponentSpec {
             Self::TFlipFlop(_) => t_flip_flop_shape(),
             Self::JKFlipFlop(_) => jk_flip_flop_shape(),
             Self::SRFlipFlop(_) => sr_flip_flop_shape(),
+            Self::Counter(_) => counter_shape(),
             Self::Encoder(e) => encoder_shape(e.sel_width),
             Self::Adder(_) => adder_shape(),
             Self::Subtractor(_) => subtractor_shape(),

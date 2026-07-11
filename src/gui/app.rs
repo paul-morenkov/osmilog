@@ -18,9 +18,9 @@ use crate::io::{
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::command::Command;
 use crate::sim::component::{
-    Adder, CompKey, Comparator, ComponentSpec, DFlipFlopConf, Demux, Divider, Encoder, FanDirection,
-    Gate, GateOp, InIdx, Input, JKFlipFlopConf, Multiplier, Mux, OutIdx, PinId, RegConf, SRFlipFlopConf,
-    Subtractor, TFlipFlopConf,
+    Adder, CompKey, Comparator, ComponentSpec, CounterConf, DFlipFlopConf, Demux, Divider, Encoder,
+    FanDirection, Gate, GateOp, InIdx, Input, JKFlipFlopConf, Multiplier, Mux, OutIdx, OverflowAction,
+    PinId, RegConf, SRFlipFlopConf, Subtractor, TFlipFlopConf,
 };
 use crate::sim::value::Value;
 
@@ -893,6 +893,64 @@ impl OsmilogApp {
                 };
                 ui.label(format!("Value: {}", val_str));
             }
+            ComponentSpec::Counter(CounterConf {
+                mut data_width,
+                mut max_value,
+                mut overflow_action,
+            }) => {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Data width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Max value:");
+                    changed |= ui.add(egui::DragValue::new(&mut max_value)).changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Overflow action:");
+                    egui::ComboBox::from_id_salt(key)
+                        .selected_text(format!("{overflow_action:?}"))
+                        .show_ui(ui, |ui| {
+                            for action in [
+                                OverflowAction::Wrap,
+                                OverflowAction::StayMax,
+                                OverflowAction::PassMax,
+                                OverflowAction::LoadNext,
+                            ] {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut overflow_action,
+                                        action,
+                                        format!("{action:?}"),
+                                    )
+                                    .changed();
+                            }
+                        });
+                });
+                if changed {
+                    self.reconfigure_component(
+                        key,
+                        ComponentSpec::Counter(CounterConf {
+                            data_width,
+                            max_value,
+                            overflow_action,
+                        }),
+                    );
+                }
+
+                let q = self.circuit.components[comp_key].pins.out_cache[0];
+                let carry = self.circuit.components[comp_key].pins.out_cache[1];
+                let val_str = |v: Value| match v {
+                    Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
+                    Value::Floating => "Floating".to_string(),
+                    Value::Invalid => "Invalid (width mismatch)".to_string(),
+                };
+                ui.label(format!("Q: {}", val_str(q)));
+                ui.label(format!("Carry: {}", val_str(carry)));
+            }
             ComponentSpec::DFlipFlop(_)
             | ComponentSpec::TFlipFlop(_)
             | ComponentSpec::JKFlipFlop(_)
@@ -1602,6 +1660,16 @@ impl OsmilogApp {
                                 ui.close();
                             }
                         });
+                        if ui.button("Counter").clicked() {
+                            self.mode = InteractionMode::Placing {
+                                spec: ComponentSpec::Counter(CounterConf {
+                                    data_width: 1,
+                                    max_value: 1,
+                                    overflow_action: OverflowAction::default(),
+                                }),
+                            };
+                            ui.close();
+                        }
                     });
                     ui.menu_button("Tunnel", |ui| {
                         if ui.button("Feed").clicked() {
