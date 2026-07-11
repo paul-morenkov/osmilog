@@ -252,6 +252,13 @@ pub const fn reg_size() -> Vec2 {
     vec2(px(REG_W), px(stack_h(2)))
 }
 
+pub const fn counter_size() -> Vec2 {
+    // 3 inputs (load/data/count) stacked on the left, sizing the body; the 2
+    // outputs (Q/carry) center on the right within that same height, same
+    // technique as comparator_size's busier-side-drives-height.
+    vec2(px(REG_W), px(stack_h(3)))
+}
+
 // Square body, same proportions as op2_size (ARITH_W == stack_h(2)) even though
 // a flip-flop only has one data-side input - the write-enable pin lives on the
 // bottom edge instead of stacking with it on the left.
@@ -435,6 +442,69 @@ pub fn reg_shape() -> ComponentShape {
         output_anchors: vec![PinAnchor::right(REG_W, h_cells / 2)],
         extra_strokes: vec![],
         output_bubbles: vec![false],
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// Pin layout matches CounterConf's fixed pin order: input[0] = data, input[1]
+// = load, input[2] = count (left edge), but the requested visual order
+// top-to-bottom is load/data/count, so pin index and grid row diverge here -
+// unlike reg_shape/comparator_shape, where index order and row order agree.
+// output[0] = Q, output[1] = carry, centered as a pair on the right within
+// the busier (3-pin) left stack's height - same "fewer side centers on the
+// busier side" technique as comparator_shape.
+pub fn counter_shape() -> ComponentShape {
+    let h_cells = stack_h(3); // 6
+    let center_row = h_cells / 2; // 3
+
+    let input_anchors = vec![
+        PinAnchor::left(pin_row(1)), // data -> middle row
+        PinAnchor::left(pin_row(0)), // load -> top row
+        PinAnchor::left(pin_row(2)), // count -> bottom row
+    ];
+    let output_anchors = vec![
+        PinAnchor::right(REG_W, center_row - 1), // Q
+        PinAnchor::right(REG_W, center_row + 1), // carry
+    ];
+
+    let row_y = |r: u32| r as f32 / h_cells as f32;
+    let labels = vec![
+        ComponentLabel {
+            text: "L",
+            pos: vec2(0.28, row_y(pin_row(0))),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "D",
+            pos: vec2(0.28, row_y(pin_row(1))),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "CT",
+            pos: vec2(0.22, row_y(pin_row(2))),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "Q",
+            pos: vec2(0.68, row_y(center_row - 1)),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "CO",
+            pos: vec2(0.6, row_y(center_row + 1)),
+            ..Default::default()
+        },
+    ];
+
+    ComponentShape {
+        size: counter_size(),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors,
+        extra_strokes: vec![],
+        output_bubbles: vec![false, false],
         labels,
         dynamic_label_pos: Vec2::ZERO,
     }
@@ -1004,6 +1074,7 @@ mod tests {
         assert_shape_on_grid("t_flip_flop", &t_flip_flop_shape());
         assert_shape_on_grid("jk_flip_flop", &jk_flip_flop_shape());
         assert_shape_on_grid("sr_flip_flop", &sr_flip_flop_shape());
+        assert_shape_on_grid("counter", &counter_shape());
         assert_shape_on_grid("adder", &adder_shape());
         assert_shape_on_grid("subtractor", &subtractor_shape());
         assert_shape_on_grid("multiplier", &multiplier_shape());
