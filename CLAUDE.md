@@ -5,7 +5,7 @@ either programmatically (constructing `Component`s and wiring them with `Circuit
 interactively in the GUI. The simulator propagates combinational signal changes through the
 circuit graph until stable (`settle`), and advances sequential state on an explicit clock tick
 (`tick_clock`). The app targets both desktop (native window, via `eframe`) and the browser
-(WASM), and circuits save to / load from a plain JSON file (`.som`).
+(WASM), and circuits save to / load from a plain JSON file (`.osm`).
 
 The crate is a library (`src/lib.rs`: `pub mod gui / io / sim`) plus a thin binary
 (`src/main.rs`) that just constructs `OsmilogApp` and hands it to `eframe`. Tests live in
@@ -23,7 +23,7 @@ WASM adds `wasm-bindgen`/`wasm-bindgen-futures`/`js-sys`/`web-sys`.
     src/sim.rs                       pub mod circuit / command / component / net / value
     src/sim/value.rs                  Value - signal representation (Floating / Fixed / Invalid)
     src/sim/net.rs                    Net - a wire connecting component pins
-    src/sim/component.rs              Component, Logic/CombLogic, ComponentSpec, pin/key types
+    src/sim/component.rs              Component, Logic/CombLogic/SeqLogic, ComponentSpec, pin/key types
     src/sim/component/*.rs            one file per component kind (gate, mux, demux, splitter, reg, adder, ...)
     src/sim/circuit.rs                Circuit - the simulation graph, evaluation engine, tunnels
     src/sim/command.rs                Command/CommandOutput/UndoAction - the undo-recordable mutation layer
@@ -64,9 +64,9 @@ never learns about signal values.
 Two things deliberately cross the boundary, and both do it by depending on `sim`, never the
 reverse:
 
-- **`sim::component::ComponentSpec`** is a plain construction-params enum, defined by `sim` as the
-  inverse of `to_component()` (`Component::spec()`; the GUI's `PlacedComponent` uses it as its
-  "what to construct" record). The GUI reuses this *exact* enum, unmodified, as `PlacedComponent`'s
+- **`sim::component::ComponentSpec`** is a plain construction-params enum, consumed via
+  `ComponentSpec::to_component()`; the GUI's `PlacedComponent` uses it as its "what to construct"
+  record. The GUI reuses this *exact* enum, unmodified, as `PlacedComponent`'s
   own record - `gui::placed_component` adds a second `impl ComponentSpec` block with GUI-only
   display methods (`size`, `label`, `shape`) that depend on `gui::geometry`/`gui::shape` types
   `sim` must never depend on. Rust allows an inherent impl of a crate-local type from any module
@@ -180,23 +180,41 @@ Every combinational component type (`Gate`, `Mux`, `Demux`, `Splitter`/`Combine`
 `Adder`, `Subtractor`, `Multiplier`, `Divider`, `Comparator` - one struct per file under
 `component/`) implements `CombLogic`, bundling its construction params, pin arity, and evaluation
 logic in one place so they can't drift apart. `Input` and `Output` are the two sourceless/sinkless
-special cases. `Reg` is the one sequential component type (`Logic::Seq`); sequential components
-sit out of `settle()`'s propagation and only change state via `tick_clock()`. See each file under
-`src/sim/component/` for a given type's specific behavior.
+special cases.
+
+    pub trait SeqLogic {
+        fn n_inputs(&self) -> usize;
+        fn n_outputs(&self) -> usize;
+        fn tick(&mut self, inputs: &[Value]) -> Vec<Value>;
+        fn observe(&self) -> Vec<Value>;
+        fn snapshot(&self) -> SeqState;
+        fn input_width(&self, i: usize) -> Option<u8>;
+        fn output_width(&self, i: usize) -> Option<u8>;
+    }
+
+Sequential component types (`Logic::Seq`; currently `Reg`, with more - e.g. `DFlipFlop` - being
+added the same way) implement `SeqLogic` instead, and each one splits in two: a `*Conf` struct
+(`RegConf`) holding only static construction params, and a runtime struct (`Reg`) that wraps a
+`conf: RegConf` plus the mutable latched `Value`. This mirrors `CombLogic`'s "one struct, config +
+logic together" idea while keeping the params embeddable in `ComponentSpec` (see below) without
+runtime state riding along - `LogicSeq::Reg(Reg)` holds the runtime struct; `ComponentSpec::Reg`
+holds only the bare `RegConf`. Sequential components sit out of `settle()`'s propagation and only
+change state via `tick_clock()` (which calls `SeqLogic::tick`); `observe()` is what `settle()` reads
+instead. See each file under `src/sim/component/` for a given type's specific behavior.
 
 ### ComponentSpec (`component.rs`)
 
-    pub enum ComponentSpec { Input(Input), Gate(Gate), Mux(Mux), .. }
+    pub enum ComponentSpec { Input(Input), Gate(Gate), Mux(Mux), Reg(RegConf), .. }
     fn ComponentSpec::to_component(&self) -> Component
-    fn Component::spec(&self) -> ComponentSpec   // pub(crate)
 
 The canonical "construction params" record - everything needed to build an equivalent
 `Component`, without any live wiring or runtime state (a `Reg`'s latched value, a live
-`Component`'s `NetKey`s, are never part of a `ComponentSpec`). It's the GUI's `PlacedComponent`
-record (see Simulator/GUI separation above for how the GUI attaches its own methods to this same
-type). `Component::spec()` (the inverse of `to_component()`) has no production caller now that undo
-tombstones live components rather than snapshotting them into specs; it's retained, guarded by
-`test_component_spec_round_trips_pin_arity`, for the arity invariant the GUI relies on.
+`Component`'s `NetKey`s, are never part of a `ComponentSpec`) - which is why a sequential variant
+like `ComponentSpec::Reg` holds the bare `RegConf`, never the runtime `Reg`. It's the GUI's
+`PlacedComponent` record (see Simulator/GUI separation above for how the GUI attaches its own
+methods to this same type). There is no `Component -> ComponentSpec` inverse: undo tombstones live
+components rather than snapshotting them into specs, so nothing needs to reconstruct a spec from a
+live `Component`.
 
 ## GUI (`src/gui/`)
 
@@ -351,9 +369,4 @@ app state).
   downstream.
 - **`set_input` error handling**: silently no-ops on a non-`Input` component instead of returning
   a `Result` (marked with a `TODO` in `circuit.rs`).
-- **More component types**: decoders, memories, additional sequential elements beyond `Reg`.
 - **Subcircuits / hierarchical components**: not started.
-
-Multi-select (rectangle select + bulk delete, `InteractionMode::BulkSelect`/`bulk_selection`) is
-already implemented, despite appearing as a future item in older notes - don't assume anything
-described as "not yet done" elsewhere is still accurate without checking the code.

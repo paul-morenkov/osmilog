@@ -18,8 +18,9 @@ use crate::io::{
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::command::Command;
 use crate::sim::component::{
-    Adder, CompKey, Comparator, ComponentSpec, Demux, Divider, Encoder, FanDirection, Gate, GateOp,
-    InIdx, Input, Multiplier, Mux, OutIdx, PinId, Reg, Subtractor,
+    Adder, CompKey, Comparator, ComponentSpec, DFlipFlopConf, Demux, Divider, Encoder, FanDirection,
+    Gate, GateOp, InIdx, Input, JKFlipFlopConf, Multiplier, Mux, OutIdx, PinId, RegConf, SRFlipFlopConf,
+    Subtractor, TFlipFlopConf,
 };
 use crate::sim::value::Value;
 
@@ -153,6 +154,10 @@ pub struct OsmilogApp {
     // `apply_pending_load`.
     #[cfg(target_arch = "wasm32")]
     pending_load: crate::io::wasm::PendingLoad,
+    // Toggles the in-app puffin flamegraph window (Debug menu). puffin
+    // scopes are recorded regardless; this just controls whether the
+    // viewer is drawn.
+    show_profiler: bool,
 }
 
 // ── CanvasCtx ─────────────────────────────────────────────────────────────────
@@ -187,10 +192,12 @@ impl OsmilogApp {
             last_settle_error: None,
             #[cfg(target_arch = "wasm32")]
             pending_load: crate::io::wasm::new_pending_load(),
+            show_profiler: false,
         }
     }
 
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        puffin::set_scopes_on(true);
         Self::empty()
     }
 
@@ -346,6 +353,7 @@ impl OsmilogApp {
     // (fan-out/driver-conflict handling lives in Circuit::link). A group with
     // no component pin is skipped. Called after any wiring edit.
     pub(crate) fn rebuild_circuit(&mut self) {
+        puffin::profile_function!();
         // Reconcile each circuit tunnel's label from its GUI record
         let renames: Vec<(TunnelKey, String)> = self
             .tunnels
@@ -422,6 +430,7 @@ impl OsmilogApp {
     // nodes in a connected group share one net, so we resolve the group's value
     // from any pin/tunnel endpoint on it (Floating if it has none).
     fn wire_node_values(&self) -> HashMap<WireNodeKey, Value> {
+        puffin::profile_function!();
         let mut out = HashMap::new();
         for group in self.wiring.groups() {
             let mut val = Value::Floating;
@@ -455,6 +464,7 @@ impl OsmilogApp {
     // terminal vs. empty space. Priority: pin (out, then in), tunnel, wire
     // node, wire segment, else the snapped cursor cell.
     fn wire_target_at(&self, pos: Pos2, pan: Vec2) -> (NodeAttach, GridPos, bool) {
+        puffin::profile_function!();
         if let Some((pck, pin)) = pin_at_pos(self.active_components(), pan, pos, PinKind::Output) {
             let gp = pin_grid_pos(
                 &self.components[pck].spec.shape(),
@@ -863,7 +873,7 @@ impl OsmilogApp {
                     );
                 }
             }
-            ComponentSpec::Reg(Reg { mut data_width }) => {
+            ComponentSpec::Reg(RegConf { mut data_width }) => {
                 let mut changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Data width:");
@@ -872,9 +882,21 @@ impl OsmilogApp {
                         .changed();
                 });
                 if changed {
-                    self.reconfigure_component(key, ComponentSpec::Reg(Reg { data_width }));
+                    self.reconfigure_component(key, ComponentSpec::Reg(RegConf { data_width }));
                 }
 
+                let cur = self.circuit.components[comp_key].pins.out_cache[0];
+                let val_str = match cur {
+                    Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
+                    Value::Floating => "Floating".to_string(),
+                    Value::Invalid => "Invalid (width mismatch)".to_string(),
+                };
+                ui.label(format!("Value: {}", val_str));
+            }
+            ComponentSpec::DFlipFlop(_)
+            | ComponentSpec::TFlipFlop(_)
+            | ComponentSpec::JKFlipFlop(_)
+            | ComponentSpec::SRFlipFlop(_) => {
                 let cur = self.circuit.components[comp_key].pins.out_cache[0];
                 let val_str = match cur {
                     Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
@@ -1203,6 +1225,7 @@ impl OsmilogApp {
     // (screen space): a component/tunnel counts when its bounding rect is
     // inside, a wire when both endpoints are.
     fn items_in_rect(&self, rect: Rect, pan: Vec2) -> Vec<Selected> {
+        puffin::profile_function!();
         let mut out = Vec::new();
         for (key, pc) in self.active_components() {
             if rect.contains_rect(component_bounding_rect(pc, pan)) {
@@ -1549,10 +1572,36 @@ impl OsmilogApp {
                     ui.menu_button("Memory", |ui| {
                         if ui.button("Register").clicked() {
                             self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Reg(Reg { data_width: 1 }),
+                                spec: ComponentSpec::Reg(RegConf { data_width: 1 }),
                             };
                             ui.close();
                         }
+                        ui.menu_button("Flip-Flop", |ui| {
+                            if ui.button("D Flip-Flop").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::DFlipFlop(DFlipFlopConf),
+                                };
+                                ui.close();
+                            }
+                            if ui.button("T Flip-Flop").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::TFlipFlop(TFlipFlopConf),
+                                };
+                                ui.close();
+                            }
+                            if ui.button("JK Flip-Flop").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::JKFlipFlop(JKFlipFlopConf),
+                                };
+                                ui.close();
+                            }
+                            if ui.button("SR Flip-Flop").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::SRFlipFlop(SRFlipFlopConf),
+                                };
+                                ui.close();
+                            }
+                        });
                     });
                     ui.menu_button("Tunnel", |ui| {
                         if ui.button("Feed").clicked() {
@@ -1568,6 +1617,9 @@ impl OsmilogApp {
                             ui.close();
                         }
                     });
+                });
+                ui.menu_button("Debug", |ui| {
+                    ui.checkbox(&mut self.show_profiler, "Profiler");
                 });
                 if ui.button("Tick Clock").clicked() {
                     // A clock tick is a simulation step, not an edit - issue it
@@ -1588,6 +1640,7 @@ impl OsmilogApp {
 
     // ── Canvas drawing ────────────────────────────────────────────────────
     fn draw_canvas(&self, painter: &Painter, clip_rect: Rect, pan: Vec2, theme: Theme) {
+        puffin::profile_function!();
         painter.rect_filled(clip_rect, 0.0, theme.canvas_bg);
         draw_grid(painter, clip_rect, pan, theme);
 
@@ -1595,6 +1648,7 @@ impl OsmilogApp {
         // value: any component pin / tunnel on the group resolves (live) to
         // that net's Value; a dangling group (no endpoints) is Floating.
         let node_value = self.wire_node_values();
+
         for (seg_key, seg) in self.wiring.active_segments() {
             let a = self.wiring.nodes[seg.a];
             let b = self.wiring.nodes[seg.b];
@@ -1608,6 +1662,7 @@ impl OsmilogApp {
             }
             painter.line_segment([p0, p1], stroke);
         }
+
         // Junction dots where three or more segments meet, so a real branch
         // reads differently from a mere crossing.
         for (nk, node) in self.wiring.active_nodes() {
@@ -1622,12 +1677,14 @@ impl OsmilogApp {
         }
 
         // Draw components
+
         for (pc_key, pc) in self.active_components() {
             let is_selected = self.is_highlighted(Selected::Component(pc_key));
             draw_component(painter, pc, pan, &self.circuit, is_selected, theme);
         }
 
         // Draw tunnels
+
         for (pt_key, pt) in self.active_tunnels() {
             let is_selected = self.is_highlighted(Selected::Tunnel(pt_key));
             draw_tunnel(painter, pt, pan, &self.circuit, is_selected, theme);
@@ -1639,6 +1696,7 @@ impl OsmilogApp {
     // Undo/Redo. Must run before `handle_canvas_interaction` reads `self.mode`
     // in the same frame, since Escape can reset it to Idle.
     fn handle_canvas_shortcuts(&mut self, ctx: &egui::Context) {
+        puffin::profile_function!();
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             match &self.mode {
                 InteractionMode::SelectionDrag {
@@ -1737,6 +1795,7 @@ impl OsmilogApp {
 
     // ── Canvas mode dispatch ──────────────────────────────────────────────
     fn handle_canvas_interaction(&mut self, cc: &CanvasCtx) {
+        puffin::profile_function!();
         let pointer = cc
             .response
             .interact_pointer_pos()
@@ -1766,6 +1825,7 @@ impl OsmilogApp {
     }
 
     fn interact_idle(&mut self, cc: &CanvasCtx, pointer: Option<Pos2>) {
+        puffin::profile_function!();
         // Hover reticle: hovering over a wire (but not a pin) shows
         // where a branch would tap the wire.
         if let Some(pos) = pointer {
@@ -1919,6 +1979,7 @@ impl OsmilogApp {
         cursor: Pos2,
         dragging: bool,
     ) {
+        puffin::profile_function!();
         let end = pointer.unwrap_or(cursor);
         let (drop_attach, drop_gp, terminal) = self.wire_target_at(end, cc.pan);
 
@@ -2001,6 +2062,7 @@ impl OsmilogApp {
         free_nodes: Vec<(WireNodeKey, GridPos)>,
         drag_origin: Pos2,
     ) {
+        puffin::profile_function!();
         if let Some(pos) = pointer {
             let delta_x = ((pos.x - drag_origin.x) / GRID_SIZE).round() as i32;
             let delta_y = ((pos.y - drag_origin.y) / GRID_SIZE).round() as i32;
@@ -2057,6 +2119,7 @@ impl OsmilogApp {
         start: GridPos,
         current: GridPos,
     ) {
+        puffin::profile_function!();
         // Track the live corner, then paint the rubber-band box.
         let current = pointer.map(|p| snap_to_grid(p, cc.pan)).unwrap_or(current);
         let rect = selection_screen_rect(start, current, cc.pan);
@@ -2089,6 +2152,11 @@ impl OsmilogApp {
 
 impl eframe::App for OsmilogApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Frame boundary for every puffin scope recorded this frame (in both
+        // logic() and ui() - eframe calls them once each, in that order).
+        puffin::GlobalProfiler::lock().new_frame();
+        puffin::profile_function!();
+
         #[cfg(target_arch = "wasm32")]
         self.apply_pending_load();
 
@@ -2099,8 +2167,13 @@ impl eframe::App for OsmilogApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        puffin::profile_function!();
         let ctx = ui.ctx().clone();
         let theme = Theme::from_visuals(ui.visuals());
+
+        if self.show_profiler {
+            puffin_egui::profiler_window(&ctx);
+        }
 
         self.show_menu_bar(ui, theme);
 
@@ -2236,6 +2309,7 @@ fn pin_at_pos<'a>(
     pos: Pos2,
     kind: PinKind,
 ) -> Option<(PlacedCompKey, PinId)> {
+    puffin::profile_function!();
     let hit_r = PIN_RADIUS * 2.0;
     for (key, pc) in components {
         let shape = pc.spec.shape();
@@ -2267,6 +2341,7 @@ fn tunnel_pin_at_pos<'a>(
     pan: Vec2,
     pos: Pos2,
 ) -> Option<PlacedTunnelKey> {
+    puffin::profile_function!();
     let hit_r = PIN_RADIUS * 2.0;
     for (key, tunnel) in tunnels {
         if tunnel_pin_pos(tunnel, pan).distance(pos) <= hit_r {
@@ -2332,6 +2407,7 @@ fn draw_component(
     is_selected: bool,
     theme: Theme,
 ) {
+    puffin::profile_function!();
     let shape = pc.spec.shape();
     let rect = component_bounding_rect(pc, pan);
     let fill = theme.component_fill;
@@ -2418,6 +2494,7 @@ fn draw_tunnel(
     is_selected: bool,
     theme: Theme,
 ) {
+    puffin::profile_function!();
     let shape = tunnel_shape(pt.role);
     let rect = tunnel_bounding_rect(pt, pan);
     // Distinct fill from components (theme's "open" widget tone), to visually

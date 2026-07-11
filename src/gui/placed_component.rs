@@ -33,6 +33,9 @@ impl ComponentSpec {
             Self::Mux(m) => mux_size(m.sel_width),
             Self::Demux(d) => demux_size(d.sel_width),
             Self::Reg(_) => reg_size(),
+            Self::DFlipFlop(_) | Self::TFlipFlop(_) | Self::JKFlipFlop(_) | Self::SRFlipFlop(_) => {
+                flip_flop_size()
+            }
             Self::Encoder(e) => encoder_size(e.sel_width),
             Self::Adder(_) => op2_size(),
             Self::Subtractor(_) => op2_size(),
@@ -59,6 +62,10 @@ impl ComponentSpec {
             Self::Mux(_) => "MUX",
             Self::Demux(_) => "DEMUX",
             Self::Reg(_) => "REG",
+            Self::DFlipFlop(_) => "D-FF",
+            Self::TFlipFlop(_) => "T-FF",
+            Self::JKFlipFlop(_) => "JK-FF",
+            Self::SRFlipFlop(_) => "SR-FF",
             Self::Encoder(_) => "ENC",
             Self::Adder(_) => "ADD",
             Self::Subtractor(_) => "SUB",
@@ -73,6 +80,7 @@ impl ComponentSpec {
     }
 
     pub fn shape(&self) -> ComponentShape {
+        puffin::profile_function!();
         match self {
             Self::Input(_) => input_shape(),
             Self::Output => output_shape(),
@@ -80,6 +88,10 @@ impl ComponentSpec {
             Self::Mux(m) => mux_shape(m.sel_width),
             Self::Demux(d) => demux_shape(d.sel_width),
             Self::Reg(_) => reg_shape(),
+            Self::DFlipFlop(_) => d_flip_flop_shape(),
+            Self::TFlipFlop(_) => t_flip_flop_shape(),
+            Self::JKFlipFlop(_) => jk_flip_flop_shape(),
+            Self::SRFlipFlop(_) => sr_flip_flop_shape(),
             Self::Encoder(e) => encoder_shape(e.sel_width),
             Self::Adder(_) => adder_shape(),
             Self::Subtractor(_) => subtractor_shape(),

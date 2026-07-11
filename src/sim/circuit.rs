@@ -111,6 +111,7 @@ impl Circuit {
     }
 
     pub fn clear_nets(&mut self) {
+        puffin::profile_function!();
         for comp in self.components.values_mut() {
             comp.clear_pins();
         }
@@ -172,6 +173,7 @@ impl Circuit {
     }
 
     pub fn link(&mut self, a: CompKey, a_pin: PinId, b: CompKey, b_pin: PinId) -> NetKey {
+        puffin::profile_function!();
         let net_a = self.net_of(a, a_pin);
         let net_b = self.net_of(b, b_pin);
 
@@ -457,6 +459,7 @@ impl Circuit {
     }
 
     pub fn settle(&mut self) -> Result<(), SettleError> {
+        puffin::profile_function!();
         let mut revisits: SecondaryMap<NetKey, usize> = SecondaryMap::new();
         let iteration_budget = self
             .nets
@@ -554,6 +557,7 @@ impl Circuit {
     // Value::Invalid, the same structural signal used for a width mismatch and
     // handled identically downstream (Invalid stays local, never propagates).
     fn resolve_net(&mut self, net: NetKey) -> bool {
+        puffin::profile_function!();
         let old = self.nets[net].value;
 
         let new = if self.net_width_conflict(net) || self.nets[net].sources.len() > 1 {
@@ -574,6 +578,7 @@ impl Circuit {
     // Evaluates component logic, storing the Value in pins.out_cache and marking the net as dirty
     // if necessary.
     fn eval_component(&mut self, comp: CompKey) {
+        puffin::profile_function!();
         let new_values = self.components[comp].evaluate(&self.nets);
         self.apply_output_values(comp, new_values);
     }
@@ -582,6 +587,7 @@ impl Circuit {
     // and marks any changed output net dirty. Shared by eval_component (combinational path)
     // and tick_clock (sequential path).
     fn apply_output_values(&mut self, comp: CompKey, new_values: Vec<Value>) {
+        puffin::profile_function!();
         let c = &mut self.components[comp];
         let mut dirty_nets = Vec::new();
 
@@ -607,6 +613,7 @@ impl Circuit {
     // LogicSeq variants - a new sequential type only needs new match arms in
     // Component::evaluate/tick, not changes here.
     pub fn tick_clock(&mut self) -> Result<(), SettleError> {
+        puffin::profile_function!();
         let seq_comps: Vec<CompKey> = self
             .components
             .iter()

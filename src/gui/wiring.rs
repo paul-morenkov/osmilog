@@ -539,6 +539,7 @@ impl Wiring {
     /// active segments) are skipped. Drives both the circuit rebuild and
     /// per-segment colouring.
     pub fn groups(&self) -> Vec<Group> {
+        puffin::profile_function!();
         // Union-find over active node keys, unioning the two ends of every
         // active segment.
         let mut parent: HashMap<WireNodeKey, WireNodeKey> =

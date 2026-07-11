@@ -130,6 +130,7 @@ impl Circuit {
     /// `TickClock` which settles internally). Callers that don't need the
     /// undo take `.0`.
     pub fn apply(&mut self, command: Command) -> (CommandOutput, UndoAction) {
+        puffin::profile_function!();
         match command {
             Command::AddComponent(comp) => {
                 let key = self.add_component(comp);
@@ -167,7 +168,10 @@ impl Circuit {
             }
             Command::AddTunnel { label, role } => {
                 let key = self.add_tunnel(label, role);
-                (CommandOutput::Tunnel(key), UndoAction::DeactivateTunnel(key))
+                (
+                    CommandOutput::Tunnel(key),
+                    UndoAction::DeactivateTunnel(key),
+                )
             }
             Command::LinkTunnel { tunnel, comp, pin } => {
                 let net = self.link_tunnel(tunnel, comp, pin);
@@ -283,7 +287,10 @@ impl Circuit {
             // Clock ticks are issued untracked (see OsmilogApp's Tick Clock
             // handler), so a RestoreSeqState should never reach the history.
             UndoAction::RestoreSeqState { .. } => {
-                debug_assert!(false, "RestoreSeqState reached apply_undo: clock ticks must be untracked");
+                debug_assert!(
+                    false,
+                    "RestoreSeqState reached apply_undo: clock ticks must be untracked"
+                );
                 UndoAction::NoOp
             }
         }
@@ -818,6 +825,7 @@ mod tests {
                 assert_eq!(snapshots[0].0, reg);
                 match snapshots[0].1 {
                     SeqState::Reg(v) => assert_eq!(v, Value::new(0, 1)), // pre-tick, not the just-latched 1
+                    _ => panic!(),
                 }
             }
             other => panic!("expected RestoreSeqState, got {other:?}"),
@@ -863,36 +871,5 @@ mod tests {
         c.link(reg, PinId::output(0), out, PinId::input(0));
         c.settle().unwrap();
         assert_eq!(c.read_output(out), Value::ZERO);
-    }
-
-    #[test]
-    fn test_component_spec_round_trips_pin_arity() {
-        use crate::sim::component::FanDirection;
-
-        let mut c = Circuit::new();
-        let cases: Vec<Component> = vec![
-            Component::input(3, 4),
-            Component::output(),
-            Component::gate(GateOp::And, 3, 2),
-            Component::mux(4, 2),
-            Component::demux(4, 2),
-            Component::reg(8),
-            Component::priority_encoder(3),
-            Component::adder(4),
-            Component::subtractor(4),
-            Component::multiplier(4),
-            Component::divider(4),
-            Component::comparator(4),
-            Component::splitter(vec![vec![0, 1], vec![2, 3]], FanDirection::Right),
-        ];
-        for comp in cases {
-            let expected_inputs = comp.pins.inputs.len();
-            let expected_outputs = comp.pins.outputs.len();
-            let key = c.add_component(comp);
-            let spec = c.components[key].spec();
-            let rebuilt = spec.to_component();
-            assert_eq!(rebuilt.pins.inputs.len(), expected_inputs);
-            assert_eq!(rebuilt.pins.outputs.len(), expected_outputs);
-        }
     }
 }
