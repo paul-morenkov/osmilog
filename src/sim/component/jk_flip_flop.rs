@@ -68,16 +68,17 @@ impl SeqLogic for JKFlipFlop {
     }
 
     fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
-        let j = inputs[JKFlipFlopConf::J_PIN] == Value::ONE;
-        let k = inputs[JKFlipFlopConf::K_PIN] == Value::ONE;
+        let j = inputs[JKFlipFlopConf::J_PIN];
+        let k = inputs[JKFlipFlopConf::K_PIN];
         let write_enable = inputs[JKFlipFlopConf::WRITE_EN_PIN];
 
         if matches!(write_enable, Value::ONE | Value::Floating) {
             self.value = match (j, k) {
-                (false, false) => self.value, // hold
-                (false, true) => Value::ZERO, // reset
-                (true, false) => Value::ONE,  // set
-                (true, true) => !self.value,  // toggle
+                (Value::ZERO, Value::ZERO) => self.value, // hold
+                (Value::ZERO, Value::ONE) => Value::ZERO, // reset
+                (Value::ONE, Value::ZERO) => Value::ONE,  // set
+                (Value::ONE, Value::ONE) => !self.value,  // toggle
+                _ => Value::Floating,
             };
         }
         vec![self.value]
@@ -132,7 +133,10 @@ mod tests {
     #[test]
     fn test_hold_when_j_and_k_both_zero() {
         let mut ff = new_jk_flip_flop();
-        assert_eq!(ff.tick(&[Value::ONE, Value::ZERO, Value::ONE]), vec![Value::ONE]);
+        assert_eq!(
+            ff.tick(&[Value::ONE, Value::ZERO, Value::ONE]),
+            vec![Value::ONE]
+        );
         assert_eq!(
             ff.tick(&[Value::ZERO, Value::ZERO, Value::ONE]),
             vec![Value::ONE]
@@ -145,7 +149,10 @@ mod tests {
         assert_eq!(ff.observe(), vec![Value::ZERO]);
 
         // J=1, K=1: toggles 0 -> 1.
-        assert_eq!(ff.tick(&[Value::ONE, Value::ONE, Value::ONE]), vec![Value::ONE]);
+        assert_eq!(
+            ff.tick(&[Value::ONE, Value::ONE, Value::ONE]),
+            vec![Value::ONE]
+        );
 
         // J=1, K=1: toggles 1 -> 0.
         assert_eq!(
