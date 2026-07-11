@@ -180,6 +180,17 @@ impl Component {
         }
     }
 
+    // Latched output values of a sequential component, reported without
+    // recomputing from inputs (what evaluate() dispatches to for Logic::Seq).
+    // Only valid on Logic::Seq components - callers must filter with
+    // is_sequential() first.
+    pub fn observe(&self) -> Vec<Value> {
+        match &self.logic {
+            Logic::Comb(_) => unreachable!("observe() called on a combinational component"),
+            Logic::Seq(seq) => seq.observe(),
+        }
+    }
+
     // Advances one clock tick given pre-collected input values (see read_inputs).
     // Mutates persisted state and returns new out_cache values. Only valid on
     // Logic::Seq components - callers must filter with is_sequential() first.
@@ -187,6 +198,15 @@ impl Component {
         match &mut self.logic {
             Logic::Comb(_) => unreachable!("tick() called on a combinational component"),
             Logic::Seq(seq) => seq.tick(inputs),
+        }
+    }
+
+    // Restores latched sequential state to its power-on initial value. Only
+    // valid on Logic::Seq components - callers must filter with is_sequential().
+    pub fn reset(&mut self) {
+        match &mut self.logic {
+            Logic::Comb(_) => unreachable!("reset() called on a combinational component"),
+            Logic::Seq(seq) => seq.reset(),
         }
     }
 
@@ -525,6 +545,10 @@ pub trait SeqLogic {
     fn tick(&mut self, inputs: &[Value]) -> Vec<Value>;
     fn observe(&self) -> Vec<Value>;
     fn snapshot(&self) -> SeqState;
+    // Restores the latched state to its power-on initial value (what the
+    // constructor sets), without touching construction params. Drives the
+    // GUI's clock "Stop" (see Circuit::reset_sequential).
+    fn reset(&mut self);
     // Expected bit width of pin `i`, from construction params (not any live
     // Value). None means any width (currently only Output). Used by
     // Circuit::resolve_net() to flag width-disagreeing nets.
@@ -597,6 +621,17 @@ impl LogicSeq {
             Self::JKFlipFlop(ff) => ff.observe(),
             Self::SRFlipFlop(ff) => ff.observe(),
             Self::Counter(c) => c.observe(),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        match self {
+            Self::Reg(reg) => reg.reset(),
+            Self::DFlipFlop(ff) => ff.reset(),
+            Self::TFlipFlop(ff) => ff.reset(),
+            Self::JKFlipFlop(ff) => ff.reset(),
+            Self::SRFlipFlop(ff) => ff.reset(),
+            Self::Counter(c) => c.reset(),
         }
     }
 

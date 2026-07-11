@@ -170,6 +170,11 @@ impl SeqLogic for Counter {
         vec![self.value, self.carry]
     }
 
+    fn reset(&mut self) {
+        self.value = Value::new(0, self.conf.data_width);
+        self.carry = Value::ZERO;
+    }
+
     fn snapshot(&self) -> SeqState {
         SeqState::Counter {
             value: self.value,

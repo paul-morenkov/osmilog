@@ -75,6 +75,10 @@ impl SeqLogic for Reg {
         vec![self.value]
     }
 
+    fn reset(&mut self) {
+        self.value = Value::new(0, self.conf.data_width);
+    }
+
     fn snapshot(&self) -> SeqState {
         SeqState::Reg(self.value)
     }

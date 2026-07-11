@@ -36,6 +36,7 @@ pub enum Command {
         new_label: String,
     },
     TickClock,
+    ResetSequential,
     RemoveComponent(CompKey),
 }
 
@@ -76,7 +77,8 @@ impl CommandOutput {
         }
     }
 
-    /// Panics unless this came from `Command::TickClock`.
+    /// Panics unless this came from `Command::TickClock` or
+    /// `Command::ResetSequential`.
     pub fn unwrap_settle(self) -> Result<(), SettleError> {
         match self {
             Self::Settle(r) => r,
@@ -218,6 +220,12 @@ impl Circuit {
                     UndoAction::RestoreSeqState { snapshots },
                 )
             }
+            // Like TickClock, a simulation step rather than an edit - the GUI
+            // issues it untracked (clock "Stop"), so its undo is a NoOp.
+            Command::ResetSequential => (
+                CommandOutput::Settle(self.reset_sequential()),
+                UndoAction::NoOp,
+            ),
             Command::RemoveComponent(key) => {
                 let was_active = self.components.get(key).is_some_and(|c| c.active);
                 self.remove_component(key);
