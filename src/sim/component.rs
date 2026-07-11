@@ -4,6 +4,7 @@ use slotmap::{new_key_type, SlotMap};
 
 mod adder;
 mod comparator;
+mod d_flip_flop;
 mod demux;
 mod divider;
 mod encoder;
@@ -17,6 +18,7 @@ mod subtractor;
 
 pub use adder::Adder;
 pub use comparator::Comparator;
+pub use d_flip_flop::{DFlipFlop, DFlipFlopConf};
 pub use demux::Demux;
 pub use divider::Divider;
 pub use encoder::Encoder;
@@ -484,6 +486,7 @@ pub trait SeqLogic {
 #[derive(Debug)]
 pub enum LogicSeq {
     Reg(Reg),
+    DFlipFlop(DFlipFlop),
 }
 
 // Generic reflection of LogicSeq's persisted state - one arm per LogicSeq
@@ -492,30 +495,35 @@ pub enum LogicSeq {
 #[derive(Debug, Clone, Copy)]
 pub enum SeqState {
     Reg(Value),
+    FlipFlop(Value),
 }
 
 impl LogicSeq {
     pub fn n_inputs(&self) -> usize {
         match self {
             Self::Reg(reg) => reg.n_inputs(),
+            Self::DFlipFlop(ff) => ff.n_inputs(),
         }
     }
 
     pub fn n_outputs(&self) -> usize {
         match self {
             Self::Reg(reg) => reg.n_outputs(),
+            Self::DFlipFlop(ff) => ff.n_outputs(),
         }
     }
 
     pub fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
         match self {
             LogicSeq::Reg(reg) => reg.tick(inputs),
+            Self::DFlipFlop(ff) => ff.tick(inputs),
         }
     }
 
     pub fn observe(&self) -> Vec<Value> {
         match self {
             Self::Reg(reg) => reg.observe(),
+            Self::DFlipFlop(ff) => ff.observe(),
         }
     }
 
@@ -526,18 +534,21 @@ impl LogicSeq {
     pub(crate) fn snapshot(&self) -> SeqState {
         match self {
             Self::Reg(reg) => reg.snapshot(),
+            Self::DFlipFlop(ff) => ff.snapshot(),
         }
     }
 
     pub fn input_width(&self, i: usize) -> Option<u8> {
         match self {
             Self::Reg(reg) => reg.input_width(i),
+            Self::DFlipFlop(ff) => ff.input_width(i),
         }
     }
 
     pub fn output_width(&self, i: usize) -> Option<u8> {
         match self {
             Self::Reg(reg) => reg.output_width(i),
+            Self::DFlipFlop(ff) => ff.output_width(i),
         }
     }
 }

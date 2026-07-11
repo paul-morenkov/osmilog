@@ -1,6 +1,5 @@
-use crate::sim::{component::SeqLogic, value::Value};
-
-use super::SeqState;
+use super::{SeqLogic, SeqState};
+use crate::sim::value::Value;
 
 // Register config only - the latched runtime value lives in LogicSeq::Reg::value, not here,
 // so this struct stays a pure construction record (embeddable directly in ComponentDef).

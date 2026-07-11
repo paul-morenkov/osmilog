@@ -825,6 +825,7 @@ mod tests {
                 assert_eq!(snapshots[0].0, reg);
                 match snapshots[0].1 {
                     SeqState::Reg(v) => assert_eq!(v, Value::new(0, 1)), // pre-tick, not the just-latched 1
+                    _ => panic!(),
                 }
             }
             other => panic!("expected RestoreSeqState, got {other:?}"),
