@@ -15,6 +15,7 @@ use crate::gui::wiring::{NodeAttach, WireNode, WireNodeKey, WireSegKey, WireSegm
 use crate::io::{
     CircuitFile, ComponentEntry, LoadError, NodeAttachEntry, NodeEntry, SegEntry, TunnelEntry,
 };
+use crate::platform;
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::command::Command;
 use crate::sim::component::*;
@@ -223,11 +224,12 @@ pub struct OsmilogApp {
     // both are transient "something went wrong" status shown in the same
     // red label in the menu bar (see the "Menu bar" section of `ui`).
     pub last_settle_error: Option<String>,
-    // WASM file dialogs are Promise-based, so a load kicked off from the File
-    // menu delivers its result here on a later frame, not synchronously - see
-    // `apply_pending_load`.
-    #[cfg(target_arch = "wasm32")]
-    pending_load: crate::io::wasm::PendingLoad,
+    // Platform-specific file I/O state and orchestration (native OS dialogs vs.
+    // browser async pick / Blob download + in-app Save As modal), behind one
+    // interface so the call sites below are cfg-free. See `crate::platform` and
+    // the `with_io` helper; native's IoState is a ZST, web's holds the async
+    // load slot + modal contents.
+    io: platform::IoState,
     // Toggles the in-app puffin flamegraph window (Debug menu). puffin
     // scopes are recorded regardless; this just controls whether the
     // viewer is drawn.
@@ -267,8 +269,7 @@ impl OsmilogApp {
             selected: None,
             clipboard: Clipboard::new(),
             last_settle_error: None,
-            #[cfg(target_arch = "wasm32")]
-            pending_load: crate::io::wasm::new_pending_load(),
+            io: platform::IoState::default(),
             show_profiler: false,
             clock: ClockControl::default(),
         }
@@ -1579,21 +1580,17 @@ impl OsmilogApp {
         self.history.end_batch();
     }
 
-    // Applies a File > Load result that a spawned WASM load task has
-    // delivered into `pending_load`, if any is waiting. No-op most frames.
-    #[cfg(target_arch = "wasm32")]
-    fn apply_pending_load(&mut self) {
-        let Some(outcome) = self.pending_load.borrow_mut().take() else {
-            return;
-        };
-        match outcome {
-            Ok(file) => {
-                if let Err(e) = self.load_circuit_file(&file) {
-                    self.last_settle_error = Some(format!("load failed: {e}"));
-                }
-            }
-            Err(e) => self.last_settle_error = Some(format!("load failed: {e}")),
-        }
+    // Runs `f` with the platform `IoState` temporarily moved out of `self`, so
+    // the IO methods can take a `&mut OsmilogApp` (to serialize, install a
+    // loaded file, or set an error) without aliasing `self.io`. Both backends'
+    // `IoState` is `Default`, so the take/restore is cheap - web's is an Rc +
+    // Option, native's is a ZST - and it keeps every File-menu / per-frame call
+    // site cfg-free.
+    fn with_io<R>(&mut self, f: impl FnOnce(&mut platform::IoState, &mut Self) -> R) -> R {
+        let mut io = std::mem::take(&mut self.io);
+        let r = f(&mut io, self);
+        self.io = io;
+        r
     }
 
     // ── Menu bar ──────────────────────────────────────────────────────────
@@ -1606,38 +1603,17 @@ impl OsmilogApp {
             ui.horizontal(|ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Save").clicked() {
-                        match self.to_circuit_file().to_json() {
-                            Ok(json) => {
-                                #[cfg(not(target_arch = "wasm32"))]
-                                if let Some(Err(e)) = crate::io::native::save_dialog(&json) {
-                                    self.last_settle_error = Some(format!("save failed: {e}"));
-                                }
-                                #[cfg(target_arch = "wasm32")]
-                                crate::io::wasm::trigger_download(&json);
-                            }
-                            Err(e) => self.last_settle_error = Some(format!("save failed: {e}")),
-                        }
+                        // Native opens the OS "Save As" dialog and writes
+                        // synchronously; web opens an in-app filename modal
+                        // (completed by drive_save_dialog on a later frame).
+                        self.with_io(|io, app| io.request_save(app));
                         ui.close();
                     }
                     if ui.add_enabled(!locked, egui::Button::new("Load")).clicked() {
-                        #[cfg(not(target_arch = "wasm32"))]
-                        if let Some(outcome) = crate::io::native::load_dialog() {
-                            match outcome {
-                                Ok(file) => {
-                                    if let Err(e) = self.load_circuit_file(&file) {
-                                        self.last_settle_error = Some(format!("load failed: {e}"));
-                                    }
-                                }
-                                Err(e) => {
-                                    self.last_settle_error = Some(format!("load failed: {e}"))
-                                }
-                            }
-                        }
-                        // WASM's file pick + read is async - this just kicks the
-                        // task off; the result lands in pending_load and is
-                        // applied by apply_pending_load on a later frame.
-                        #[cfg(target_arch = "wasm32")]
-                        crate::io::wasm::spawn_load_dialog(self.pending_load.clone());
+                        // Native picks + reads + installs synchronously; web
+                        // kicks off an async task whose result lands in the IO
+                        // state and is installed by poll_pending_load later.
+                        self.with_io(|io, app| io.request_load(app));
                         ui.close();
                     }
                 });
@@ -2435,14 +2411,15 @@ impl eframe::App for OsmilogApp {
         puffin::GlobalProfiler::lock().new_frame();
         puffin::profile_function!();
 
-        #[cfg(target_arch = "wasm32")]
-        self.apply_pending_load();
+        // Installs an async File > Load result if a web load task has delivered
+        // one; no-op on native (and every quiet frame on web).
+        self.with_io(|io, app| io.poll_pending_load(app));
 
         self.advance_clock(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            #[cfg(not(target_arch = "wasm32"))]
-            std::process::exit(0);
+            // Exits the process on native; no-op on web (the canvas just stops).
+            platform::quit();
         }
     }
 
@@ -2456,6 +2433,10 @@ impl eframe::App for OsmilogApp {
         }
 
         self.show_menu_bar(ui, theme);
+
+        // Draws the web "Save As" filename modal while it's open (and completes
+        // the download on confirm); no-op on native.
+        self.with_io(|io, app| io.drive_save_dialog(&ctx, app));
 
         egui::Panel::left("properties")
             .min_size(200.0)
