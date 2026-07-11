@@ -1,19 +1,94 @@
+use crate::sim::{component::SeqLogic, value::Value};
+
+use super::SeqState;
+
 // Register config only - the latched runtime value lives in LogicSeq::Reg::value, not here,
 // so this struct stays a pure construction record (embeddable directly in ComponentDef).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Reg {
+pub struct RegConf {
     pub data_width: u8,
 }
 
-impl Reg {
+impl RegConf {
     pub const DATA_PIN: usize = 0;
     pub const WRITE_EN_PIN: usize = 1;
+}
 
+impl RegConf {
     pub fn n_inputs(&self) -> usize {
         2
     }
+
     pub fn n_outputs(&self) -> usize {
         1
+    }
+
+    pub fn input_width(&self, i: usize) -> Option<u8> {
+        match i {
+            RegConf::DATA_PIN => Some(self.data_width), // data
+            RegConf::WRITE_EN_PIN => Some(1),           // write_enable
+            _ => None,
+        }
+    }
+
+    pub fn output_width(&self, i: usize) -> Option<u8> {
+        match i {
+            0 => Some(self.data_width),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Reg {
+    conf: RegConf,
+    value: Value,
+}
+
+impl Reg {
+    pub fn new(data_width: u8) -> Self {
+        Self {
+            conf: RegConf { data_width },
+            value: Value::new(0, data_width),
+        }
+    }
+}
+
+impl SeqLogic for Reg {
+    fn n_inputs(&self) -> usize {
+        self.conf.n_inputs()
+    }
+
+    fn n_outputs(&self) -> usize {
+        self.conf.n_outputs()
+    }
+
+    fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
+        let data = inputs[RegConf::DATA_PIN];
+        let write_enable = inputs[RegConf::WRITE_EN_PIN];
+        if matches!(
+            write_enable,
+            Value::Fixed { bits: 1, width: 1 } | Value::Floating
+        ) {
+            self.value = data;
+        }
+        vec![self.value]
+    }
+
+    fn observe(&self) -> Vec<Value> {
+        vec![self.value]
+    }
+
+    fn snapshot(&self) -> SeqState {
+        SeqState::Reg(self.value)
+    }
+
+    fn input_width(&self, i: usize) -> Option<u8> {
+        self.conf.input_width(i)
+    }
+
+    fn output_width(&self, i: usize) -> Option<u8> {
+        self.conf.output_width(i)
     }
 }
 
@@ -25,10 +100,7 @@ mod tests {
     use test_case::test_case;
 
     fn new_reg(data_width: u8) -> LogicSeq {
-        LogicSeq::Reg {
-            config: Reg { data_width },
-            value: Value::new(0, data_width),
-        }
+        LogicSeq::Reg(Reg::new(data_width))
     }
 
     #[test]

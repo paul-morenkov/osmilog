@@ -24,7 +24,7 @@ pub use gate::{Gate, GateOp};
 pub use input::Input;
 pub use multiplier::Multiplier;
 pub use mux::Mux;
-pub use reg::Reg;
+pub use reg::{Reg, RegConf};
 pub use splitter::{FanDirection, Splitter};
 pub use subtractor::Subtractor;
 
@@ -91,10 +91,7 @@ impl Component {
     }
 
     pub fn reg(data_width: u8) -> Self {
-        Self::from_seq(LogicSeq::Reg {
-            config: Reg { data_width },
-            value: Value::new(0, data_width),
-        })
+        Self::from_seq(LogicSeq::Reg(Reg::new(data_width)))
     }
 
     pub fn splitter(arm_bits: Vec<Vec<u8>>, direction: FanDirection) -> Self {
@@ -199,35 +196,6 @@ impl Component {
             *output = None;
         }
     }
-
-    // Reconstruction record for this component's construction parameters
-    // (not live wiring or persisted state) - the inverse of
-    // `ComponentSpec::to_component`. No production caller now that undo
-    // tombstones removed components instead of snapshotting them; retained
-    // (with `test_component_spec_round_trips_pin_arity`) to guard the arity
-    // invariant PlacedComponent.def relies on.
-    #[allow(dead_code)]
-    pub(crate) fn spec(&self) -> ComponentSpec {
-        match &self.logic {
-            Logic::Comb(LogicComb::Input(p)) => ComponentSpec::Input(p.clone()),
-            Logic::Comb(LogicComb::Output) => ComponentSpec::Output,
-            Logic::Comb(LogicComb::Gate(g)) => ComponentSpec::Gate(g.clone()),
-            Logic::Comb(LogicComb::Mux(m)) => ComponentSpec::Mux(m.clone()),
-            Logic::Comb(LogicComb::Demux(d)) => ComponentSpec::Demux(d.clone()),
-            Logic::Comb(LogicComb::Encoder(e)) => ComponentSpec::Encoder(e.clone()),
-            Logic::Comb(LogicComb::Adder(a)) => ComponentSpec::Adder(a.clone()),
-            Logic::Comb(LogicComb::Subtractor(s)) => ComponentSpec::Subtractor(s.clone()),
-            Logic::Comb(LogicComb::Multiplier(m)) => ComponentSpec::Multiplier(m.clone()),
-            Logic::Comb(LogicComb::Divider(d)) => ComponentSpec::Divider(d.clone()),
-            Logic::Comb(LogicComb::Comparator(c)) => ComponentSpec::Comparator(c.clone()),
-            Logic::Comb(LogicComb::Splitter(s)) => ComponentSpec::Splitter {
-                width: s.data_width(),
-                arm_bits: s.arm_bits(),
-                direction: s.direction(),
-            },
-            Logic::Seq(LogicSeq::Reg { config, .. }) => ComponentSpec::Reg(config.clone()),
-        }
-    }
 }
 
 // The canonical "construction params" record for a component - one variant
@@ -242,7 +210,7 @@ pub enum ComponentSpec {
     Gate(Gate),
     Mux(Mux),
     Demux(Demux),
-    Reg(Reg),
+    Reg(RegConf),
     Encoder(Encoder),
     Adder(Adder),
     Subtractor(Subtractor),
@@ -275,7 +243,11 @@ impl ComponentSpec {
             Self::Multiplier(m) => m.n_inputs(),
             Self::Divider(d) => d.n_inputs(),
             Self::Comparator(c) => c.n_inputs(),
-            Self::Splitter { arm_bits, direction, .. } => match direction {
+            Self::Splitter {
+                arm_bits,
+                direction,
+                ..
+            } => match direction {
                 FanDirection::Right => 1,
                 FanDirection::Left => arm_bits.len(),
             },
@@ -296,7 +268,11 @@ impl ComponentSpec {
             Self::Multiplier(m) => m.n_outputs(),
             Self::Divider(d) => d.n_outputs(),
             Self::Comparator(c) => c.n_outputs(),
-            Self::Splitter { arm_bits, direction, .. } => match direction {
+            Self::Splitter {
+                arm_bits,
+                direction,
+                ..
+            } => match direction {
                 FanDirection::Right => arm_bits.len(),
                 FanDirection::Left => 1,
             },
@@ -317,9 +293,11 @@ impl ComponentSpec {
             Self::Multiplier(m) => Component::multiplier(m.data_width),
             Self::Divider(d) => Component::divider(d.data_width),
             Self::Comparator(c) => Component::comparator(c.data_width),
-            Self::Splitter { arm_bits, direction, .. } => {
-                Component::splitter(arm_bits.clone(), *direction)
-            }
+            Self::Splitter {
+                arm_bits,
+                direction,
+                ..
+            } => Component::splitter(arm_bits.clone(), *direction),
         }
     }
 }
@@ -487,12 +465,25 @@ impl LogicComb {
     }
 }
 
+pub trait SeqLogic {
+    fn n_inputs(&self) -> usize;
+    fn n_outputs(&self) -> usize;
+    fn tick(&mut self, inputs: &[Value]) -> Vec<Value>;
+    fn observe(&self) -> Vec<Value>;
+    fn snapshot(&self) -> SeqState;
+    // Expected bit width of pin `i`, from construction params (not any live
+    // Value). None means any width (currently only Output). Used by
+    // Circuit::resolve_net() to flag width-disagreeing nets.
+    fn input_width(&self, i: usize) -> Option<u8>;
+    fn output_width(&self, i: usize) -> Option<u8>;
+}
+
 // LogicSeq mirrors LogicComb, except its config struct (Reg) holds only
 // static params - the mutable latched `value` lives in the enum variant, not
 // the struct, so a construction record can embed Reg without runtime state.
 #[derive(Debug)]
 pub enum LogicSeq {
-    Reg { config: Reg, value: Value },
+    Reg(Reg),
 }
 
 // Generic reflection of LogicSeq's persisted state - one arm per LogicSeq
@@ -506,35 +497,25 @@ pub enum SeqState {
 impl LogicSeq {
     pub fn n_inputs(&self) -> usize {
         match self {
-            Self::Reg { config, .. } => config.n_inputs(),
+            Self::Reg(reg) => reg.n_inputs(),
         }
     }
 
     pub fn n_outputs(&self) -> usize {
         match self {
-            Self::Reg { config, .. } => config.n_outputs(),
+            Self::Reg(reg) => reg.n_outputs(),
         }
     }
 
     pub fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
         match self {
-            Self::Reg { value, .. } => {
-                let data = inputs[Reg::DATA_PIN];
-                let write_enable = inputs[Reg::WRITE_EN_PIN];
-                if matches!(
-                    write_enable,
-                    Value::Fixed { bits: 1, width: 1 } | Value::Floating
-                ) {
-                    *value = data;
-                }
-                vec![*value]
-            }
+            LogicSeq::Reg(reg) => reg.tick(inputs),
         }
     }
 
     pub fn observe(&self) -> Vec<Value> {
         match self {
-            Self::Reg { value, .. } => vec![*value],
+            Self::Reg(reg) => reg.observe(),
         }
     }
 
@@ -544,26 +525,19 @@ impl LogicSeq {
     // it, so undo can restore it directly later.
     pub(crate) fn snapshot(&self) -> SeqState {
         match self {
-            Self::Reg { value, .. } => SeqState::Reg(*value),
+            Self::Reg(reg) => reg.snapshot(),
         }
     }
 
     pub fn input_width(&self, i: usize) -> Option<u8> {
         match self {
-            Self::Reg { config, .. } => match i {
-                Reg::DATA_PIN => Some(config.data_width), // data
-                Reg::WRITE_EN_PIN => Some(1),             // write_enable
-                _ => None,
-            },
+            Self::Reg(reg) => reg.input_width(i),
         }
     }
 
     pub fn output_width(&self, i: usize) -> Option<u8> {
         match self {
-            Self::Reg { config, .. } => match i {
-                0 => Some(config.data_width),
-                _ => None,
-            },
+            Self::Reg(reg) => reg.output_width(i),
         }
     }
 }

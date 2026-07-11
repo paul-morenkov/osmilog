@@ -5,7 +5,7 @@ either programmatically (constructing `Component`s and wiring them with `Circuit
 interactively in the GUI. The simulator propagates combinational signal changes through the
 circuit graph until stable (`settle`), and advances sequential state on an explicit clock tick
 (`tick_clock`). The app targets both desktop (native window, via `eframe`) and the browser
-(WASM), and circuits save to / load from a plain JSON file (`.som`).
+(WASM), and circuits save to / load from a plain JSON file (`.osm`).
 
 The crate is a library (`src/lib.rs`: `pub mod gui / io / sim`) plus a thin binary
 (`src/main.rs`) that just constructs `OsmilogApp` and hands it to `eframe`. Tests live in
@@ -353,7 +353,3 @@ app state).
   a `Result` (marked with a `TODO` in `circuit.rs`).
 - **More component types**: decoders, memories, additional sequential elements beyond `Reg`.
 - **Subcircuits / hierarchical components**: not started.
-
-Multi-select (rectangle select + bulk delete, `InteractionMode::BulkSelect`/`bulk_selection`) is
-already implemented, despite appearing as a future item in older notes - don't assume anything
-described as "not yet done" elsewhere is still accurate without checking the code.

@@ -19,7 +19,7 @@ use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::command::Command;
 use crate::sim::component::{
     Adder, CompKey, Comparator, ComponentSpec, Demux, Divider, Encoder, FanDirection, Gate, GateOp,
-    InIdx, Input, Multiplier, Mux, OutIdx, PinId, Reg, Subtractor,
+    InIdx, Input, Multiplier, Mux, OutIdx, PinId, RegConf, Subtractor,
 };
 use crate::sim::value::Value;
 
@@ -872,7 +872,7 @@ impl OsmilogApp {
                     );
                 }
             }
-            ComponentSpec::Reg(Reg { mut data_width }) => {
+            ComponentSpec::Reg(RegConf { mut data_width }) => {
                 let mut changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Data width:");
@@ -881,7 +881,7 @@ impl OsmilogApp {
                         .changed();
                 });
                 if changed {
-                    self.reconfigure_component(key, ComponentSpec::Reg(Reg { data_width }));
+                    self.reconfigure_component(key, ComponentSpec::Reg(RegConf { data_width }));
                 }
 
                 let cur = self.circuit.components[comp_key].pins.out_cache[0];
@@ -1559,7 +1559,7 @@ impl OsmilogApp {
                     ui.menu_button("Memory", |ui| {
                         if ui.button("Register").clicked() {
                             self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Reg(Reg { data_width: 1 }),
+                                spec: ComponentSpec::Reg(RegConf { data_width: 1 }),
                             };
                             ui.close();
                         }
