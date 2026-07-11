@@ -1388,10 +1388,12 @@ impl OsmilogApp {
             Selected::Component(key) => self
                 .components
                 .get(key)
+                .filter(|pc| pc.active)
                 .map(|pc| (component_bounding_rect(pc, pan), pc.grid_pos)),
             Selected::Tunnel(key) => self
                 .tunnels
                 .get(key)
+                .filter(|pt| pt.active)
                 .map(|pt| (tunnel_bounding_rect(pt, pan), pt.grid_pos)),
             Selected::Wire(_) => None,
         }
@@ -2174,13 +2176,11 @@ impl OsmilogApp {
                     // Click a component/tunnel body (components take
                     // priority), then a wire segment, else deselect.
                     let maybe_comp = self
-                        .components
-                        .iter()
+                        .active_components()
                         .find(|(_k, pc)| component_bounding_rect(pc, cc.pan).contains(pos))
                         .map(|(k, _)| Selected::Component(k));
                     let maybe_tunnel = self
-                        .tunnels
-                        .iter()
+                        .active_tunnels()
                         .find(|(_k, pt)| tunnel_bounding_rect(pt, cc.pan).contains(pos))
                         .map(|(k, _)| Selected::Tunnel(k));
                     let maybe_wire = self

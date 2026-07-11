@@ -186,6 +186,7 @@ special cases.
         fn n_inputs(&self) -> usize;
         fn n_outputs(&self) -> usize;
         fn tick(&mut self, inputs: &[Value]) -> Vec<Value>;
+        fn apply_async(&mut self, inputs: &[Value]);
         fn observe(&self) -> Vec<Value>;
         fn snapshot(&self) -> SeqState;
         fn input_width(&self, i: usize) -> Option<u8>;
@@ -198,9 +199,21 @@ added the same way) implement `SeqLogic` instead, and each one splits in two: a 
 `conf: RegConf` plus the mutable latched `Value`. This mirrors `CombLogic`'s "one struct, config +
 logic together" idea while keeping the params embeddable in `ComponentSpec` (see below) without
 runtime state riding along - `LogicSeq::Reg(Reg)` holds the runtime struct; `ComponentSpec::Reg`
-holds only the bare `RegConf`. Sequential components sit out of `settle()`'s propagation and only
-change state via `tick_clock()` (which calls `SeqLogic::tick`); `observe()` is what `settle()` reads
-instead. See each file under `src/sim/component/` for a given type's specific behavior.
+holds only the bare `RegConf`. A sequential component has *two* ways its latched state can change,
+and `observe()` is a pure read of that state (no inputs). `tick()` is the clocked update, driven only
+by `tick_clock()`. `apply_async()` is the asynchronous, level-sensitive update: `settle()` runs it on
+every evaluation of a sequential component (`eval_component`), so an input can mutate latched state
+*without a clock tick* - e.g. an async reset that clears the value the instant its pin is held.
+Because it runs inside the fixpoint loop, `apply_async` must be **idempotent** (re-applying it with
+the same inputs is a no-op after the first), which is what keeps `settle()` convergent despite now
+mutating sequential state; `settle()` re-evaluates sequential sinks like any other on an input change
+for exactly this reason (the old "sequential components sit out of settle()" rule is gone). The
+register and all four flip-flops carry an async reset pin (label "0", bottom-right): `apply_async`
+destructively clears the latch while it's held (exactly `Value::ONE`), and `tick` treats the same pin
+as dominant so a clock edge while it's asserted can't write anything else. The clear is destructive
+and *not* undoable - like clock ticks (see the Command layer / In-Progress notes), async state
+changes happen in `settle()`/derived-rebuild rather than through a recorded `Command`. See each file
+under `src/sim/component/` for a given type's specific behavior.
 
 ### ComponentSpec (`component.rs`)
 

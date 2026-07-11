@@ -488,12 +488,15 @@ impl Circuit {
                     });
                 }
 
-                let sinks: Vec<_> = self.nets[net]
-                    .sinks
-                    .iter()
-                    .copied()
-                    .filter(|(comp, _)| !self.components[*comp].is_sequential())
-                    .collect();
+                // Re-evaluate every sink, sequential ones included: a
+                // sequential component's observe() can depend on its live
+                // inputs (e.g. an async reset pin), so an input change must
+                // refresh its output within the same settle(), without a clock
+                // tick. This never advances clocked state - eval_component
+                // dispatches Logic::Seq to observe(), not tick() - so it stays
+                // a pure function of (latched state, inputs) and can't
+                // oscillate any more than combinational logic can.
+                let sinks: Vec<_> = self.nets[net].sinks.to_vec();
 
                 for (comp, _) in sinks {
                     self.eval_component(comp);
@@ -579,6 +582,18 @@ impl Circuit {
     // if necessary.
     fn eval_component(&mut self, comp: CompKey) {
         puffin::profile_function!();
+        // A sequential component may apply asynchronous, level-sensitive
+        // effects to its own latched state here (e.g. an async reset that
+        // clears the value the instant its pin is held) before its output is
+        // read - so an input change takes effect within this same settle(),
+        // with no clock tick. This is the one place besides tick_clock() where
+        // settle() mutates latched state; it's sound because apply_async is
+        // idempotent, so re-evaluating a component any number of times before
+        // the queue drains converges to the same state.
+        if self.components[comp].is_sequential() {
+            let inputs = self.components[comp].read_inputs(&self.nets);
+            self.components[comp].apply_async(&inputs);
+        }
         let new_values = self.components[comp].evaluate(&self.nets);
         self.apply_output_values(comp, new_values);
     }
@@ -752,7 +767,7 @@ impl Circuit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::component::GateOp;
+    use crate::sim::component::{GateOp, RegConf};
 
     // ---- Group 1: construction / basic wiring ----
 
@@ -1053,6 +1068,76 @@ mod tests {
         c.settle().unwrap();
         c.tick_clock().unwrap(); // latches 1; trailing settle() propagates through not_g
         assert_eq!(c.read_output(out), Value::ZERO); // NOT(1) = 0
+    }
+
+    #[test]
+    fn test_reg_async_reset_destroys_state_during_settle_without_a_tick() {
+        // The whole point of async-reset support: driving the reset pin clears
+        // the register within settle() alone (no tick_clock()), destructively -
+        // once cleared it stays zero even after the reset pin is released.
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(9, 4));
+        let we = c.add_component(Component::input(1, 1));
+        let rst = c.add_component(Component::input(0, 1)); // reset deasserted
+        let reg = c.add_component(Component::reg(4));
+        let out = c.add_component(Component::output());
+        c.link(data, PinId::output(0), reg, PinId::input(RegConf::DATA_PIN as u8));
+        c.link(we, PinId::output(0), reg, PinId::input(RegConf::WRITE_EN_PIN as u8));
+        c.link(rst, PinId::output(0), reg, PinId::input(RegConf::RESET_PIN as u8));
+        c.link(reg, PinId::output(0), out, PinId::input(0));
+
+        // Latch 9 into the register.
+        c.settle().unwrap();
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out), Value::new(9, 4));
+
+        // Assert reset and merely settle() - no tick. State clears immediately.
+        c.set_input(rst, 1, 1);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(0, 4));
+
+        // Release reset, still no tick: the clear was destructive, so it stays
+        // 0 - the old 9 is gone.
+        c.set_input(rst, 0, 1);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(0, 4));
+    }
+
+    #[test]
+    fn test_t_flip_flop_async_reset_gui_flow() {
+        // The exact interactive flow: a T input and the async "0" pin wired to
+        // a T flip-flop. Toggle it high over a few clocks, pulse "0" to clear
+        // it mid-run (no tick), then resume ticking from zero.
+        use crate::sim::component::TFlipFlopConf as T;
+        let mut c = Circuit::new();
+        let toggle = c.add_component(Component::input(1, 1)); // T held high
+        let rst = c.add_component(Component::input(0, 1)); // "0" pin, deasserted
+        let ff = c.add_component(Component::t_flip_flop());
+        let out = c.add_component(Component::output());
+        c.link(toggle, PinId::output(0), ff, PinId::input(T::TOGGLE_PIN as u8));
+        c.link(rst, PinId::output(0), ff, PinId::input(T::RESET_PIN as u8));
+        c.link(ff, PinId::output(0), out, PinId::input(0));
+        c.settle().unwrap();
+
+        // Three toggles: 0 -> 1 -> 0 -> 1, ending high.
+        c.tick_clock().unwrap();
+        c.tick_clock().unwrap();
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out), Value::ONE);
+
+        // Toggle "0" on: clears to 0 at once, no tick.
+        c.set_input(rst, 1, 1);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::ZERO);
+
+        // Toggle "0" back off: stays 0 (destroyed, not restored).
+        c.set_input(rst, 0, 1);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::ZERO);
+
+        // Resume clocking: toggles from 0 -> 1 as normal.
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out), Value::ONE);
     }
 
     #[test]

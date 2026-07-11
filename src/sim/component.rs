@@ -173,10 +173,21 @@ impl Component {
         let inputs = self.read_inputs(nets);
         match &self.logic {
             Logic::Comb(comb) => comb.evaluate(&inputs),
-            // Sequential components never recompute via the combinational
-            // path - they just report their latched value(s). State only
-            // changes via tick().
+            // Sequential components report their latched value here; any async
+            // input effect (e.g. a reset) was already folded into that state by
+            // apply_async(), and clocked changes only happen in tick().
             Logic::Seq(seq) => seq.observe(),
+        }
+    }
+
+    // Applies a sequential component's asynchronous, level-sensitive logic
+    // (e.g. an async reset) to its latched state, given current inputs. No-op
+    // for combinational components. Called by Circuit::settle() so an async
+    // input can take effect without a clock tick; must be idempotent (see
+    // SeqLogic::apply_async).
+    pub fn apply_async(&mut self, inputs: &[Value]) {
+        if let Logic::Seq(seq) = &mut self.logic {
+            seq.apply_async(inputs);
         }
     }
 
@@ -543,6 +554,18 @@ pub trait SeqLogic {
     fn n_inputs(&self) -> usize;
     fn n_outputs(&self) -> usize;
     fn tick(&mut self, inputs: &[Value]) -> Vec<Value>;
+    // Applies asynchronous, level-sensitive effects to latched state given the
+    // current inputs - e.g. an async reset that clears the value the instant
+    // it's held, with no clock edge. Run by Circuit::settle() on every
+    // evaluation of the component, so it MUST be idempotent: applying it
+    // repeatedly with the same inputs must leave state unchanged after the
+    // first. A purely clocked component has no async effects and leaves state
+    // untouched. This is the one place, besides tick(), that mutates latched
+    // state - see the Circuit::settle() call site for why that's sound.
+    fn apply_async(&mut self, inputs: &[Value]);
+    // The latched output value(s), reported as-is without consulting inputs or
+    // advancing state. Any async input effect has already been folded into the
+    // latched state by apply_async(), so this stays a pure read.
     fn observe(&self) -> Vec<Value>;
     fn snapshot(&self) -> SeqState;
     // Restores the latched state to its power-on initial value (what the
@@ -610,6 +633,17 @@ impl LogicSeq {
             Self::JKFlipFlop(ff) => ff.tick(inputs),
             Self::SRFlipFlop(ff) => ff.tick(inputs),
             Self::Counter(c) => c.tick(inputs),
+        }
+    }
+
+    pub fn apply_async(&mut self, inputs: &[Value]) {
+        match self {
+            Self::Reg(reg) => reg.apply_async(inputs),
+            Self::DFlipFlop(ff) => ff.apply_async(inputs),
+            Self::TFlipFlop(ff) => ff.apply_async(inputs),
+            Self::JKFlipFlop(ff) => ff.apply_async(inputs),
+            Self::SRFlipFlop(ff) => ff.apply_async(inputs),
+            Self::Counter(c) => c.apply_async(inputs),
         }
     }
 

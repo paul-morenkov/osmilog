@@ -414,13 +414,22 @@ pub fn mux_shape(sel_width: u8) -> ComponentShape {
 pub fn reg_shape() -> ComponentShape {
     let h_cells = stack_h(2); // 4
 
-    // input[0] = data (row 1), input[1] = write_enable (row 3), both on the left
-    // edge; output[0] centers on the right (row 2).
-    let input_anchors = vec![PinAnchor::left(pin_row(0)), PinAnchor::left(pin_row(1))];
+    // input[0] = data (row 1), input[1] = write_enable (row 3), both on the
+    // left edge; input[2] = async reset on the bottom edge, toward the right
+    // (one cell in from the corner); output[0] centers on the right (row 2).
+    let input_anchors = vec![
+        PinAnchor::left(pin_row(0)),
+        PinAnchor::left(pin_row(1)),
+        PinAnchor::bottom(REG_W - 1, h_cells),
+    ];
 
     // "D"/"WE" sit level with their pins (same y as the anchors above), offset
-    // right of the left-edge pin dot with room to spare in the box.
+    // right of the left-edge pin dot with room to spare in the box. The reset
+    // "0" sits just above its bottom-edge pin, a fixed pixel inset up (like the
+    // flip-flops' bottom-edge labels).
     let row_y = |i: usize| pin_row(i) as f32 / h_cells as f32;
+    const EDGE_LABEL_INSET_PX: f32 = 6.0;
+    let reset_y = 1.0 - EDGE_LABEL_INSET_PX / px(h_cells);
     let labels = vec![
         ComponentLabel {
             text: "D",
@@ -430,6 +439,11 @@ pub fn reg_shape() -> ComponentShape {
         ComponentLabel {
             text: "WE",
             pos: vec2(0.28, row_y(1)),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "0",
+            pos: vec2((REG_W - 1) as f32 / REG_W as f32, reset_y),
             ..Default::default()
         },
     ];
@@ -544,10 +558,13 @@ fn two_input_flip_flop_shape(
     let h_cells = stack_h(2); // 4, matching op2's square proportions
     let center_row = h_cells / 2;
 
+    // input[0]/[1] = control inputs (left), input[2] = write-enable (bottom
+    // center), input[3] = async reset (bottom edge, toward the right).
     let input_anchors = vec![
         PinAnchor::left(pin_row(0)),
         PinAnchor::left(pin_row(1)),
         PinAnchor::bottom(ARITH_CENTER_COL, h_cells),
+        PinAnchor::bottom(ARITH_W - 1, h_cells),
     ];
 
     const EDGE_LABEL_INSET_PX: f32 = 6.0;
@@ -569,6 +586,11 @@ fn two_input_flip_flop_shape(
         ComponentLabel {
             text: "WE",
             pos: vec2(0.5, we_y),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "0",
+            pos: vec2((ARITH_W - 1) as f32 / ARITH_W as f32, we_y),
             ..Default::default()
         },
     ];
@@ -593,9 +615,12 @@ fn flip_flop_shape(data_label: &'static str) -> ComponentShape {
     let h_cells = stack_h(2); // 4, matching op2's square proportions
     let center_row = h_cells / 2;
 
+    // input[0] = data/toggle (left center), input[1] = write-enable (bottom
+    // center), input[2] = async reset (bottom edge, toward the right).
     let input_anchors = vec![
         PinAnchor::left(center_row),
         PinAnchor::bottom(ARITH_CENTER_COL, h_cells),
+        PinAnchor::bottom(ARITH_W - 1, h_cells),
     ];
 
     const EDGE_LABEL_INSET_PX: f32 = 6.0;
@@ -612,6 +637,11 @@ fn flip_flop_shape(data_label: &'static str) -> ComponentShape {
         ComponentLabel {
             text: "WE",
             pos: vec2(0.5, bottom_y),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "0",
+            pos: vec2((ARITH_W - 1) as f32 / ARITH_W as f32, bottom_y),
             ..Default::default()
         },
     ];
