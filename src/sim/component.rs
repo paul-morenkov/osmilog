@@ -10,11 +10,14 @@ mod divider;
 mod encoder;
 mod gate;
 mod input;
+mod jk_flip_flop;
 mod multiplier;
 mod mux;
 mod reg;
 mod splitter;
+mod sr_flip_flop;
 mod subtractor;
+mod t_flip_flop;
 
 pub use adder::Adder;
 pub use comparator::Comparator;
@@ -24,11 +27,14 @@ pub use divider::Divider;
 pub use encoder::Encoder;
 pub use gate::{Gate, GateOp};
 pub use input::Input;
+pub use jk_flip_flop::{JKFlipFlop, JKFlipFlopConf};
 pub use multiplier::Multiplier;
 pub use mux::Mux;
 pub use reg::{Reg, RegConf};
 pub use splitter::{FanDirection, Splitter};
+pub use sr_flip_flop::{SRFlipFlop, SRFlipFlopConf};
 pub use subtractor::Subtractor;
+pub use t_flip_flop::{TFlipFlop, TFlipFlopConf};
 
 new_key_type! {
     pub struct CompKey;
@@ -94,6 +100,22 @@ impl Component {
 
     pub fn reg(data_width: u8) -> Self {
         Self::from_seq(LogicSeq::Reg(Reg::new(data_width)))
+    }
+
+    pub fn d_flip_flop() -> Self {
+        Self::from_seq(LogicSeq::DFlipFlop(DFlipFlop::new()))
+    }
+
+    pub fn t_flip_flop() -> Self {
+        Self::from_seq(LogicSeq::TFlipFlop(TFlipFlop::new()))
+    }
+
+    pub fn jk_flip_flop() -> Self {
+        Self::from_seq(LogicSeq::JKFlipFlop(JKFlipFlop::new()))
+    }
+
+    pub fn sr_flip_flop() -> Self {
+        Self::from_seq(LogicSeq::SRFlipFlop(SRFlipFlop::new()))
     }
 
     pub fn splitter(arm_bits: Vec<Vec<u8>>, direction: FanDirection) -> Self {
@@ -219,6 +241,10 @@ pub enum ComponentSpec {
     Multiplier(Multiplier),
     Divider(Divider),
     Comparator(Comparator),
+    DFlipFlop(DFlipFlopConf),
+    TFlipFlop(TFlipFlopConf),
+    JKFlipFlop(JKFlipFlopConf),
+    SRFlipFlop(SRFlipFlopConf),
     Splitter {
         // The trunk width being edited in the GUI properties panel,
         // independent of how many bits `arm_bits` actually assigns.
@@ -245,6 +271,10 @@ impl ComponentSpec {
             Self::Multiplier(m) => m.n_inputs(),
             Self::Divider(d) => d.n_inputs(),
             Self::Comparator(c) => c.n_inputs(),
+            Self::DFlipFlop(ff) => ff.n_inputs(),
+            Self::TFlipFlop(ff) => ff.n_inputs(),
+            Self::JKFlipFlop(ff) => ff.n_inputs(),
+            Self::SRFlipFlop(ff) => ff.n_inputs(),
             Self::Splitter {
                 arm_bits,
                 direction,
@@ -270,6 +300,10 @@ impl ComponentSpec {
             Self::Multiplier(m) => m.n_outputs(),
             Self::Divider(d) => d.n_outputs(),
             Self::Comparator(c) => c.n_outputs(),
+            Self::DFlipFlop(ff) => ff.n_outputs(),
+            Self::TFlipFlop(ff) => ff.n_outputs(),
+            Self::JKFlipFlop(ff) => ff.n_outputs(),
+            Self::SRFlipFlop(ff) => ff.n_outputs(),
             Self::Splitter {
                 arm_bits,
                 direction,
@@ -295,6 +329,10 @@ impl ComponentSpec {
             Self::Multiplier(m) => Component::multiplier(m.data_width),
             Self::Divider(d) => Component::divider(d.data_width),
             Self::Comparator(c) => Component::comparator(c.data_width),
+            Self::DFlipFlop(_) => Component::d_flip_flop(),
+            Self::TFlipFlop(_) => Component::t_flip_flop(),
+            Self::JKFlipFlop(_) => Component::jk_flip_flop(),
+            Self::SRFlipFlop(_) => Component::sr_flip_flop(),
             Self::Splitter {
                 arm_bits,
                 direction,
@@ -487,6 +525,9 @@ pub trait SeqLogic {
 pub enum LogicSeq {
     Reg(Reg),
     DFlipFlop(DFlipFlop),
+    TFlipFlop(TFlipFlop),
+    JKFlipFlop(JKFlipFlop),
+    SRFlipFlop(SRFlipFlop),
 }
 
 // Generic reflection of LogicSeq's persisted state - one arm per LogicSeq
@@ -503,6 +544,9 @@ impl LogicSeq {
         match self {
             Self::Reg(reg) => reg.n_inputs(),
             Self::DFlipFlop(ff) => ff.n_inputs(),
+            Self::TFlipFlop(ff) => ff.n_inputs(),
+            Self::JKFlipFlop(ff) => ff.n_inputs(),
+            Self::SRFlipFlop(ff) => ff.n_inputs(),
         }
     }
 
@@ -510,6 +554,9 @@ impl LogicSeq {
         match self {
             Self::Reg(reg) => reg.n_outputs(),
             Self::DFlipFlop(ff) => ff.n_outputs(),
+            Self::TFlipFlop(ff) => ff.n_outputs(),
+            Self::JKFlipFlop(ff) => ff.n_outputs(),
+            Self::SRFlipFlop(ff) => ff.n_outputs(),
         }
     }
 
@@ -517,6 +564,9 @@ impl LogicSeq {
         match self {
             LogicSeq::Reg(reg) => reg.tick(inputs),
             Self::DFlipFlop(ff) => ff.tick(inputs),
+            Self::TFlipFlop(ff) => ff.tick(inputs),
+            Self::JKFlipFlop(ff) => ff.tick(inputs),
+            Self::SRFlipFlop(ff) => ff.tick(inputs),
         }
     }
 
@@ -524,6 +574,9 @@ impl LogicSeq {
         match self {
             Self::Reg(reg) => reg.observe(),
             Self::DFlipFlop(ff) => ff.observe(),
+            Self::TFlipFlop(ff) => ff.observe(),
+            Self::JKFlipFlop(ff) => ff.observe(),
+            Self::SRFlipFlop(ff) => ff.observe(),
         }
     }
 
@@ -535,6 +588,9 @@ impl LogicSeq {
         match self {
             Self::Reg(reg) => reg.snapshot(),
             Self::DFlipFlop(ff) => ff.snapshot(),
+            Self::TFlipFlop(ff) => ff.snapshot(),
+            Self::JKFlipFlop(ff) => ff.snapshot(),
+            Self::SRFlipFlop(ff) => ff.snapshot(),
         }
     }
 
@@ -542,6 +598,9 @@ impl LogicSeq {
         match self {
             Self::Reg(reg) => reg.input_width(i),
             Self::DFlipFlop(ff) => ff.input_width(i),
+            Self::TFlipFlop(ff) => ff.input_width(i),
+            Self::JKFlipFlop(ff) => ff.input_width(i),
+            Self::SRFlipFlop(ff) => ff.input_width(i),
         }
     }
 
@@ -549,6 +608,9 @@ impl LogicSeq {
         match self {
             Self::Reg(reg) => reg.output_width(i),
             Self::DFlipFlop(ff) => ff.output_width(i),
+            Self::TFlipFlop(ff) => ff.output_width(i),
+            Self::JKFlipFlop(ff) => ff.output_width(i),
+            Self::SRFlipFlop(ff) => ff.output_width(i),
         }
     }
 }

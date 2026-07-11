@@ -65,10 +65,7 @@ impl SeqLogic for Reg {
     fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
         let data = inputs[RegConf::DATA_PIN];
         let write_enable = inputs[RegConf::WRITE_EN_PIN];
-        if matches!(
-            write_enable,
-            Value::Fixed { bits: 1, width: 1 } | Value::Floating
-        ) {
+        if matches!(write_enable, Value::ONE | Value::Floating) {
             self.value = data;
         }
         vec![self.value]

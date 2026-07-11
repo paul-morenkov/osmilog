@@ -252,6 +252,13 @@ pub const fn reg_size() -> Vec2 {
     vec2(px(REG_W), px(stack_h(2)))
 }
 
+// Square body, same proportions as op2_size (ARITH_W == stack_h(2)) even though
+// a flip-flop only has one data-side input - the write-enable pin lives on the
+// bottom edge instead of stacking with it on the left.
+pub const fn flip_flop_size() -> Vec2 {
+    vec2(px(ARITH_W), px(stack_h(2)))
+}
+
 // Height accounts only for the two addend pins on the left edge, same formula as a
 // 2-input gate - the carry-in/carry-out pins sit at the bottom/top edges (like
 // encoder's enable_in/enable_out) and don't consume extra vertical space of their own.
@@ -426,6 +433,125 @@ pub fn reg_shape() -> ComponentShape {
         fill_outline: None,
         input_anchors,
         output_anchors: vec![PinAnchor::right(REG_W, h_cells / 2)],
+        extra_strokes: vec![],
+        output_bubbles: vec![false],
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// D flip-flop: data in on the left edge, write-enable in on the bottom edge
+// (like op2_shape's carry-in), Q out on the right edge - all centered on the
+// square body.
+pub fn d_flip_flop_shape() -> ComponentShape {
+    flip_flop_shape("D")
+}
+
+// Same layout as d_flip_flop_shape(); the toggle input replaces the data input.
+pub fn t_flip_flop_shape() -> ComponentShape {
+    flip_flop_shape("T")
+}
+
+// JK/SR flip-flop: both control inputs stack on the left edge (like reg's
+// D/WE), write-enable in on the bottom edge (like op2's carry-in), Q out on
+// the right edge - all centered on the square body.
+pub fn jk_flip_flop_shape() -> ComponentShape {
+    two_input_flip_flop_shape("J", "K")
+}
+
+// Same layout as jk_flip_flop_shape(); set/reset replace jump/kill.
+pub fn sr_flip_flop_shape() -> ComponentShape {
+    two_input_flip_flop_shape("S", "R")
+}
+
+// Pin layout matches JKFlipFlop/SRFlipFlop's fixed order: input[0]/[1] = the
+// two control inputs (left edge, stacked like reg's D/WE), input[2] =
+// write-enable (bottom edge, centered); output[0] = Q (right edge, centered).
+fn two_input_flip_flop_shape(
+    top_label: &'static str,
+    bottom_label: &'static str,
+) -> ComponentShape {
+    let h_cells = stack_h(2); // 4, matching op2's square proportions
+    let center_row = h_cells / 2;
+
+    let input_anchors = vec![
+        PinAnchor::left(pin_row(0)),
+        PinAnchor::left(pin_row(1)),
+        PinAnchor::bottom(ARITH_CENTER_COL, h_cells),
+    ];
+
+    const EDGE_LABEL_INSET_PX: f32 = 6.0;
+    let h = px(h_cells);
+    let we_y = 1.0 - EDGE_LABEL_INSET_PX / h;
+    let row_y = |i: usize| pin_row(i) as f32 / h_cells as f32;
+
+    let labels = vec![
+        ComponentLabel {
+            text: top_label,
+            pos: vec2(0.28, row_y(0)),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: bottom_label,
+            pos: vec2(0.28, row_y(1)),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "WE",
+            pos: vec2(0.5, we_y),
+            ..Default::default()
+        },
+    ];
+
+    ComponentShape {
+        size: flip_flop_size(),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors: vec![PinAnchor::right(ARITH_W, center_row)],
+        extra_strokes: vec![],
+        output_bubbles: vec![false],
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// Pin layout matches DFlipFlop/TFlipFlop's fixed order: input[0] = data/toggle
+// (left edge, centered), input[1] = write-enable (bottom edge, centered);
+// output[0] = Q (right edge, centered).
+fn flip_flop_shape(data_label: &'static str) -> ComponentShape {
+    let h_cells = stack_h(2); // 4, matching op2's square proportions
+    let center_row = h_cells / 2;
+
+    let input_anchors = vec![
+        PinAnchor::left(center_row),
+        PinAnchor::bottom(ARITH_CENTER_COL, h_cells),
+    ];
+
+    const EDGE_LABEL_INSET_PX: f32 = 6.0;
+    let h = px(h_cells);
+    let bottom_y = 1.0 - EDGE_LABEL_INSET_PX / h;
+    let row_y = center_row as f32 / h_cells as f32;
+
+    let labels = vec![
+        ComponentLabel {
+            text: data_label,
+            pos: vec2(0.28, row_y),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "WE",
+            pos: vec2(0.5, bottom_y),
+            ..Default::default()
+        },
+    ];
+
+    ComponentShape {
+        size: flip_flop_size(),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors: vec![PinAnchor::right(ARITH_W, center_row)],
         extra_strokes: vec![],
         output_bubbles: vec![false],
         labels,
@@ -874,6 +1000,10 @@ mod tests {
         }
 
         assert_shape_on_grid("reg", &reg_shape());
+        assert_shape_on_grid("d_flip_flop", &d_flip_flop_shape());
+        assert_shape_on_grid("t_flip_flop", &t_flip_flop_shape());
+        assert_shape_on_grid("jk_flip_flop", &jk_flip_flop_shape());
+        assert_shape_on_grid("sr_flip_flop", &sr_flip_flop_shape());
         assert_shape_on_grid("adder", &adder_shape());
         assert_shape_on_grid("subtractor", &subtractor_shape());
         assert_shape_on_grid("multiplier", &multiplier_shape());

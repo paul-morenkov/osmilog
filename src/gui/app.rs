@@ -18,8 +18,9 @@ use crate::io::{
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::command::Command;
 use crate::sim::component::{
-    Adder, CompKey, Comparator, ComponentSpec, Demux, Divider, Encoder, FanDirection, Gate, GateOp,
-    InIdx, Input, Multiplier, Mux, OutIdx, PinId, RegConf, Subtractor,
+    Adder, CompKey, Comparator, ComponentSpec, DFlipFlopConf, Demux, Divider, Encoder, FanDirection,
+    Gate, GateOp, InIdx, Input, JKFlipFlopConf, Multiplier, Mux, OutIdx, PinId, RegConf, SRFlipFlopConf,
+    Subtractor, TFlipFlopConf,
 };
 use crate::sim::value::Value;
 
@@ -892,6 +893,18 @@ impl OsmilogApp {
                 };
                 ui.label(format!("Value: {}", val_str));
             }
+            ComponentSpec::DFlipFlop(_)
+            | ComponentSpec::TFlipFlop(_)
+            | ComponentSpec::JKFlipFlop(_)
+            | ComponentSpec::SRFlipFlop(_) => {
+                let cur = self.circuit.components[comp_key].pins.out_cache[0];
+                let val_str = match cur {
+                    Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
+                    Value::Floating => "Floating".to_string(),
+                    Value::Invalid => "Invalid (width mismatch)".to_string(),
+                };
+                ui.label(format!("Value: {}", val_str));
+            }
             ComponentSpec::Encoder(Encoder { mut sel_width }) => {
                 let mut changed = false;
                 ui.horizontal(|ui| {
@@ -1563,6 +1576,32 @@ impl OsmilogApp {
                             };
                             ui.close();
                         }
+                        ui.menu_button("Flip-Flop", |ui| {
+                            if ui.button("D Flip-Flop").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::DFlipFlop(DFlipFlopConf),
+                                };
+                                ui.close();
+                            }
+                            if ui.button("T Flip-Flop").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::TFlipFlop(TFlipFlopConf),
+                                };
+                                ui.close();
+                            }
+                            if ui.button("JK Flip-Flop").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::JKFlipFlop(JKFlipFlopConf),
+                                };
+                                ui.close();
+                            }
+                            if ui.button("SR Flip-Flop").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::SRFlipFlop(SRFlipFlopConf),
+                                };
+                                ui.close();
+                            }
+                        });
                     });
                     ui.menu_button("Tunnel", |ui| {
                         if ui.button("Feed").clicked() {
