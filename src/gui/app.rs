@@ -155,6 +155,28 @@ impl Default for ClockControl {
     }
 }
 
+// Decides, for one frame of the auto-advance loop, whether the clock should
+// tick and what the new `last_tick_time` reference becomes. Returns None when
+// the interval hasn't elapsed yet. Kept pure (no egui/self) so the cadence is
+// unit-testable.
+//
+// The reference advances by exactly one `interval` rather than snapping to
+// `now`, so the average tick rate stays `1/interval` no matter how often frames
+// are produced. (Snapping to `now` folds each frame's overshoot past the
+// boundary into the cadence, which is why moving the mouse - a flood of extra
+// repaints - visibly sped ticking up.) If we've fallen more than one interval
+// behind (the app was idle or suspended), resync to `now` instead of firing a
+// catch-up burst of missed ticks.
+fn next_tick_schedule(now: f64, last: f64, interval: f64) -> Option<f64> {
+    if now - last < interval {
+        None
+    } else if now - last >= 2.0 * interval {
+        Some(now)
+    } else {
+        Some(last + interval)
+    }
+}
+
 // ── OsmilogApp ────────────────────────────────────────────────────────────────
 
 new_key_type! {
@@ -289,9 +311,9 @@ impl OsmilogApp {
         }
         let interval = 1.0 / self.clock.ticks_per_second.max(0.001) as f64;
         let now = ctx.input(|i| i.time);
-        if now - self.clock.last_tick_time >= interval {
+        if let Some(next) = next_tick_schedule(now, self.clock.last_tick_time, interval) {
             self.tick_once();
-            self.clock.last_tick_time = now;
+            self.clock.last_tick_time = next;
             if self.last_settle_error.is_some() {
                 self.clock.run = ClockRun::Paused;
                 return;
@@ -3813,6 +3835,28 @@ mod tests {
         app.paste_clipboard();
         assert_eq!(app.components.len(), before);
         assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn test_next_tick_schedule_is_frame_rate_independent() {
+        let interval = 0.2;
+
+        // Interval not elapsed yet: no tick.
+        assert_eq!(next_tick_schedule(0.1, 0.0, interval), None);
+
+        // Dense frames (mouse moving): a frame lands just past the boundary.
+        // The reference advances by exactly one interval, NOT to `now`, so the
+        // small overshoot doesn't accumulate into the cadence.
+        assert_eq!(next_tick_schedule(0.21, 0.0, interval), Some(0.2));
+        assert_eq!(next_tick_schedule(0.216, 0.0, interval), Some(0.2));
+
+        // Sparse frames still within one interval of slack: same steady step,
+        // so idle and moving-mouse converge on the same average rate.
+        assert_eq!(next_tick_schedule(0.39, 0.0, interval), Some(0.2));
+
+        // Fell more than one interval behind (idle/suspended): resync to `now`
+        // and drop the missed ticks rather than firing a burst.
+        assert_eq!(next_tick_schedule(5.0, 0.0, interval), Some(5.0));
     }
 
     #[test]
