@@ -93,6 +93,7 @@ pub struct ComponentShape {
 }
 
 pub fn tessellate_path(cmds: &[ShapeCmd], rect: Rect) -> Vec<Pos2> {
+    puffin::profile_function!();
     // Converts from normalized coordinate to rect coordinate
     let scale = |v: Vec2| {
         pos2(

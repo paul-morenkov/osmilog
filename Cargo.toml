@@ -21,11 +21,17 @@ slotmap    = "1.1.1"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd        = "0.15"
+puffin      = "0.20"
+puffin_egui = "0.30"
 
 [dev-dependencies]
 test-case = "3.3.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# Core puffin instrumentation panics on wasm32 without this feature (it has no
+# std::time::Instant); it switches to js_sys::Date/web-time instead. Cargo
+# unifies this with the plain `puffin` dep above, so puffin_egui gets it too.
+puffin = { version = "0.20", features = ["web"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
@@ -40,3 +46,12 @@ web-sys = { version = "0.3", features = [
     "BlobPropertyBag",
     "Url",
 ] }
+
+# The published puffin_egui 0.30.0 still targets egui 0.33, which conflicts
+# with this crate's egui 0.35 (two incompatible `egui::Context` types). Pin
+# both puffin crates to the same git rev, which bumped puffin_egui to egui
+# 0.35 - patching just puffin_egui alone would leave two separate `puffin`
+# instances (and thus two separate profiler globals) in the graph.
+[patch.crates-io]
+puffin      = { git = "https://github.com/EmbarkStudios/puffin", rev = "d06bed0fcb8c8e4c78643d4ead7cf1de9b76fd3b" }
+puffin_egui = { git = "https://github.com/EmbarkStudios/puffin", rev = "d06bed0fcb8c8e4c78643d4ead7cf1de9b76fd3b" }

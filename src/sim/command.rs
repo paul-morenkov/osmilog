@@ -130,6 +130,7 @@ impl Circuit {
     /// `TickClock` which settles internally). Callers that don't need the
     /// undo take `.0`.
     pub fn apply(&mut self, command: Command) -> (CommandOutput, UndoAction) {
+        puffin::profile_function!();
         match command {
             Command::AddComponent(comp) => {
                 let key = self.add_component(comp);

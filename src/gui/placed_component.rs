@@ -73,6 +73,7 @@ impl ComponentSpec {
     }
 
     pub fn shape(&self) -> ComponentShape {
+        puffin::profile_function!();
         match self {
             Self::Input(_) => input_shape(),
             Self::Output => output_shape(),
