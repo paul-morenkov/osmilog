@@ -19,8 +19,8 @@ use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::command::Command;
 use crate::sim::component::{
     Adder, CompKey, Comparator, ComponentSpec, CounterConf, DFlipFlopConf, Demux, Divider, Encoder,
-    FanDirection, Gate, GateOp, InIdx, Input, JKFlipFlopConf, Multiplier, Mux, OutIdx, OverflowAction,
-    PinId, RegConf, SRFlipFlopConf, Subtractor, TFlipFlopConf,
+    FanDirection, Gate, GateOp, InIdx, Input, JKFlipFlopConf, Multiplier, Mux, OutIdx,
+    OverflowAction, PinId, RegConf, SRFlipFlopConf, Subtractor, TFlipFlopConf,
 };
 use crate::sim::value::Value;
 
@@ -118,6 +118,43 @@ enum PinKind {
     Output,
 }
 
+// ── ClockControl ──────────────────────────────────────────────────────────────
+
+// The clock transport's run state. Editing is locked whenever this is not
+// `Stopped` (see OsmilogApp::editing_locked) - the whole run session (Play →
+// Pause → …) is read-only, and only Stop returns to an editable circuit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClockRun {
+    // Idle and editable; the clock is not advancing (initial state).
+    Stopped,
+    // Auto-advancing at `ticks_per_second`; editing locked.
+    Playing,
+    // Frozen mid-run with sequential state preserved; editing locked.
+    Paused,
+}
+
+// Clock transport state: the run mode plus the auto-advance speed and the
+// egui frame-clock timestamp of the last auto-tick. See OsmilogApp::logic for
+// the auto-advance loop and show_menu_bar for the Play/Pause/Step/Stop UI.
+pub struct ClockControl {
+    run: ClockRun,
+    // Auto-advance rate in ticks per real second (Playing only).
+    ticks_per_second: f32,
+    // ctx.input(|i| i.time) value when the last auto-tick fired. Chosen over
+    // std::time::Instant, which panics on wasm32.
+    last_tick_time: f64,
+}
+
+impl Default for ClockControl {
+    fn default() -> Self {
+        Self {
+            run: ClockRun::Stopped,
+            ticks_per_second: 1.0,
+            last_tick_time: 0.0,
+        }
+    }
+}
+
 // ── OsmilogApp ────────────────────────────────────────────────────────────────
 
 new_key_type! {
@@ -158,6 +195,9 @@ pub struct OsmilogApp {
     // scopes are recorded regardless; this just controls whether the
     // viewer is drawn.
     show_profiler: bool,
+    // Clock transport: run state (play/pause/stop), speed, and auto-advance
+    // timing. Drives the menu-bar controls and the edit lockout during a run.
+    pub clock: ClockControl,
 }
 
 // ── CanvasCtx ─────────────────────────────────────────────────────────────────
@@ -193,6 +233,7 @@ impl OsmilogApp {
             #[cfg(target_arch = "wasm32")]
             pending_load: crate::io::wasm::new_pending_load(),
             show_profiler: false,
+            clock: ClockControl::default(),
         }
     }
 
@@ -206,6 +247,57 @@ impl OsmilogApp {
             Ok(_) => self.last_settle_error = None,
             Err(e) => self.last_settle_error = Some(e.to_string()),
         }
+    }
+
+    // True while a clock run session is active (Playing or Paused). The single
+    // gate for the edit lockout: canvas interaction, shortcuts, the Add/Edit
+    // menus, File > Load, and the properties panel are all disabled when this
+    // is true. Only Stop (which resets sequential state) returns to editable.
+    pub fn editing_locked(&self) -> bool {
+        self.clock.run != ClockRun::Stopped
+    }
+
+    // Advances the clock exactly one tick, untracked (bypassing self.apply) so
+    // it never lands on the undo stack - clock stepping is a simulation step,
+    // not a structural edit. Used by both the Step button and the auto-advance
+    // loop in logic().
+    fn tick_once(&mut self) {
+        let result = self.circuit.apply(Command::TickClock).0.unwrap_settle();
+        self.record_settle_result(result);
+    }
+
+    // Stops the clock: resets all sequential state to its power-on value
+    // (untracked, like a tick) and returns to the editable Stopped state.
+    pub fn stop_clock(&mut self) {
+        let result = self
+            .circuit
+            .apply(Command::ResetSequential)
+            .0
+            .unwrap_settle();
+        self.record_settle_result(result);
+        self.clock.run = ClockRun::Stopped;
+    }
+
+    // Auto-advances the clock while Playing. Uses egui's frame clock
+    // (ctx.input(|i| i.time), wasm-safe) to fire a tick once per interval, and
+    // request_repaint_after to keep the frame loop alive between ticks (the app
+    // is otherwise reactive and wouldn't repaint on its own). A tick that fails
+    // to settle auto-pauses so we don't hammer a broken circuit every frame.
+    fn advance_clock(&mut self, ctx: &egui::Context) {
+        if self.clock.run != ClockRun::Playing {
+            return;
+        }
+        let interval = 1.0 / self.clock.ticks_per_second.max(0.001) as f64;
+        let now = ctx.input(|i| i.time);
+        if now - self.clock.last_tick_time >= interval {
+            self.tick_once();
+            self.clock.last_tick_time = now;
+            if self.last_settle_error.is_some() {
+                self.clock.run = ClockRun::Paused;
+                return;
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(interval));
     }
 
     // Applies a Command and records its UndoAction into history in one place;
@@ -671,23 +763,31 @@ impl OsmilogApp {
             }
             Some(Selection::Single(sel)) => *sel,
         };
-        match sel {
-            Selected::Component(key) => self.show_component_properties(key, ui),
-            Selected::Tunnel(key) => self.show_tunnel_properties(key, ui),
-            Selected::Wire(_) => {
-                ui.heading("WIRE");
-                ui.label("A wire segment. Press Backspace or Delete to remove it.");
-            }
-        }
-
-        ui.separator();
-        if ui.button("Delete").clicked() {
+        // The whole editor is read-only during a run session. Future
+        // runtime-drivable components (e.g. a Button, or live Input toggles)
+        // would carve their specific widgets out of this lock - e.g. via a
+        // `spec.accepts_runtime_input()` predicate consulted inside the
+        // per-component editors - rather than being blanket-disabled here.
+        let locked = self.editing_locked();
+        ui.add_enabled_ui(!locked, |ui| {
             match sel {
-                Selected::Component(key) => self.delete_component(key),
-                Selected::Tunnel(key) => self.delete_tunnel(key),
-                Selected::Wire(seg) => self.delete_wire(seg),
+                Selected::Component(key) => self.show_component_properties(key, ui),
+                Selected::Tunnel(key) => self.show_tunnel_properties(key, ui),
+                Selected::Wire(_) => {
+                    ui.heading("WIRE");
+                    ui.label("A wire segment. Press Backspace or Delete to remove it.");
+                }
             }
-        }
+
+            ui.separator();
+            if ui.button("Delete").clicked() {
+                match sel {
+                    Selected::Component(key) => self.delete_component(key),
+                    Selected::Tunnel(key) => self.delete_tunnel(key),
+                    Selected::Wire(seg) => self.delete_wire(seg),
+                }
+            }
+        });
     }
 
     fn show_tunnel_properties(&mut self, key: PlacedTunnelKey, ui: &mut egui::Ui) {
@@ -1453,6 +1553,10 @@ impl OsmilogApp {
 
     // ── Menu bar ──────────────────────────────────────────────────────────
     fn show_menu_bar(&mut self, ui: &mut egui::Ui, theme: Theme) {
+        // A run session (Playing/Paused) makes the whole editor read-only; the
+        // structural menus, Load, and the properties panel are disabled while
+        // it's true (Save/Debug/clock transport stay live).
+        let locked = self.editing_locked();
         egui::Panel::top("menu_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.menu_button("File", |ui| {
@@ -1470,7 +1574,7 @@ impl OsmilogApp {
                         }
                         ui.close();
                     }
-                    if ui.button("Load").clicked() {
+                    if ui.add_enabled(!locked, egui::Button::new("Load")).clicked() {
                         #[cfg(not(target_arch = "wasm32"))]
                         if let Some(outcome) = crate::io::native::load_dialog() {
                             match outcome {
@@ -1492,210 +1596,209 @@ impl OsmilogApp {
                         ui.close();
                     }
                 });
-                ui.menu_button("Edit", |ui| {
-                    if ui
-                        .add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
-                        .clicked()
-                    {
-                        self.undo();
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
-                        .clicked()
-                    {
-                        self.redo();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(self.selected.is_some(), egui::Button::new("Copy"))
-                        .clicked()
-                    {
-                        self.copy_selection();
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(!self.clipboard.is_empty(), egui::Button::new("Paste"))
-                        .clicked()
-                    {
-                        self.paste_clipboard();
-                        ui.close();
-                    }
+                ui.add_enabled_ui(!locked, |ui| {
+                    ui.menu_button("Edit", |ui| {
+                        if ui
+                            .add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
+                            .clicked()
+                        {
+                            self.undo();
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
+                            .clicked()
+                        {
+                            self.redo();
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(self.selected.is_some(), egui::Button::new("Copy"))
+                            .clicked()
+                        {
+                            self.copy_selection();
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(!self.clipboard.is_empty(), egui::Button::new("Paste"))
+                            .clicked()
+                        {
+                            self.paste_clipboard();
+                            ui.close();
+                        }
+                    });
                 });
-                ui.menu_button("Add", |ui| {
-                    ui.menu_button("Gates", |ui| {
-                        let gates = [
-                            ("AND", GateOp::And, 2),
-                            ("OR", GateOp::Or, 2),
-                            ("XOR", GateOp::Xor, 2),
-                            ("NAND", GateOp::Nand, 2),
-                            ("NOR", GateOp::Nor, 2),
-                            ("NOT", GateOp::Not, 1),
-                        ];
-                        for (name, op, n) in gates {
-                            if ui.button(name).clicked() {
+                ui.add_enabled_ui(!locked, |ui| {
+                    ui.menu_button("Add", |ui| {
+                        ui.menu_button("Gates", |ui| {
+                            let gates = [
+                                ("AND", GateOp::And, 2),
+                                ("OR", GateOp::Or, 2),
+                                ("XOR", GateOp::Xor, 2),
+                                ("NAND", GateOp::Nand, 2),
+                                ("NOR", GateOp::Nor, 2),
+                                ("NOT", GateOp::Not, 1),
+                            ];
+                            for (name, op, n) in gates {
+                                if ui.button(name).clicked() {
+                                    self.mode = InteractionMode::Placing {
+                                        spec: ComponentSpec::Gate(Gate {
+                                            op,
+                                            n_inputs: n,
+                                            width: 1,
+                                        }),
+                                    };
+                                    ui.close();
+                                }
+                            }
+                        });
+                        if ui.button("Input").clicked() {
+                            self.mode = InteractionMode::Placing {
+                                spec: ComponentSpec::Input(Input { bits: 0, width: 1 }),
+                            };
+                            ui.close();
+                        }
+                        if ui.button("Output").clicked() {
+                            self.mode = InteractionMode::Placing {
+                                spec: ComponentSpec::Output,
+                            };
+                            ui.close();
+                        }
+
+                        ui.menu_button("Plexers", |ui| {
+                            if ui.button("Mux").clicked() {
                                 self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::Gate(Gate {
-                                        op,
-                                        n_inputs: n,
-                                        width: 1,
+                                    spec: ComponentSpec::Mux(Mux {
+                                        data_width: 1,
+                                        sel_width: 1,
                                     }),
                                 };
                                 ui.close();
                             }
-                        }
-                    });
-                    if ui.button("Input").clicked() {
-                        self.mode = InteractionMode::Placing {
-                            spec: ComponentSpec::Input(Input { bits: 0, width: 1 }),
-                        };
-                        ui.close();
-                    }
-                    if ui.button("Output").clicked() {
-                        self.mode = InteractionMode::Placing {
-                            spec: ComponentSpec::Output,
-                        };
-                        ui.close();
-                    }
-
-                    ui.menu_button("Plexers", |ui| {
-                        if ui.button("Mux").clicked() {
-                            self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Mux(Mux {
-                                    data_width: 1,
-                                    sel_width: 1,
-                                }),
-                            };
-                            ui.close();
-                        }
-                        if ui.button("Demux").clicked() {
-                            self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Demux(Demux {
-                                    data_width: 1,
-                                    sel_width: 1,
-                                }),
-                            };
-                            ui.close();
-                        }
-                        if ui.button("Splitter").clicked() {
-                            self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Splitter {
-                                    width: 2,
-                                    arm_bits: vec![vec![0], vec![1]],
-                                    direction: FanDirection::Right,
-                                },
-                            };
-                            ui.close();
-                        }
-                        if ui.button("Encoder").clicked() {
-                            self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Encoder(Encoder { sel_width: 1 }),
-                            };
-                            ui.close();
-                        }
-                    });
-                    ui.menu_button("Arithmetic", |ui| {
-                        if ui.button("Adder").clicked() {
-                            self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Adder(Adder { data_width: 1 }),
-                            };
-                            ui.close();
-                        }
-                        if ui.button("Subtractor").clicked() {
-                            self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Subtractor(Subtractor { data_width: 1 }),
-                            };
-                            ui.close();
-                        }
-                        if ui.button("Multiplier").clicked() {
-                            self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Multiplier(Multiplier { data_width: 1 }),
-                            };
-                            ui.close();
-                        }
-                        if ui.button("Divider").clicked() {
-                            self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Divider(Divider { data_width: 1 }),
-                            };
-                            ui.close();
-                        }
-                        if ui.button("Comparator").clicked() {
-                            self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Comparator(Comparator { data_width: 1 }),
-                            };
-                            ui.close();
-                        }
-                    });
-                    ui.menu_button("Memory", |ui| {
-                        if ui.button("Register").clicked() {
-                            self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Reg(RegConf { data_width: 1 }),
-                            };
-                            ui.close();
-                        }
-                        ui.menu_button("Flip-Flop", |ui| {
-                            if ui.button("D Flip-Flop").clicked() {
+                            if ui.button("Demux").clicked() {
                                 self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::DFlipFlop(DFlipFlopConf),
+                                    spec: ComponentSpec::Demux(Demux {
+                                        data_width: 1,
+                                        sel_width: 1,
+                                    }),
                                 };
                                 ui.close();
                             }
-                            if ui.button("T Flip-Flop").clicked() {
+                            if ui.button("Splitter").clicked() {
                                 self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::TFlipFlop(TFlipFlopConf),
+                                    spec: ComponentSpec::Splitter {
+                                        width: 2,
+                                        arm_bits: vec![vec![0], vec![1]],
+                                        direction: FanDirection::Right,
+                                    },
                                 };
                                 ui.close();
                             }
-                            if ui.button("JK Flip-Flop").clicked() {
+                            if ui.button("Encoder").clicked() {
                                 self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::JKFlipFlop(JKFlipFlopConf),
-                                };
-                                ui.close();
-                            }
-                            if ui.button("SR Flip-Flop").clicked() {
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::SRFlipFlop(SRFlipFlopConf),
+                                    spec: ComponentSpec::Encoder(Encoder { sel_width: 1 }),
                                 };
                                 ui.close();
                             }
                         });
-                        if ui.button("Counter").clicked() {
-                            self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Counter(CounterConf {
-                                    data_width: 1,
-                                    max_value: 1,
-                                    overflow_action: OverflowAction::default(),
-                                }),
-                            };
-                            ui.close();
-                        }
-                    });
-                    ui.menu_button("Tunnel", |ui| {
-                        if ui.button("Feed").clicked() {
-                            self.mode = InteractionMode::PlacingTunnel {
-                                role: TunnelRole::Feed,
-                            };
-                            ui.close();
-                        }
-                        if ui.button("Pull").clicked() {
-                            self.mode = InteractionMode::PlacingTunnel {
-                                role: TunnelRole::Pull,
-                            };
-                            ui.close();
-                        }
+                        ui.menu_button("Arithmetic", |ui| {
+                            if ui.button("Adder").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::Adder(Adder { data_width: 1 }),
+                                };
+                                ui.close();
+                            }
+                            if ui.button("Subtractor").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::Subtractor(Subtractor { data_width: 1 }),
+                                };
+                                ui.close();
+                            }
+                            if ui.button("Multiplier").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::Multiplier(Multiplier { data_width: 1 }),
+                                };
+                                ui.close();
+                            }
+                            if ui.button("Divider").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::Divider(Divider { data_width: 1 }),
+                                };
+                                ui.close();
+                            }
+                            if ui.button("Comparator").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::Comparator(Comparator { data_width: 1 }),
+                                };
+                                ui.close();
+                            }
+                        });
+                        ui.menu_button("Memory", |ui| {
+                            if ui.button("Register").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::Reg(RegConf { data_width: 1 }),
+                                };
+                                ui.close();
+                            }
+                            ui.menu_button("Flip-Flop", |ui| {
+                                if ui.button("D Flip-Flop").clicked() {
+                                    self.mode = InteractionMode::Placing {
+                                        spec: ComponentSpec::DFlipFlop(DFlipFlopConf),
+                                    };
+                                    ui.close();
+                                }
+                                if ui.button("T Flip-Flop").clicked() {
+                                    self.mode = InteractionMode::Placing {
+                                        spec: ComponentSpec::TFlipFlop(TFlipFlopConf),
+                                    };
+                                    ui.close();
+                                }
+                                if ui.button("JK Flip-Flop").clicked() {
+                                    self.mode = InteractionMode::Placing {
+                                        spec: ComponentSpec::JKFlipFlop(JKFlipFlopConf),
+                                    };
+                                    ui.close();
+                                }
+                                if ui.button("SR Flip-Flop").clicked() {
+                                    self.mode = InteractionMode::Placing {
+                                        spec: ComponentSpec::SRFlipFlop(SRFlipFlopConf),
+                                    };
+                                    ui.close();
+                                }
+                            });
+                            if ui.button("Counter").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::Counter(CounterConf {
+                                        data_width: 1,
+                                        max_value: 1,
+                                        overflow_action: OverflowAction::default(),
+                                    }),
+                                };
+                                ui.close();
+                            }
+                        });
+                        ui.menu_button("Tunnel", |ui| {
+                            if ui.button("Feed").clicked() {
+                                self.mode = InteractionMode::PlacingTunnel {
+                                    role: TunnelRole::Feed,
+                                };
+                                ui.close();
+                            }
+                            if ui.button("Pull").clicked() {
+                                self.mode = InteractionMode::PlacingTunnel {
+                                    role: TunnelRole::Pull,
+                                };
+                                ui.close();
+                            }
+                        });
                     });
                 });
                 ui.menu_button("Debug", |ui| {
                     ui.checkbox(&mut self.show_profiler, "Profiler");
                 });
-                if ui.button("Tick Clock").clicked() {
-                    // A clock tick is a simulation step, not an edit - issue it
-                    // untracked (bypassing self.apply) so it never lands on the
-                    // undo stack (undo is scoped to structural edits only).
-                    let result = self.circuit.apply(Command::TickClock).0.unwrap_settle();
-                    self.record_settle_result(result);
-                }
+                ui.separator();
+                self.show_clock_controls(ui);
                 if let Some(err) = &self.last_settle_error {
                     ui.colored_label(theme.error_text, err);
                 }
@@ -1704,6 +1807,61 @@ impl OsmilogApp {
                 });
             })
         });
+    }
+
+    // The clock transport: a speed setting plus Play / Pause / Step / Stop.
+    // Buttons are enable-gated on the current run state (see the state table in
+    // ClockRun); entering Play locks editing for the whole session and Stop
+    // resets sequential state. All ticks are issued untracked (see tick_once).
+    fn show_clock_controls(&mut self, ui: &mut egui::Ui) {
+        let run = self.clock.run;
+
+        // Speed is only adjustable while stopped - locked during a run session.
+        ui.add_enabled(
+            run == ClockRun::Stopped,
+            egui::DragValue::new(&mut self.clock.ticks_per_second)
+                .speed(0.1)
+                .range(1.0..=60.0)
+                .suffix(" tick/s"),
+        );
+
+        // Play: start (from Stopped) or resume (from Paused) auto-advancing.
+        // Resets the auto-advance clock and abandons any in-progress placement
+        // so nothing can edit mid-run.
+        if ui
+            .add_enabled(run != ClockRun::Playing, egui::Button::new("Play"))
+            .clicked()
+        {
+            self.clock.run = ClockRun::Playing;
+            self.clock.last_tick_time = ui.ctx().input(|i| i.time);
+            self.mode = InteractionMode::Idle;
+        }
+
+        // Pause: freeze mid-run, preserving sequential state (stays locked).
+        if ui
+            .add_enabled(run == ClockRun::Playing, egui::Button::new("Pause"))
+            .clicked()
+        {
+            self.clock.run = ClockRun::Paused;
+        }
+
+        // Step: advance exactly one tick. Available when not playing - from
+        // Stopped it's a single manual tick (stays editable); from Paused it
+        // nudges the frozen run forward one step.
+        if ui
+            .add_enabled(run != ClockRun::Playing, egui::Button::new("Step"))
+            .clicked()
+        {
+            self.tick_once();
+        }
+
+        // Stop: halt, reset all sequential state to power-on, return to editable.
+        if ui
+            .add_enabled(run != ClockRun::Stopped, egui::Button::new("Stop"))
+            .clicked()
+        {
+            self.stop_clock();
+        }
     }
 
     // ── Canvas drawing ────────────────────────────────────────────────────
@@ -1807,11 +1965,13 @@ impl OsmilogApp {
 
         // Backspace/Delete removes the current selection (bulk selection
         // takes priority). Guarded on widget focus so it edits a focused
-        // text field instead of deleting.
+        // text field instead of deleting, and on the clock lock so no editing
+        // shortcut fires during a run session (Playing/Paused).
         let editing_text = ctx.memory(|m| m.focused().is_some());
+        let edits_blocked = editing_text || self.editing_locked();
         let delete_pressed =
             ctx.input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete));
-        if delete_pressed && !editing_text {
+        if delete_pressed && !edits_blocked {
             match &self.selected {
                 Some(Selection::Bulk(_)) => self.delete_bulk(),
                 Some(Selection::Single(sel)) => match *sel {
@@ -1824,9 +1984,9 @@ impl OsmilogApp {
         }
 
         // Undo (Ctrl/Cmd+Z) / redo (Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z). Same
-        // focus guard as delete so the shortcuts don't fire while typing in
-        // the tunnel-label field (where Ctrl+Z should edit text).
-        if !editing_text {
+        // focus/lock guard as delete so the shortcuts don't fire while typing in
+        // the tunnel-label field (where Ctrl+Z should edit text) or mid-run.
+        if !edits_blocked {
             let (undo, redo) = ctx.input(|i| {
                 let cmd = i.modifiers.command;
                 let z = i.key_pressed(egui::Key::Z);
@@ -1842,10 +2002,10 @@ impl OsmilogApp {
             }
         }
 
-        // Copy (Ctrl/Cmd+C) / Paste (Ctrl/Cmd+V). Same focus guard as
+        // Copy (Ctrl/Cmd+C) / Paste (Ctrl/Cmd+V). Same focus/lock guard as
         // delete/undo/redo so the shortcuts don't fire while typing in the
-        // tunnel-label field (where Ctrl+C/V should edit text).
-        if !editing_text {
+        // tunnel-label field (where Ctrl+C/V should edit text) or mid-run.
+        if !edits_blocked {
             let (copy, paste) = ctx.input(|i| {
                 let cmd = i.modifiers.command;
                 (
@@ -1907,7 +2067,10 @@ impl OsmilogApp {
             }
         }
 
-        if cc.response.drag_started() {
+        // All drag gestures (wire draw, component/bulk move, rubber-band
+        // select) mutate the circuit or selection - suppressed during a run
+        // session. Plain click-to-select below stays available for inspection.
+        if !self.editing_locked() && cc.response.drag_started() {
             let origin = cc.ctx.input(|i| i.pointer.press_origin());
             if let Some(pos) = origin {
                 if let Some((attach, gp)) = self.wire_start_at(pos, cc.pan) {
@@ -1973,10 +2136,12 @@ impl OsmilogApp {
             if let Some(pos) = pointer {
                 // A click starts a polyline only from a pin/tunnel;
                 // clicking a bare wire selects it instead (branching
-                // off a wire is a drag gesture, handled above).
+                // off a wire is a drag gesture, handled above). Suppressed
+                // during a run session so only selection remains.
                 let pin_start = self
                     .wire_start_at(pos, cc.pan)
-                    .filter(|(a, _)| matches!(a, NodeAttach::Pin(..) | NodeAttach::Tunnel(_)));
+                    .filter(|(a, _)| matches!(a, NodeAttach::Pin(..) | NodeAttach::Tunnel(_)))
+                    .filter(|_| !self.editing_locked());
                 if let Some((attach, gp)) = pin_start {
                     self.mode = InteractionMode::WireDraw {
                         points: vec![gp],
@@ -2227,6 +2392,8 @@ impl eframe::App for OsmilogApp {
 
         #[cfg(target_arch = "wasm32")]
         self.apply_pending_load();
+
+        self.advance_clock(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) {
             #[cfg(not(target_arch = "wasm32"))]
@@ -3646,5 +3813,51 @@ mod tests {
         app.paste_clipboard();
         assert_eq!(app.components.len(), before);
         assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn test_editing_locked_tracks_run_state() {
+        let mut app = OsmilogApp::empty();
+        // Stopped (initial) is editable.
+        assert!(!app.editing_locked());
+
+        // Both Playing and Paused lock the whole run session.
+        app.clock.run = ClockRun::Playing;
+        assert!(app.editing_locked());
+        app.clock.run = ClockRun::Paused;
+        assert!(app.editing_locked());
+
+        // Stop returns to editable.
+        app.stop_clock();
+        assert_eq!(app.clock.run, ClockRun::Stopped);
+        assert!(!app.editing_locked());
+    }
+
+    #[test]
+    fn test_stop_clock_resets_register_through_gui() {
+        let mut app = OsmilogApp::empty();
+        let data = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let we = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let reg = place(&mut app, ComponentSpec::Reg(RegConf { data_width: 1 }));
+        let out = place(&mut app, ComponentSpec::Output);
+
+        connect_pins(&mut app, (data, PinId::output(0)), (reg, PinId::input(0)));
+        connect_pins(&mut app, (we, PinId::output(0)), (reg, PinId::input(1)));
+        connect_pins(&mut app, (reg, PinId::output(0)), (out, PinId::input(0)));
+        app.rebuild_circuit();
+
+        let out_key = app.components[out].key;
+        // Register powers on at 0.
+        assert_eq!(app.circuit.read_output(out_key), Value::ZERO);
+
+        // A tick with write-enable high latches the data (1).
+        app.tick_once();
+        assert_eq!(app.circuit.read_output(out_key), Value::ONE);
+
+        // Stop resets the register to 0 and returns to the editable state.
+        app.clock.run = ClockRun::Playing;
+        app.stop_clock();
+        assert_eq!(app.clock.run, ClockRun::Stopped);
+        assert_eq!(app.circuit.read_output(out_key), Value::ZERO);
     }
 }

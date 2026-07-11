@@ -637,6 +637,29 @@ impl Circuit {
         self.settle()
     }
 
+    // Restores every active sequential component's latched state to its
+    // power-on initial value, dirties the changed output nets, and settles to
+    // propagate the reset through the combinational circuit. Drives the GUI's
+    // clock "Stop" (see gui::app). Like tick_clock, generic over LogicSeq
+    // variants - a new sequential type only needs a SeqLogic::reset impl.
+    pub fn reset_sequential(&mut self) -> Result<(), SettleError> {
+        puffin::profile_function!();
+        let seq_comps: Vec<CompKey> = self
+            .components
+            .iter()
+            .filter(|(_, c)| c.active && c.is_sequential())
+            .map(|(key, _)| key)
+            .collect();
+
+        for key in seq_comps {
+            self.components[key].reset();
+            let values = self.components[key].observe();
+            self.apply_output_values(key, values);
+        }
+
+        self.settle()
+    }
+
     pub fn remove_component(&mut self, key: CompKey) {
         let Some(comp) = self.components.get(key) else {
             return;
@@ -1099,6 +1122,53 @@ mod tests {
 
         c.settle().unwrap();
         c.tick_clock().unwrap(); // no sequential components; behaves like settle()
+        assert_eq!(c.read_output(o), Value::ONE);
+    }
+
+    #[test]
+    fn test_reset_sequential_restores_initial_state() {
+        use crate::sim::component::OverflowAction;
+        let mut c = Circuit::new();
+        let data = c.add_component(Component::input(5, 4));
+        let we = c.add_component(Component::input(1, 1));
+        let reg = c.add_component(Component::reg(4));
+        let out_reg = c.add_component(Component::output());
+
+        // A counter counting up, with its own latched value.
+        let load = c.add_component(Component::input(0, 1));
+        let count = c.add_component(Component::input(1, 1));
+        let counter = c.add_component(Component::counter(4, 15, OverflowAction::Wrap));
+        let out_ctr = c.add_component(Component::output());
+
+        c.link(data, PinId::output(0), reg, PinId::input(0));
+        c.link(we, PinId::output(0), reg, PinId::input(1));
+        c.link(reg, PinId::output(0), out_reg, PinId::input(0));
+        c.link(load, PinId::output(0), counter, PinId::input(1)); // LOAD_PIN = 0 (count up)
+        c.link(count, PinId::output(0), counter, PinId::input(2)); // COUNT_PIN
+        c.link(counter, PinId::output(0), out_ctr, PinId::input(0)); // Q_PIN
+        c.settle().unwrap();
+
+        // Advance a few ticks so both hold non-initial state.
+        c.tick_clock().unwrap();
+        c.tick_clock().unwrap();
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out_reg), Value::new(5, 4));
+        assert_eq!(c.read_output(out_ctr), Value::new(3, 4));
+
+        // Reset returns both to their power-on initial value and propagates it.
+        c.reset_sequential().unwrap();
+        assert_eq!(c.read_output(out_reg), Value::new(0, 4));
+        assert_eq!(c.read_output(out_ctr), Value::new(0, 4));
+    }
+
+    #[test]
+    fn test_reset_sequential_noop_with_no_sequential_components() {
+        let mut c = Circuit::new();
+        let a = c.add_component(Component::input(1, 1));
+        let o = c.add_component(Component::output());
+        c.link(a, PinId::output(0), o, PinId::input(0));
+        c.settle().unwrap();
+        c.reset_sequential().unwrap(); // behaves like settle()
         assert_eq!(c.read_output(o), Value::ONE);
     }
 

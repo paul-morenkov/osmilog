@@ -88,6 +88,10 @@ impl SeqLogic for SRFlipFlop {
         vec![self.value]
     }
 
+    fn reset(&mut self) {
+        self.value = Value::ZERO;
+    }
+
     fn snapshot(&self) -> SeqState {
         SeqState::FlipFlop(self.value)
     }
