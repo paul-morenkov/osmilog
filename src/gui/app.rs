@@ -17,11 +17,7 @@ use crate::io::{
 };
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
 use crate::sim::command::Command;
-use crate::sim::component::{
-    Adder, CompKey, Comparator, ComponentSpec, CounterConf, DFlipFlopConf, Demux, Divider, Encoder,
-    FanDirection, Gate, GateOp, InIdx, Input, JKFlipFlopConf, Multiplier, Mux, OutIdx,
-    OverflowAction, PinId, RegConf, SRFlipFlopConf, Subtractor, TFlipFlopConf,
-};
+use crate::sim::component::*;
 use crate::sim::value::Value;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -155,25 +151,44 @@ impl Default for ClockControl {
     }
 }
 
-// Decides, for one frame of the auto-advance loop, whether the clock should
-// tick and what the new `last_tick_time` reference becomes. Returns None when
-// the interval hasn't elapsed yet. Kept pure (no egui/self) so the cadence is
-// unit-testable.
+impl ClockControl {
+    fn interval(&self) -> f64 {
+        1.0 / self.ticks_per_second.max(0.001) as f64
+    }
+}
+
+// Upper bound on ticks fired in a single frame. egui is reactive and only wakes
+// via request_repaint_after, whose delivered frame gap is >= the requested one
+// and jitters longer (OS timer granularity, vsync, WASM setTimeout clamping and
+// background-tab throttling). A late/coalesced wake therefore covers several
+// intervals at once, and all of them must fire or the sequential state skips
+// values. This cap stops a genuine multi-second stall (a breakpoint, a
+// backgrounded tab) from replaying a huge backlog - a "spiral of death"; past it
+// we resync to `now` and drop the backlog instead.
+const MAX_CATCHUP_TICKS: u32 = 8;
+
+// Fixed-timestep accumulator for one frame of the auto-advance loop: given the
+// current frame time, the reference timestamp of the last fired tick, and the
+// interval, returns how many ticks are due this frame and the new reference.
+// Kept pure (no egui/self) so the cadence is unit-testable.
 //
-// The reference advances by exactly one `interval` rather than snapping to
-// `now`, so the average tick rate stays `1/interval` no matter how often frames
-// are produced. (Snapping to `now` folds each frame's overshoot past the
-// boundary into the cadence, which is why moving the mouse - a flood of extra
-// repaints - visibly sped ticking up.) If we've fallen more than one interval
-// behind (the app was idle or suspended), resync to `now` instead of firing a
-// catch-up burst of missed ticks.
-fn next_tick_schedule(now: f64, last: f64, interval: f64) -> Option<f64> {
+// It fires *every* whole interval elapsed since `last`, not just one - a single
+// late frame that spans two intervals owes two ticks, and dropping the extra is
+// exactly the "frame skip" a counter shows as missing numbers. The reference
+// advances by whole intervals (`last + n*interval`), preserving sub-interval
+// phase so the average rate stays `1/interval` regardless of frame jitter;
+// snapping it to `now` would fold each frame's overshoot into the cadence (which
+// is why moving the mouse once sped ticking up). Only a backlog beyond
+// MAX_CATCHUP_TICKS - a real stall, not ordinary jitter - resyncs to `now`.
+fn ticks_due(now: f64, last: f64, interval: f64) -> (u32, f64) {
     if now - last < interval {
-        None
-    } else if now - last >= 2.0 * interval {
-        Some(now)
+        return (0, last);
+    }
+    let elapsed = ((now - last) / interval).floor() as u32;
+    if elapsed > MAX_CATCHUP_TICKS {
+        (MAX_CATCHUP_TICKS, now)
     } else {
-        Some(last + interval)
+        (elapsed, last + elapsed as f64 * interval)
     }
 }
 
@@ -301,25 +316,33 @@ impl OsmilogApp {
     }
 
     // Auto-advances the clock while Playing. Uses egui's frame clock
-    // (ctx.input(|i| i.time), wasm-safe) to fire a tick once per interval, and
-    // request_repaint_after to keep the frame loop alive between ticks (the app
-    // is otherwise reactive and wouldn't repaint on its own). A tick that fails
-    // to settle auto-pauses so we don't hammer a broken circuit every frame.
+    // (ctx.input(|i| i.time), wasm-safe) with a fixed-timestep accumulator
+    // (ticks_due) that fires every interval elapsed this frame - not just one -
+    // so a late or coalesced repaint doesn't skip ticks. request_repaint_after
+    // keeps the frame loop alive between ticks (the app is otherwise reactive and
+    // wouldn't repaint on its own); we aim it at the next tick boundary rather
+    // than a full interval out, so the wake targets the deadline instead of
+    // drifting past it. A tick that fails to settle auto-pauses so we don't
+    // hammer a broken circuit every frame.
     fn advance_clock(&mut self, ctx: &egui::Context) {
         if self.clock.run != ClockRun::Playing {
             return;
         }
-        let interval = 1.0 / self.clock.ticks_per_second.max(0.001) as f64;
         let now = ctx.input(|i| i.time);
-        if let Some(next) = next_tick_schedule(now, self.clock.last_tick_time, interval) {
+        let interval = self.clock.interval();
+        let (n_ticks, next) = ticks_due(now, self.clock.last_tick_time, interval);
+        self.clock.last_tick_time = next;
+        for _ in 0..n_ticks {
             self.tick_once();
-            self.clock.last_tick_time = next;
             if self.last_settle_error.is_some() {
                 self.clock.run = ClockRun::Paused;
                 return;
             }
         }
-        ctx.request_repaint_after(std::time::Duration::from_secs_f64(interval));
+        // Wake right at the next boundary (in (0, interval]), not a full interval
+        // from now, so repaint timing tracks the tick schedule.
+        let wait = (self.clock.last_tick_time + interval - now).max(0.0);
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
     }
 
     // Applies a Command and records its UndoAction into history in one place;
@@ -3838,25 +3861,37 @@ mod tests {
     }
 
     #[test]
-    fn test_next_tick_schedule_is_frame_rate_independent() {
+    fn test_ticks_due_is_frame_rate_independent() {
         let interval = 0.2;
 
-        // Interval not elapsed yet: no tick.
-        assert_eq!(next_tick_schedule(0.1, 0.0, interval), None);
+        // (n_ticks exact; reference compared with a float tolerance.)
+        let check = |(n, next): (u32, f64), en: u32, enext: f64| {
+            assert_eq!(n, en);
+            assert!((next - enext).abs() < 1e-9, "ref {next} != {enext}");
+        };
+
+        // Interval not elapsed yet: no tick, reference unchanged.
+        check(ticks_due(0.1, 0.0, interval), 0, 0.0);
 
         // Dense frames (mouse moving): a frame lands just past the boundary.
-        // The reference advances by exactly one interval, NOT to `now`, so the
-        // small overshoot doesn't accumulate into the cadence.
-        assert_eq!(next_tick_schedule(0.21, 0.0, interval), Some(0.2));
-        assert_eq!(next_tick_schedule(0.216, 0.0, interval), Some(0.2));
+        // One tick; the reference advances by exactly one interval, NOT to `now`,
+        // so the small overshoot doesn't accumulate into the cadence.
+        check(ticks_due(0.21, 0.0, interval), 1, 0.2);
+        check(ticks_due(0.216, 0.0, interval), 1, 0.2);
 
-        // Sparse frames still within one interval of slack: same steady step,
-        // so idle and moving-mouse converge on the same average rate.
-        assert_eq!(next_tick_schedule(0.39, 0.0, interval), Some(0.2));
+        // A late/coalesced frame spanning two intervals owes TWO ticks (the core
+        // fix: no dropped ticks). Reference advances by two whole intervals,
+        // keeping phase - the leftover 0.01 carries into the next frame.
+        check(ticks_due(0.41, 0.0, interval), 2, 0.4);
 
-        // Fell more than one interval behind (idle/suspended): resync to `now`
-        // and drop the missed ticks rather than firing a burst.
-        assert_eq!(next_tick_schedule(5.0, 0.0, interval), Some(5.0));
+        // Three intervals in one frame -> three ticks.
+        check(ticks_due(0.61, 0.0, interval), 3, 0.6);
+
+        // A genuine stall beyond the catch-up cap: fire the cap, then resync to
+        // `now` and drop the backlog rather than replaying a burst.
+        let (n, next) = ticks_due(100.0, 0.0, interval);
+        assert_eq!(n, MAX_CATCHUP_TICKS);
+        assert_eq!(next, 100.0);
     }
 
     #[test]
