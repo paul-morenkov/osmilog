@@ -198,6 +198,7 @@ fn ticks_due(now: f64, last: f64, interval: f64) -> (u32, f64) {
 new_key_type! {
     pub struct PlacedCompKey;
     pub struct PlacedTunnelKey;
+    pub struct DocId;
 }
 
 pub struct OsmilogApp {
@@ -241,6 +242,74 @@ pub struct OsmilogApp {
     // Set by the "Edit contents…" button in the properties panel; the window
     // (show_rom_editor) closes it on ✕ or if the component goes away.
     rom_editor_open: Option<PlacedCompKey>,
+    // ── Multiple circuits ──────────────────────────────────────────────────
+    // All circuit documents held in memory. Exactly one is *active*: its
+    // per-circuit state (circuit/history/components/tunnels/wiring/mode/pan/
+    // selected/clock/rom_editor_open, above) lives directly in those live
+    // fields, and its `CircuitDoc::state` is None. Every other document parks
+    // its state in `CircuitDoc::state` until switched to. See DocState.
+    documents: SlotMap<DocId, CircuitDoc>,
+    // Stable palette display order for `documents` (SlotMap iteration order is
+    // unspecified). Grows as circuits are created.
+    doc_order: Vec<DocId>,
+    // Which document's state is currently live in the fields above.
+    active: DocId,
+    // New-circuit name dialog: Some(buffer) while open (the String doubles as
+    // the live text-field contents), None while closed. Mirrors the web Save As
+    // modal pattern (platform/web.rs) but lives on the app so native gets it too.
+    new_circuit_dialog: Option<String>,
+}
+
+// The per-circuit ("document") state, bundled so an inactive circuit can be
+// parked while another is edited. These are exactly the live per-circuit fields
+// on OsmilogApp; the active document keeps them in those fields (and its
+// CircuitDoc::state is None), while inactive documents hold a DocState here.
+// Swapping is a set of std::mem moves (see take_active_state/put_active_state) -
+// no serialization, so no ComponentSpec/ROM deep-copy on a switch.
+struct DocState {
+    circuit: Circuit,
+    history: History,
+    components: SlotMap<PlacedCompKey, PlacedComponent>,
+    tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel>,
+    wiring: Wiring,
+    mode: InteractionMode,
+    pan: Vec2,
+    selected: Option<Selection>,
+    clock: ClockControl,
+    rom_editor_open: Option<PlacedCompKey>,
+}
+
+impl DocState {
+    // A fresh blank document - the same per-circuit initial values empty() uses.
+    fn blank() -> Self {
+        Self {
+            circuit: Circuit::new(),
+            history: History::default(),
+            components: SlotMap::default(),
+            tunnels: SlotMap::default(),
+            wiring: Wiring::new(),
+            mode: InteractionMode::Idle,
+            pan: Vec2::ZERO,
+            selected: None,
+            clock: ClockControl::default(),
+            rom_editor_open: None,
+        }
+    }
+}
+
+// One circuit document: its display name plus its parked state while inactive.
+// `state` is None exactly when this is the active document (its state is live
+// on OsmilogApp); Some for every parked/inactive document.
+struct CircuitDoc {
+    name: String,
+    state: Option<DocState>,
+}
+
+// Default name suggested for a new circuit, e.g. "Circuit 2" for the second
+// document. Only a suggestion (prefilled into the dialog / used when the user
+// clears the field) - names aren't required to be unique; identity is the DocId.
+fn default_new_circuit_name(documents: &SlotMap<DocId, CircuitDoc>) -> String {
+    format!("Circuit {}", documents.len() + 1)
 }
 
 // ── CanvasCtx ─────────────────────────────────────────────────────────────────
@@ -262,6 +331,14 @@ impl OsmilogApp {
     // a fresh app without an eframe::CreationContext, which isn't
     // constructible outside a running eframe host.
     pub fn empty() -> Self {
+        // The single initial "Main" document. It's the active one, so its state
+        // lives in the live per-circuit fields below and its CircuitDoc::state
+        // is None (parked state is only for inactive documents).
+        let mut documents = SlotMap::with_key();
+        let active = documents.insert(CircuitDoc {
+            name: "Main".to_string(),
+            state: None,
+        });
         Self {
             circuit: Circuit::new(),
             history: History::default(),
@@ -277,12 +354,80 @@ impl OsmilogApp {
             show_profiler: false,
             clock: ClockControl::default(),
             rom_editor_open: None,
+            documents,
+            doc_order: vec![active],
+            active,
+            new_circuit_dialog: None,
         }
     }
 
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         puffin::set_scopes_on(true);
         Self::empty()
+    }
+
+    // ── Multiple circuits ──────────────────────────────────────────────────
+
+    // Move the active document's live per-circuit fields out into a DocState.
+    // The placeholders left behind are throwaway - every caller immediately
+    // overwrites the live fields with an incoming DocState (put_active_state).
+    fn take_active_state(&mut self) -> DocState {
+        DocState {
+            circuit: std::mem::replace(&mut self.circuit, Circuit::new()),
+            history: std::mem::take(&mut self.history),
+            components: std::mem::take(&mut self.components),
+            tunnels: std::mem::take(&mut self.tunnels),
+            wiring: std::mem::replace(&mut self.wiring, Wiring::new()),
+            mode: std::mem::replace(&mut self.mode, InteractionMode::Idle),
+            pan: std::mem::replace(&mut self.pan, Vec2::ZERO),
+            selected: self.selected.take(),
+            clock: std::mem::take(&mut self.clock),
+            rom_editor_open: self.rom_editor_open.take(),
+        }
+    }
+
+    // Install a DocState into the live per-circuit fields (inverse of the move
+    // done by take_active_state).
+    fn put_active_state(&mut self, state: DocState) {
+        self.circuit = state.circuit;
+        self.history = state.history;
+        self.components = state.components;
+        self.tunnels = state.tunnels;
+        self.wiring = state.wiring;
+        self.mode = state.mode;
+        self.pan = state.pan;
+        self.selected = state.selected;
+        self.clock = state.clock;
+        self.rom_editor_open = state.rom_editor_open;
+    }
+
+    // Make `target` the active document: park the current active's live state
+    // into its CircuitDoc, then unpark `target`'s state into the live fields.
+    // No-op if `target` is already active. No net rebuild is needed - a parked
+    // circuit already holds its settled nets, moved back intact.
+    fn switch_circuit(&mut self, target: DocId) {
+        if target == self.active {
+            return;
+        }
+        let parked = self.take_active_state();
+        self.documents[self.active].state = Some(parked);
+        let incoming = self.documents[target]
+            .state
+            .take()
+            .expect("inactive document must have parked state");
+        self.put_active_state(incoming);
+        self.active = target;
+    }
+
+    // Create a new blank circuit document, make it active, and open a blank
+    // canvas on it. The previously-active document is parked unchanged.
+    fn create_circuit_doc(&mut self, name: String) {
+        let parked = self.take_active_state();
+        self.documents[self.active].state = Some(parked);
+        let id = self.documents.insert(CircuitDoc { name, state: None });
+        self.doc_order.push(id);
+        self.put_active_state(DocState::blank());
+        self.active = id;
     }
 
     fn record_settle_result<T>(&mut self, result: Result<T, crate::sim::circuit::SettleError>) {
@@ -1140,7 +1285,9 @@ impl OsmilogApp {
                 ui.horizontal(|ui| {
                     ui.label("Max value:");
                     changed |= ui
-                        .add(egui::DragValue::new(&mut max_value).range(0..=Value::mask(data_width)))
+                        .add(
+                            egui::DragValue::new(&mut max_value).range(0..=Value::mask(data_width)),
+                        )
                         .changed();
                 });
                 ui.horizontal(|ui| {
@@ -1478,11 +1625,12 @@ impl OsmilogApp {
                                         ComponentSpec::Rom(rom) => rom.word(i),
                                         _ => 0,
                                     };
-                                    let resp = ui.add(
-                                        egui::DragValue::new(&mut val)
-                                            .range(0..=mask)
-                                            .hexadecimal(word_nibbles, false, true),
-                                    );
+                                    let resp =
+                                        ui.add(
+                                            egui::DragValue::new(&mut val)
+                                                .range(0..=mask)
+                                                .hexadecimal(word_nibbles, false, true),
+                                        );
                                     if resp.changed() {
                                         edits.push((i, val));
                                     }
@@ -1497,6 +1645,55 @@ impl OsmilogApp {
         }
         if !open {
             self.rom_editor_open = None;
+        }
+    }
+
+    // Draws the "New Circuit" name dialog while `new_circuit_dialog` is Some.
+    // The Option doubles as open-state and the live text buffer, mirroring the
+    // web Save As modal (platform/web.rs); living here (not in the web backend)
+    // means native gets the dialog too. On Create it makes a new active blank
+    // circuit; Cancel / ✕ / an empty-after-trim name that's still confirmed all
+    // fall back sensibly. Driven once per frame from `ui()`.
+    fn create_new_circuit_dialog(&mut self, ctx: &egui::Context) {
+        let Some(name) = &mut self.new_circuit_dialog else {
+            return;
+        };
+        let mut open = true;
+        let mut confirmed = false;
+        let mut cancelled = false;
+        egui::Window::new("New Circuit")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    let resp = ui.text_edit_singleline(name);
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        confirmed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Create").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        if confirmed {
+            let trimmed = name.trim();
+            let final_name = if trimmed.is_empty() {
+                default_new_circuit_name(&self.documents)
+            } else {
+                trimmed.to_string()
+            };
+            self.create_circuit_doc(final_name);
+        }
+        if !open || confirmed || cancelled {
+            self.new_circuit_dialog = None;
         }
     }
 
@@ -1851,24 +2048,53 @@ impl OsmilogApp {
     }
 
     // ── Component palette (top half of the left panel) ────────────────────
-    // The former "Add" menu, inlined into the left panel as a live palette.
-    // Categories that used to be submenus are now CollapsingHeaders that
-    // expand in place; leaf entries arm a Placing/PlacingTunnel interaction.
     // The whole palette is disabled during a run session (same lock as the
     // structural menus and the properties panel below it).
     fn show_component_palette(&mut self, ui: &mut egui::Ui) {
         let locked = self.editing_locked();
         ui.add_enabled_ui(!locked, |ui| {
-            // User-created circuits. For now the only entry is "Main", the
-            // circuit currently being edited; subcircuits will be added here.
-            egui::CollapsingHeader::new("User Created")
-                .default_open(true)
-                .show(ui, |ui| {
-                    // Selected marks it as the circuit in the editor. Placing a
-                    // subcircuit isn't implemented yet, so this is inert.
-                    let _ = ui.selectable_label(true, "Main");
-                });
+            // User-created circuits: one selectable entry per document, with a
+            // "+" on the header row to create a new one. Selecting an entry
+            // switches the whole editing session to that circuit. Uses a custom
+            // CollapsingState so the "+" button can sit on the header row.
+            let hdr_id = ui.make_persistent_id("user_created_hdr");
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                hdr_id,
+                true,
+            )
+            .show_header(ui, |ui| {
+                ui.label("User Created");
+                if ui.small_button("+").clicked() {
+                    self.new_circuit_dialog = Some(default_new_circuit_name(&self.documents));
+                }
+            })
+            .body(|ui| {
+                // Record the clicked target and switch after the loop, so the
+                // list read-borrow of `self.doc_order`/`documents` doesn't
+                // overlap the &mut self switch_circuit call.
+                let mut clicked = None;
+                for &doc_id in &self.doc_order {
+                    let name = &self.documents[doc_id].name;
+                    if ui.selectable_label(doc_id == self.active, name).clicked() {
+                        clicked = Some(doc_id);
+                    }
+                }
+                if let Some(target) = clicked {
+                    self.switch_circuit(target);
+                }
+            });
 
+            if ui.button("Input").clicked() {
+                self.mode = InteractionMode::Placing {
+                    spec: ComponentSpec::Input(Input { bits: 0, width: 1 }),
+                };
+            }
+            if ui.button("Output").clicked() {
+                self.mode = InteractionMode::Placing {
+                    spec: ComponentSpec::Output,
+                };
+            }
             egui::CollapsingHeader::new("Gates").show(ui, |ui| {
                 let gates = [
                     ("AND", GateOp::And, 2),
@@ -1890,16 +2116,6 @@ impl OsmilogApp {
                     }
                 }
             });
-            if ui.button("Input").clicked() {
-                self.mode = InteractionMode::Placing {
-                    spec: ComponentSpec::Input(Input { bits: 0, width: 1 }),
-                };
-            }
-            if ui.button("Output").clicked() {
-                self.mode = InteractionMode::Placing {
-                    spec: ComponentSpec::Output,
-                };
-            }
             egui::CollapsingHeader::new("Plexers").show(ui, |ui| {
                 if ui.button("Mux").clicked() {
                     self.mode = InteractionMode::Placing {
@@ -1974,9 +2190,14 @@ impl OsmilogApp {
                         }),
                     };
                 }
-                if ui.button("ROM").clicked() {
+                if ui.button("Counter").clicked() {
+                    let data_width = 1;
                     self.mode = InteractionMode::Placing {
-                        spec: ComponentSpec::Rom(Rom::new(8, 8)),
+                        spec: ComponentSpec::Counter(CounterConf {
+                            data_width,
+                            max_value: Value::mask(data_width),
+                            overflow_action: OverflowAction::default(),
+                        }),
                     };
                 }
                 egui::CollapsingHeader::new("Flip-Flop").show(ui, |ui| {
@@ -2001,14 +2222,9 @@ impl OsmilogApp {
                         };
                     }
                 });
-                if ui.button("Counter").clicked() {
-                    let data_width = 1;
+                if ui.button("ROM").clicked() {
                     self.mode = InteractionMode::Placing {
-                        spec: ComponentSpec::Counter(CounterConf {
-                            data_width,
-                            max_value: Value::mask(data_width),
-                            overflow_action: OverflowAction::default(),
-                        }),
+                        spec: ComponentSpec::Rom(Rom::new(8, 8)),
                     };
                 }
             });
@@ -2633,6 +2849,9 @@ impl eframe::App for OsmilogApp {
 
         // ROM contents editor window, drawn while a ROM's editor is open.
         self.show_rom_editor(&ctx);
+
+        // "New Circuit" name dialog, drawn while it's open.
+        self.create_new_circuit_dialog(&ctx);
 
         // Draws the web "Save As" filename modal while it's open (and completes
         // the download on confirm); no-op on native.
@@ -4144,5 +4363,90 @@ mod tests {
         app.stop_clock();
         assert_eq!(app.clock.run, ClockRun::Stopped);
         assert_eq!(app.circuit.read_output(out_key), Value::ZERO);
+    }
+
+    // ── Multiple circuits ──────────────────────────────────────────────────
+
+    #[test]
+    fn empty_app_has_one_active_main_document() {
+        let app = OsmilogApp::empty();
+        assert_eq!(app.documents.len(), 1);
+        assert_eq!(app.doc_order.len(), 1);
+        assert_eq!(app.doc_order[0], app.active);
+        assert_eq!(app.documents[app.active].name, "Main");
+        // The active document's state is live, not parked.
+        assert!(app.documents[app.active].state.is_none());
+    }
+
+    #[test]
+    fn create_circuit_doc_adds_active_blank_document() {
+        let mut app = OsmilogApp::empty();
+        let main = app.active;
+        place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        assert_eq!(app.components.len(), 1);
+
+        app.create_circuit_doc("C2".to_string());
+
+        // A second document exists and is now active, with a blank canvas.
+        assert_eq!(app.documents.len(), 2);
+        assert_eq!(app.doc_order.len(), 2);
+        assert_ne!(app.active, main);
+        assert_eq!(app.documents[app.active].name, "C2");
+        assert!(app.components.is_empty());
+        // The previous document is parked (its state moved off the live fields).
+        assert!(app.documents[main].state.is_some());
+        assert!(app.documents[app.active].state.is_none());
+    }
+
+    #[test]
+    fn switching_circuits_parks_and_restores_state() {
+        let mut app = OsmilogApp::empty();
+        let main = app.active;
+
+        // Build a settled AND-of-two-highs -> Output on "Main".
+        let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let b = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let g = place(
+            &mut app,
+            ComponentSpec::Gate(Gate {
+                op: GateOp::And,
+                n_inputs: 2,
+                width: 1,
+            }),
+        );
+        let o = place(&mut app, ComponentSpec::Output);
+        connect_pins(&mut app, (a, PinId::output(0)), (g, PinId::input(0)));
+        connect_pins(&mut app, (b, PinId::output(0)), (g, PinId::input(1)));
+        connect_pins(&mut app, (g, PinId::output(0)), (o, PinId::input(0)));
+        app.rebuild_circuit();
+        let o_key = app.components[o].key;
+        assert_eq!(app.circuit.read_output(o_key), Value::ONE);
+
+        // Create + switch to a blank second circuit: Main's contents vanish
+        // from the live fields.
+        app.create_circuit_doc("C2".to_string());
+        assert!(app.components.is_empty());
+
+        // Switch back: Main's components and settled net values return intact,
+        // without a rebuild (the parked circuit kept its nets).
+        app.switch_circuit(main);
+        assert_eq!(app.active, main);
+        assert_eq!(app.components.len(), 4);
+        assert_eq!(app.circuit.read_output(o_key), Value::ONE);
+    }
+
+    #[test]
+    fn switch_to_active_is_a_noop() {
+        let mut app = OsmilogApp::empty();
+        let main = app.active;
+        place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+
+        app.switch_circuit(main);
+
+        assert_eq!(app.active, main);
+        assert_eq!(app.documents.len(), 1);
+        assert_eq!(app.components.len(), 1);
+        // Active document's state stays live (never parked into itself).
+        assert!(app.documents[main].state.is_none());
     }
 }
