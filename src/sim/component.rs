@@ -15,6 +15,7 @@ mod jk_flip_flop;
 mod multiplier;
 mod mux;
 mod reg;
+mod rom;
 mod shift_reg;
 mod splitter;
 mod sr_flip_flop;
@@ -34,6 +35,7 @@ pub use jk_flip_flop::{JKFlipFlop, JKFlipFlopConf};
 pub use multiplier::Multiplier;
 pub use mux::Mux;
 pub use reg::{Reg, RegConf};
+pub use rom::{Rom, MAX_ADDRESS_WIDTH};
 pub use shift_reg::{ShiftReg, ShiftRegConf};
 pub use splitter::{FanDirection, Splitter};
 pub use sr_flip_flop::{SRFlipFlop, SRFlipFlopConf};
@@ -166,6 +168,12 @@ impl Component {
         Self::from_comb(LogicComb::Comparator(Comparator { data_width }))
     }
 
+    // Builds a ROM from a full Rom record (widths + contents). Takes the record
+    // by value so to_component() can hand over a clone of the placed spec's data.
+    pub fn rom(rom: Rom) -> Self {
+        Self::from_comb(LogicComb::Rom(rom))
+    }
+
     // Reads the current Value of every input pin from net state, without mutating
     // anything. Used by evaluate() and by Circuit::tick_clock()'s input-collection stage.
     pub fn read_inputs(&self, nets: &SlotMap<NetKey, Net>) -> Vec<Value> {
@@ -293,6 +301,7 @@ pub enum ComponentSpec {
     Multiplier(Multiplier),
     Divider(Divider),
     Comparator(Comparator),
+    Rom(Rom),
     DFlipFlop(DFlipFlopConf),
     TFlipFlop(TFlipFlopConf),
     JKFlipFlop(JKFlipFlopConf),
@@ -325,6 +334,7 @@ impl ComponentSpec {
             Self::Multiplier(m) => m.n_inputs(),
             Self::Divider(d) => d.n_inputs(),
             Self::Comparator(c) => c.n_inputs(),
+            Self::Rom(r) => r.n_inputs(),
             Self::DFlipFlop(ff) => ff.n_inputs(),
             Self::TFlipFlop(ff) => ff.n_inputs(),
             Self::JKFlipFlop(ff) => ff.n_inputs(),
@@ -356,6 +366,7 @@ impl ComponentSpec {
             Self::Multiplier(m) => m.n_outputs(),
             Self::Divider(d) => d.n_outputs(),
             Self::Comparator(c) => c.n_outputs(),
+            Self::Rom(r) => r.n_outputs(),
             Self::DFlipFlop(ff) => ff.n_outputs(),
             Self::TFlipFlop(ff) => ff.n_outputs(),
             Self::JKFlipFlop(ff) => ff.n_outputs(),
@@ -389,6 +400,11 @@ impl ComponentSpec {
             Self::Multiplier(m) => Component::multiplier(m.data_width),
             Self::Divider(d) => Component::divider(d.data_width),
             Self::Comparator(c) => Component::comparator(c.data_width),
+            // shared(), not clone(): the live component and the placed spec
+            // deliberately share one buffer (see Rom's docs). Every other
+            // spec->component build owns its params outright, but a ROM's bulk
+            // contents are too big to duplicate.
+            Self::Rom(r) => Component::rom(r.shared()),
             Self::DFlipFlop(_) => Component::d_flip_flop(),
             Self::TFlipFlop(_) => Component::t_flip_flop(),
             Self::JKFlipFlop(_) => Component::jk_flip_flop(),
@@ -477,6 +493,7 @@ pub enum LogicComb {
     Multiplier(Multiplier),
     Divider(Divider),
     Comparator(Comparator),
+    Rom(Rom),
 }
 
 impl LogicComb {
@@ -494,6 +511,7 @@ impl LogicComb {
             Self::Multiplier(m) => m.n_inputs(),
             Self::Divider(d) => d.n_inputs(),
             Self::Comparator(c) => c.n_inputs(),
+            Self::Rom(r) => r.n_inputs(),
         }
     }
 
@@ -511,6 +529,7 @@ impl LogicComb {
             Self::Multiplier(m) => m.n_outputs(),
             Self::Divider(d) => d.n_outputs(),
             Self::Comparator(c) => c.n_outputs(),
+            Self::Rom(r) => r.n_outputs(),
         }
     }
 
@@ -528,6 +547,7 @@ impl LogicComb {
             Self::Multiplier(m) => m.evaluate(inputs),
             Self::Divider(d) => d.evaluate(inputs),
             Self::Comparator(c) => c.evaluate(inputs),
+            Self::Rom(r) => r.evaluate(inputs),
         }
     }
 
@@ -545,6 +565,7 @@ impl LogicComb {
             Self::Multiplier(m) => m.input_width(i),
             Self::Divider(d) => d.input_width(i),
             Self::Comparator(c) => c.input_width(i),
+            Self::Rom(r) => r.input_width(i),
         }
     }
 
@@ -562,6 +583,7 @@ impl LogicComb {
             Self::Multiplier(m) => m.output_width(i),
             Self::Divider(d) => d.output_width(i),
             Self::Comparator(c) => c.output_width(i),
+            Self::Rom(r) => r.output_width(i),
         }
     }
 }

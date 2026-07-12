@@ -304,6 +304,12 @@ pub const fn encoder_size(sel_width: u8) -> Vec2 {
     vec2(px(MUX_W), px(sel_pitch(sel_width).height(k)))
 }
 
+// A plain box, same footprint as reg_size (REG_W wide, 4 cells tall) so the
+// single A input on the left and D output on the right both center on grid row 2.
+pub const fn rom_size() -> Vec2 {
+    vec2(px(REG_W), px(stack_h(2)))
+}
+
 pub const fn io_size() -> Vec2 {
     // 1-pin edge → 2 cells tall, so the single side-pin centers on grid row 1.
     vec2(px(IO_W), px(stack_h(1)))
@@ -943,6 +949,44 @@ fn op2_shape(
         output_anchors,
         extra_strokes: vec![],
         output_bubbles: vec![false, false],
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// A memory block: single address input "A" on the left edge, single data output
+// "D" on the right edge, both centered vertically, with a "ROM" label in the body.
+pub fn rom_shape() -> ComponentShape {
+    let h_cells = stack_h(2); // 4
+    let center_row = h_cells / 2; // 2
+    let row_y = center_row as f32 / h_cells as f32;
+
+    let labels = vec![
+        ComponentLabel {
+            text: "ROM",
+            pos: vec2(0.5, 0.5),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "A",
+            pos: vec2(0.2, row_y),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "D",
+            pos: vec2(0.8, row_y),
+            ..Default::default()
+        },
+    ];
+
+    ComponentShape {
+        size: rom_size(),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors: vec![PinAnchor::left(center_row)],
+        output_anchors: vec![PinAnchor::right(REG_W, center_row)],
+        extra_strokes: vec![],
+        output_bubbles: vec![false],
         labels,
         dynamic_label_pos: Vec2::ZERO,
     }

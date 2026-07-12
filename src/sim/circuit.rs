@@ -96,6 +96,30 @@ impl Circuit {
         }
     }
 
+    /// Writes one word into a ROM component's contents in place, masked to its
+    /// data_width, and re-evaluates it so the change propagates on the next
+    /// settle(). No-op if `comp` isn't a ROM or `index` is out of range. Unlike
+    /// structural edits this bypasses the Command/undo layer entirely (like
+    /// set_input / clock ticks): ROM contents are mutated live, not undoable.
+    pub fn write_rom(&mut self, comp: CompKey, index: usize, value: u32) {
+        // set_word takes &self (interior mutability), so this needs only a shared
+        // borrow to write; re-evaluate afterward, once that borrow has ended, to
+        // dirty the output net.
+        let wrote = if let Logic::Comb(LogicComb::Rom(rom)) = &self.components[comp].logic {
+            if index < rom.len() {
+                rom.set_word(index, value);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if wrote {
+            self.eval_component(comp);
+        }
+    }
+
     /// The current value on `comp`'s input, if it's an Output component;
     /// `Value::Floating` otherwise.
     pub fn read_output(&self, comp: CompKey) -> Value {
@@ -1587,5 +1611,32 @@ mod tests {
                                                           // (per Value::Not), and that net's own widths agree - so it resolves
                                                           // as ordinary Floating rather than carrying Invalid any further.
         assert_eq!(c.read_output(out), Value::Floating);
+    }
+
+    #[test]
+    fn test_rom_reads_and_write_rom_propagates() {
+        let mut c = Circuit::new();
+        // Address input (width 3) -> ROM (data_width 8, 8 words) -> Output.
+        let addr = c.add_component(Component::input(2, 3));
+        let rom = crate::sim::component::Rom::new(8, 3);
+        rom.set_word(2, 0x5A);
+        let rom_key = c.add_component(Component::rom(rom));
+        let out = c.add_component(Component::output());
+        c.link(addr, PinId::output(0), rom_key, PinId::input(0));
+        c.link(rom_key, PinId::output(0), out, PinId::input(0));
+        c.settle().unwrap();
+
+        // Reads the pre-loaded word at address 2.
+        assert_eq!(c.read_output(out), Value::new(0x5A, 8));
+
+        // An in-place content write at the addressed cell propagates on settle.
+        c.write_rom(rom_key, 2, 0xFF);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(0xFF, 8));
+
+        // Writing a *different* address leaves the current output untouched.
+        c.write_rom(rom_key, 5, 0x11);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(0xFF, 8));
     }
 }

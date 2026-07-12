@@ -123,6 +123,7 @@ Circuit's public interface:
     fn remove_tunnel(&mut self, tunnel: TunnelKey)
     fn rename_tunnel(&mut self, tunnel: TunnelKey, new_label: String)
     fn set_input(&mut self, comp: CompKey, bits: u32, width: u8)
+    fn write_rom(&mut self, comp: CompKey, index: usize, value: u32)
     fn read_output(&self, comp: CompKey) -> Value
     fn clear_nets(&mut self)
     fn settle(&mut self) -> Result<(), SettleError>
@@ -177,10 +178,42 @@ references. The remaining real inverses: `DeactivateComponent`/`DeactivateTunnel
     }
 
 Every combinational component type (`Gate`, `Mux`, `Demux`, `Splitter`/`Combine`, `Encoder`,
-`Adder`, `Subtractor`, `Multiplier`, `Divider`, `Comparator` - one struct per file under
+`Adder`, `Subtractor`, `Multiplier`, `Divider`, `Comparator`, `Rom` - one struct per file under
 `component/`) implements `CombLogic`, bundling its construction params, pin arity, and evaluation
 logic in one place so they can't drift apart. `Input` and `Output` are the two sourceless/sinkless
 special cases.
+
+`Rom` (read-only memory: one address input "A", one data output "D") is the one combinational type
+carrying *bulk* state - its `Vec<u32>` contents (length `2^address_width`) are the construction
+params, embedded whole in both `ComponentSpec::Rom(Rom)` and `LogicComb::Rom(Rom)` and thus persisted
+by serializing the spec. It stays combinational because `evaluate()` is a pure read (address indexes
+the table); the contents only change through an explicit `Circuit::write_rom`, which mutates the
+contents *in place* (masked to `data_width`) and re-evaluates - deliberately bypassing the
+Command/undo layer, exactly like `set_input`/clock ticks, so contents edits are not undoable.
+Parameter (width) changes *do* go through the normal undoable `reconfigure_component` path, resizing
+the table preserve-and-fit (`Rom::resized`: zero-extend/truncate on address_width, mask on
+data_width).
+
+**One shared copy, not two.** The contents can be tens of MiB, so the placed spec and the live
+circuit component must not each hold their own `Vec`. `Rom::data` is therefore an
+`Rc<RefCell<Vec<u32>>>`, and `ComponentSpec::to_component()` shares the handle (`Rom::shared`, an
+`Rc` bump) instead of copying - the *one* deliberate place a spec and its live component alias state,
+so a `write_rom` through the component is visible to the spec (what the editor reads and what's
+saved) with no mirror write. This forces a hand-written `Clone` for `Rom` that **deep-copies** the
+buffer (a fresh `Rc`): the codebase treats `ComponentSpec: Clone` as "independent copy" everywhere
+that matters (paste, undo snapshots, save via `clipboard.rs`/`CircuitFile`), and a shallow `Rc`-bump
+clone would make a pasted ROM alias the original's contents. So: `shared()` = alias (exactly one
+seam), `clone()` = independent (everywhere else). On disk the `Rc<RefCell<..>>` is transparent -
+it serializes as a plain word array (needs serde's `rc` feature), so the save format is unchanged.
+`Rc` (not `Arc`) suffices because app state is single-threaded; interior mutability means
+`set_word`/`write_rom` need only `&self`.
+
+The GUI reads/writes contents through the shared handle (`OsmilogApp::write_rom_cell` just calls
+`Circuit::write_rom` + `settle`; the spec updates for free). The properties panel special-cases
+`Rom` *before* its generic per-frame `spec.clone()` so it never deep-copies the buffer just to read
+the widths. The contents editor is a virtualized `egui::Window` (`OsmilogApp::show_rom_editor`,
+hex-dump rows via `ScrollArea::show_rows`) opened from the properties panel, and is the app's first
+free-floating window.
 
     pub trait SeqLogic {
         fn n_inputs(&self) -> usize;

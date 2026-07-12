@@ -237,6 +237,10 @@ pub struct OsmilogApp {
     // Clock transport: run state (play/pause/stop), speed, and auto-advance
     // timing. Drives the menu-bar controls and the edit lockout during a run.
     pub clock: ClockControl,
+    // The placed ROM whose contents editor window is currently open, if any.
+    // Set by the "Edit contents…" button in the properties panel; the window
+    // (show_rom_editor) closes it on ✕ or if the component goes away.
+    rom_editor_open: Option<PlacedCompKey>,
 }
 
 // ── CanvasCtx ─────────────────────────────────────────────────────────────────
@@ -272,6 +276,7 @@ impl OsmilogApp {
             io: platform::IoState::default(),
             show_profiler: false,
             clock: ClockControl::default(),
+            rom_editor_open: None,
         }
     }
 
@@ -885,6 +890,46 @@ impl OsmilogApp {
         ui.heading(pc.spec.label());
         ui.separator();
 
+        // ROM is handled before the generic `pc.spec.clone()` below: a ROM's
+        // spec carries its whole contents buffer, and Clone deep-copies it (see
+        // Rom), so cloning it every frame the panel is shown would be a large
+        // per-frame copy. Read only its (Copy) widths by reference instead.
+        if matches!(self.components[key].spec, ComponentSpec::Rom(_)) {
+            let (mut data_width, mut address_width) = match &self.components[key].spec {
+                ComponentSpec::Rom(rom) => (rom.data_width, rom.address_width),
+                _ => unreachable!(),
+            };
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label("Data width:");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Address width:");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut address_width).range(1..=MAX_ADDRESS_WIDTH))
+                    .changed();
+            });
+            ui.label(format!("{} words", 1usize << address_width));
+            if changed {
+                // Preserve+fit: resize/mask the existing contents rather than
+                // wiping them, then reconfigure through the normal (undoable)
+                // path. resized() owns a fresh buffer, so the immutable borrow
+                // ends before reconfigure_component takes &mut self.
+                let resized = match &self.components[key].spec {
+                    ComponentSpec::Rom(rom) => rom.resized(data_width, address_width),
+                    _ => unreachable!(),
+                };
+                self.reconfigure_component(key, ComponentSpec::Rom(resized));
+            }
+            if ui.button("Edit contents…").clicked() {
+                self.rom_editor_open = Some(key);
+            }
+            return;
+        }
+
         let spec = pc.spec.clone();
         match spec {
             ComponentSpec::Input(Input {
@@ -1234,6 +1279,9 @@ impl OsmilogApp {
                     );
                 }
             }
+            // ComponentSpec::Rom is handled before this match (see the top of
+            // this fn) to avoid deep-cloning its contents buffer every frame.
+            ComponentSpec::Rom(_) => unreachable!("Rom handled before the spec clone"),
             ComponentSpec::Splitter {
                 mut width,
                 mut arm_bits,
@@ -1354,6 +1402,102 @@ impl OsmilogApp {
         self.rebuild_circuit();
         self.history.end_batch();
         self.selected = Some(Selection::Single(Selected::Component(pc_key)));
+    }
+
+    // Writes one word into a placed ROM's contents, then settles so a downstream
+    // read updates. The placed spec and the live component share one buffer (see
+    // Rom::shared), so write_rom mutates what the spec sees too - no separate
+    // mirror write. Deliberately not routed through Command/History: ROM contents
+    // are mutated in place and are not undoable (like clock ticks).
+    fn write_rom_cell(&mut self, pc: PlacedCompKey, index: usize, value: u32) {
+        let comp_key = self.components[pc].key;
+        self.circuit.write_rom(comp_key, index, value);
+        let result = self.circuit.settle();
+        self.record_settle_result(result);
+    }
+
+    // Draws the ROM contents editor window while `rom_editor_open` names a live
+    // ROM. Hex-dump layout: one row per WORDS_PER_ROW words, a base-address label,
+    // then a hex DragValue per word. The row list is virtualized (show_rows) so a
+    // 2^24-word ROM only builds the handful of rows actually on screen. Edits are
+    // collected during the (self-immutable) draw pass and applied afterward.
+    fn show_rom_editor(&mut self, ctx: &egui::Context) {
+        const WORDS_PER_ROW: usize = 8;
+
+        let Some(pc) = self.rom_editor_open else {
+            return;
+        };
+        // Close if the ROM was deleted or undone away (or the key now names
+        // something else after a reconfigure to a different type).
+        let (data_width, len) = match self.components.get(pc) {
+            Some(c) if c.active => match &c.spec {
+                ComponentSpec::Rom(rom) => (rom.data_width, rom.len()),
+                _ => {
+                    self.rom_editor_open = None;
+                    return;
+                }
+            },
+            _ => {
+                self.rom_editor_open = None;
+                return;
+            }
+        };
+
+        let word_nibbles = data_width.div_ceil(4) as usize;
+        let addr_nibbles = (usize::BITS - (len.max(1) - 1).leading_zeros())
+            .div_ceil(4)
+            .max(1) as usize;
+        let mask = if data_width >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << data_width) - 1
+        };
+        let total_rows = len.div_ceil(WORDS_PER_ROW);
+
+        let mut open = true;
+        let mut edits: Vec<(usize, u32)> = Vec::new();
+        egui::Window::new("ROM contents")
+            .open(&mut open)
+            .default_size([440.0, 480.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                let row_height = ui.spacing().interact_size.y;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_height, total_rows, |ui, range| {
+                        for row in range {
+                            let base = row * WORDS_PER_ROW;
+                            ui.horizontal(|ui| {
+                                ui.monospace(format!("0x{base:0addr_nibbles$X}:"));
+                                for col in 0..WORDS_PER_ROW {
+                                    let i = base + col;
+                                    if i >= len {
+                                        break;
+                                    }
+                                    let mut val = match &self.components[pc].spec {
+                                        ComponentSpec::Rom(rom) => rom.word(i),
+                                        _ => 0,
+                                    };
+                                    let resp = ui.add(
+                                        egui::DragValue::new(&mut val)
+                                            .range(0..=mask)
+                                            .hexadecimal(word_nibbles, false, true),
+                                    );
+                                    if resp.changed() {
+                                        edits.push((i, val));
+                                    }
+                                }
+                            });
+                        }
+                    });
+            });
+
+        for (i, v) in edits {
+            self.write_rom_cell(pc, i, v);
+        }
+        if !open {
+            self.rom_editor_open = None;
+        }
     }
 
     // Removes a placed component: drop it from the circuit and its wire nodes
@@ -1810,6 +1954,12 @@ impl OsmilogApp {
                                         num_stages: 4,
                                         parallel_load: false,
                                     }),
+                                };
+                                ui.close();
+                            }
+                            if ui.button("ROM").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::Rom(Rom::new(8, 8)),
                                 };
                                 ui.close();
                             }
@@ -2485,6 +2635,9 @@ impl eframe::App for OsmilogApp {
         }
 
         self.show_menu_bar(ui, theme);
+
+        // ROM contents editor window, drawn while a ROM's editor is open.
+        self.show_rom_editor(&ctx);
 
         // Draws the web "Save As" filename modal while it's open (and completes
         // the download on confirm); no-op on native.
