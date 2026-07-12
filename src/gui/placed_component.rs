@@ -68,6 +68,11 @@ impl ComponentSpec {
             Self::Comparator(_) => comparator_size(),
             Self::Rom(_) => rom_size(),
             Self::Splitter { arm_bits, .. } => splitter_size(arm_bits.len() as u8),
+            Self::Subcircuit {
+                input_widths,
+                output_widths,
+                ..
+            } => subcircuit_size(input_widths.len(), output_widths.len()),
         }
     }
 
@@ -104,6 +109,11 @@ impl ComponentSpec {
                 FanDirection::Right => "SPLIT",
                 FanDirection::Left => "COMBINE",
             },
+            // The on-canvas label is the referenced document's name, drawn
+            // dynamically from the spec (see draw_component); this static
+            // fallback is only used where a &'static str is required (e.g. the
+            // properties-panel heading).
+            Self::Subcircuit { .. } => "SUB",
         }
     }
 
@@ -134,6 +144,11 @@ impl ComponentSpec {
                 direction,
                 ..
             } => splitter_shape(arm_bits.len() as u8, *direction),
+            Self::Subcircuit {
+                input_widths,
+                output_widths,
+                ..
+            } => subcircuit_shape(input_widths.len(), output_widths.len()),
         }
     }
 }

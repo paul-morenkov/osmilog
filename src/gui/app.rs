@@ -1,7 +1,7 @@
 use eframe;
 use egui::epaint::{PathShape, PathStroke};
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
-use slotmap::{new_key_type, SlotMap};
+use slotmap::{new_key_type, SecondaryMap, SlotMap};
 use std::collections::HashMap;
 
 use crate::gui::clipboard::Clipboard;
@@ -365,6 +365,9 @@ impl OsmilogApp {
             .expect("inactive document must have parked state");
         self.put_active_state(incoming);
         self.active = target;
+        // Reflect any edits made to child circuits while they were the active
+        // document: re-derive every placed subcircuit here against its source.
+        self.refresh_subcircuits();
     }
 
     // Create a new blank circuit document, make it active, and open a blank
@@ -514,7 +517,7 @@ impl OsmilogApp {
 
     fn place_component(&mut self, spec: ComponentSpec, grid_pos: GridPos) -> PlacedCompKey {
         self.history.begin_batch();
-        let comp = spec.to_component();
+        let comp = self.instantiate(&spec);
         let key = self.apply(Command::AddComponent(comp)).unwrap_comp();
         let pc = PlacedComponent::new(key, spec, grid_pos);
         let pc_key = self.components.insert(pc);
@@ -579,6 +582,15 @@ impl OsmilogApp {
         self.tunnels.iter().filter(|(_, pt)| pt.active)
     }
 
+    // Whether the active document contains any placed subcircuit. Subcircuit
+    // persistence is deferred (a serialized DocId is meaningless across a
+    // reload), so the save path uses this to refuse rather than write a file
+    // that can't round-trip.
+    fn active_has_subcircuit(&self) -> bool {
+        self.active_components()
+            .any(|(_, pc)| matches!(pc.spec, ComponentSpec::Subcircuit { .. }))
+    }
+
     // Rebuilds every circuit net from the GUI wiring graph: clear_nets() drops
     // all nets, then each connected wire group is replayed as circuit links
     // (fan-out/driver-conflict handling lives in Circuit::link). A group with
@@ -636,6 +648,288 @@ impl OsmilogApp {
         }
         let result = self.circuit.settle();
         self.record_settle_result(result);
+    }
+
+    // ── Subcircuits ───────────────────────────────────────────────────────────
+    //
+    // Builds a live sim Component from a ComponentSpec. Identical to
+    // spec.to_component() for every primitive type; a Subcircuit spec instead
+    // has its inner Circuit built from the referenced document (which
+    // to_component can't do - it has no document registry). This is the one
+    // spec->component build path the GUI uses (place_component /
+    // reconfigure_component), so subcircuits always get a real inner circuit.
+    fn instantiate(&self, spec: &ComponentSpec) -> Component {
+        let mut visited = Vec::new();
+        self.instantiate_with(spec, &mut visited)
+    }
+
+    // `visited` breaks any accidental reference cycle (placement guards against
+    // real ones via would_cycle): a document already on the stack yields an
+    // empty placeholder instead of recursing forever.
+    fn instantiate_with(&self, spec: &ComponentSpec, visited: &mut Vec<DocId>) -> Component {
+        match spec {
+            ComponentSpec::Subcircuit {
+                doc,
+                input_widths,
+                output_widths,
+                ..
+            } => {
+                if visited.contains(doc) {
+                    return Component::subcircuit_placeholder(
+                        input_widths.len(),
+                        output_widths.len(),
+                    );
+                }
+                visited.push(*doc);
+                let (inner, inputs, outputs) = self.build_doc_circuit(*doc, visited);
+                visited.pop();
+                Component::subcircuit(inner, inputs, outputs)
+            }
+            _ => spec.to_component(),
+        }
+    }
+
+    // Builds a fresh standalone Circuit from a referenced document's records
+    // (its parked DocState), translating placed components/tunnels + the wiring
+    // graph the same way rebuild_circuit translates the live doc - but into a
+    // new Circuit rather than self.circuit, untracked, and recursing through
+    // instantiate_with for nested subcircuits. Returns the inner Input/Output
+    // component keys ordered top-down (then left-to-right), which is the pin
+    // order the subcircuit component exposes and its shape lays out.
+    fn build_doc_circuit(
+        &self,
+        doc: DocId,
+        visited: &mut Vec<DocId>,
+    ) -> (Circuit, Vec<CompKey>, Vec<CompKey>) {
+        // A subcircuit only ever targets a parked (non-active) document, so its
+        // records live in the CircuitDoc's state.
+        let Some(state) = self.documents.get(doc).and_then(|d| d.state.as_ref()) else {
+            return (Circuit::new(), Vec::new(), Vec::new());
+        };
+
+        let mut circuit = Circuit::new();
+        let mut comp_map: SecondaryMap<PlacedCompKey, CompKey> = SecondaryMap::new();
+        for (pck, pc) in state.components.iter().filter(|(_, pc)| pc.active) {
+            let comp = self.instantiate_with(&pc.spec, visited);
+            comp_map.insert(pck, circuit.add_component(comp));
+        }
+
+        let mut tunnel_map: SecondaryMap<PlacedTunnelKey, TunnelKey> = SecondaryMap::new();
+        for (ptk, pt) in state.tunnels.iter().filter(|(_, pt)| pt.active) {
+            tunnel_map.insert(ptk, circuit.add_tunnel(pt.label.clone(), pt.role));
+        }
+
+        for group in state.wiring.groups() {
+            let pins: Vec<(CompKey, PinId)> = group
+                .pins
+                .iter()
+                .filter_map(|&(pck, pin)| comp_map.get(pck).map(|&ck| (ck, pin)))
+                .collect();
+            let Some(&(anchor_comp, anchor_pin)) = pins.first() else {
+                continue;
+            };
+            for &(comp, pin) in &pins[1..] {
+                circuit.link(anchor_comp, anchor_pin, comp, pin);
+            }
+            for &ptk in &group.tunnels {
+                if let Some(&tk) = tunnel_map.get(ptk) {
+                    circuit.link_tunnel(tk, anchor_comp, anchor_pin);
+                }
+            }
+        }
+
+        // Boundary pins are ordered top-down (then left-to-right) by the
+        // Input/Output components' grid positions.
+        let mut inputs: Vec<(GridPos, CompKey)> = Vec::new();
+        let mut outputs: Vec<(GridPos, CompKey)> = Vec::new();
+        for (pck, pc) in state.components.iter().filter(|(_, pc)| pc.active) {
+            match pc.spec {
+                ComponentSpec::Input(_) => inputs.push((pc.grid_pos, comp_map[pck])),
+                ComponentSpec::Output => outputs.push((pc.grid_pos, comp_map[pck])),
+                _ => {}
+            }
+        }
+        inputs.sort_by_key(|(g, _)| (g.y, g.x));
+        outputs.sort_by_key(|(g, _)| (g.y, g.x));
+
+        let _ = circuit.settle();
+        (
+            circuit,
+            inputs.into_iter().map(|(_, k)| k).collect(),
+            outputs.into_iter().map(|(_, k)| k).collect(),
+        )
+    }
+
+    // The interface a subcircuit component exposes for a given document: its
+    // display name plus the per-pin widths of the boundary Input/Output
+    // components (top-down). Cached into the ComponentSpec::Subcircuit so the
+    // `&self` spec methods (n_inputs/size/shape/...) need no document registry;
+    // refreshed on switch-back (refresh_subcircuits).
+    fn derive_subcircuit_interface(&self, doc: DocId) -> (String, Vec<u8>, Vec<u8>) {
+        let name = self
+            .documents
+            .get(doc)
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
+        let mut visited = Vec::new();
+        let (circuit, in_keys, out_keys) = self.build_doc_circuit(doc, &mut visited);
+        let input_widths = in_keys
+            .iter()
+            .map(|&k| {
+                circuit
+                    .components
+                    .get(k)
+                    .and_then(|c| c.output_width(OutIdx(0)))
+                    .unwrap_or(1)
+            })
+            .collect();
+        let output_widths = out_keys
+            .iter()
+            .map(|&k| match circuit.read_output(k) {
+                Value::Fixed { width, .. } => width,
+                _ => 1,
+            })
+            .collect();
+        (name, input_widths, output_widths)
+    }
+
+    // Builds the Subcircuit spec for placing `doc` as a component, deriving its
+    // cached interface now.
+    fn subcircuit_spec(&self, doc: DocId) -> ComponentSpec {
+        let (name, input_widths, output_widths) = self.derive_subcircuit_interface(doc);
+        ComponentSpec::Subcircuit {
+            doc,
+            name,
+            input_widths,
+            output_widths,
+        }
+    }
+
+    // Rebuilds one placed subcircuit's live inner Circuit in place (same
+    // CompKey, same outer pins), so inner edits that didn't change the boundary
+    // are reflected. Used by refresh_subcircuits for the common case.
+    fn rebuild_subcircuit_inner(&mut self, pck: PlacedCompKey) {
+        let ComponentSpec::Subcircuit { doc, .. } = self.components[pck].spec else {
+            return;
+        };
+        let comp_key = self.components[pck].key;
+        let mut visited = Vec::new();
+        let (inner, inputs, outputs) = self.build_doc_circuit(doc, &mut visited);
+        if let Some(comp) = self.circuit.components.get_mut(comp_key) {
+            if let Logic::Sub(sub) = &mut comp.logic {
+                sub.inner = inner;
+                sub.inputs = inputs;
+                sub.outputs = outputs;
+            }
+        }
+    }
+
+    // Reconciles every placed subcircuit in the active document against its
+    // referenced document, called after a switch makes this document active so
+    // edits to a child circuit show up here. If the boundary changed (pin
+    // count), reconfigure_component rebuilds the whole record (pruning wires to
+    // dropped pins, positional binding); otherwise the inner circuit is rebuilt
+    // in place and the cached name/widths refreshed. Finishes with a single
+    // rebuild_circuit so the re-derived inner outputs settle outward.
+    fn refresh_subcircuits(&mut self) {
+        let subs: Vec<(PlacedCompKey, DocId)> = self
+            .active_components()
+            .filter_map(|(pck, pc)| match &pc.spec {
+                ComponentSpec::Subcircuit { doc, .. } => Some((pck, *doc)),
+                _ => None,
+            })
+            .collect();
+
+        let mut rebuilt_any = false;
+        for (pck, doc) in subs {
+            let (name, input_widths, output_widths) = self.derive_subcircuit_interface(doc);
+            let (old_in, old_out, old_name) = match &self.components[pck].spec {
+                ComponentSpec::Subcircuit {
+                    input_widths,
+                    output_widths,
+                    name,
+                    ..
+                } => (input_widths.len(), output_widths.len(), name.clone()),
+                _ => continue,
+            };
+
+            if old_in != input_widths.len() || old_out != output_widths.len() {
+                // Boundary changed: full reconfigure (prunes stale wires, new
+                // shape, rebuilt inner circuit). It rebuild_circuits itself.
+                self.reconfigure_component(
+                    pck,
+                    ComponentSpec::Subcircuit {
+                        doc,
+                        name,
+                        input_widths,
+                        output_widths,
+                    },
+                );
+            } else {
+                // Same boundary: refresh the cached name/widths (display only;
+                // shape is unchanged since pin counts match) and rebuild the
+                // inner circuit in place.
+                if old_name != name {
+                    self.components[pck].spec = ComponentSpec::Subcircuit {
+                        doc,
+                        name,
+                        input_widths,
+                        output_widths,
+                    };
+                }
+                self.rebuild_subcircuit_inner(pck);
+                rebuilt_any = true;
+            }
+        }
+
+        if rebuilt_any {
+            self.rebuild_circuit();
+        }
+    }
+
+    // The documents referenced (as subcircuits) directly by `doc`'s placed
+    // components. Reads the live fields for the active doc, the parked state
+    // otherwise.
+    fn doc_references(&self, doc: DocId) -> Vec<DocId> {
+        let comps = if doc == self.active {
+            Some(&self.components)
+        } else {
+            self.documents
+                .get(doc)
+                .and_then(|d| d.state.as_ref())
+                .map(|s| &s.components)
+        };
+        comps
+            .into_iter()
+            .flat_map(|c| c.values())
+            .filter(|pc| pc.active)
+            .filter_map(|pc| match &pc.spec {
+                ComponentSpec::Subcircuit { doc, .. } => Some(*doc),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // Whether placing `target` as a subcircuit in the active document would
+    // create a cycle: true if target is the active doc itself, or target
+    // already (transitively) references the active doc.
+    fn would_cycle(&self, target: DocId) -> bool {
+        if target == self.active {
+            return true;
+        }
+        let mut stack = vec![target];
+        let mut seen: Vec<DocId> = Vec::new();
+        while let Some(d) = stack.pop() {
+            if d == self.active {
+                return true;
+            }
+            if seen.contains(&d) {
+                continue;
+            }
+            seen.push(d);
+            stack.extend(self.doc_references(d));
+        }
+        false
     }
 
     // Repositions the component's wire-anchor nodes to its current pin grid
@@ -1460,6 +1754,26 @@ impl OsmilogApp {
                     );
                 }
             }
+            // Read-only: a subcircuit's interface is derived from the referenced
+            // document, not edited here. Offer a jump to edit that document
+            // (mirrors ROM's "Edit contents…" affordance); interface changes
+            // are picked up on switch-back (refresh_subcircuits).
+            ComponentSpec::Subcircuit {
+                doc,
+                name,
+                input_widths,
+                output_widths,
+            } => {
+                ui.label(format!("Circuit: {name}"));
+                ui.label(format!(
+                    "{} input(s), {} output(s)",
+                    input_widths.len(),
+                    output_widths.len()
+                ));
+                if ui.button("Open circuit").clicked() {
+                    self.switch_circuit(doc);
+                }
+            }
         }
     }
 
@@ -1471,7 +1785,7 @@ impl OsmilogApp {
         let old_key = self.components[pc_key].key;
         let grid_pos = self.components[pc_key].grid_pos;
 
-        let new_comp = new_spec.to_component();
+        let new_comp = self.instantiate(&new_spec);
         let new_n_in = new_comp.pins.inputs.len();
         let new_n_out = new_comp.pins.outputs.len();
 
@@ -1933,10 +2247,20 @@ impl OsmilogApp {
             ui.horizontal(|ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Save").clicked() {
-                        // Native opens the OS "Save As" dialog and writes
-                        // synchronously; web opens an in-app filename modal
-                        // (completed by drive_save_dialog on a later frame).
-                        self.with_io(|io, app| io.request_save(app));
+                        if self.active_has_subcircuit() {
+                            // Deferred: a circuit containing subcircuits can't
+                            // round-trip yet (the DocId reference isn't
+                            // persisted). Refuse rather than write a broken file.
+                            self.last_settle_error = Some(
+                                "Saving a circuit that contains subcircuits isn't supported yet."
+                                    .to_string(),
+                            );
+                        } else {
+                            // Native opens the OS "Save As" dialog and writes
+                            // synchronously; web opens an in-app filename modal
+                            // (completed by drive_save_dialog on a later frame).
+                            self.with_io(|io, app| io.request_save(app));
+                        }
                         ui.close();
                     }
                     if ui.add_enabled(!locked, egui::Button::new("Load")).clicked() {
@@ -2018,18 +2342,42 @@ impl OsmilogApp {
                 }
             })
             .body(|ui| {
-                // Record the clicked target and switch after the loop, so the
-                // list read-borrow of `self.doc_order`/`documents` doesn't
-                // overlap the &mut self switch_circuit call.
-                let mut clicked = None;
+                // Single click places the circuit as a subcircuit on the
+                // current canvas (a ghost that follows the cursor; nothing is
+                // dropped until a canvas click). Double click opens it for
+                // editing. A double click's first click only *enters* placing
+                // mode, which the second click cancels before switching - so no
+                // stray component is ever placed. A circuit that would nest into
+                // itself (directly or transitively) can't be placed. Targets are
+                // recorded and acted on after the loop, so the read-borrow of
+                // `doc_order`/`documents` doesn't overlap the &mut self calls.
+                let mut switch_target = None;
+                let mut place_target = None;
                 for &doc_id in &self.doc_order {
-                    let name = &self.documents[doc_id].name;
-                    if ui.selectable_label(doc_id == self.active, name).clicked() {
-                        clicked = Some(doc_id);
+                    let cyclic = self.would_cycle(doc_id);
+                    let resp = ui.selectable_label(
+                        doc_id == self.active,
+                        &self.documents[doc_id].name,
+                    );
+                    let resp = resp.on_hover_text(if cyclic {
+                        "Can't nest: would create a cycle"
+                    } else {
+                        "Click to place as subcircuit · double-click to edit"
+                    });
+                    if resp.double_clicked() {
+                        switch_target = Some(doc_id);
+                    } else if resp.clicked() && !cyclic {
+                        place_target = Some(doc_id);
                     }
                 }
-                if let Some(target) = clicked {
+                if let Some(target) = switch_target {
+                    // Cancel any placing started by this double click's first
+                    // click, so the parent doc isn't parked mid-placement.
+                    self.mode = InteractionMode::Idle;
                     self.switch_circuit(target);
+                } else if let Some(doc) = place_target {
+                    let spec = self.subcircuit_spec(doc);
+                    self.mode = InteractionMode::Placing { spec };
                 }
             });
 
@@ -3125,6 +3473,22 @@ fn draw_component(
         );
     }
 
+    // A subcircuit's on-canvas label is the referenced document's name, drawn
+    // dynamically (like a tunnel label) since it isn't a &'static str.
+    if let ComponentSpec::Subcircuit { name, .. } = &pc.spec {
+        let label_pos = egui::pos2(
+            rect.left() + shape.dynamic_label_pos.x * rect.width(),
+            rect.top() + shape.dynamic_label_pos.y * rect.height(),
+        );
+        painter.text(
+            label_pos,
+            Align2::CENTER_CENTER,
+            name,
+            FontId::monospace(LABEL_FONT_SIZE),
+            theme.label_text,
+        );
+    }
+
     for i in 0..pc.spec.n_inputs() {
         let pos = comp_pin_pos(shape, pc.grid_pos, pan, PinId::input(i as u8));
         let val = circuit.components[pc.key].pins.inputs[i]
@@ -3234,6 +3598,20 @@ fn draw_ghost(painter: &Painter, spec: &ComponentSpec, grid_pos: GridPos, pan: V
             label_pos,
             Align2::CENTER_CENTER,
             label.text,
+            FontId::monospace(LABEL_FONT_SIZE),
+            ghost_col,
+        );
+    }
+
+    if let ComponentSpec::Subcircuit { name, .. } = spec {
+        let label_pos = egui::pos2(
+            rect.left() + shape.dynamic_label_pos.x * rect.width(),
+            rect.top() + shape.dynamic_label_pos.y * rect.height(),
+        );
+        painter.text(
+            label_pos,
+            Align2::CENTER_CENTER,
+            name,
             FontId::monospace(LABEL_FONT_SIZE),
             ghost_col,
         );
@@ -4396,5 +4774,73 @@ mod tests {
         assert_eq!(app.components.len(), 1);
         // Active document's state stays live (never parked into itself).
         assert!(app.documents[main].state.is_none());
+    }
+
+    #[test]
+    fn subcircuit_placement_derives_interface_and_simulates() {
+        let mut app = OsmilogApp::empty();
+        let main = app.active;
+
+        // Main: a 1-bit passthrough Input -> Output (one boundary pin each).
+        let in_main = place(&mut app, ComponentSpec::Input(Input { bits: 0, width: 1 }));
+        let out_main = place(&mut app, ComponentSpec::Output);
+        connect_pins(
+            &mut app,
+            (in_main, PinId::output(0)),
+            (out_main, PinId::input(0)),
+        );
+        app.rebuild_circuit();
+
+        // New circuit C2 (now active, Main parked); place Main as a subcircuit.
+        app.create_circuit_doc("C2".to_string());
+        let spec = app.subcircuit_spec(main);
+        let sub = app.place_component(spec, GridPos::new(5, 5));
+
+        // Interface derived from Main's one Input and one Output.
+        assert_eq!(app.components[sub].spec.n_inputs(), 1);
+        assert_eq!(app.components[sub].spec.n_outputs(), 1);
+
+        // Drive it end-to-end: C2 Input(=1) -> sub -> C2 Output. The passthrough
+        // subcircuit settles a 1 out through the boundary.
+        let x = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let y = place(&mut app, ComponentSpec::Output);
+        connect_pins(&mut app, (x, PinId::output(0)), (sub, PinId::input(0)));
+        connect_pins(&mut app, (sub, PinId::output(0)), (y, PinId::input(0)));
+        app.rebuild_circuit();
+        let y_key = app.components[y].key;
+        assert_eq!(app.circuit.read_output(y_key), Value::ONE);
+    }
+
+    #[test]
+    fn subcircuit_placement_prevents_cycles() {
+        let mut app = OsmilogApp::empty();
+        let main = app.active;
+
+        // Main is a passthrough so it has a usable boundary.
+        let in_main = place(&mut app, ComponentSpec::Input(Input { bits: 0, width: 1 }));
+        let out_main = place(&mut app, ComponentSpec::Output);
+        connect_pins(
+            &mut app,
+            (in_main, PinId::output(0)),
+            (out_main, PinId::input(0)),
+        );
+        app.rebuild_circuit();
+
+        // C2 contains a subcircuit of Main.
+        app.create_circuit_doc("C2".to_string());
+        let c2 = app.active;
+        let spec = app.subcircuit_spec(main);
+        app.place_component(spec, GridPos::new(5, 5));
+
+        // Back on Main: placing C2 here would form Main -> C2 -> Main. Rejected.
+        app.switch_circuit(main);
+        assert!(app.would_cycle(c2), "C2 references Main, so nesting it cycles");
+        assert!(app.would_cycle(main), "a circuit can't contain itself");
+
+        // A fresh, unrelated circuit is fine to nest.
+        app.create_circuit_doc("C3".to_string());
+        let c3 = app.active;
+        app.switch_circuit(main);
+        assert!(!app.would_cycle(c3));
     }
 }

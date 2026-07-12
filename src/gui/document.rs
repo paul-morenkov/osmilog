@@ -9,7 +9,7 @@
 //! serialization, so no `ComponentSpec`/ROM deep-copy on a switch.
 
 use egui::Vec2;
-use slotmap::{new_key_type, SlotMap};
+use slotmap::SlotMap;
 
 use crate::gui::app::{
     ClockControl, InteractionMode, PlacedCompKey, PlacedTunnel, PlacedTunnelKey, Selection,
@@ -19,11 +19,11 @@ use crate::gui::placed_component::PlacedComponent;
 use crate::gui::wiring::Wiring;
 use crate::sim::circuit::Circuit;
 
-new_key_type! {
-    /// Stable identity of a circuit document, independent of display order. The
-    /// handle a future `ComponentSpec::Subcircuit(DocId)` would reference.
-    pub struct DocId;
-}
+/// Stable identity of a circuit document, independent of display order, and the
+/// handle `ComponentSpec::Subcircuit` references. Defined in `sim::component`
+/// (so the spec can embed it without a gui dependency) and re-exported here,
+/// where the document registry lives.
+pub use crate::sim::component::DocId;
 
 /// The per-circuit ("document") state, bundled so an inactive circuit can be
 /// parked while another is edited. These are exactly the live per-circuit fields

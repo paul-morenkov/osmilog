@@ -60,6 +60,10 @@ const SHIFT_REG_W: u32 = 3;
 
 const ROM_W: u32 = 7;
 
+// A subcircuit is a plain box carrying the referenced document's name; wide
+// enough for a short name and for pins to read as belonging to distinct sides.
+const SUBCIRCUIT_W: u32 = 6;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(from = "[i32; 2]", into = "[i32; 2]")]
 pub struct GridPos {
@@ -144,6 +148,17 @@ const fn gate_pitch(n_inputs: usize) -> Pitch {
 /// body needlessly tall.
 const fn sel_pitch(sel_width: u8) -> Pitch {
     if sel_width >= 2 {
+        Pitch::Tight
+    } else {
+        Pitch::Spread
+    }
+}
+
+/// A subcircuit's boundary pins (variable count, derived from the referenced
+/// document's Input/Output components) pack tightly once a roomy spread would
+/// make the body needlessly tall - same threshold as gates.
+const fn sub_pitch(k: usize) -> Pitch {
+    if k > 3 {
         Pitch::Tight
     } else {
         Pitch::Spread
@@ -316,6 +331,14 @@ pub const fn rom_size() -> Vec2 {
 pub const fn io_size() -> Vec2 {
     // 1-pin edge → 2 cells tall, so the single side-pin centers on grid row 1.
     vec2(px(IO_W), px(stack_h(1)))
+}
+
+// Height scales off whichever boundary side (inputs on the left, outputs on the
+// right) has more pins; each side packs top-down from row 1 with its own pitch.
+// Both pitch heights are even, so their max is too.
+pub fn subcircuit_size(n_in: usize, n_out: usize) -> Vec2 {
+    let h_cells = sub_pitch(n_in).height(n_in).max(sub_pitch(n_out).height(n_out));
+    vec2(px(SUBCIRCUIT_W), px(h_cells))
 }
 
 // ── Shape builders ────────────────────────────────────────────────────────────
@@ -545,6 +568,37 @@ pub fn counter_shape() -> ComponentShape {
         output_bubbles: vec![false, false],
         labels,
         dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// A subcircuit: a plain box with `n_in` inputs on the left edge and `n_out`
+// outputs on the right, each side packed top-down from row 1 in the pin order
+// the component exposes (the GUI derives that from the inner Input/Output
+// component positions). The referenced document's name is drawn at
+// `dynamic_label_pos` (like a tunnel label) since it isn't known at 'static
+// time; `labels` therefore stays empty.
+pub fn subcircuit_shape(n_in: usize, n_out: usize) -> ComponentShape {
+    let in_pitch = sub_pitch(n_in);
+    let out_pitch = sub_pitch(n_out);
+    let h_cells = in_pitch.height(n_in).max(out_pitch.height(n_out));
+
+    let input_anchors = (0..n_in)
+        .map(|i| PinAnchor::left(in_pitch.row(i, n_in)))
+        .collect();
+    let output_anchors = (0..n_out)
+        .map(|i| PinAnchor::right(SUBCIRCUIT_W, out_pitch.row(i, n_out)))
+        .collect();
+
+    ComponentShape {
+        size: vec2(px(SUBCIRCUIT_W), px(h_cells)),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors,
+        extra_strokes: vec![],
+        output_bubbles: vec![false; n_out],
+        labels: vec![],
+        dynamic_label_pos: vec2(0.5, 0.5),
     }
 }
 
@@ -1277,6 +1331,25 @@ mod tests {
 
         assert_shape_on_grid("tunnel feed", &tunnel_shape(TunnelRole::Feed));
         assert_shape_on_grid("tunnel pull", &tunnel_shape(TunnelRole::Pull));
+
+        // Subcircuits have a variable, independent pin count on each edge
+        // (derived from the referenced circuit's Input/Output components).
+        for n_in in 0..=6usize {
+            for n_out in 0..=6usize {
+                let shape = subcircuit_shape(n_in, n_out);
+                assert_eq!(
+                    shape.input_anchors.len(),
+                    n_in,
+                    "subcircuit {n_in}x{n_out}: input anchor count",
+                );
+                assert_eq!(
+                    shape.output_anchors.len(),
+                    n_out,
+                    "subcircuit {n_in}x{n_out}: output anchor count",
+                );
+                assert_shape_on_grid(&format!("subcircuit {n_in}x{n_out}"), &shape);
+            }
+        }
     }
 
     // Bubble output pins sit one cell beyond the right edge (col == width + 1) so

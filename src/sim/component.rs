@@ -1,3 +1,4 @@
+use crate::sim::circuit::Circuit;
 use crate::sim::net::{Net, NetKey};
 use crate::sim::value::Value;
 use slotmap::{new_key_type, SlotMap};
@@ -44,6 +45,16 @@ pub use t_flip_flop::{TFlipFlop, TFlipFlopConf};
 
 new_key_type! {
     pub struct CompKey;
+}
+
+new_key_type! {
+    /// Opaque reference to another circuit document, embedded in
+    /// `ComponentSpec::Subcircuit`. The simulator never dereferences it: the GUI
+    /// owns the document registry (`SlotMap<DocId, CircuitDoc>`) and builds a
+    /// subcircuit's inner `Circuit` from the referenced document. Defined here
+    /// (not in the GUI) so `ComponentSpec` can carry it without `sim` depending
+    /// on `gui`; re-exported from `gui::document`.
+    pub struct DocId;
 }
 
 #[derive(Debug)]
@@ -144,6 +155,39 @@ impl Component {
         Self::from_comb(LogicComb::Splitter(Splitter::new(arm_bits, direction)))
     }
 
+    // Builds a subcircuit component wrapping a whole inner Circuit. `inputs` /
+    // `outputs` are the inner Input / Output component keys in the pin order
+    // this component exposes (the GUI derives that top-down); pin arity comes
+    // straight from their lengths. See Logic::Sub / SubCircuit.
+    pub fn subcircuit(inner: Circuit, inputs: Vec<CompKey>, outputs: Vec<CompKey>) -> Self {
+        let pins = Pins::new(inputs.len(), outputs.len());
+        Self {
+            pins,
+            logic: Logic::Sub(SubCircuit {
+                inner,
+                inputs,
+                outputs,
+            }),
+            active: true,
+        }
+    }
+
+    // A subcircuit component with the given pin arity but an empty inner
+    // circuit (no boundary keys), so it settles to all-Floating outputs. Only a
+    // safe fallback for ComponentSpec::to_component() on a Subcircuit spec; the
+    // GUI builds real subcircuits via gui::app::instantiate.
+    pub fn subcircuit_placeholder(n_inputs: usize, n_outputs: usize) -> Self {
+        Self {
+            pins: Pins::new(n_inputs, n_outputs),
+            logic: Logic::Sub(SubCircuit {
+                inner: Circuit::new(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+            }),
+            active: true,
+        }
+    }
+
     pub fn priority_encoder(sel_width: u8) -> Self {
         Self::from_comb(LogicComb::Encoder(Encoder { sel_width }))
     }
@@ -195,6 +239,10 @@ impl Component {
             // input effect (e.g. a reset) was already folded into that state by
             // apply_async(), and clocked changes only happen in tick().
             Logic::Seq(seq) => seq.observe(),
+            // A subcircuit's inner Circuit was already driven+settled by
+            // apply_async() (settle-time) or tick() (clock-time), so this is a
+            // pure read of its boundary Output components.
+            Logic::Sub(sub) => sub.observe(),
         }
     }
 
@@ -204,8 +252,13 @@ impl Component {
     // input can take effect without a clock tick; must be idempotent (see
     // SeqLogic::apply_async).
     pub fn apply_async(&mut self, inputs: &[Value]) {
-        if let Logic::Seq(seq) = &mut self.logic {
-            seq.apply_async(inputs);
+        match &mut self.logic {
+            Logic::Seq(seq) => seq.apply_async(inputs),
+            // Drive the boundary Input components with the current inputs and
+            // settle the inner circuit. Idempotent: driving the same values
+            // marks nothing dirty and settle() becomes a no-op.
+            Logic::Sub(sub) => sub.drive_and_settle(inputs),
+            Logic::Comb(_) => {}
         }
     }
 
@@ -217,6 +270,7 @@ impl Component {
         match &self.logic {
             Logic::Comb(_) => unreachable!("observe() called on a combinational component"),
             Logic::Seq(seq) => seq.observe(),
+            Logic::Sub(sub) => sub.observe(),
         }
     }
 
@@ -227,6 +281,9 @@ impl Component {
         match &mut self.logic {
             Logic::Comb(_) => unreachable!("tick() called on a combinational component"),
             Logic::Seq(seq) => seq.tick(inputs),
+            // Forward the clock edge into the inner circuit, then read its
+            // boundary Output components as the new latched values.
+            Logic::Sub(sub) => sub.tick(inputs),
         }
     }
 
@@ -236,6 +293,7 @@ impl Component {
         match &mut self.logic {
             Logic::Comb(_) => unreachable!("reset() called on a combinational component"),
             Logic::Seq(seq) => seq.reset(),
+            Logic::Sub(sub) => sub.reset(),
         }
     }
 
@@ -257,10 +315,23 @@ impl Component {
         matches!(self.logic, Logic::Seq(_))
     }
 
+    pub fn is_subcircuit(&self) -> bool {
+        matches!(self.logic, Logic::Sub(_))
+    }
+
+    // Components whose state advances on a clock tick and whose async effects
+    // run inside settle(): sequential components and subcircuits. The engine's
+    // whole-component sweeps (eval_component's apply_async, tick_clock,
+    // reset_sequential) key on this rather than is_sequential().
+    pub fn is_stateful(&self) -> bool {
+        matches!(self.logic, Logic::Seq(_) | Logic::Sub(_))
+    }
+
     pub fn input_width(&self, i: InIdx) -> Option<u8> {
         match &self.logic {
             Logic::Comb(c) => c.input_width(i.0 as usize),
             Logic::Seq(s) => s.input_width(i.0 as usize),
+            Logic::Sub(sub) => sub.input_width(i.0 as usize),
         }
     }
 
@@ -268,6 +339,7 @@ impl Component {
         match &self.logic {
             Logic::Comb(c) => c.output_width(i.0 as usize),
             Logic::Seq(s) => s.output_width(i.0 as usize),
+            Logic::Sub(sub) => sub.output_width(i.0 as usize),
         }
     }
 
@@ -316,6 +388,22 @@ pub enum ComponentSpec {
         arm_bits: Vec<Vec<u8>>,
         direction: FanDirection,
     },
+    // A whole other circuit document, placed as a component. `doc` is the link;
+    // `name` and the per-pin widths are a *cached derived interface* (like a
+    // Rom caching its contents in the spec) so all the `&self` spec methods
+    // (n_inputs/size/shape/...) work without a document registry. The cache is
+    // refreshed from the referenced document on switch-back
+    // (gui::app::refresh_subcircuits). The live inner Circuit is NOT here - it's
+    // built GUI-side (gui::app::build_circuit_from_doc) into Logic::Sub. `doc`
+    // is #[serde(skip)] because a DocId is not meaningful across a reload;
+    // subcircuit persistence is deferred (see CLAUDE.md / the save guard).
+    Subcircuit {
+        #[serde(skip)]
+        doc: DocId,
+        name: String,
+        input_widths: Vec<u8>,
+        output_widths: Vec<u8>,
+    },
 }
 
 impl ComponentSpec {
@@ -348,6 +436,7 @@ impl ComponentSpec {
                 FanDirection::Right => 1,
                 FanDirection::Left => arm_bits.len(),
             },
+            Self::Subcircuit { input_widths, .. } => input_widths.len(),
         }
     }
 
@@ -380,6 +469,7 @@ impl ComponentSpec {
                 FanDirection::Right => arm_bits.len(),
                 FanDirection::Left => 1,
             },
+            Self::Subcircuit { output_widths, .. } => output_widths.len(),
         }
     }
 
@@ -415,6 +505,17 @@ impl ComponentSpec {
                 direction,
                 ..
             } => Component::splitter(arm_bits.clone(), *direction),
+            // A real subcircuit needs its inner Circuit built from the
+            // referenced document, which requires the GUI's document registry;
+            // that build goes through gui::app::instantiate, not here. This
+            // arm is only reached if to_component() is called on a Subcircuit
+            // spec directly - it yields a correctly-pinned but empty (all
+            // outputs Floating) placeholder rather than panicking.
+            Self::Subcircuit {
+                input_widths,
+                output_widths,
+                ..
+            } => Component::subcircuit_placeholder(input_widths.len(), output_widths.len()),
         }
     }
 }
@@ -461,6 +562,79 @@ impl Pins {
 pub enum Logic {
     Comb(LogicComb),
     Seq(LogicSeq),
+    // A whole Circuit simulated as one component - a third kind alongside
+    // combinational and sequential, because it both propagates combinationally
+    // (its inner circuit needs &mut to settle) and holds clocked state (it
+    // forwards clock ticks inward). See SubCircuit.
+    Sub(SubCircuit),
+}
+
+// The runtime state of a subcircuit component: the owned inner Circuit plus the
+// boundary Input / Output component keys, in this component's pin order (the
+// GUI derives that order top-down from the inner Input/Output positions). Built
+// GUI-side from a referenced document; never cloned or serialized, because
+// Circuit is neither - the authoritative, persistable form lives at the
+// ComponentSpec::Subcircuit / Wiring layer, and the inner Circuit is rebuilt
+// from it (see gui::app::build_circuit_from_doc).
+#[derive(Debug)]
+pub struct SubCircuit {
+    pub inner: Circuit,
+    pub inputs: Vec<CompKey>,
+    pub outputs: Vec<CompKey>,
+}
+
+impl SubCircuit {
+    // Feed each boundary Input with the enclosing circuit's input values and
+    // settle. drive_input marks a net dirty only when the value actually
+    // changes, so re-running this with identical inputs settles nothing - the
+    // idempotence apply_async() requires. A settle error is swallowed here; it
+    // surfaces on the enclosing circuit's own settle() via the same nets.
+    fn drive_and_settle(&mut self, inputs: &[Value]) {
+        self.drive_inputs(inputs);
+        let _ = self.inner.settle();
+    }
+
+    fn drive_inputs(&mut self, inputs: &[Value]) {
+        for (i, &key) in self.inputs.iter().enumerate() {
+            let value = inputs.get(i).copied().unwrap_or(Value::Floating);
+            self.inner.drive_input(key, value);
+        }
+    }
+
+    // The current values on the boundary Output components. Pure read (&self):
+    // the inner circuit is already settled by the time evaluate()/observe()
+    // call this.
+    fn observe(&self) -> Vec<Value> {
+        self.outputs
+            .iter()
+            .map(|&key| self.inner.read_output(key))
+            .collect()
+    }
+
+    fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
+        self.drive_inputs(inputs);
+        let _ = self.inner.tick_clock();
+        self.observe()
+    }
+
+    fn reset(&mut self) {
+        let _ = self.inner.reset_sequential();
+    }
+
+    // Boundary input width = the inner Input component's own output width.
+    fn input_width(&self, i: usize) -> Option<u8> {
+        self.inputs
+            .get(i)
+            .and_then(|&key| self.inner.components.get(key))
+            .and_then(|c| c.output_width(OutIdx(0)))
+    }
+
+    // Boundary output widths are left unconstrained (like a bare Output): the
+    // driven Value carries its own width, and the inner Output declares no
+    // fixed width to check against.
+    fn output_width(&self, _i: usize) -> Option<u8> {
+        None
+    }
 }
 
 // Each LogicComb variant (besides Output) wraps a struct implementing
