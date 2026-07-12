@@ -249,12 +249,7 @@ mod tests {
 
     fn placed_component(grid_pos: GridPos) -> PlacedComponent {
         let spec = ComponentSpec::Input(Input { bits: 0, width: 1 });
-        PlacedComponent {
-            key: crate::sim::component::CompKey::default(),
-            spec,
-            grid_pos,
-            active: true,
-        }
+        PlacedComponent::new(crate::sim::component::CompKey::default(), spec, grid_pos)
     }
 
     fn placed_tunnel(label: &str, grid_pos: GridPos) -> PlacedTunnel {

@@ -54,6 +54,10 @@ const TUNNEL_W: u32 = 4;
 
 const REG_W: u32 = 3;
 
+// Same width as Reg (fits "D"/"LD"/"SH"/"0" labels); ShiftReg's height instead
+// scales with num_stages, so it stays a dedicated constant.
+const SHIFT_REG_W: u32 = 3;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(from = "[i32; 2]", into = "[i32; 2]")]
 pub struct GridPos {
@@ -257,6 +261,17 @@ pub const fn counter_size() -> Vec2 {
     // outputs (Q/carry) center on the right within that same height, same
     // technique as comparator_size's busier-side-drives-height.
     vec2(px(REG_W), px(stack_h(3)))
+}
+
+// Height packs one row per preamble pin (D, optionally L, SH) plus one row
+// per stage, contiguously (no Pitch stack - there's no symmetric centre row
+// to preserve here since the bottom-edge reset pin isn't centered on it),
+// plus one extra row so the reset pin has the same 1-cell gap off the last
+// stage row that reg_size/flip_flop_size leave before their bottom pins.
+pub const fn shift_reg_size(num_stages: usize, parallel_load: bool) -> Vec2 {
+    let preamble = if parallel_load { 3 } else { 2 };
+    let total_rows = preamble + num_stages as u32;
+    vec2(px(SHIFT_REG_W), px(total_rows + 1))
 }
 
 // Square body, same proportions as op2_size (ARITH_W == stack_h(2)) even though
@@ -519,6 +534,89 @@ pub fn counter_shape() -> ComponentShape {
         output_anchors,
         extra_strokes: vec![],
         output_bubbles: vec![false, false],
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// Pin layout matches ShiftRegConf's pin order: input[0] = serial data (row 0),
+// input[1] = load (row 1, parallel_load only), input[next] = shift, then one
+// stage input per row (parallel_load only), then the async reset (bottom
+// edge, toward the right, like reg_shape). Rows are simply contiguous
+// top-to-bottom - unlike the Pitch stacks elsewhere, there's no symmetric
+// centre row to preserve since the bottom-edge reset pin isn't centered.
+// Serial mode has a single output (the last stage, right edge, aligned with
+// its row); parallel_load mode has one output per stage, each aligned with
+// its own input row.
+pub fn shift_reg_shape(num_stages: usize, parallel_load: bool) -> ComponentShape {
+    let num_stages = num_stages.max(1);
+    let preamble = if parallel_load { 3 } else { 2 };
+    let total_rows = preamble + num_stages;
+    let h_cells = total_rows as u32 + 1;
+    let row = |i: usize| (i + 1) as u32;
+    let row_y = |r: u32| r as f32 / h_cells as f32;
+
+    let mut input_anchors = vec![PinAnchor::left(row(0))]; // data
+    let mut labels = vec![ComponentLabel {
+        text: "D",
+        pos: vec2(0.28, row_y(row(0))),
+        ..Default::default()
+    }];
+
+    let mut next = 1;
+    if parallel_load {
+        input_anchors.push(PinAnchor::left(row(next))); // load
+        labels.push(ComponentLabel {
+            text: "L",
+            pos: vec2(0.28, row_y(row(next))),
+            ..Default::default()
+        });
+        next += 1;
+    }
+    input_anchors.push(PinAnchor::left(row(next))); // shift
+    labels.push(ComponentLabel {
+        text: "SH",
+        pos: vec2(0.22, row_y(row(next))),
+        ..Default::default()
+    });
+    next += 1;
+
+    let stage_rows: Vec<u32> = (0..num_stages).map(|i| row(next + i)).collect();
+    let output_anchors: Vec<PinAnchor> = if parallel_load {
+        for &r in &stage_rows {
+            input_anchors.push(PinAnchor::left(r));
+        }
+        stage_rows
+            .iter()
+            .map(|&r| PinAnchor::right(SHIFT_REG_W, r))
+            .collect()
+    } else {
+        vec![PinAnchor::right(
+            SHIFT_REG_W,
+            *stage_rows.last().expect("num_stages >= 1"),
+        )]
+    };
+
+    // Async reset: bottom edge, toward the right (one cell in from the
+    // corner), same placement as reg_shape/flip_flop_shape's reset pin.
+    input_anchors.push(PinAnchor::bottom(SHIFT_REG_W - 1, h_cells));
+    const EDGE_LABEL_INSET_PX: f32 = 6.0;
+    let reset_y = 1.0 - EDGE_LABEL_INSET_PX / px(h_cells);
+    labels.push(ComponentLabel {
+        text: "0",
+        pos: vec2((SHIFT_REG_W - 1) as f32 / SHIFT_REG_W as f32, reset_y),
+        ..Default::default()
+    });
+
+    let output_bubbles = vec![false; output_anchors.len()];
+    ComponentShape {
+        size: vec2(px(SHIFT_REG_W), px(h_cells)),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors,
+        extra_strokes: vec![],
+        output_bubbles,
         labels,
         dynamic_label_pos: Vec2::ZERO,
     }
@@ -1100,6 +1198,14 @@ mod tests {
         }
 
         assert_shape_on_grid("reg", &reg_shape());
+        for num_stages in 1..=4usize {
+            for parallel_load in [false, true] {
+                assert_shape_on_grid(
+                    &format!("shift_reg stages={num_stages} pl={parallel_load}"),
+                    &shift_reg_shape(num_stages, parallel_load),
+                );
+            }
+        }
         assert_shape_on_grid("d_flip_flop", &d_flip_flop_shape());
         assert_shape_on_grid("t_flip_flop", &t_flip_flop_shape());
         assert_shape_on_grid("jk_flip_flop", &jk_flip_flop_shape());

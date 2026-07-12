@@ -10,11 +10,33 @@ pub struct PlacedComponent {
     pub key: CompKey,
     pub spec: ComponentSpec,
     pub grid_pos: GridPos,
+    // Cached `spec.shape()`. Building a ComponentShape allocates several Vecs,
+    // and drawing/hit-testing reads it multiple times per component per frame,
+    // so it's built once here (only `spec` determines it) instead of rebuilt on
+    // every read. Kept in lockstep with `spec` by only constructing through
+    // `PlacedComponent::new` - `reconfigure_component` rebuilds via that path.
+    pub shape: ComponentShape,
     // Tombstone flag, mirroring sim::Component::active and wiring::WireNode::active:
     // a deleted PlacedComponent is flagged inactive rather than removed, so
     // its PlacedCompKey stays valid for Wiring/selection/drag state that
     // reference it. Reads iterate OsmilogApp::active_components.
     pub active: bool,
+}
+
+impl PlacedComponent {
+    // Builds a placed component, caching its ComponentShape (see the `shape`
+    // field). This is the only place a PlacedComponent is created, so `shape`
+    // can never drift from `spec`.
+    pub fn new(key: CompKey, spec: ComponentSpec, grid_pos: GridPos) -> Self {
+        let shape = spec.shape();
+        Self {
+            key,
+            spec,
+            grid_pos,
+            shape,
+            active: true,
+        }
+    }
 }
 
 // ── GUI-only visual concerns for ComponentSpec ────────────────────────────────
@@ -33,6 +55,7 @@ impl ComponentSpec {
             Self::Mux(m) => mux_size(m.sel_width),
             Self::Demux(d) => demux_size(d.sel_width),
             Self::Reg(_) => reg_size(),
+            Self::ShiftReg(sr) => shift_reg_size(sr.num_stages, sr.parallel_load),
             Self::DFlipFlop(_) | Self::TFlipFlop(_) | Self::JKFlipFlop(_) | Self::SRFlipFlop(_) => {
                 flip_flop_size()
             }
@@ -63,6 +86,7 @@ impl ComponentSpec {
             Self::Mux(_) => "MUX",
             Self::Demux(_) => "DEMUX",
             Self::Reg(_) => "REG",
+            Self::ShiftReg(_) => "SHIFT",
             Self::DFlipFlop(_) => "D-FF",
             Self::TFlipFlop(_) => "T-FF",
             Self::JKFlipFlop(_) => "JK-FF",
@@ -90,6 +114,7 @@ impl ComponentSpec {
             Self::Mux(m) => mux_shape(m.sel_width),
             Self::Demux(d) => demux_shape(d.sel_width),
             Self::Reg(_) => reg_shape(),
+            Self::ShiftReg(sr) => shift_reg_shape(sr.num_stages, sr.parallel_load),
             Self::DFlipFlop(_) => d_flip_flop_shape(),
             Self::TFlipFlop(_) => t_flip_flop_shape(),
             Self::JKFlipFlop(_) => jk_flip_flop_shape(),

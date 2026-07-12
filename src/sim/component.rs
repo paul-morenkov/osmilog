@@ -15,6 +15,7 @@ mod jk_flip_flop;
 mod multiplier;
 mod mux;
 mod reg;
+mod shift_reg;
 mod splitter;
 mod sr_flip_flop;
 mod subtractor;
@@ -33,6 +34,7 @@ pub use jk_flip_flop::{JKFlipFlop, JKFlipFlopConf};
 pub use multiplier::Multiplier;
 pub use mux::Mux;
 pub use reg::{Reg, RegConf};
+pub use shift_reg::{ShiftReg, ShiftRegConf};
 pub use splitter::{FanDirection, Splitter};
 pub use sr_flip_flop::{SRFlipFlop, SRFlipFlopConf};
 pub use subtractor::Subtractor;
@@ -102,6 +104,14 @@ impl Component {
 
     pub fn reg(data_width: u8) -> Self {
         Self::from_seq(LogicSeq::Reg(Reg::new(data_width)))
+    }
+
+    pub fn shift_reg(data_width: u8, num_stages: usize, parallel_load: bool) -> Self {
+        Self::from_seq(LogicSeq::ShiftReg(ShiftReg::new(
+            data_width,
+            num_stages,
+            parallel_load,
+        )))
     }
 
     pub fn d_flip_flop() -> Self {
@@ -276,6 +286,7 @@ pub enum ComponentSpec {
     Mux(Mux),
     Demux(Demux),
     Reg(RegConf),
+    ShiftReg(ShiftRegConf),
     Encoder(Encoder),
     Adder(Adder),
     Subtractor(Subtractor),
@@ -307,6 +318,7 @@ impl ComponentSpec {
             Self::Mux(m) => m.n_inputs(),
             Self::Demux(d) => d.n_inputs(),
             Self::Reg(r) => r.n_inputs(),
+            Self::ShiftReg(sr) => sr.n_inputs(),
             Self::Encoder(e) => e.n_inputs(),
             Self::Adder(a) => a.n_inputs(),
             Self::Subtractor(s) => s.n_inputs(),
@@ -337,6 +349,7 @@ impl ComponentSpec {
             Self::Mux(m) => m.n_outputs(),
             Self::Demux(d) => d.n_outputs(),
             Self::Reg(r) => r.n_outputs(),
+            Self::ShiftReg(sr) => sr.n_outputs(),
             Self::Encoder(e) => e.n_outputs(),
             Self::Adder(a) => a.n_outputs(),
             Self::Subtractor(s) => s.n_outputs(),
@@ -367,6 +380,9 @@ impl ComponentSpec {
             Self::Mux(m) => Component::mux(m.data_width, m.sel_width),
             Self::Demux(d) => Component::demux(d.data_width, d.sel_width),
             Self::Reg(r) => Component::reg(r.data_width),
+            Self::ShiftReg(sr) => {
+                Component::shift_reg(sr.data_width, sr.num_stages, sr.parallel_load)
+            }
             Self::Encoder(e) => Component::priority_encoder(e.sel_width),
             Self::Adder(a) => Component::adder(a.data_width),
             Self::Subtractor(s) => Component::subtractor(s.data_width),
@@ -585,6 +601,7 @@ pub trait SeqLogic {
 #[derive(Debug)]
 pub enum LogicSeq {
     Reg(Reg),
+    ShiftReg(ShiftReg),
     DFlipFlop(DFlipFlop),
     TFlipFlop(TFlipFlop),
     JKFlipFlop(JKFlipFlop),
@@ -595,9 +612,10 @@ pub enum LogicSeq {
 // Generic reflection of LogicSeq's persisted state - one arm per LogicSeq
 // variant, colocated here for the same "new variant -> matching arm"
 // locality the tick/observe dispatch above already relies on.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum SeqState {
     Reg(Value),
+    ShiftReg(Vec<Value>),
     FlipFlop(Value),
     Counter { value: Value, carry: Value },
 }
@@ -606,6 +624,7 @@ impl LogicSeq {
     pub fn n_inputs(&self) -> usize {
         match self {
             Self::Reg(reg) => reg.n_inputs(),
+            Self::ShiftReg(sr) => sr.n_inputs(),
             Self::DFlipFlop(ff) => ff.n_inputs(),
             Self::TFlipFlop(ff) => ff.n_inputs(),
             Self::JKFlipFlop(ff) => ff.n_inputs(),
@@ -617,6 +636,7 @@ impl LogicSeq {
     pub fn n_outputs(&self) -> usize {
         match self {
             Self::Reg(reg) => reg.n_outputs(),
+            Self::ShiftReg(sr) => sr.n_outputs(),
             Self::DFlipFlop(ff) => ff.n_outputs(),
             Self::TFlipFlop(ff) => ff.n_outputs(),
             Self::JKFlipFlop(ff) => ff.n_outputs(),
@@ -628,6 +648,7 @@ impl LogicSeq {
     pub fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
         match self {
             LogicSeq::Reg(reg) => reg.tick(inputs),
+            Self::ShiftReg(sr) => sr.tick(inputs),
             Self::DFlipFlop(ff) => ff.tick(inputs),
             Self::TFlipFlop(ff) => ff.tick(inputs),
             Self::JKFlipFlop(ff) => ff.tick(inputs),
@@ -639,6 +660,7 @@ impl LogicSeq {
     pub fn apply_async(&mut self, inputs: &[Value]) {
         match self {
             Self::Reg(reg) => reg.apply_async(inputs),
+            Self::ShiftReg(sr) => sr.apply_async(inputs),
             Self::DFlipFlop(ff) => ff.apply_async(inputs),
             Self::TFlipFlop(ff) => ff.apply_async(inputs),
             Self::JKFlipFlop(ff) => ff.apply_async(inputs),
@@ -650,6 +672,7 @@ impl LogicSeq {
     pub fn observe(&self) -> Vec<Value> {
         match self {
             Self::Reg(reg) => reg.observe(),
+            Self::ShiftReg(sr) => sr.observe(),
             Self::DFlipFlop(ff) => ff.observe(),
             Self::TFlipFlop(ff) => ff.observe(),
             Self::JKFlipFlop(ff) => ff.observe(),
@@ -661,6 +684,7 @@ impl LogicSeq {
     pub fn reset(&mut self) {
         match self {
             Self::Reg(reg) => reg.reset(),
+            Self::ShiftReg(sr) => sr.reset(),
             Self::DFlipFlop(ff) => ff.reset(),
             Self::TFlipFlop(ff) => ff.reset(),
             Self::JKFlipFlop(ff) => ff.reset(),
@@ -676,6 +700,7 @@ impl LogicSeq {
     pub(crate) fn snapshot(&self) -> SeqState {
         match self {
             Self::Reg(reg) => reg.snapshot(),
+            Self::ShiftReg(sr) => sr.snapshot(),
             Self::DFlipFlop(ff) => ff.snapshot(),
             Self::TFlipFlop(ff) => ff.snapshot(),
             Self::JKFlipFlop(ff) => ff.snapshot(),
@@ -687,6 +712,7 @@ impl LogicSeq {
     pub fn input_width(&self, i: usize) -> Option<u8> {
         match self {
             Self::Reg(reg) => reg.input_width(i),
+            Self::ShiftReg(sr) => sr.input_width(i),
             Self::DFlipFlop(ff) => ff.input_width(i),
             Self::TFlipFlop(ff) => ff.input_width(i),
             Self::JKFlipFlop(ff) => ff.input_width(i),
@@ -698,6 +724,7 @@ impl LogicSeq {
     pub fn output_width(&self, i: usize) -> Option<u8> {
         match self {
             Self::Reg(reg) => reg.output_width(i),
+            Self::ShiftReg(sr) => sr.output_width(i),
             Self::DFlipFlop(ff) => ff.output_width(i),
             Self::TFlipFlop(ff) => ff.output_width(i),
             Self::JKFlipFlop(ff) => ff.output_width(i),

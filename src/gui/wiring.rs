@@ -163,12 +163,27 @@ impl Wiring {
             .map(|(k, _)| k)
     }
 
-    // Count of active segments incident on a node (its degree). Used both for
-    // cleanup (degree 0 -> orphan) and drawing (degree >= 3 -> junction dot).
+    // Count of active segments incident on a node (its degree). Scans every
+    // segment, so callers needing the degree of *one* node use this; callers
+    // needing *many* (drawing all junction dots) use `degrees` instead, which
+    // computes them all in a single pass rather than one scan per node.
     pub fn degree(&self, node: WireNodeKey) -> usize {
         self.active_segments()
             .filter(|(_, s)| s.a == node || s.b == node)
             .count()
+    }
+
+    // Incident active-segment count for every node that has at least one, in a
+    // single pass over the segments (nodes with degree 0 are simply absent, so
+    // look them up with `.get(&k).copied().unwrap_or(0)`). Replaces per-node
+    // `degree` calls in the per-frame drawing path, which were O(nodes x segments).
+    pub fn degrees(&self) -> HashMap<WireNodeKey, usize> {
+        let mut counts: HashMap<WireNodeKey, usize> = HashMap::new();
+        for (_, s) in self.active_segments() {
+            *counts.entry(s.a).or_default() += 1;
+            *counts.entry(s.b).or_default() += 1;
+        }
+        counts
     }
 
     // The active segment (if any) that gp lies strictly inside: colinear,
@@ -560,7 +575,14 @@ impl Wiring {
             root
         }
 
+        // Nodes touched by at least one active segment, recorded during the same
+        // pass. Only these form a group; an orphan node (should not normally
+        // exist post-cleanup) contributes nothing. Tracking membership here
+        // avoids a per-node `degree` scan below, which was O(nodes x segments).
+        let mut connected: HashSet<WireNodeKey> = HashSet::new();
         for (_, s) in self.active_segments() {
+            connected.insert(s.a);
+            connected.insert(s.b);
             let ra = find(&mut parent, s.a);
             let rb = find(&mut parent, s.b);
             if ra != rb {
@@ -569,11 +591,8 @@ impl Wiring {
         }
 
         let mut by_root: HashMap<WireNodeKey, Group> = HashMap::new();
-        // Only nodes that carry at least one active segment form a group; an
-        // orphan node (should not normally exist post-cleanup) contributes
-        // nothing.
         for (k, node) in self.active_nodes() {
-            if self.degree(k) == 0 {
+            if !connected.contains(&k) {
                 continue;
             }
             let root = find(&mut parent, k);

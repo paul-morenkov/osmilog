@@ -418,12 +418,7 @@ impl OsmilogApp {
         self.history.begin_batch();
         let comp = spec.to_component();
         let key = self.apply(Command::AddComponent(comp)).unwrap_comp();
-        let pc = PlacedComponent {
-            key,
-            spec,
-            grid_pos,
-            active: true,
-        };
+        let pc = PlacedComponent::new(key, spec, grid_pos);
         let pc_key = self.components.insert(pc);
         // Record the placement's undo: tombstone this record. Paired with the
         // Sim DeactivateComponent already recorded by apply() above, so undo
@@ -551,10 +546,10 @@ impl OsmilogApp {
         let Some(pc) = self.components.get(pck) else {
             return;
         };
-        let shape = pc.spec.shape();
+        let shape = &pc.shape;
         let grid_pos = pc.grid_pos;
         self.wiring
-            .sync_component_nodes(pck, |pin| pin_grid_pos(&shape, grid_pos, pin));
+            .sync_component_nodes(pck, |pin| pin_grid_pos(shape, grid_pos, pin));
     }
 
     fn sync_tunnel_wire_nodes(&mut self, ptk: PlacedTunnelKey) {
@@ -605,7 +600,7 @@ impl OsmilogApp {
         puffin::profile_function!();
         if let Some((pck, pin)) = pin_at_pos(self.active_components(), pan, pos, PinKind::Output) {
             let gp = pin_grid_pos(
-                &self.components[pck].spec.shape(),
+                &self.components[pck].shape,
                 self.components[pck].grid_pos,
                 pin,
             );
@@ -613,7 +608,7 @@ impl OsmilogApp {
         }
         if let Some((pck, pin)) = pin_at_pos(self.active_components(), pan, pos, PinKind::Input) {
             let gp = pin_grid_pos(
-                &self.components[pck].spec.shape(),
+                &self.components[pck].shape,
                 self.components[pck].grid_pos,
                 pin,
             );
@@ -1039,6 +1034,52 @@ impl OsmilogApp {
                 };
                 ui.label(format!("Value: {}", val_str));
             }
+            ComponentSpec::ShiftReg(ShiftRegConf {
+                mut data_width,
+                mut num_stages,
+                mut parallel_load,
+            }) => {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Data width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Stages:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut num_stages).range(1..=16))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    changed |= ui.checkbox(&mut parallel_load, "Parallel load").changed();
+                });
+                if changed {
+                    self.reconfigure_component(
+                        key,
+                        ComponentSpec::ShiftReg(ShiftRegConf {
+                            data_width,
+                            num_stages,
+                            parallel_load,
+                        }),
+                    );
+                }
+
+                let val_str = |v: Value| match v {
+                    Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
+                    Value::Floating => "Floating".to_string(),
+                    Value::Invalid => "Invalid (width mismatch)".to_string(),
+                };
+                for (i, v) in self.circuit.components[comp_key]
+                    .pins
+                    .out_cache
+                    .iter()
+                    .enumerate()
+                {
+                    ui.label(format!("Stage {i}: {}", val_str(*v)));
+                }
+            }
             ComponentSpec::Counter(CounterConf {
                 mut data_width,
                 mut max_value,
@@ -1053,7 +1094,9 @@ impl OsmilogApp {
                 });
                 ui.horizontal(|ui| {
                     ui.label("Max value:");
-                    changed |= ui.add(egui::DragValue::new(&mut max_value)).changed();
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut max_value).range(0..=Value::mask(data_width)))
+                        .changed();
                 });
                 ui.horizontal(|ui| {
                     ui.label("Overflow action:");
@@ -1077,6 +1120,7 @@ impl OsmilogApp {
                         });
                 });
                 if changed {
+                    max_value = max_value.min(Value::mask(data_width)); // Re-cap in case data_width shrank below max_value
                     self.reconfigure_component(
                         key,
                         ComponentSpec::Counter(CounterConf {
@@ -1295,12 +1339,7 @@ impl OsmilogApp {
         // and deactivate the new one, but the record itself needs restoring).
         let old_spec = std::mem::replace(
             &mut self.components[pc_key],
-            PlacedComponent {
-                key: new_key,
-                spec: new_spec,
-                grid_pos,
-                active: true,
-            },
+            PlacedComponent::new(new_key, new_spec, grid_pos),
         )
         .spec;
         self.history.push_gui(GuiUndoAction::SwapComponentSpec {
@@ -1764,6 +1803,16 @@ impl OsmilogApp {
                                 };
                                 ui.close();
                             }
+                            if ui.button("Shift Register").clicked() {
+                                self.mode = InteractionMode::Placing {
+                                    spec: ComponentSpec::ShiftReg(ShiftRegConf {
+                                        data_width: 1,
+                                        num_stages: 4,
+                                        parallel_load: false,
+                                    }),
+                                };
+                                ui.close();
+                            }
                             ui.menu_button("Flip-Flop", |ui| {
                                 if ui.button("D Flip-Flop").clicked() {
                                     self.mode = InteractionMode::Placing {
@@ -1791,10 +1840,11 @@ impl OsmilogApp {
                                 }
                             });
                             if ui.button("Counter").clicked() {
+                                let data_width = 1;
                                 self.mode = InteractionMode::Placing {
                                     spec: ComponentSpec::Counter(CounterConf {
-                                        data_width: 1,
-                                        max_value: 1,
+                                        data_width,
+                                        max_value: Value::mask(data_width),
                                         overflow_action: OverflowAction::default(),
                                     }),
                                 };
@@ -1913,9 +1963,11 @@ impl OsmilogApp {
         }
 
         // Junction dots where three or more segments meet, so a real branch
-        // reads differently from a mere crossing.
+        // reads differently from a mere crossing. All degrees in one pass, not
+        // a per-node scan of every segment.
+        let degrees = self.wiring.degrees();
         for (nk, node) in self.wiring.active_nodes() {
-            if self.wiring.degree(nk) >= 3 {
+            if degrees.get(&nk).copied().unwrap_or(0) >= 3 {
                 let val = node_value.get(&nk).copied().unwrap_or(Value::Floating);
                 painter.circle_filled(
                     grid_to_screen(node.pos, pan),
@@ -2466,7 +2518,7 @@ impl eframe::App for OsmilogApp {
 // ── Geometry ─────────────────────────────────────────────────────────────────
 
 fn component_bounding_rect(pc: &PlacedComponent, pan: Vec2) -> Rect {
-    let size = pc.spec.size();
+    let size = pc.shape.size;
     let tl = egui::pos2(
         pc.grid_pos.x as f32 * GRID_SIZE + pan.x,
         pc.grid_pos.y as f32 * GRID_SIZE + pan.y,
@@ -2573,11 +2625,11 @@ fn pin_at_pos<'a>(
     puffin::profile_function!();
     let hit_r = PIN_RADIUS * 2.0;
     for (key, pc) in components {
-        let shape = pc.spec.shape();
+        let shape = &pc.shape;
         match kind {
             PinKind::Output => {
                 for i in 0..pc.spec.n_outputs() {
-                    let pp = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::output(i as u8));
+                    let pp = comp_pin_pos(shape, pc.grid_pos, pan, PinId::output(i as u8));
                     if pos.distance(pp) <= hit_r {
                         return Some((key, PinId::output(i as u8)));
                     }
@@ -2585,7 +2637,7 @@ fn pin_at_pos<'a>(
             }
             PinKind::Input => {
                 for i in 0..pc.spec.n_inputs() {
-                    let pp = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::input(i as u8));
+                    let pp = comp_pin_pos(shape, pc.grid_pos, pan, PinId::input(i as u8));
                     if pos.distance(pp) <= hit_r {
                         return Some((key, PinId::input(i as u8)));
                     }
@@ -2669,7 +2721,7 @@ fn draw_component(
     theme: Theme,
 ) {
     puffin::profile_function!();
-    let shape = pc.spec.shape();
+    let shape = &pc.shape;
     let rect = component_bounding_rect(pc, pan);
     let fill = theme.component_fill;
     let (stroke_w, stroke_col) = if is_selected {
@@ -2711,7 +2763,7 @@ fn draw_component(
             let anchor = &shape.output_anchors[i];
             // The pin sits one cell beyond the body edge; the bubble is drawn in
             // the gap, just outside the edge (one cell back from the pin).
-            let pin = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::output(i as u8));
+            let pin = comp_pin_pos(shape, pc.grid_pos, pan, PinId::output(i as u8));
             let edge = pin - anchor.wire_dir * GRID_SIZE;
             let center = edge + anchor.wire_dir * BUBBLE_R;
             painter.circle_filled(center, BUBBLE_R, fill);
@@ -2734,14 +2786,14 @@ fn draw_component(
     }
 
     for i in 0..pc.spec.n_inputs() {
-        let pos = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::input(i as u8));
+        let pos = comp_pin_pos(shape, pc.grid_pos, pan, PinId::input(i as u8));
         let val = circuit.components[pc.key].pins.inputs[i]
             .map(|nk| circuit.nets[nk].value)
             .unwrap_or(Value::Floating);
         painter.circle_filled(pos, PIN_RADIUS, value_stroke(theme, val).color);
     }
     for i in 0..pc.spec.n_outputs() {
-        let pos = comp_pin_pos(&shape, pc.grid_pos, pan, PinId::output(i as u8));
+        let pos = comp_pin_pos(shape, pc.grid_pos, pan, PinId::output(i as u8));
         let val = circuit.components[pc.key].pins.out_cache[i];
         painter.circle_filled(pos, PIN_RADIUS, value_stroke(theme, val).color);
     }
@@ -2903,12 +2955,12 @@ mod tests {
     // pin's grid cell, and return the two node keys.
     fn connect_pins(app: &mut OsmilogApp, a: (PlacedCompKey, PinId), b: (PlacedCompKey, PinId)) {
         let pa = pin_grid_pos(
-            &app.components[a.0].spec.shape(),
+            &app.components[a.0].shape,
             app.components[a.0].grid_pos,
             a.1,
         );
         let pb = pin_grid_pos(
-            &app.components[b.0].spec.shape(),
+            &app.components[b.0].shape,
             app.components[b.0].grid_pos,
             b.1,
         );
@@ -2932,7 +2984,7 @@ mod tests {
     // Insert a wire (one segment) between a component pin and a tunnel.
     fn connect_pin_tunnel(app: &mut OsmilogApp, c: (PlacedCompKey, PinId), ptk: PlacedTunnelKey) {
         let pc = pin_grid_pos(
-            &app.components[c.0].spec.shape(),
+            &app.components[c.0].shape,
             app.components[c.0].grid_pos,
             c.1,
         );
@@ -3434,12 +3486,12 @@ mod tests {
         );
         let b = app.place_component(ComponentSpec::Output, GridPos::new(10, 0));
         let pa = pin_grid_pos(
-            &app.components[a].spec.shape(),
+            &app.components[a].shape,
             app.components[a].grid_pos,
             PinId::output(0),
         );
         let pb = pin_grid_pos(
-            &app.components[b].spec.shape(),
+            &app.components[b].shape,
             app.components[b].grid_pos,
             PinId::input(0),
         );
