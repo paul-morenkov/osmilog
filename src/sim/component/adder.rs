@@ -26,19 +26,21 @@ impl CombLogic for Adder {
     }
 
     fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
+        // A Floating carry-in behaves the same as a zero carry-in; anything else
+        // non-Fixed, or a Fixed carry-in at the wrong width, falls through to Floating.
+        let carry_in = match inputs[Self::CARRY_IN_PIN] {
+            Value::Floating => Some(0u32),
+            Value::Fixed { bits, width: 1 } => Some(bits),
+            _ => None,
+        };
         match (
             inputs[Self::ADDEND_1_PIN],
             inputs[Self::ADDEND_2_PIN],
-            inputs[Self::CARRY_IN_PIN],
+            carry_in,
         ) {
-            (
-                Value::Fixed { bits: a, width: aw },
-                Value::Fixed { bits: b, width: bw },
-                Value::Fixed {
-                    bits: cin,
-                    width: cw,
-                },
-            ) if aw == self.data_width && bw == self.data_width && cw == 1 => {
+            (Value::Fixed { bits: a, width: aw }, Value::Fixed { bits: b, width: bw }, Some(cin))
+                if aw == self.data_width && bw == self.data_width =>
+            {
                 // Widen to u64 so a+b+cin can't overflow u32 (both addends can be up
                 // to Value::mask(32) = u32::MAX) before it's split back into sum/carry.
                 let sum_full = a as u64 + b as u64 + cin as u64;
@@ -103,6 +105,15 @@ mod tests {
         assert_eq!(
             a.evaluate(&[Value::new(15, 4), Value::new(2, 4), Value::ZERO]),
             vec![Value::new(1, 4), Value::ONE]
+        );
+    }
+
+    #[test]
+    fn test_floating_carry_in_behaves_as_zero() {
+        let a = adder(4);
+        assert_eq!(
+            a.evaluate(&[Value::new(2, 4), Value::new(3, 4), Value::Floating]),
+            vec![Value::new(5, 4), Value::ZERO]
         );
     }
 
