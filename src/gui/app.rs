@@ -1835,188 +1835,6 @@ impl OsmilogApp {
                         }
                     });
                 });
-                ui.add_enabled_ui(!locked, |ui| {
-                    ui.menu_button("Add", |ui| {
-                        ui.menu_button("Gates", |ui| {
-                            let gates = [
-                                ("AND", GateOp::And, 2),
-                                ("OR", GateOp::Or, 2),
-                                ("XOR", GateOp::Xor, 2),
-                                ("NAND", GateOp::Nand, 2),
-                                ("NOR", GateOp::Nor, 2),
-                                ("NOT", GateOp::Not, 1),
-                            ];
-                            for (name, op, n) in gates {
-                                if ui.button(name).clicked() {
-                                    self.mode = InteractionMode::Placing {
-                                        spec: ComponentSpec::Gate(Gate {
-                                            op,
-                                            n_inputs: n,
-                                            width: 1,
-                                        }),
-                                    };
-                                    ui.close();
-                                }
-                            }
-                        });
-                        if ui.button("Input").clicked() {
-                            self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Input(Input { bits: 0, width: 1 }),
-                            };
-                            ui.close();
-                        }
-                        if ui.button("Output").clicked() {
-                            self.mode = InteractionMode::Placing {
-                                spec: ComponentSpec::Output,
-                            };
-                            ui.close();
-                        }
-
-                        ui.menu_button("Plexers", |ui| {
-                            if ui.button("Mux").clicked() {
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::Mux(Mux {
-                                        data_width: 1,
-                                        sel_width: 1,
-                                    }),
-                                };
-                                ui.close();
-                            }
-                            if ui.button("Demux").clicked() {
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::Demux(Demux {
-                                        data_width: 1,
-                                        sel_width: 1,
-                                    }),
-                                };
-                                ui.close();
-                            }
-                            if ui.button("Splitter").clicked() {
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::Splitter {
-                                        width: 2,
-                                        arm_bits: vec![vec![0], vec![1]],
-                                        direction: FanDirection::Right,
-                                    },
-                                };
-                                ui.close();
-                            }
-                            if ui.button("Encoder").clicked() {
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::Encoder(Encoder { sel_width: 1 }),
-                                };
-                                ui.close();
-                            }
-                        });
-                        ui.menu_button("Arithmetic", |ui| {
-                            if ui.button("Adder").clicked() {
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::Adder(Adder { data_width: 1 }),
-                                };
-                                ui.close();
-                            }
-                            if ui.button("Subtractor").clicked() {
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::Subtractor(Subtractor { data_width: 1 }),
-                                };
-                                ui.close();
-                            }
-                            if ui.button("Multiplier").clicked() {
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::Multiplier(Multiplier { data_width: 1 }),
-                                };
-                                ui.close();
-                            }
-                            if ui.button("Divider").clicked() {
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::Divider(Divider { data_width: 1 }),
-                                };
-                                ui.close();
-                            }
-                            if ui.button("Comparator").clicked() {
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::Comparator(Comparator { data_width: 1 }),
-                                };
-                                ui.close();
-                            }
-                        });
-                        ui.menu_button("Memory", |ui| {
-                            if ui.button("Register").clicked() {
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::Reg(RegConf { data_width: 1 }),
-                                };
-                                ui.close();
-                            }
-                            if ui.button("Shift Register").clicked() {
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::ShiftReg(ShiftRegConf {
-                                        data_width: 1,
-                                        num_stages: 4,
-                                        parallel_load: false,
-                                    }),
-                                };
-                                ui.close();
-                            }
-                            if ui.button("ROM").clicked() {
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::Rom(Rom::new(8, 8)),
-                                };
-                                ui.close();
-                            }
-                            ui.menu_button("Flip-Flop", |ui| {
-                                if ui.button("D Flip-Flop").clicked() {
-                                    self.mode = InteractionMode::Placing {
-                                        spec: ComponentSpec::DFlipFlop(DFlipFlopConf),
-                                    };
-                                    ui.close();
-                                }
-                                if ui.button("T Flip-Flop").clicked() {
-                                    self.mode = InteractionMode::Placing {
-                                        spec: ComponentSpec::TFlipFlop(TFlipFlopConf),
-                                    };
-                                    ui.close();
-                                }
-                                if ui.button("JK Flip-Flop").clicked() {
-                                    self.mode = InteractionMode::Placing {
-                                        spec: ComponentSpec::JKFlipFlop(JKFlipFlopConf),
-                                    };
-                                    ui.close();
-                                }
-                                if ui.button("SR Flip-Flop").clicked() {
-                                    self.mode = InteractionMode::Placing {
-                                        spec: ComponentSpec::SRFlipFlop(SRFlipFlopConf),
-                                    };
-                                    ui.close();
-                                }
-                            });
-                            if ui.button("Counter").clicked() {
-                                let data_width = 1;
-                                self.mode = InteractionMode::Placing {
-                                    spec: ComponentSpec::Counter(CounterConf {
-                                        data_width,
-                                        max_value: Value::mask(data_width),
-                                        overflow_action: OverflowAction::default(),
-                                    }),
-                                };
-                                ui.close();
-                            }
-                        });
-                        ui.menu_button("Tunnel", |ui| {
-                            if ui.button("Feed").clicked() {
-                                self.mode = InteractionMode::PlacingTunnel {
-                                    role: TunnelRole::Feed,
-                                };
-                                ui.close();
-                            }
-                            if ui.button("Pull").clicked() {
-                                self.mode = InteractionMode::PlacingTunnel {
-                                    role: TunnelRole::Pull,
-                                };
-                                ui.close();
-                            }
-                        });
-                    });
-                });
                 ui.menu_button("Debug", |ui| {
                     ui.checkbox(&mut self.show_profiler, "Profiler");
                 });
@@ -2029,6 +1847,183 @@ impl OsmilogApp {
                     ui.weak(format!("v{APP_VERSION} ({GIT_SHA})"));
                 });
             })
+        });
+    }
+
+    // ── Component palette (top half of the left panel) ────────────────────
+    // The former "Add" menu, inlined into the left panel as a live palette.
+    // Categories that used to be submenus are now CollapsingHeaders that
+    // expand in place; leaf entries arm a Placing/PlacingTunnel interaction.
+    // The whole palette is disabled during a run session (same lock as the
+    // structural menus and the properties panel below it).
+    fn show_component_palette(&mut self, ui: &mut egui::Ui) {
+        let locked = self.editing_locked();
+        ui.add_enabled_ui(!locked, |ui| {
+            // User-created circuits. For now the only entry is "Main", the
+            // circuit currently being edited; subcircuits will be added here.
+            egui::CollapsingHeader::new("User Created")
+                .default_open(true)
+                .show(ui, |ui| {
+                    // Selected marks it as the circuit in the editor. Placing a
+                    // subcircuit isn't implemented yet, so this is inert.
+                    let _ = ui.selectable_label(true, "Main");
+                });
+
+            egui::CollapsingHeader::new("Gates").show(ui, |ui| {
+                let gates = [
+                    ("AND", GateOp::And, 2),
+                    ("OR", GateOp::Or, 2),
+                    ("XOR", GateOp::Xor, 2),
+                    ("NAND", GateOp::Nand, 2),
+                    ("NOR", GateOp::Nor, 2),
+                    ("NOT", GateOp::Not, 1),
+                ];
+                for (name, op, n) in gates {
+                    if ui.button(name).clicked() {
+                        self.mode = InteractionMode::Placing {
+                            spec: ComponentSpec::Gate(Gate {
+                                op,
+                                n_inputs: n,
+                                width: 1,
+                            }),
+                        };
+                    }
+                }
+            });
+            if ui.button("Input").clicked() {
+                self.mode = InteractionMode::Placing {
+                    spec: ComponentSpec::Input(Input { bits: 0, width: 1 }),
+                };
+            }
+            if ui.button("Output").clicked() {
+                self.mode = InteractionMode::Placing {
+                    spec: ComponentSpec::Output,
+                };
+            }
+            egui::CollapsingHeader::new("Plexers").show(ui, |ui| {
+                if ui.button("Mux").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::Mux(Mux {
+                            data_width: 1,
+                            sel_width: 1,
+                        }),
+                    };
+                }
+                if ui.button("Demux").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::Demux(Demux {
+                            data_width: 1,
+                            sel_width: 1,
+                        }),
+                    };
+                }
+                if ui.button("Splitter").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::Splitter {
+                            width: 2,
+                            arm_bits: vec![vec![0], vec![1]],
+                            direction: FanDirection::Right,
+                        },
+                    };
+                }
+                if ui.button("Encoder").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::Encoder(Encoder { sel_width: 1 }),
+                    };
+                }
+            });
+            egui::CollapsingHeader::new("Arithmetic").show(ui, |ui| {
+                if ui.button("Adder").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::Adder(Adder { data_width: 1 }),
+                    };
+                }
+                if ui.button("Subtractor").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::Subtractor(Subtractor { data_width: 1 }),
+                    };
+                }
+                if ui.button("Multiplier").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::Multiplier(Multiplier { data_width: 1 }),
+                    };
+                }
+                if ui.button("Divider").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::Divider(Divider { data_width: 1 }),
+                    };
+                }
+                if ui.button("Comparator").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::Comparator(Comparator { data_width: 1 }),
+                    };
+                }
+            });
+            egui::CollapsingHeader::new("Memory").show(ui, |ui| {
+                if ui.button("Register").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::Reg(RegConf { data_width: 1 }),
+                    };
+                }
+                if ui.button("Shift Register").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::ShiftReg(ShiftRegConf {
+                            data_width: 1,
+                            num_stages: 4,
+                            parallel_load: false,
+                        }),
+                    };
+                }
+                if ui.button("ROM").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::Rom(Rom::new(8, 8)),
+                    };
+                }
+                egui::CollapsingHeader::new("Flip-Flop").show(ui, |ui| {
+                    if ui.button("D Flip-Flop").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            spec: ComponentSpec::DFlipFlop(DFlipFlopConf),
+                        };
+                    }
+                    if ui.button("T Flip-Flop").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            spec: ComponentSpec::TFlipFlop(TFlipFlopConf),
+                        };
+                    }
+                    if ui.button("JK Flip-Flop").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            spec: ComponentSpec::JKFlipFlop(JKFlipFlopConf),
+                        };
+                    }
+                    if ui.button("SR Flip-Flop").clicked() {
+                        self.mode = InteractionMode::Placing {
+                            spec: ComponentSpec::SRFlipFlop(SRFlipFlopConf),
+                        };
+                    }
+                });
+                if ui.button("Counter").clicked() {
+                    let data_width = 1;
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::Counter(CounterConf {
+                            data_width,
+                            max_value: Value::mask(data_width),
+                            overflow_action: OverflowAction::default(),
+                        }),
+                    };
+                }
+            });
+            egui::CollapsingHeader::new("Tunnel").show(ui, |ui| {
+                if ui.button("Feed").clicked() {
+                    self.mode = InteractionMode::PlacingTunnel {
+                        role: TunnelRole::Feed,
+                    };
+                }
+                if ui.button("Pull").clicked() {
+                    self.mode = InteractionMode::PlacingTunnel {
+                        role: TunnelRole::Pull,
+                    };
+                }
+            });
         });
     }
 
@@ -2643,11 +2638,36 @@ impl eframe::App for OsmilogApp {
         // the download on confirm); no-op on native.
         self.with_io(|io, app| io.drive_save_dialog(&ctx, app));
 
-        egui::Panel::left("properties")
+        egui::Panel::left("left_panel")
             .min_size(200.0)
             .resizable(true)
             .show(ui, |ui| {
-                self.show_properties(ui);
+                // Top half: the component palette (formerly the Add menu).
+                // Bottom half: the properties panel for the current selection.
+                // The split is a resizable inner top panel; each half scrolls.
+                // A min height of half the left panel keeps the palette from
+                // shrinking (and re-laying-out the split) as submenus collapse,
+                // and leaves less to scroll.
+                let half = ui.available_height() * 0.5;
+                egui::Panel::top("component_palette")
+                    .resizable(true)
+                    .min_size(half)
+                    .default_size(half)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("palette_scroll")
+                            // Don't shrink to content width: fill the panel so
+                            // the scrollbar sits at the far right edge.
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                self.show_component_palette(ui);
+                            });
+                    });
+                egui::ScrollArea::vertical()
+                    .id_salt("properties_scroll")
+                    .show(ui, |ui| {
+                        self.show_properties(ui);
+                    });
             });
 
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
