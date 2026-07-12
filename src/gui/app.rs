@@ -5,6 +5,7 @@ use slotmap::{new_key_type, SlotMap};
 use std::collections::HashMap;
 
 use crate::gui::clipboard::Clipboard;
+use crate::gui::document::{default_new_circuit_name, CircuitDoc, DocId, DocState};
 use crate::gui::geometry::{snap_to_grid, tunnel_shape, GridPos, GRID_SIZE, LABEL_FONT_SIZE};
 use crate::gui::gui_undo::GuiUndoAction;
 use crate::gui::history::{History, HistoryEntry};
@@ -198,7 +199,6 @@ fn ticks_due(now: f64, last: f64, interval: f64) -> (u32, f64) {
 new_key_type! {
     pub struct PlacedCompKey;
     pub struct PlacedTunnelKey;
-    pub struct DocId;
 }
 
 pub struct OsmilogApp {
@@ -258,58 +258,6 @@ pub struct OsmilogApp {
     // the live text-field contents), None while closed. Mirrors the web Save As
     // modal pattern (platform/web.rs) but lives on the app so native gets it too.
     new_circuit_dialog: Option<String>,
-}
-
-// The per-circuit ("document") state, bundled so an inactive circuit can be
-// parked while another is edited. These are exactly the live per-circuit fields
-// on OsmilogApp; the active document keeps them in those fields (and its
-// CircuitDoc::state is None), while inactive documents hold a DocState here.
-// Swapping is a set of std::mem moves (see take_active_state/put_active_state) -
-// no serialization, so no ComponentSpec/ROM deep-copy on a switch.
-struct DocState {
-    circuit: Circuit,
-    history: History,
-    components: SlotMap<PlacedCompKey, PlacedComponent>,
-    tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel>,
-    wiring: Wiring,
-    mode: InteractionMode,
-    pan: Vec2,
-    selected: Option<Selection>,
-    clock: ClockControl,
-    rom_editor_open: Option<PlacedCompKey>,
-}
-
-impl DocState {
-    // A fresh blank document - the same per-circuit initial values empty() uses.
-    fn blank() -> Self {
-        Self {
-            circuit: Circuit::new(),
-            history: History::default(),
-            components: SlotMap::default(),
-            tunnels: SlotMap::default(),
-            wiring: Wiring::new(),
-            mode: InteractionMode::Idle,
-            pan: Vec2::ZERO,
-            selected: None,
-            clock: ClockControl::default(),
-            rom_editor_open: None,
-        }
-    }
-}
-
-// One circuit document: its display name plus its parked state while inactive.
-// `state` is None exactly when this is the active document (its state is live
-// on OsmilogApp); Some for every parked/inactive document.
-struct CircuitDoc {
-    name: String,
-    state: Option<DocState>,
-}
-
-// Default name suggested for a new circuit, e.g. "Circuit 2" for the second
-// document. Only a suggestion (prefilled into the dialog / used when the user
-// clears the field) - names aren't required to be unique; identity is the DocId.
-fn default_new_circuit_name(documents: &SlotMap<DocId, CircuitDoc>) -> String {
-    format!("Circuit {}", documents.len() + 1)
 }
 
 // ── CanvasCtx ─────────────────────────────────────────────────────────────────
