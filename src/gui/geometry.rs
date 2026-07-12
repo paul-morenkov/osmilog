@@ -58,6 +58,8 @@ const REG_W: u32 = 3;
 // scales with num_stages, so it stays a dedicated constant.
 const SHIFT_REG_W: u32 = 3;
 
+const ROM_W: u32 = 7;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(from = "[i32; 2]", into = "[i32; 2]")]
 pub struct GridPos {
@@ -153,6 +155,7 @@ const fn sel_pitch(sel_width: u8) -> Pitch {
 fn pin_row(i: usize) -> u32 {
     Pitch::Spread.row(i, 0)
 }
+
 const fn stack_h(k: usize) -> u32 {
     Pitch::Spread.height(k)
 }
@@ -307,7 +310,7 @@ pub const fn encoder_size(sel_width: u8) -> Vec2 {
 // A plain box, same footprint as reg_size (REG_W wide, 4 cells tall) so the
 // single A input on the left and D output on the right both center on grid row 2.
 pub const fn rom_size() -> Vec2 {
-    vec2(px(REG_W), px(stack_h(2)))
+    vec2(px(ROM_W), px(stack_h(2)))
 }
 
 pub const fn io_size() -> Vec2 {
@@ -984,7 +987,7 @@ pub fn rom_shape() -> ComponentShape {
         outline: rect_outline(),
         fill_outline: None,
         input_anchors: vec![PinAnchor::left(center_row)],
-        output_anchors: vec![PinAnchor::right(REG_W, center_row)],
+        output_anchors: vec![PinAnchor::right(ROM_W, center_row)],
         extra_strokes: vec![],
         output_bubbles: vec![false],
         labels,
