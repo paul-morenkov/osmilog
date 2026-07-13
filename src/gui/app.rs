@@ -1112,6 +1112,11 @@ impl OsmilogApp {
 
         self.install_circuit_records(snapshot, &[], &[]);
         self.rebuild_circuit();
+        // Placement while installing records goes through the ordinary
+        // undo-recordable path (place_component/place_tunnel), which would
+        // otherwise leave a freshly loaded circuit with an undo stack that
+        // just re-deletes everything just placed. Loading isn't an edit.
+        self.history = History::default();
         Ok(())
     }
 
@@ -1190,6 +1195,9 @@ impl OsmilogApp {
     fn load_circuit_entry(&mut self, entry: &CircuitEntry, doc_ids: &[DocId]) {
         self.install_circuit_records(&entry.snapshot, &entry.subcircuits, doc_ids);
         self.rebuild_circuit();
+        // See load_snapshot: placement records undo entries that loading a
+        // fresh document should not carry.
+        self.history = History::default();
     }
 
     // Places one circuit's records (components, tunnels, wire nodes/segments)
@@ -4090,6 +4098,39 @@ mod tests {
             .unwrap()
             .key;
         assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::ONE);
+    }
+
+    #[test]
+    fn test_load_snapshot_clears_undo_history() {
+        // Loading a snapshot places components/tunnels through the ordinary
+        // undo-recordable path; a fresh load must not leave those placements
+        // sitting on the undo stack, or undo would delete the just-loaded
+        // circuit one piece at a time instead of being a no-op.
+        let mut app = OsmilogApp::empty();
+        place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        place(&mut app, ComponentSpec::Output);
+        app.place_tunnel(TunnelRole::Pull, GridPos::new(0, 0));
+        let snap = app.to_snapshot();
+
+        let mut loaded = OsmilogApp::empty();
+        loaded.load_snapshot(&snap).unwrap();
+
+        assert!(!loaded.history.can_undo());
+        assert!(!loaded.history.can_redo());
+    }
+
+    #[test]
+    fn test_load_project_file_clears_undo_history() {
+        let mut app = OsmilogApp::empty();
+        place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        place(&mut app, ComponentSpec::Output);
+        let file = app.to_project_file();
+
+        let mut loaded = OsmilogApp::empty();
+        loaded.load_project_file(&file).unwrap();
+
+        assert!(!loaded.history.can_undo());
+        assert!(!loaded.history.can_redo());
     }
 
     #[test]
