@@ -1,12 +1,14 @@
 use eframe;
 use egui::epaint::{PathShape, PathStroke};
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, StrokeKind};
 use slotmap::{new_key_type, SecondaryMap, SlotMap};
 use std::collections::HashMap;
 
 use crate::gui::clipboard::Clipboard;
 use crate::gui::document::{default_new_circuit_name, CircuitDoc, DocId, DocState};
-use crate::gui::geometry::{snap_to_grid, tunnel_shape, GridPos, GRID_SIZE, LABEL_FONT_SIZE};
+use crate::gui::geometry::{
+    tunnel_shape, Camera, GridPos, LABEL_FONT_SIZE, ZOOM_MAX, ZOOM_MIN, ZOOM_SCROLL_SPEED,
+};
 use crate::gui::gui_undo::GuiUndoAction;
 use crate::gui::history::{History, HistoryEntry};
 use crate::gui::placed_component::PlacedComponent;
@@ -29,6 +31,11 @@ const PIN_RADIUS: f32 = 3.0;
 const WIRE_THICKNESS_THIN: f32 = 2.0;
 const WIRE_THICKNESS_THICK: f32 = 4.0;
 const COMP_STROKE: f32 = 1.5;
+
+/// Minimum on-screen spacing (px) kept between drawn grid dots; `draw_grid`
+/// thins to a coarser stride of grid cells rather than let dots crowd closer
+/// than this as the view zooms out.
+const GRID_DOT_MIN_SPACING_PX: f32 = 16.0;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_SHA: &str = env!("OSMILOG_GIT_SHA");
@@ -213,7 +220,7 @@ pub struct OsmilogApp {
     // circuit's nets are rebuilt from this graph (see rebuild_circuit).
     pub wiring: Wiring,
     pub mode: InteractionMode,
-    pub pan: Vec2,
+    pub camera: Camera,
     // None: nothing selected. Some(Single): properties panel/body-drag target.
     // Some(Bulk): non-empty means Backspace/Delete removes the whole set.
     // Cleared by a click in empty space or Escape.
@@ -275,7 +282,7 @@ struct CanvasCtx<'a> {
     response: &'a egui::Response,
     painter: &'a Painter,
     ctx: &'a egui::Context,
-    pan: Vec2,
+    camera: Camera,
     theme: Theme,
 }
 
@@ -299,7 +306,7 @@ impl OsmilogApp {
             tunnels: SlotMap::default(),
             wiring: Wiring::new(),
             mode: InteractionMode::Idle,
-            pan: Vec2::ZERO,
+            camera: Camera::default(),
             selected: None,
             clipboard: Clipboard::new(),
             last_settle_error: None,
@@ -316,8 +323,13 @@ impl OsmilogApp {
         }
     }
 
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         puffin::set_scopes_on(true);
+        // `Options` lives in the Context's persistent memory (like styles/widget
+        // state), so this sticks for the app's lifetime - no need to re-set it
+        // every frame in handle_camera_input.
+        cc.egui_ctx
+            .options_mut(|o| o.input_options.scroll_zoom_speed = ZOOM_SCROLL_SPEED);
         Self::empty()
     }
 
@@ -334,7 +346,7 @@ impl OsmilogApp {
             tunnels: std::mem::take(&mut self.tunnels),
             wiring: std::mem::replace(&mut self.wiring, Wiring::new()),
             mode: std::mem::replace(&mut self.mode, InteractionMode::Idle),
-            pan: std::mem::replace(&mut self.pan, Vec2::ZERO),
+            camera: std::mem::take(&mut self.camera),
             selected: self.selected.take(),
             clock: std::mem::take(&mut self.clock),
             rom_editor_open: self.rom_editor_open.take(),
@@ -351,7 +363,7 @@ impl OsmilogApp {
         self.tunnels = state.tunnels;
         self.wiring = state.wiring;
         self.mode = state.mode;
-        self.pan = state.pan;
+        self.camera = state.camera;
         self.selected = state.selected;
         self.clock = state.clock;
         self.rom_editor_open = state.rom_editor_open;
@@ -1009,9 +1021,10 @@ impl OsmilogApp {
     // to bind, the on-grid point to route to, and whether it's a real
     // terminal vs. empty space. Priority: pin (out, then in), tunnel, wire
     // node, wire segment, else the snapped cursor cell.
-    fn wire_target_at(&self, pos: Pos2, pan: Vec2) -> (NodeAttach, GridPos, bool) {
+    fn wire_target_at(&self, pos: Pos2, camera: Camera) -> (NodeAttach, GridPos, bool) {
         puffin::profile_function!();
-        if let Some((pck, pin)) = pin_at_pos(self.active_components(), pan, pos, PinKind::Output) {
+        if let Some((pck, pin)) = pin_at_pos(self.active_components(), camera, pos, PinKind::Output)
+        {
             let gp = pin_grid_pos(
                 &self.components[pck].shape,
                 self.components[pck].grid_pos,
@@ -1019,7 +1032,8 @@ impl OsmilogApp {
             );
             return (NodeAttach::Pin(pck, pin), gp, true);
         }
-        if let Some((pck, pin)) = pin_at_pos(self.active_components(), pan, pos, PinKind::Input) {
+        if let Some((pck, pin)) = pin_at_pos(self.active_components(), camera, pos, PinKind::Input)
+        {
             let gp = pin_grid_pos(
                 &self.components[pck].shape,
                 self.components[pck].grid_pos,
@@ -1027,26 +1041,26 @@ impl OsmilogApp {
             );
             return (NodeAttach::Pin(pck, pin), gp, true);
         }
-        if let Some(ptk) = tunnel_pin_at_pos(self.active_tunnels(), pan, pos) {
+        if let Some(ptk) = tunnel_pin_at_pos(self.active_tunnels(), camera, pos) {
             return (
                 NodeAttach::Tunnel(ptk),
                 tunnel_pin_grid(&self.tunnels[ptk]),
                 true,
             );
         }
-        if let Some(nk) = self.wiring.node_at_pos(pos, pan) {
+        if let Some(nk) = self.wiring.node_at_pos(pos, camera) {
             return (NodeAttach::Free, self.wiring.nodes[nk].pos, true);
         }
-        if let Some((_, gp)) = self.wiring.segment_at_pos(pos, pan) {
+        if let Some((_, gp)) = self.wiring.segment_at_pos(pos, camera) {
             return (NodeAttach::Free, gp, true);
         }
-        (NodeAttach::Free, snap_to_grid(pos, pan), false)
+        (NodeAttach::Free, camera.screen_to_grid(pos), false)
     }
 
     // A wire may only start on a real terminal (pin, tunnel, or existing wire),
     // not in empty space.
-    fn wire_start_at(&self, pos: Pos2, pan: Vec2) -> Option<(NodeAttach, GridPos)> {
-        let (attach, gp, terminal) = self.wire_target_at(pos, pan);
+    fn wire_start_at(&self, pos: Pos2, camera: Camera) -> Option<(NodeAttach, GridPos)> {
+        let (attach, gp, terminal) = self.wire_target_at(pos, camera);
         terminal.then_some((attach, gp))
     }
 
@@ -2114,6 +2128,12 @@ impl OsmilogApp {
             .default_size([440.0, 480.0])
             .resizable(true)
             .show(ctx, |ui| {
+                // DragValue renders with `drag_value_text_style` (defaults to
+                // the proportional Button style), so its digit widths vary
+                // and columns drift out of alignment across rows. Force it
+                // monospace to keep the hex grid aligned; scoped to this Ui
+                // so it doesn't affect DragValues elsewhere in the app.
+                ui.style_mut().drag_value_text_style = egui::TextStyle::Monospace;
                 let row_height = ui.spacing().interact_size.y;
                 ui.add_enabled_ui(values_enabled, |ui| {
                     egui::ScrollArea::vertical()
@@ -2212,6 +2232,9 @@ impl OsmilogApp {
             .default_size([440.0, 480.0])
             .resizable(true)
             .show(ctx, |ui| {
+                // See show_rom_editor: force monospace so DragValue columns
+                // stay aligned across rows.
+                ui.style_mut().drag_value_text_style = egui::TextStyle::Monospace;
                 let row_height = ui.spacing().interact_size.y;
                 ui.add_enabled_ui(values_enabled, |ui| {
                     egui::ScrollArea::vertical()
@@ -2368,18 +2391,18 @@ impl OsmilogApp {
     // deciding whether a drag-start point hits it and what "original
     // position" a ComponentDrag should restore on cancel/undo. `None` for a
     // Selected::Wire (no draggable body) or a stale key.
-    fn drag_grid_pos(&self, sel: Selected, pan: Vec2) -> Option<(Rect, GridPos)> {
+    fn drag_grid_pos(&self, sel: Selected, camera: Camera) -> Option<(Rect, GridPos)> {
         match sel {
             Selected::Component(key) => self
                 .components
                 .get(key)
                 .filter(|pc| pc.active)
-                .map(|pc| (component_bounding_rect(pc, pan), pc.grid_pos)),
+                .map(|pc| (component_bounding_rect(pc, camera), pc.grid_pos)),
             Selected::Tunnel(key) => self
                 .tunnels
                 .get(key)
                 .filter(|pt| pt.active)
-                .map(|pt| (tunnel_bounding_rect(pt, pan), pt.grid_pos)),
+                .map(|pt| (tunnel_bounding_rect(pt, camera), pt.grid_pos)),
             Selected::Wire(_) => None,
         }
     }
@@ -2415,22 +2438,22 @@ impl OsmilogApp {
     // Every component, tunnel, and wire segment fully contained in `rect`
     // (screen space): a component/tunnel counts when its bounding rect is
     // inside, a wire when both endpoints are.
-    fn items_in_rect(&self, rect: Rect, pan: Vec2) -> Vec<Selected> {
+    fn items_in_rect(&self, rect: Rect, camera: Camera) -> Vec<Selected> {
         puffin::profile_function!();
         let mut out = Vec::new();
         for (key, pc) in self.active_components() {
-            if rect.contains_rect(component_bounding_rect(pc, pan)) {
+            if rect.contains_rect(component_bounding_rect(pc, camera)) {
                 out.push(Selected::Component(key));
             }
         }
         for (key, pt) in self.active_tunnels() {
-            if rect.contains_rect(tunnel_bounding_rect(pt, pan)) {
+            if rect.contains_rect(tunnel_bounding_rect(pt, camera)) {
                 out.push(Selected::Tunnel(key));
             }
         }
         for (key, seg) in self.wiring.active_segments() {
-            let a = grid_to_screen(self.wiring.nodes[seg.a].pos, pan);
-            let b = grid_to_screen(self.wiring.nodes[seg.b].pos, pan);
+            let a = camera.grid_to_screen(self.wiring.nodes[seg.a].pos);
+            let b = camera.grid_to_screen(self.wiring.nodes[seg.b].pos);
             if rect.contains(a) && rect.contains(b) {
                 out.push(Selected::Wire(key));
             }
@@ -2937,10 +2960,10 @@ impl OsmilogApp {
     }
 
     // ── Canvas drawing ────────────────────────────────────────────────────
-    fn draw_canvas(&self, painter: &Painter, clip_rect: Rect, pan: Vec2, theme: Theme) {
+    fn draw_canvas(&self, painter: &Painter, clip_rect: Rect, camera: Camera, theme: Theme) {
         puffin::profile_function!();
         painter.rect_filled(clip_rect, 0.0, theme.canvas_bg);
-        draw_grid(painter, clip_rect, pan, theme);
+        draw_grid(painter, clip_rect, camera, theme);
 
         // Draw wire segments. Colour comes from each connected group's net
         // value: any component pin / tunnel on the group resolves (live) to
@@ -2950,14 +2973,16 @@ impl OsmilogApp {
         for (seg_key, seg) in self.wiring.active_segments() {
             let a = self.wiring.nodes[seg.a];
             let b = self.wiring.nodes[seg.b];
-            let p0 = grid_to_screen(a.pos, pan);
-            let p1 = grid_to_screen(b.pos, pan);
+            let p0 = camera.grid_to_screen(a.pos);
+            let p1 = camera.grid_to_screen(b.pos);
             let val = node_value.get(&seg.a).copied().unwrap_or(Value::Floating);
             let mut stroke = value_stroke(theme, val);
             if self.is_highlighted(Selected::Wire(seg_key)) {
                 stroke.color = theme.outline_selected;
                 stroke.width += 1.5;
             }
+            stroke.width = camera.scale(stroke.width);
+            let (p0, p1) = extend_segment(p0, p1, stroke.width / 2.0);
             painter.line_segment([p0, p1], stroke);
         }
 
@@ -2969,8 +2994,8 @@ impl OsmilogApp {
             if degrees.get(&nk).copied().unwrap_or(0) >= 3 {
                 let val = node_value.get(&nk).copied().unwrap_or(Value::Floating);
                 painter.circle_filled(
-                    grid_to_screen(node.pos, pan),
-                    PIN_RADIUS,
+                    camera.grid_to_screen(node.pos),
+                    camera.scale(PIN_RADIUS),
                     value_stroke(theme, val).color,
                 );
             }
@@ -2980,14 +3005,51 @@ impl OsmilogApp {
 
         for (pc_key, pc) in self.active_components() {
             let is_selected = self.is_highlighted(Selected::Component(pc_key));
-            draw_component(painter, pc, pan, &self.circuit, is_selected, theme);
+            draw_component(painter, pc, camera, &self.circuit, is_selected, theme);
         }
 
         // Draw tunnels
 
         for (pt_key, pt) in self.active_tunnels() {
             let is_selected = self.is_highlighted(Selected::Tunnel(pt_key));
-            draw_tunnel(painter, pt, pan, &self.circuit, is_selected, theme);
+            draw_tunnel(painter, pt, camera, &self.circuit, is_selected, theme);
+        }
+    }
+
+    // ── Canvas pan / zoom ─────────────────────────────────────────────────
+    // Middle-mouse drag pans; Ctrl(+Cmd)+scroll zooms toward the cursor. Both
+    // gestures are independent of the primary-button gestures the interaction
+    // modes handle (`drag_started`/`clicked`/`drag_delta` are primary-only), so
+    // this runs as a standalone pre-step in `ui()`.
+    fn handle_camera_input(&mut self, response: &egui::Response, ctx: &egui::Context) {
+        puffin::profile_function!();
+        // Pan: middle-button drag. Use the raw pointer delta - `drag_delta`
+        // tracks only the primary button.
+        if response.dragged_by(egui::PointerButton::Middle) {
+            self.camera.pan += ctx.input(|i| i.pointer.delta());
+        }
+
+        // Zoom: Ctrl(+Cmd)+scroll, only while hovering the canvas. egui folds a
+        // ctrl-scroll (its default `zoom_modifier`) - and any trackpad pinch -
+        // into `zoom_delta()`, a multiplicative factor (1.0 = no change). egui's
+        // own scroll-zoom sensitivity is set directly at startup (see
+        // ZOOM_SCROLL_SPEED, set in `OsmilogApp::new`) rather than rescaled here
+        // - `zoom_delta()` is already exactly the factor we want to apply.
+        if response.hovered() {
+            let zoom_delta = ctx.input(|i| i.zoom_delta());
+            if zoom_delta != 1.0 {
+                if let Some(cursor) = ctx.pointer_hover_pos() {
+                    let old = self.camera.zoom;
+                    let new = (old * zoom_delta).clamp(ZOOM_MIN, ZOOM_MAX);
+                    if new != old {
+                        // Keep the grid point under the cursor fixed:
+                        // pan' = cursor - (cursor - pan) * (new / old).
+                        let c = cursor.to_vec2();
+                        self.camera.pan = c - (c - self.camera.pan) * (new / old);
+                        self.camera.zoom = new;
+                    }
+                }
+            }
         }
     }
 
@@ -3131,12 +3193,17 @@ impl OsmilogApp {
         // Hover reticle: hovering over a wire (but not a pin) shows
         // where a branch would tap the wire.
         if let Some(pos) = pointer {
-            if pin_at_pos(self.active_components(), cc.pan, pos, PinKind::Output).is_none()
-                && pin_at_pos(self.active_components(), cc.pan, pos, PinKind::Input).is_none()
-                && tunnel_pin_at_pos(self.active_tunnels(), cc.pan, pos).is_none()
+            if pin_at_pos(self.active_components(), cc.camera, pos, PinKind::Output).is_none()
+                && pin_at_pos(self.active_components(), cc.camera, pos, PinKind::Input).is_none()
+                && tunnel_pin_at_pos(self.active_tunnels(), cc.camera, pos).is_none()
             {
-                if let Some((_, gp)) = self.wiring.segment_at_pos(pos, cc.pan) {
-                    draw_reticle(cc.painter, grid_to_screen(gp, cc.pan), cc.theme);
+                if let Some((_, gp)) = self.wiring.segment_at_pos(pos, cc.camera) {
+                    draw_reticle(
+                        cc.painter,
+                        cc.camera.grid_to_screen(gp),
+                        cc.camera,
+                        cc.theme,
+                    );
                 }
             }
         }
@@ -3144,10 +3211,16 @@ impl OsmilogApp {
         // All drag gestures (wire draw, component/bulk move, rubber-band
         // select) mutate the circuit or selection - suppressed during a run
         // session. Plain click-to-select below stays available for inspection.
-        if !self.editing_locked() && cc.response.drag_started() {
+        // egui's `drag_started`/`dragged` flags are button-agnostic, so exclude
+        // a middle-button drag here - that gesture pans the camera
+        // (`handle_camera_input`) and must not also start an edit gesture.
+        if !self.editing_locked()
+            && cc.response.drag_started()
+            && !cc.response.dragged_by(egui::PointerButton::Middle)
+        {
             let origin = cc.ctx.input(|i| i.pointer.press_origin());
             if let Some(pos) = origin {
-                if let Some((attach, gp)) = self.wire_start_at(pos, cc.pan) {
+                if let Some((attach, gp)) = self.wire_start_at(pos, cc.camera) {
                     // Drag from a pin / tunnel / existing wire → draw
                     // a wire (quick elbow, committed on release).
                     self.mode = InteractionMode::WireDraw {
@@ -3163,7 +3236,7 @@ impl OsmilogApp {
                         // bounding rect. A lone selected wire has no body to
                         // drag (drag_grid_pos returns None for it).
                         let sel = *sel;
-                        self.drag_grid_pos(sel, cc.pan)
+                        self.drag_grid_pos(sel, cc.camera)
                             .filter(|(rect, _)| rect.contains(pos))
                             .map(|(_, grid_pos)| (vec![(sel, grid_pos)], Vec::new()))
                     }
@@ -3173,14 +3246,15 @@ impl OsmilogApp {
                         // selection also covers, as long as the drag began
                         // inside *any one* component/tunnel's bounding rect.
                         let started_inside = sels.iter().any(|sel| {
-                            self.drag_grid_pos(*sel, cc.pan)
+                            self.drag_grid_pos(*sel, cc.camera)
                                 .is_some_and(|(rect, _)| rect.contains(pos))
                         });
                         started_inside.then(|| {
                             let items: Vec<(Selected, GridPos)> = sels
                                 .iter()
                                 .filter_map(|sel| {
-                                    self.drag_grid_pos(*sel, cc.pan).map(|(_, gp)| (*sel, gp))
+                                    self.drag_grid_pos(*sel, cc.camera)
+                                        .map(|(_, gp)| (*sel, gp))
                                 })
                                 .collect();
                             let free_nodes = self.free_wire_nodes(sels);
@@ -3196,7 +3270,7 @@ impl OsmilogApp {
                     };
                 } else {
                     // Drag from empty space → rubber-band bulk select.
-                    let gp = snap_to_grid(pos, cc.pan);
+                    let gp = cc.camera.screen_to_grid(pos);
                     self.selected = None;
                     self.mode = InteractionMode::BulkSelect {
                         start: gp,
@@ -3213,7 +3287,7 @@ impl OsmilogApp {
                 // off a wire is a drag gesture, handled above). Suppressed
                 // during a run session so only selection remains.
                 let pin_start = self
-                    .wire_start_at(pos, cc.pan)
+                    .wire_start_at(pos, cc.camera)
                     .filter(|(a, _)| matches!(a, NodeAttach::Pin(..) | NodeAttach::Tunnel(_)))
                     .filter(|_| !self.editing_locked());
                 if let Some((attach, gp)) = pin_start {
@@ -3228,15 +3302,15 @@ impl OsmilogApp {
                     // priority), then a wire segment, else deselect.
                     let maybe_comp = self
                         .active_components()
-                        .find(|(_k, pc)| component_bounding_rect(pc, cc.pan).contains(pos))
+                        .find(|(_k, pc)| component_bounding_rect(pc, cc.camera).contains(pos))
                         .map(|(k, _)| Selected::Component(k));
                     let maybe_tunnel = self
                         .active_tunnels()
-                        .find(|(_k, pt)| tunnel_bounding_rect(pt, cc.pan).contains(pos))
+                        .find(|(_k, pt)| tunnel_bounding_rect(pt, cc.camera).contains(pos))
                         .map(|(k, _)| Selected::Tunnel(k));
                     let maybe_wire = self
                         .wiring
-                        .segment_at_pos(pos, cc.pan)
+                        .segment_at_pos(pos, cc.camera)
                         .map(|(seg, _)| Selected::Wire(seg));
                     self.selected = maybe_comp
                         .or(maybe_tunnel)
@@ -3249,12 +3323,12 @@ impl OsmilogApp {
 
     fn interact_placing(&mut self, cc: &CanvasCtx, pointer: Option<Pos2>, spec: ComponentSpec) {
         if let Some(pos) = pointer {
-            let gp = snap_to_grid(pos, cc.pan);
-            draw_ghost(cc.painter, &spec, gp, cc.pan, cc.theme);
+            let gp = cc.camera.screen_to_grid(pos);
+            draw_ghost(cc.painter, &spec, gp, cc.camera, cc.theme);
         }
         if cc.response.clicked() {
             if let Some(pos) = pointer {
-                let gp = snap_to_grid(pos, cc.pan);
+                let gp = cc.camera.screen_to_grid(pos);
                 self.place_component(spec, gp);
                 self.mode = InteractionMode::Idle;
             }
@@ -3263,12 +3337,12 @@ impl OsmilogApp {
 
     fn interact_placing_tunnel(&mut self, cc: &CanvasCtx, pointer: Option<Pos2>, role: TunnelRole) {
         if let Some(pos) = pointer {
-            let gp = snap_to_grid(pos, cc.pan);
-            draw_tunnel_ghost(cc.painter, role, gp, cc.pan, cc.theme);
+            let gp = cc.camera.screen_to_grid(pos);
+            draw_tunnel_ghost(cc.painter, role, gp, cc.camera, cc.theme);
         }
         if cc.response.clicked() {
             if let Some(pos) = pointer {
-                let gp = snap_to_grid(pos, cc.pan);
+                let gp = cc.camera.screen_to_grid(pos);
                 self.place_tunnel(role, gp);
                 self.mode = InteractionMode::Idle;
             }
@@ -3286,14 +3360,20 @@ impl OsmilogApp {
     ) {
         puffin::profile_function!();
         let end = pointer.unwrap_or(cursor);
-        let (drop_attach, drop_gp, terminal) = self.wire_target_at(end, cc.pan);
+        let (drop_attach, drop_gp, terminal) = self.wire_target_at(end, cc.camera);
 
         // Preview: committed segments, then the pending elbow from the
         // last committed corner to the (snapped) drop point.
-        let preview = Stroke::new(WIRE_THICKNESS_THIN, cc.theme.wire_drag_preview);
+        let preview = Stroke::new(
+            cc.camera.scale(WIRE_THICKNESS_THIN),
+            cc.theme.wire_drag_preview,
+        );
         for w in points.windows(2) {
             cc.painter.line_segment(
-                [grid_to_screen(w[0], cc.pan), grid_to_screen(w[1], cc.pan)],
+                [
+                    cc.camera.grid_to_screen(w[0]),
+                    cc.camera.grid_to_screen(w[1]),
+                ],
                 preview,
             );
         }
@@ -3301,7 +3381,7 @@ impl OsmilogApp {
         let mut prev = *points.last().unwrap();
         for p in &pending {
             cc.painter.line_segment(
-                [grid_to_screen(prev, cc.pan), grid_to_screen(*p, cc.pan)],
+                [cc.camera.grid_to_screen(prev), cc.camera.grid_to_screen(*p)],
                 preview,
             );
             prev = *p;
@@ -3369,8 +3449,9 @@ impl OsmilogApp {
     ) {
         puffin::profile_function!();
         if let Some(pos) = pointer {
-            let delta_x = ((pos.x - drag_origin.x) / GRID_SIZE).round() as i32;
-            let delta_y = ((pos.y - drag_origin.y) / GRID_SIZE).round() as i32;
+            let step = cc.camera.grid_scale();
+            let delta_x = ((pos.x - drag_origin.x) / step).round() as i32;
+            let delta_y = ((pos.y - drag_origin.y) / step).round() as i32;
             // Every dragged item moves by the same delta from its own
             // drag-start position, so a bulk drag keeps the selection's
             // relative layout intact.
@@ -3426,8 +3507,10 @@ impl OsmilogApp {
     ) {
         puffin::profile_function!();
         // Track the live corner, then paint the rubber-band box.
-        let current = pointer.map(|p| snap_to_grid(p, cc.pan)).unwrap_or(current);
-        let rect = selection_screen_rect(start, current, cc.pan);
+        let current = pointer
+            .map(|p| cc.camera.screen_to_grid(p))
+            .unwrap_or(current);
+        let rect = selection_screen_rect(start, current, cc.camera);
         let c = cc.theme.outline_selected;
         cc.painter.rect_filled(
             rect,
@@ -3441,7 +3524,7 @@ impl OsmilogApp {
         // flick released the same frame it started (drag_stopped never
         // fires in the BulkSelect arm then), so the mode can't stick.
         if cc.response.drag_stopped() || !cc.response.dragged() {
-            let selected_items = self.items_in_rect(rect, cc.pan);
+            let selected_items = self.items_in_rect(rect, cc.camera);
             // If only one item in bounds, directly select it
             self.selected = match selected_items.len() {
                 0 => None,
@@ -3537,16 +3620,20 @@ impl eframe::App for OsmilogApp {
 
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let clip_rect = painter.clip_rect();
-        let pan = self.pan;
+
+        // Update the camera (middle-drag pan, Ctrl+scroll zoom) before drawing so
+        // the change applies this same frame.
+        self.handle_camera_input(&response, &ctx);
+        let camera = self.camera;
 
         self.handle_canvas_shortcuts(&ctx);
-        self.draw_canvas(&painter, clip_rect, pan, theme);
+        self.draw_canvas(&painter, clip_rect, camera, theme);
 
         let cc = CanvasCtx {
             response: &response,
             painter: &painter,
             ctx: &ctx,
-            pan,
+            camera,
             theme,
         };
         self.handle_canvas_interaction(&cc);
@@ -3648,13 +3735,11 @@ fn extract_records(
     )
 }
 
-fn component_bounding_rect(pc: &PlacedComponent, pan: Vec2) -> Rect {
-    let size = pc.shape.size;
-    let tl = egui::pos2(
-        pc.grid_pos.x as f32 * GRID_SIZE + pan.x,
-        pc.grid_pos.y as f32 * GRID_SIZE + pan.y,
-    );
-    Rect::from_min_size(tl, size)
+fn component_bounding_rect(pc: &PlacedComponent, camera: Camera) -> Rect {
+    Rect::from_min_size(
+        camera.grid_to_screen(pc.grid_pos),
+        pc.shape.size * camera.zoom,
+    )
 }
 
 // Grid coordinate of a pin: the component's grid_pos plus the anchor's whole-cell
@@ -3683,17 +3768,10 @@ fn tunnel_pin_grid(pt: &PlacedTunnel) -> GridPos {
     )
 }
 
-fn grid_to_screen(gp: GridPos, pan: Vec2) -> Pos2 {
-    egui::pos2(
-        gp.x as f32 * GRID_SIZE + pan.x,
-        gp.y as f32 * GRID_SIZE + pan.y,
-    )
-}
-
 // The screen-space rectangle spanned by a BulkSelect drag's two grid corners,
 // normalized so either drag direction yields the same box.
-fn selection_screen_rect(start: GridPos, current: GridPos, pan: Vec2) -> Rect {
-    Rect::from_two_pos(grid_to_screen(start, pan), grid_to_screen(current, pan))
+fn selection_screen_rect(start: GridPos, current: GridPos, camera: Camera) -> Rect {
+    Rect::from_two_pos(camera.grid_to_screen(start), camera.grid_to_screen(current))
 }
 
 // A quick L-elbow (one horizontal then one vertical run) from `from` to `to`,
@@ -3711,56 +3789,46 @@ fn route_elbow(from: GridPos, to: GridPos) -> Vec<GridPos> {
 
 // Takes an already-computed ComponentShape (not &PlacedComponent) so callers
 // needing multiple pins from one component compute shape() once and reuse it.
-fn comp_pin_pos(shape: &ComponentShape, grid_pos: GridPos, pan: Vec2, pin: PinId) -> Pos2 {
-    let tl = egui::pos2(
-        grid_pos.x as f32 * GRID_SIZE + pan.x,
-        grid_pos.y as f32 * GRID_SIZE + pan.y,
-    );
+fn comp_pin_pos(shape: &ComponentShape, grid_pos: GridPos, camera: Camera, pin: PinId) -> Pos2 {
+    let tl = camera.grid_to_screen(grid_pos);
     let anchor = match pin {
         PinId::In(InIdx(i)) => &shape.input_anchors[i as usize],
         PinId::Out(OutIdx(i)) => &shape.output_anchors[i as usize],
     };
     // Anchors are whole grid cells from the top-left (itself grid-aligned), so
     // every pin lands exactly on a grid intersection.
-    tl + anchor.cell * GRID_SIZE
+    tl + anchor.cell * camera.grid_scale()
 }
 
-fn tunnel_bounding_rect(pt: &PlacedTunnel, pan: Vec2) -> Rect {
+fn tunnel_bounding_rect(pt: &PlacedTunnel, camera: Camera) -> Rect {
     let size = tunnel_shape(pt.role).size;
-    let tl = egui::pos2(
-        pt.grid_pos.x as f32 * GRID_SIZE + pan.x,
-        pt.grid_pos.y as f32 * GRID_SIZE + pan.y,
-    );
-    Rect::from_min_size(tl, size)
+    Rect::from_min_size(camera.grid_to_screen(pt.grid_pos), size * camera.zoom)
 }
 
-fn tunnel_pin_pos(pt: &PlacedTunnel, pan: Vec2) -> Pos2 {
+fn tunnel_pin_pos(pt: &PlacedTunnel, camera: Camera) -> Pos2 {
     let shape = tunnel_shape(pt.role);
-    let tl = egui::pos2(
-        pt.grid_pos.x as f32 * GRID_SIZE + pan.x,
-        pt.grid_pos.y as f32 * GRID_SIZE + pan.y,
-    );
+    let tl = camera.grid_to_screen(pt.grid_pos);
     let anchor = match pt.role {
         TunnelRole::Feed => &shape.output_anchors[0],
         TunnelRole::Pull => &shape.input_anchors[0],
     };
-    tl + anchor.cell * GRID_SIZE
+    tl + anchor.cell * camera.grid_scale()
 }
 
 fn pin_at_pos<'a>(
     components: impl Iterator<Item = (PlacedCompKey, &'a PlacedComponent)>,
-    pan: Vec2,
+    camera: Camera,
     pos: Pos2,
     kind: PinKind,
 ) -> Option<(PlacedCompKey, PinId)> {
     puffin::profile_function!();
-    let hit_r = PIN_RADIUS * 2.0;
+    let hit_r = camera.scale(PIN_RADIUS * 2.0);
     for (key, pc) in components {
         let shape = &pc.shape;
         match kind {
             PinKind::Output => {
                 for i in 0..pc.spec.n_outputs() {
-                    let pp = comp_pin_pos(shape, pc.grid_pos, pan, PinId::output(i as u8));
+                    let pp = comp_pin_pos(shape, pc.grid_pos, camera, PinId::output(i as u8));
                     if pos.distance(pp) <= hit_r {
                         return Some((key, PinId::output(i as u8)));
                     }
@@ -3768,7 +3836,7 @@ fn pin_at_pos<'a>(
             }
             PinKind::Input => {
                 for i in 0..pc.spec.n_inputs() {
-                    let pp = comp_pin_pos(shape, pc.grid_pos, pan, PinId::input(i as u8));
+                    let pp = comp_pin_pos(shape, pc.grid_pos, camera, PinId::input(i as u8));
                     if pos.distance(pp) <= hit_r {
                         return Some((key, PinId::input(i as u8)));
                     }
@@ -3782,13 +3850,13 @@ fn pin_at_pos<'a>(
 // start and end on either a Feed or a Pull tunnel.
 fn tunnel_pin_at_pos<'a>(
     tunnels: impl Iterator<Item = (PlacedTunnelKey, &'a PlacedTunnel)>,
-    pan: Vec2,
+    camera: Camera,
     pos: Pos2,
 ) -> Option<PlacedTunnelKey> {
     puffin::profile_function!();
-    let hit_r = PIN_RADIUS * 2.0;
+    let hit_r = camera.scale(PIN_RADIUS * 2.0);
     for (key, tunnel) in tunnels {
-        if tunnel_pin_pos(tunnel, pan).distance(pos) <= hit_r {
+        if tunnel_pin_pos(tunnel, camera).distance(pos) <= hit_r {
             return Some(key);
         }
     }
@@ -3819,26 +3887,72 @@ fn value_stroke(theme: Theme, val: Value) -> Stroke {
 
 // ── Drawing ───────────────────────────────────────────────────────────────────
 
-fn draw_grid(painter: &Painter, clip_rect: Rect, pan: Vec2, theme: Theme) {
-    let x0 = ((clip_rect.left() - pan.x) / GRID_SIZE).floor() as i32;
-    let x1 = ((clip_rect.right() - pan.x) / GRID_SIZE).ceil() as i32;
-    let y0 = ((clip_rect.top() - pan.y) / GRID_SIZE).floor() as i32;
-    let y1 = ((clip_rect.bottom() - pan.y) / GRID_SIZE).ceil() as i32;
-    for gx in x0..=x1 {
-        for gy in y0..=y1 {
+// egui's line segments use butt caps with no joins, so two segments meeting
+// at a grid-node corner leave a visible notch (the stroke doesn't reach past
+// the shared center point in the perpendicular direction). Extending each
+// end by half the stroke width fills that gap, at the cost of slightly
+// overshooting unjoined endpoints (wire tips, pins) by the same amount.
+fn extend_segment(p0: Pos2, p1: Pos2, extend: f32) -> (Pos2, Pos2) {
+    let delta = p1 - p0;
+    let len = delta.length();
+    if len < f32::EPSILON {
+        return (p0, p1);
+    }
+    let dir = delta / len;
+    (p0 - dir * extend, p1 + dir * extend)
+}
+
+fn draw_grid(painter: &Painter, clip_rect: Rect, camera: Camera, theme: Theme) {
+    let step = camera.grid_scale();
+    // As the view zooms out, thin the drawn dots to every `stride`-th grid
+    // cell so on-screen spacing never crowds below GRID_DOT_MIN_SPACING_PX -
+    // otherwise a wide-out view would paint thousands of near-touching dots.
+    let stride = grid_dot_stride(step);
+    let cell_x1 = ((clip_rect.right() - camera.pan.x) / step).ceil() as i32;
+    let cell_y1 = ((clip_rect.bottom() - camera.pan.y) / step).ceil() as i32;
+    let x0 = (((clip_rect.left() - camera.pan.x) / step).floor() as i32).div_euclid(stride) * stride;
+    let y0 = (((clip_rect.top() - camera.pan.y) / step).floor() as i32).div_euclid(stride) * stride;
+
+    let mut gx = x0;
+    while gx <= cell_x1 {
+        let mut gy = y0;
+        while gy <= cell_y1 {
             painter.circle_filled(
-                egui::pos2(gx as f32 * GRID_SIZE + pan.x, gy as f32 * GRID_SIZE + pan.y),
+                camera.grid_to_screen(GridPos::new(gx, gy)),
                 1.0,
                 theme.grid_dot,
             );
+            gy += stride;
         }
+        gx += stride;
+    }
+}
+
+/// Smallest stride (in grid cells, one of 1/2/5 times a power of ten) that
+/// keeps on-screen dot spacing at least `GRID_DOT_MIN_SPACING_PX` given
+/// `cell_px` pixels per grid cell - the standard "nice numbers" tick-spacing
+/// pick, applied to grid dots instead of axis labels.
+fn grid_dot_stride(cell_px: f32) -> i32 {
+    if cell_px >= GRID_DOT_MIN_SPACING_PX {
+        return 1;
+    }
+    let target = GRID_DOT_MIN_SPACING_PX / cell_px;
+    let mut magnitude = 1i32;
+    loop {
+        for base in [1, 2, 5] {
+            let candidate = base * magnitude;
+            if candidate as f32 >= target {
+                return candidate;
+            }
+        }
+        magnitude *= 10;
     }
 }
 
 // A small crosshair marking where a branch would tap an existing wire.
-fn draw_reticle(painter: &Painter, pos: Pos2, theme: Theme) {
-    let r = PIN_RADIUS + 1.0;
-    let stroke = Stroke::new(1.0, theme.wire_drag_preview);
+fn draw_reticle(painter: &Painter, pos: Pos2, camera: Camera, theme: Theme) {
+    let r = camera.scale(PIN_RADIUS + 1.0);
+    let stroke = Stroke::new(camera.scale(1.0), theme.wire_drag_preview);
     painter.line_segment([pos - egui::vec2(r, 0.0), pos + egui::vec2(r, 0.0)], stroke);
     painter.line_segment([pos - egui::vec2(0.0, r), pos + egui::vec2(0.0, r)], stroke);
 }
@@ -3846,19 +3960,19 @@ fn draw_reticle(painter: &Painter, pos: Pos2, theme: Theme) {
 fn draw_component(
     painter: &Painter,
     pc: &PlacedComponent,
-    pan: Vec2,
+    camera: Camera,
     circuit: &Circuit,
     is_selected: bool,
     theme: Theme,
 ) {
     puffin::profile_function!();
     let shape = &pc.shape;
-    let rect = component_bounding_rect(pc, pan);
+    let rect = component_bounding_rect(pc, camera);
     let fill = theme.component_fill;
     let (stroke_w, stroke_col) = if is_selected {
-        (COMP_STROKE + 1.0, theme.outline_selected)
+        (camera.scale(COMP_STROKE + 1.0), theme.outline_selected)
     } else {
-        (COMP_STROKE, theme.outline_default)
+        (camera.scale(COMP_STROKE), theme.outline_default)
     };
     let outline_stroke = Stroke::new(stroke_w, stroke_col);
 
@@ -3889,16 +4003,17 @@ fn draw_component(
         painter.add(egui::Shape::line(stroke_pts, outline_stroke));
     }
 
+    let bubble_r = camera.scale(BUBBLE_R);
     for (i, &has_bubble) in shape.output_bubbles.iter().enumerate() {
         if has_bubble {
             let anchor = &shape.output_anchors[i];
             // The pin sits one cell beyond the body edge; the bubble is drawn in
             // the gap, just outside the edge (one cell back from the pin).
-            let pin = comp_pin_pos(shape, pc.grid_pos, pan, PinId::output(i as u8));
-            let edge = pin - anchor.wire_dir * GRID_SIZE;
-            let center = edge + anchor.wire_dir * BUBBLE_R;
-            painter.circle_filled(center, BUBBLE_R, fill);
-            painter.circle_stroke(center, BUBBLE_R, outline_stroke);
+            let pin = comp_pin_pos(shape, pc.grid_pos, camera, PinId::output(i as u8));
+            let edge = pin - anchor.wire_dir * camera.grid_scale();
+            let center = edge + anchor.wire_dir * bubble_r;
+            painter.circle_filled(center, bubble_r, fill);
+            painter.circle_stroke(center, bubble_r, outline_stroke);
         }
     }
 
@@ -3911,7 +4026,7 @@ fn draw_component(
             label_pos,
             Align2::CENTER_CENTER,
             label.text,
-            FontId::monospace(label.font_size),
+            FontId::monospace(camera.scale(label.font_size)),
             theme.label_text,
         );
     }
@@ -3927,7 +4042,7 @@ fn draw_component(
             label_pos,
             Align2::CENTER_CENTER,
             name,
-            FontId::monospace(LABEL_FONT_SIZE),
+            FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
             theme.label_text,
         );
     }
@@ -3944,43 +4059,44 @@ fn draw_component(
             label_pos,
             Align2::CENTER_CENTER,
             format!("0x{:X}", bits),
-            FontId::monospace(LABEL_FONT_SIZE),
+            FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
             theme.label_text,
         );
     }
 
+    let pin_r = camera.scale(PIN_RADIUS);
     for i in 0..pc.spec.n_inputs() {
-        let pos = comp_pin_pos(shape, pc.grid_pos, pan, PinId::input(i as u8));
+        let pos = comp_pin_pos(shape, pc.grid_pos, camera, PinId::input(i as u8));
         let val = circuit.components[pc.key].pins.inputs[i]
             .map(|nk| circuit.nets[nk].value)
             .unwrap_or(Value::Floating);
-        painter.circle_filled(pos, PIN_RADIUS, value_stroke(theme, val).color);
+        painter.circle_filled(pos, pin_r, value_stroke(theme, val).color);
     }
     for i in 0..pc.spec.n_outputs() {
-        let pos = comp_pin_pos(shape, pc.grid_pos, pan, PinId::output(i as u8));
+        let pos = comp_pin_pos(shape, pc.grid_pos, camera, PinId::output(i as u8));
         let val = circuit.components[pc.key].pins.out_cache[i];
-        painter.circle_filled(pos, PIN_RADIUS, value_stroke(theme, val).color);
+        painter.circle_filled(pos, pin_r, value_stroke(theme, val).color);
     }
 }
 
 fn draw_tunnel(
     painter: &Painter,
     pt: &PlacedTunnel,
-    pan: Vec2,
+    camera: Camera,
     circuit: &Circuit,
     is_selected: bool,
     theme: Theme,
 ) {
     puffin::profile_function!();
     let shape = tunnel_shape(pt.role);
-    let rect = tunnel_bounding_rect(pt, pan);
+    let rect = tunnel_bounding_rect(pt, camera);
     // Distinct fill from components (theme's "open" widget tone), to visually
     // distinguish tunnels.
     let fill = theme.tunnel_fill;
     let (stroke_w, stroke_col) = if is_selected {
-        (COMP_STROKE + 1.0, theme.outline_selected)
+        (camera.scale(COMP_STROKE + 1.0), theme.outline_selected)
     } else {
-        (COMP_STROKE, theme.outline_default)
+        (camera.scale(COMP_STROKE), theme.outline_default)
     };
 
     let fill_pts = tessellate_path(&shape.outline, rect);
@@ -4007,7 +4123,7 @@ fn draw_tunnel(
         label_pos,
         Align2::CENTER_CENTER,
         &pt.label,
-        FontId::monospace(LABEL_FONT_SIZE),
+        FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
         theme.label_text,
     );
 
@@ -4018,34 +4134,37 @@ fn draw_tunnel(
         .map(|nk| circuit.nets[nk].value)
         .unwrap_or(Value::Floating);
     painter.circle_filled(
-        tunnel_pin_pos(pt, pan),
-        PIN_RADIUS,
+        tunnel_pin_pos(pt, camera),
+        camera.scale(PIN_RADIUS),
         value_stroke(theme, val).color,
     );
 }
 
-fn draw_ghost(painter: &Painter, spec: &ComponentSpec, grid_pos: GridPos, pan: Vec2, theme: Theme) {
+fn draw_ghost(
+    painter: &Painter,
+    spec: &ComponentSpec,
+    grid_pos: GridPos,
+    camera: Camera,
+    theme: Theme,
+) {
     let shape = spec.shape();
-    let tl = egui::pos2(
-        grid_pos.x as f32 * GRID_SIZE + pan.x,
-        grid_pos.y as f32 * GRID_SIZE + pan.y,
-    );
-    let rect = Rect::from_min_size(tl, shape.size);
+    let rect = Rect::from_min_size(camera.grid_to_screen(grid_pos), shape.size * camera.zoom);
     let ghost_col = theme.ghost_preview;
+    let stroke_w = camera.scale(COMP_STROKE);
 
     let pts = tessellate_path(&shape.outline, rect);
     painter.add(egui::Shape::Path(PathShape {
         points: pts,
         closed: true,
         fill: Color32::TRANSPARENT,
-        stroke: PathStroke::new(COMP_STROKE, ghost_col),
+        stroke: PathStroke::new(stroke_w, ghost_col),
     }));
 
     for stroke_cmds in &shape.extra_strokes {
         let stroke_pts = tessellate_path(stroke_cmds, rect);
         painter.add(egui::Shape::line(
             stroke_pts,
-            Stroke::new(COMP_STROKE, ghost_col),
+            Stroke::new(stroke_w, ghost_col),
         ));
     }
 
@@ -4058,7 +4177,7 @@ fn draw_ghost(painter: &Painter, spec: &ComponentSpec, grid_pos: GridPos, pan: V
             label_pos,
             Align2::CENTER_CENTER,
             label.text,
-            FontId::monospace(LABEL_FONT_SIZE),
+            FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
             ghost_col,
         );
     }
@@ -4072,7 +4191,7 @@ fn draw_ghost(painter: &Painter, spec: &ComponentSpec, grid_pos: GridPos, pan: V
             label_pos,
             Align2::CENTER_CENTER,
             name,
-            FontId::monospace(LABEL_FONT_SIZE),
+            FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
             ghost_col,
         );
     }
@@ -4082,15 +4201,11 @@ fn draw_tunnel_ghost(
     painter: &Painter,
     role: TunnelRole,
     grid_pos: GridPos,
-    pan: Vec2,
+    camera: Camera,
     theme: Theme,
 ) {
     let shape = tunnel_shape(role);
-    let tl = egui::pos2(
-        grid_pos.x as f32 * GRID_SIZE + pan.x,
-        grid_pos.y as f32 * GRID_SIZE + pan.y,
-    );
-    let rect = Rect::from_min_size(tl, shape.size);
+    let rect = Rect::from_min_size(camera.grid_to_screen(grid_pos), shape.size * camera.zoom);
     let ghost_col = theme.ghost_preview;
 
     let pts = tessellate_path(&shape.outline, rect);
@@ -4098,7 +4213,7 @@ fn draw_tunnel_ghost(
         points: pts,
         closed: true,
         fill: Color32::TRANSPARENT,
-        stroke: PathStroke::new(COMP_STROKE, ghost_col),
+        stroke: PathStroke::new(camera.scale(COMP_STROKE), ghost_col),
     }));
 
     let label_pos = egui::pos2(
@@ -4113,7 +4228,7 @@ fn draw_tunnel_ghost(
         label_pos,
         Align2::CENTER_CENTER,
         label,
-        FontId::monospace(LABEL_FONT_SIZE),
+        FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
         ghost_col,
     );
 }
@@ -4123,6 +4238,33 @@ mod tests {
     use super::*;
     use crate::gui::wiring::NodeAttach;
     use crate::sim::component::GateOp;
+
+    #[test]
+    fn grid_dot_stride_is_1_above_min_spacing() {
+        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX), 1);
+        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX * 2.0), 1);
+    }
+
+    #[test]
+    fn grid_dot_stride_picks_smallest_nice_stride_that_fits() {
+        // At half the min spacing, a stride of 2 already gets there.
+        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX / 2.0), 2);
+        // At a fifth, stride 5 is the smallest nice number that clears it.
+        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX / 4.5), 5);
+        // At a tenth, stride 10.
+        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX / 10.0), 10);
+    }
+
+    #[test]
+    fn grid_dot_stride_result_always_clears_the_minimum_spacing() {
+        for cell_px in [0.5, 1.0, 2.0, 2.5, 3.0, 7.0, 15.9, 16.0, 50.0] {
+            let stride = grid_dot_stride(cell_px);
+            assert!(
+                cell_px * stride as f32 >= GRID_DOT_MIN_SPACING_PX,
+                "cell_px={cell_px} stride={stride} leaves dots too close"
+            );
+        }
+    }
 
     fn place(app: &mut OsmilogApp, spec: ComponentSpec) -> PlacedCompKey {
         app.place_component(spec, GridPos::new(0, 0))
@@ -4500,9 +4642,9 @@ mod tests {
         connect_pins(&mut app, (a, PinId::output(0)), (b, PinId::input(0)));
         app.rebuild_circuit();
 
-        let pan = Vec2::ZERO;
-        let rect = selection_screen_rect(GridPos::new(-2, -2), GridPos::new(12, 12), pan);
-        let items = app.items_in_rect(rect, pan);
+        let camera = Camera::default();
+        let rect = selection_screen_rect(GridPos::new(-2, -2), GridPos::new(12, 12), camera);
+        let items = app.items_in_rect(rect, camera);
         assert!(items.contains(&Selected::Component(a)));
         assert!(items.contains(&Selected::Component(b)));
         assert!(!items.contains(&Selected::Component(far)));
@@ -4659,10 +4801,10 @@ mod tests {
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Output);
         assert!(app
-            .drag_grid_pos(Selected::Wire(Default::default()), Vec2::ZERO)
+            .drag_grid_pos(Selected::Wire(Default::default()), Camera::default())
             .is_none());
         assert!(app
-            .drag_grid_pos(Selected::Component(a), Vec2::ZERO)
+            .drag_grid_pos(Selected::Component(a), Camera::default())
             .is_some());
     }
 
