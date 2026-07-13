@@ -518,7 +518,7 @@ impl OsmilogApp {
     fn place_component(&mut self, spec: ComponentSpec, grid_pos: GridPos) -> PlacedCompKey {
         self.history.begin_batch();
         let comp = self.instantiate(&spec);
-        let key = self.apply(Command::AddComponent(comp)).unwrap_comp();
+        let key = self.apply(Command::comp(comp)).unwrap_comp();
         let pc = PlacedComponent::new(key, spec, grid_pos);
         let pc_key = self.components.insert(pc);
         // Record the placement's undo: tombstone this record. Paired with the
@@ -1826,7 +1826,7 @@ impl OsmilogApp {
         let new_n_out = new_comp.pins.outputs.len();
 
         self.apply(Command::RemoveComponent(old_key));
-        let new_key = self.apply(Command::AddComponent(new_comp)).unwrap_comp();
+        let new_key = self.apply(Command::comp(new_comp)).unwrap_comp();
         // Record the record swap's undo before overwriting: restores the old
         // CompKey + def (the Sim actions above reactivate the old circuit comp
         // and deactivate the new one, but the record itself needs restoring).
@@ -3189,6 +3189,7 @@ impl eframe::App for OsmilogApp {
 
         // Draws the web "Save As" filename modal while it's open (and completes
         // the download on confirm); no-op on native.
+        // TODO: Figure out if this weird closure stuff is necessary
         self.with_io(|io, app| io.drive_save_dialog(&ctx, app));
 
         egui::Panel::left("left_panel")

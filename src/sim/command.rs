@@ -7,7 +7,8 @@ use crate::sim::net::NetKey;
 // the seam the GUI's undo/redo records against.
 #[derive(Debug)]
 pub enum Command {
-    AddComponent(Component),
+    // Box to reduce enum size
+    AddComponent(Box<Component>),
     SetInput {
         comp: CompKey,
         bits: u32,
@@ -40,6 +41,12 @@ pub enum Command {
     RemoveComponent(CompKey),
 }
 
+impl Command {
+    pub fn comp(comp: Component) -> Self {
+        Self::AddComponent(Box::new(comp))
+    }
+}
+
 // The value produced by Circuit::apply(). Which variant comes back is fully
 // determined by which Command variant went in - see each unwrap_* accessor
 // for its matching Command variant(s).
@@ -53,7 +60,7 @@ pub enum CommandOutput {
 }
 
 impl CommandOutput {
-    /// Panics unless this came from `Command::AddComponent`.
+    /// Panics unless this came from `Command::comp`.
     pub fn unwrap_comp(self) -> CompKey {
         match self {
             Self::Comp(k) => k,
@@ -100,7 +107,7 @@ impl CommandOutput {
 pub enum UndoAction {
     /// No-op, or a derived-net command that undo re-derives instead.
     NoOp,
-    /// Undoes `Command::AddComponent`: tombstone the component that was added.
+    /// Undoes `Command::comp`: tombstone the component that was added.
     DeactivateComponent(CompKey),
     /// Undoes `Command::RemoveComponent`: reactivate the tombstoned component
     /// in place (its `CompKey` and any `Reg` state were preserved).
@@ -135,7 +142,7 @@ impl Circuit {
         puffin::profile_function!();
         match command {
             Command::AddComponent(comp) => {
-                let key = self.add_component(comp);
+                let key = self.add_component(*comp);
                 (
                     CommandOutput::Comp(key),
                     UndoAction::DeactivateComponent(key),
@@ -317,7 +324,7 @@ mod tests {
     fn test_apply_add_component_returns_comp_key_and_registers() {
         let mut c = Circuit::new();
         let key = c
-            .apply(Command::AddComponent(Component::input(5, 3)))
+            .apply(Command::comp(Component::input(5, 3)))
             .0
             .unwrap_comp();
         // add_component eagerly evaluates, before any link()/settle().
@@ -328,13 +335,10 @@ mod tests {
     fn test_apply_set_input_updates_value() {
         let mut c = Circuit::new();
         let i = c
-            .apply(Command::AddComponent(Component::input(0, 4)))
+            .apply(Command::comp(Component::input(0, 4)))
             .0
             .unwrap_comp();
-        let o = c
-            .apply(Command::AddComponent(Component::output()))
-            .0
-            .unwrap_comp();
+        let o = c.apply(Command::comp(Component::output())).0.unwrap_comp();
         c.apply(Command::Link {
             a: i,
             a_pin: PinId::output(0),
@@ -357,13 +361,10 @@ mod tests {
     fn test_apply_link_returns_net_key_and_wires_components() {
         let mut c = Circuit::new();
         let i = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
-        let o = c
-            .apply(Command::AddComponent(Component::output()))
-            .0
-            .unwrap_comp();
+        let o = c.apply(Command::comp(Component::output())).0.unwrap_comp();
         let net = c
             .apply(Command::Link {
                 a: i,
@@ -382,7 +383,7 @@ mod tests {
     fn test_apply_add_tunnel_and_link_tunnel_return_correct_keys() {
         let mut c = Circuit::new();
         let driver = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
         let tunnel = c
@@ -426,17 +427,14 @@ mod tests {
     fn test_apply_remove_component_tears_down_conflict() {
         let mut c = Circuit::new();
         let d1 = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
         let d2 = c
-            .apply(Command::AddComponent(Component::input(0, 1)))
+            .apply(Command::comp(Component::input(0, 1)))
             .0
             .unwrap_comp();
-        let o = c
-            .apply(Command::AddComponent(Component::output()))
-            .0
-            .unwrap_comp();
+        let o = c.apply(Command::comp(Component::output())).0.unwrap_comp();
         c.apply(Command::Link {
             a: d1,
             a_pin: PinId::output(0),
@@ -461,21 +459,15 @@ mod tests {
     fn test_apply_tick_clock_returns_settle_result_and_latches() {
         let mut c = Circuit::new();
         let data = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
         let we = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
-        let reg = c
-            .apply(Command::AddComponent(Component::reg(1)))
-            .0
-            .unwrap_comp();
-        let out = c
-            .apply(Command::AddComponent(Component::output()))
-            .0
-            .unwrap_comp();
+        let reg = c.apply(Command::comp(Component::reg(1))).0.unwrap_comp();
+        let out = c.apply(Command::comp(Component::output())).0.unwrap_comp();
         c.apply(Command::Link {
             a: data,
             a_pin: PinId::output(0),
@@ -506,11 +498,11 @@ mod tests {
     fn test_apply_clear_nets_removes_all_nets() {
         let mut c = Circuit::new();
         let a = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
         let g = c
-            .apply(Command::AddComponent(Component::gate(GateOp::Not, 1, 1)))
+            .apply(Command::comp(Component::gate(GateOp::Not, 1, 1)))
             .0
             .unwrap_comp();
         c.apply(Command::Link {
@@ -533,7 +525,7 @@ mod tests {
     fn test_command_output_unwrap_wrong_variant_panics() {
         let mut c = Circuit::new();
         let key = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
         c.apply(Command::RemoveComponent(key)).0.unwrap_comp();
@@ -544,7 +536,7 @@ mod tests {
     #[test]
     fn test_apply_add_component_undo_is_deactivate() {
         let mut c = Circuit::new();
-        let (output, undo) = c.apply(Command::AddComponent(Component::input(1, 1)));
+        let (output, undo) = c.apply(Command::comp(Component::input(1, 1)));
         let key = output.unwrap_comp();
         assert!(matches!(undo, UndoAction::DeactivateComponent(k) if k == key));
     }
@@ -553,7 +545,7 @@ mod tests {
     fn test_apply_remove_component_undo_is_reactivate() {
         let mut c = Circuit::new();
         let key = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
         let (_output, undo) = c.apply(Command::RemoveComponent(key));
@@ -567,7 +559,7 @@ mod tests {
     fn test_apply_remove_already_removed_component_is_noop() {
         let mut c = Circuit::new();
         let key = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
         c.apply(Command::RemoveComponent(key));
@@ -583,21 +575,15 @@ mod tests {
         // state survives removal and comes back on reactivation.
         let mut c = Circuit::new();
         let data = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
         let we = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
-        let reg = c
-            .apply(Command::AddComponent(Component::reg(1)))
-            .0
-            .unwrap_comp();
-        let out = c
-            .apply(Command::AddComponent(Component::output()))
-            .0
-            .unwrap_comp();
+        let reg = c.apply(Command::comp(Component::reg(1))).0.unwrap_comp();
+        let out = c.apply(Command::comp(Component::output())).0.unwrap_comp();
         c.link(data, PinId::output(0), reg, PinId::input(0));
         c.link(we, PinId::output(0), reg, PinId::input(1));
         c.link(reg, PinId::output(0), out, PinId::input(0));
@@ -609,10 +595,7 @@ mod tests {
         // output; the previously latched 1 must return.
         c.apply(Command::RemoveComponent(reg));
         c.reactivate_component(reg);
-        let out2 = c
-            .apply(Command::AddComponent(Component::output()))
-            .0
-            .unwrap_comp();
+        let out2 = c.apply(Command::comp(Component::output())).0.unwrap_comp();
         c.link(reg, PinId::output(0), out2, PinId::input(0));
         c.settle().unwrap();
         assert_eq!(c.read_output(out2), Value::ONE);
@@ -622,7 +605,7 @@ mod tests {
     fn test_apply_set_input_captures_old_value() {
         let mut c = Circuit::new();
         let i = c
-            .apply(Command::AddComponent(Component::input(3, 4)))
+            .apply(Command::comp(Component::input(3, 4)))
             .0
             .unwrap_comp();
 
@@ -649,7 +632,7 @@ mod tests {
     fn test_apply_set_input_on_non_input_is_noop() {
         let mut c = Circuit::new();
         let g = c
-            .apply(Command::AddComponent(Component::gate(GateOp::Not, 1, 1)))
+            .apply(Command::comp(Component::gate(GateOp::Not, 1, 1)))
             .0
             .unwrap_comp();
 
@@ -676,7 +659,7 @@ mod tests {
     fn test_apply_remove_tunnel_undo_is_reactivate() {
         let mut c = Circuit::new();
         let driver = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
         let tunnel = c
@@ -749,13 +732,10 @@ mod tests {
         // structure, so they record nothing to undo.
         let mut c = Circuit::new();
         let a = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
-        let b = c
-            .apply(Command::AddComponent(Component::output()))
-            .0
-            .unwrap_comp();
+        let b = c.apply(Command::comp(Component::output())).0.unwrap_comp();
         let tunnel = c
             .apply(Command::AddTunnel {
                 label: "T".to_string(),
@@ -790,21 +770,15 @@ mod tests {
     fn test_apply_tick_clock_captures_pre_tick_value() {
         let mut c = Circuit::new();
         let data = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
         let we = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
-        let reg = c
-            .apply(Command::AddComponent(Component::reg(1)))
-            .0
-            .unwrap_comp();
-        let out = c
-            .apply(Command::AddComponent(Component::output()))
-            .0
-            .unwrap_comp();
+        let reg = c.apply(Command::comp(Component::reg(1))).0.unwrap_comp();
+        let out = c.apply(Command::comp(Component::output())).0.unwrap_comp();
         c.apply(Command::Link {
             a: data,
             a_pin: PinId::output(0),
@@ -847,17 +821,14 @@ mod tests {
         // intact so a later reactivation restores it.
         let mut c = Circuit::new();
         let data = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
         let we = c
-            .apply(Command::AddComponent(Component::input(1, 1)))
+            .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
-        let reg = c
-            .apply(Command::AddComponent(Component::reg(1)))
-            .0
-            .unwrap_comp();
+        let reg = c.apply(Command::comp(Component::reg(1))).0.unwrap_comp();
         c.link(data, PinId::output(0), reg, PinId::input(0));
         c.link(we, PinId::output(0), reg, PinId::input(1));
         c.settle().unwrap();
@@ -872,10 +843,7 @@ mod tests {
         }
         // Reactivate and read: still the initial 0, never latched the 1.
         c.reactivate_component(reg);
-        let out = c
-            .apply(Command::AddComponent(Component::output()))
-            .0
-            .unwrap_comp();
+        let out = c.apply(Command::comp(Component::output())).0.unwrap_comp();
         c.link(reg, PinId::output(0), out, PinId::input(0));
         c.settle().unwrap();
         assert_eq!(c.read_output(out), Value::ZERO);
