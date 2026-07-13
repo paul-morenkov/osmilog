@@ -2114,6 +2114,12 @@ impl OsmilogApp {
             .default_size([440.0, 480.0])
             .resizable(true)
             .show(ctx, |ui| {
+                // DragValue renders with `drag_value_text_style` (defaults to
+                // the proportional Button style), so its digit widths vary
+                // and columns drift out of alignment across rows. Force it
+                // monospace to keep the hex grid aligned; scoped to this Ui
+                // so it doesn't affect DragValues elsewhere in the app.
+                ui.style_mut().drag_value_text_style = egui::TextStyle::Monospace;
                 let row_height = ui.spacing().interact_size.y;
                 ui.add_enabled_ui(values_enabled, |ui| {
                     egui::ScrollArea::vertical()
@@ -2212,6 +2218,9 @@ impl OsmilogApp {
             .default_size([440.0, 480.0])
             .resizable(true)
             .show(ctx, |ui| {
+                // See show_rom_editor: force monospace so DragValue columns
+                // stay aligned across rows.
+                ui.style_mut().drag_value_text_style = egui::TextStyle::Monospace;
                 let row_height = ui.spacing().interact_size.y;
                 ui.add_enabled_ui(values_enabled, |ui| {
                     egui::ScrollArea::vertical()
