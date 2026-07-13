@@ -6,7 +6,9 @@ use std::collections::HashMap;
 
 use crate::gui::clipboard::Clipboard;
 use crate::gui::document::{default_new_circuit_name, CircuitDoc, DocId, DocState};
-use crate::gui::geometry::{tunnel_shape, Camera, GridPos, LABEL_FONT_SIZE, ZOOM_MAX, ZOOM_MIN};
+use crate::gui::geometry::{
+    tunnel_shape, Camera, GridPos, LABEL_FONT_SIZE, ZOOM_MAX, ZOOM_MIN, ZOOM_SCROLL_SPEED,
+};
 use crate::gui::gui_undo::GuiUndoAction;
 use crate::gui::history::{History, HistoryEntry};
 use crate::gui::placed_component::PlacedComponent;
@@ -29,6 +31,11 @@ const PIN_RADIUS: f32 = 3.0;
 const WIRE_THICKNESS_THIN: f32 = 2.0;
 const WIRE_THICKNESS_THICK: f32 = 4.0;
 const COMP_STROKE: f32 = 1.5;
+
+/// Minimum on-screen spacing (px) kept between drawn grid dots; `draw_grid`
+/// thins to a coarser stride of grid cells rather than let dots crowd closer
+/// than this as the view zooms out.
+const GRID_DOT_MIN_SPACING_PX: f32 = 16.0;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_SHA: &str = env!("OSMILOG_GIT_SHA");
@@ -316,8 +323,13 @@ impl OsmilogApp {
         }
     }
 
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         puffin::set_scopes_on(true);
+        // `Options` lives in the Context's persistent memory (like styles/widget
+        // state), so this sticks for the app's lifetime - no need to re-set it
+        // every frame in handle_camera_input.
+        cc.egui_ctx
+            .options_mut(|o| o.input_options.scroll_zoom_speed = ZOOM_SCROLL_SPEED);
         Self::empty()
     }
 
@@ -1020,7 +1032,8 @@ impl OsmilogApp {
             );
             return (NodeAttach::Pin(pck, pin), gp, true);
         }
-        if let Some((pck, pin)) = pin_at_pos(self.active_components(), camera, pos, PinKind::Input) {
+        if let Some((pck, pin)) = pin_at_pos(self.active_components(), camera, pos, PinKind::Input)
+        {
             let gp = pin_grid_pos(
                 &self.components[pck].shape,
                 self.components[pck].grid_pos,
@@ -3017,7 +3030,10 @@ impl OsmilogApp {
 
         // Zoom: Ctrl(+Cmd)+scroll, only while hovering the canvas. egui folds a
         // ctrl-scroll (its default `zoom_modifier`) - and any trackpad pinch -
-        // into `zoom_delta()`, a multiplicative factor (1.0 = no change).
+        // into `zoom_delta()`, a multiplicative factor (1.0 = no change). egui's
+        // own scroll-zoom sensitivity is set directly at startup (see
+        // ZOOM_SCROLL_SPEED, set in `OsmilogApp::new`) rather than rescaled here
+        // - `zoom_delta()` is already exactly the factor we want to apply.
         if response.hovered() {
             let zoom_delta = ctx.input(|i| i.zoom_delta());
             if zoom_delta != 1.0 {
@@ -3181,7 +3197,12 @@ impl OsmilogApp {
                 && tunnel_pin_at_pos(self.active_tunnels(), cc.camera, pos).is_none()
             {
                 if let Some((_, gp)) = self.wiring.segment_at_pos(pos, cc.camera) {
-                    draw_reticle(cc.painter, cc.camera.grid_to_screen(gp), cc.camera, cc.theme);
+                    draw_reticle(
+                        cc.painter,
+                        cc.camera.grid_to_screen(gp),
+                        cc.camera,
+                        cc.theme,
+                    );
                 }
             }
         }
@@ -3231,7 +3252,8 @@ impl OsmilogApp {
                             let items: Vec<(Selected, GridPos)> = sels
                                 .iter()
                                 .filter_map(|sel| {
-                                    self.drag_grid_pos(*sel, cc.camera).map(|(_, gp)| (*sel, gp))
+                                    self.drag_grid_pos(*sel, cc.camera)
+                                        .map(|(_, gp)| (*sel, gp))
                                 })
                                 .collect();
                             let free_nodes = self.free_wire_nodes(sels);
@@ -3347,7 +3369,10 @@ impl OsmilogApp {
         );
         for w in points.windows(2) {
             cc.painter.line_segment(
-                [cc.camera.grid_to_screen(w[0]), cc.camera.grid_to_screen(w[1])],
+                [
+                    cc.camera.grid_to_screen(w[0]),
+                    cc.camera.grid_to_screen(w[1]),
+                ],
                 preview,
             );
         }
@@ -3481,7 +3506,9 @@ impl OsmilogApp {
     ) {
         puffin::profile_function!();
         // Track the live corner, then paint the rubber-band box.
-        let current = pointer.map(|p| cc.camera.screen_to_grid(p)).unwrap_or(current);
+        let current = pointer
+            .map(|p| cc.camera.screen_to_grid(p))
+            .unwrap_or(current);
         let rect = selection_screen_rect(start, current, cc.camera);
         let c = cc.theme.outline_selected;
         cc.painter.rect_filled(
@@ -3708,7 +3735,10 @@ fn extract_records(
 }
 
 fn component_bounding_rect(pc: &PlacedComponent, camera: Camera) -> Rect {
-    Rect::from_min_size(camera.grid_to_screen(pc.grid_pos), pc.shape.size * camera.zoom)
+    Rect::from_min_size(
+        camera.grid_to_screen(pc.grid_pos),
+        pc.shape.size * camera.zoom,
+    )
 }
 
 // Grid coordinate of a pin: the component's grid_pos plus the anchor's whole-cell
@@ -3858,23 +3888,48 @@ fn value_stroke(theme: Theme, val: Value) -> Stroke {
 
 fn draw_grid(painter: &Painter, clip_rect: Rect, camera: Camera, theme: Theme) {
     let step = camera.grid_scale();
-    // When zoomed far out the dots would be near-touching (and there'd be
-    // thousands of them); skip the grid below a legible spacing.
-    if step < 4.0 {
-        return;
-    }
-    let x0 = ((clip_rect.left() - camera.pan.x) / step).floor() as i32;
-    let x1 = ((clip_rect.right() - camera.pan.x) / step).ceil() as i32;
-    let y0 = ((clip_rect.top() - camera.pan.y) / step).floor() as i32;
-    let y1 = ((clip_rect.bottom() - camera.pan.y) / step).ceil() as i32;
-    for gx in x0..=x1 {
-        for gy in y0..=y1 {
+    // As the view zooms out, thin the drawn dots to every `stride`-th grid
+    // cell so on-screen spacing never crowds below GRID_DOT_MIN_SPACING_PX -
+    // otherwise a wide-out view would paint thousands of near-touching dots.
+    let stride = grid_dot_stride(step);
+    let cell_x1 = ((clip_rect.right() - camera.pan.x) / step).ceil() as i32;
+    let cell_y1 = ((clip_rect.bottom() - camera.pan.y) / step).ceil() as i32;
+    let x0 = (((clip_rect.left() - camera.pan.x) / step).floor() as i32).div_euclid(stride) * stride;
+    let y0 = (((clip_rect.top() - camera.pan.y) / step).floor() as i32).div_euclid(stride) * stride;
+
+    let mut gx = x0;
+    while gx <= cell_x1 {
+        let mut gy = y0;
+        while gy <= cell_y1 {
             painter.circle_filled(
                 camera.grid_to_screen(GridPos::new(gx, gy)),
                 1.0,
                 theme.grid_dot,
             );
+            gy += stride;
         }
+        gx += stride;
+    }
+}
+
+/// Smallest stride (in grid cells, one of 1/2/5 times a power of ten) that
+/// keeps on-screen dot spacing at least `GRID_DOT_MIN_SPACING_PX` given
+/// `cell_px` pixels per grid cell - the standard "nice numbers" tick-spacing
+/// pick, applied to grid dots instead of axis labels.
+fn grid_dot_stride(cell_px: f32) -> i32 {
+    if cell_px >= GRID_DOT_MIN_SPACING_PX {
+        return 1;
+    }
+    let target = GRID_DOT_MIN_SPACING_PX / cell_px;
+    let mut magnitude = 1i32;
+    loop {
+        for base in [1, 2, 5] {
+            let candidate = base * magnitude;
+            if candidate as f32 >= target {
+                return candidate;
+            }
+        }
+        magnitude *= 10;
     }
 }
 
@@ -4091,7 +4146,10 @@ fn draw_ghost(
 
     for stroke_cmds in &shape.extra_strokes {
         let stroke_pts = tessellate_path(stroke_cmds, rect);
-        painter.add(egui::Shape::line(stroke_pts, Stroke::new(stroke_w, ghost_col)));
+        painter.add(egui::Shape::line(
+            stroke_pts,
+            Stroke::new(stroke_w, ghost_col),
+        ));
     }
 
     for label in &shape.labels {
@@ -4164,6 +4222,33 @@ mod tests {
     use super::*;
     use crate::gui::wiring::NodeAttach;
     use crate::sim::component::GateOp;
+
+    #[test]
+    fn grid_dot_stride_is_1_above_min_spacing() {
+        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX), 1);
+        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX * 2.0), 1);
+    }
+
+    #[test]
+    fn grid_dot_stride_picks_smallest_nice_stride_that_fits() {
+        // At half the min spacing, a stride of 2 already gets there.
+        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX / 2.0), 2);
+        // At a fifth, stride 5 is the smallest nice number that clears it.
+        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX / 4.5), 5);
+        // At a tenth, stride 10.
+        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX / 10.0), 10);
+    }
+
+    #[test]
+    fn grid_dot_stride_result_always_clears_the_minimum_spacing() {
+        for cell_px in [0.5, 1.0, 2.0, 2.5, 3.0, 7.0, 15.9, 16.0, 50.0] {
+            let stride = grid_dot_stride(cell_px);
+            assert!(
+                cell_px * stride as f32 >= GRID_DOT_MIN_SPACING_PX,
+                "cell_px={cell_px} stride={stride} leaves dots too close"
+            );
+        }
+    }
 
     fn place(app: &mut OsmilogApp, spec: ComponentSpec) -> PlacedCompKey {
         app.place_component(spec, GridPos::new(0, 0))

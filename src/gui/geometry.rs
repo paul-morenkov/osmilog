@@ -19,6 +19,14 @@ pub const LABEL_FONT_SIZE: f32 = 8.0;
 pub const ZOOM_MIN: f32 = 0.25;
 pub const ZOOM_MAX: f32 = 4.0;
 
+/// Log-zoom change per pixel of ctrl(+cmd)+scroll, fed directly into egui's own
+/// `Options::input_options.scroll_zoom_speed` (see `handle_camera_input`) - egui
+/// computes its ctrl-scroll zoom factor as `exp(scroll_px * scroll_zoom_speed)`,
+/// so setting this constant *is* the sensitivity knob rather than a second scaling
+/// stacked on top of egui's own default. Pinch-to-zoom (multi-touch) is a direct
+/// physical finger-distance ratio and is unaffected by this constant.
+pub const ZOOM_SCROLL_SPEED: f32 = 1.0 / 400.0;
+
 /// A whole-cell count converted to pixels (at zoom 1.0).
 pub const fn px(cells: u32) -> f32 {
     cells as f32 * GRID_SIZE
@@ -239,7 +247,6 @@ const fn stack_h(k: usize) -> u32 {
     Pitch::Spread.height(k)
 }
 
-
 pub fn rect_outline() -> Vec<ShapeCmd> {
     vec![
         ShapeCmd::MoveTo(vec2(0.0, 0.0)),
@@ -405,7 +412,9 @@ pub const fn constant_size() -> Vec2 {
 // right) has more pins; each side packs top-down from row 1 with its own pitch.
 // Both pitch heights are even, so their max is too.
 pub fn subcircuit_size(n_in: usize, n_out: usize) -> Vec2 {
-    let h_cells = sub_pitch(n_in).height(n_in).max(sub_pitch(n_out).height(n_out));
+    let h_cells = sub_pitch(n_in)
+        .height(n_in)
+        .max(sub_pitch(n_out).height(n_out));
     vec2(px(SUBCIRCUIT_W), px(h_cells))
 }
 
