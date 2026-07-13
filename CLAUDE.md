@@ -140,7 +140,7 @@ them itself (see Simulator/GUI separation above).
 
 ### Command layer (`command.rs`)
 
-    pub enum Command { AddComponent(Component), Link { .. }, RemoveComponent(CompKey), .. }
+    pub enum Command { AddComponent(Box<Component>), Link { .. }, RemoveComponent(CompKey), .. }
     fn Circuit::apply(&mut self, command: Command) -> (CommandOutput, UndoAction)
 
 One `Command` variant per structural mutation `Circuit` supports. `apply` dispatches to the
