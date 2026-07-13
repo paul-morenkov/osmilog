@@ -68,6 +68,7 @@ impl ComponentSpec {
             Self::Divider(_) => op2_size(),
             Self::Comparator(_) => comparator_size(),
             Self::Rom(_) => rom_size(),
+            Self::Ram(_) => ram_size(),
             Self::Splitter { arm_bits, .. } => splitter_size(arm_bits.len() as u8),
             Self::Subcircuit {
                 input_widths,
@@ -111,6 +112,7 @@ impl ComponentSpec {
             Self::Divider(_) => "DIV",
             Self::Comparator(_) => "CMP",
             Self::Rom(_) => "ROM",
+            Self::Ram(_) => "RAM",
             Self::Splitter { direction, .. } => match direction {
                 FanDirection::Right => "SPLIT",
                 FanDirection::Left => "COMBINE",
@@ -146,6 +148,7 @@ impl ComponentSpec {
             Self::Divider(_) => divider_shape(),
             Self::Comparator(_) => comparator_shape(),
             Self::Rom(_) => rom_shape(),
+            Self::Ram(_) => ram_shape(),
             Self::Splitter {
                 arm_bits,
                 direction,

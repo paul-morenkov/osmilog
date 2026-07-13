@@ -40,6 +40,7 @@ pub struct DocState {
     pub(crate) selected: Option<Selection>,
     pub(crate) clock: ClockControl,
     pub(crate) rom_editor_open: Option<PlacedCompKey>,
+    pub(crate) ram_editor_open: Option<PlacedCompKey>,
 }
 
 impl DocState {
@@ -56,6 +57,7 @@ impl DocState {
             selected: None,
             clock: ClockControl::default(),
             rom_editor_open: None,
+            ram_editor_open: None,
         }
     }
 }

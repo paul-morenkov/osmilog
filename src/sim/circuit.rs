@@ -1,4 +1,4 @@
-use crate::sim::component::{CompKey, Component, Input, Logic, LogicComb, PinId};
+use crate::sim::component::{CompKey, Component, Input, Logic, LogicComb, LogicSeq, PinId};
 use crate::sim::net::{Net, NetKey};
 use crate::sim::value::Value;
 
@@ -131,6 +131,22 @@ impl Circuit {
         };
         if wrote {
             self.eval_component(comp);
+        }
+    }
+
+    /// Writes one word into a RAM component's contents in place, masked to
+    /// its data_width. Unlike write_rom this never changes data_out (RAM's
+    /// output is a *registered* read, only updated by tick_clock - see
+    /// RamCell), so there is nothing to re-evaluate; the write is purely a
+    /// debug-time direct memory edit. No-op if `comp` isn't a RAM or `index`
+    /// is out of range. Like write_rom, bypasses the Command/undo layer
+    /// entirely - RAM contents are mutated live, not undoable.
+    pub fn write_ram(&mut self, comp: CompKey, index: usize, value: u32) {
+        if let Logic::Seq(LogicSeq::Ram(ram)) = &self.components[comp].logic {
+            let contents = ram.contents();
+            if index < contents.len() {
+                contents.set_word(index, value);
+            }
         }
     }
 
