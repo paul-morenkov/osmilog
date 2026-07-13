@@ -2982,6 +2982,7 @@ impl OsmilogApp {
                 stroke.width += 1.5;
             }
             stroke.width = camera.scale(stroke.width);
+            let (p0, p1) = extend_segment(p0, p1, stroke.width / 2.0);
             painter.line_segment([p0, p1], stroke);
         }
 
@@ -3885,6 +3886,21 @@ fn value_stroke(theme: Theme, val: Value) -> Stroke {
 }
 
 // ── Drawing ───────────────────────────────────────────────────────────────────
+
+// egui's line segments use butt caps with no joins, so two segments meeting
+// at a grid-node corner leave a visible notch (the stroke doesn't reach past
+// the shared center point in the perpendicular direction). Extending each
+// end by half the stroke width fills that gap, at the cost of slightly
+// overshooting unjoined endpoints (wire tips, pins) by the same amount.
+fn extend_segment(p0: Pos2, p1: Pos2, extend: f32) -> (Pos2, Pos2) {
+    let delta = p1 - p0;
+    let len = delta.length();
+    if len < f32::EPSILON {
+        return (p0, p1);
+    }
+    let dir = delta / len;
+    (p0 - dir * extend, p1 + dir * extend)
+}
 
 fn draw_grid(painter: &Painter, clip_rect: Rect, camera: Camera, theme: Theme) {
     let step = camera.grid_scale();
