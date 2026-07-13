@@ -11,11 +11,15 @@ use crate::sim::component::{FanDirection, GateOp};
 // Everything below is declared in whole grid CELLS (u32). Pixels enter the
 // picture only through `px()`
 
-/// Pixels per grid cell - the sole cell-pixel conversion factor.
+/// Pixels per grid cell at zoom 1.0 - the sole cell-pixel conversion factor.
 pub const GRID_SIZE: f32 = 10.0;
 pub const LABEL_FONT_SIZE: f32 = 8.0;
 
-/// A whole-cell count converted to pixels.
+/// Zoom limits for the canvas camera.
+pub const ZOOM_MIN: f32 = 0.25;
+pub const ZOOM_MAX: f32 = 4.0;
+
+/// A whole-cell count converted to pixels (at zoom 1.0).
 pub const fn px(cells: u32) -> f32 {
     cells as f32 * GRID_SIZE
 }
@@ -98,6 +102,56 @@ impl From<[i32; 2]> for GridPos {
 impl From<GridPos> for [i32; 2] {
     fn from(p: GridPos) -> Self {
         [p.x, p.y]
+    }
+}
+
+// ── Camera ────────────────────────────────────────────────────────────────────
+//
+// The view transform for the canvas: a screen-pixel `pan` offset plus a `zoom`
+// scale factor. The screen<->grid transform is
+//   screen = grid * (GRID_SIZE * zoom) + pan
+// and everything drawn/hit-tested funnels through `grid_to_screen`/
+// `screen_to_grid`. Fixed pixel sizes (radii, strokes, fonts) scale via `scale`
+// so the whole canvas zooms as one, not just the spacing between things.
+#[derive(Debug, Clone, Copy)]
+pub struct Camera {
+    /// Screen-pixel offset of the grid origin.
+    pub pan: Vec2,
+    /// Scale factor; 1.0 is the default (GRID_SIZE px per cell).
+    pub zoom: f32,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            pan: Vec2::ZERO,
+            zoom: 1.0,
+        }
+    }
+}
+
+impl Camera {
+    /// Pixels per grid cell at the current zoom.
+    pub fn grid_scale(&self) -> f32 {
+        GRID_SIZE * self.zoom
+    }
+
+    pub fn grid_to_screen(&self, gp: GridPos) -> Pos2 {
+        let s = self.grid_scale();
+        Pos2::new(gp.x as f32 * s + self.pan.x, gp.y as f32 * s + self.pan.y)
+    }
+
+    pub fn screen_to_grid(&self, pos: Pos2) -> GridPos {
+        let s = self.grid_scale();
+        GridPos::new(
+            ((pos.x - self.pan.x) / s).round() as i32,
+            ((pos.y - self.pan.y) / s).round() as i32,
+        )
+    }
+
+    /// Scale a fixed pixel measurement (radius / stroke width / font size) by zoom.
+    pub fn scale(&self, px: f32) -> f32 {
+        px * self.zoom
     }
 }
 
@@ -185,12 +239,6 @@ const fn stack_h(k: usize) -> u32 {
     Pitch::Spread.height(k)
 }
 
-pub fn snap_to_grid(pos: Pos2, pan: Vec2) -> GridPos {
-    GridPos::new(
-        ((pos.x - pan.x) / GRID_SIZE).round() as i32,
-        ((pos.y - pan.y) / GRID_SIZE).round() as i32,
-    )
-}
 
 pub fn rect_outline() -> Vec<ShapeCmd> {
     vec![
@@ -1328,6 +1376,66 @@ pub fn tunnel_shape(role: TunnelRole) -> ComponentShape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_default_is_identity_transform() {
+        let cam = Camera::default();
+        // At zoom 1 / no pan, a grid cell maps to GRID_SIZE px and the origin
+        // sits at the screen origin - the old bare-GRID_SIZE behavior.
+        assert_eq!(cam.grid_to_screen(GridPos::new(0, 0)), Pos2::new(0.0, 0.0));
+        assert_eq!(
+            cam.grid_to_screen(GridPos::new(3, -2)),
+            Pos2::new(3.0 * GRID_SIZE, -2.0 * GRID_SIZE)
+        );
+    }
+
+    #[test]
+    fn camera_round_trips_grid_at_nonunit_zoom() {
+        let cam = Camera {
+            pan: Vec2::new(37.0, -14.0),
+            zoom: 2.5,
+        };
+        for gp in [
+            GridPos::new(0, 0),
+            GridPos::new(5, 9),
+            GridPos::new(-8, 3),
+            GridPos::new(120, -77),
+        ] {
+            // Screen point of a cell centre round-trips back to the same cell.
+            assert_eq!(cam.screen_to_grid(cam.grid_to_screen(gp)), gp);
+        }
+    }
+
+    #[test]
+    fn camera_cursor_anchored_zoom_keeps_point_fixed() {
+        // Mirrors handle_camera_input: pan' = cursor - (cursor - pan) * (new/old)
+        // must keep the grid point under the cursor fixed on screen.
+        let mut cam = Camera {
+            pan: Vec2::new(10.0, 20.0),
+            zoom: 1.0,
+        };
+        let cursor = Pos2::new(123.0, 45.0);
+        let grid_under_cursor = cam.screen_to_grid(cursor);
+
+        let old = cam.zoom;
+        let new = 2.0;
+        let c = cursor.to_vec2();
+        cam.pan = c - (c - cam.pan) * (new / old);
+        cam.zoom = new;
+
+        // The same grid cell is still the one under the cursor.
+        assert_eq!(cam.screen_to_grid(cursor), grid_under_cursor);
+    }
+
+    #[test]
+    fn camera_scale_multiplies_by_zoom() {
+        let cam = Camera {
+            pan: Vec2::ZERO,
+            zoom: 3.0,
+        };
+        assert_eq!(cam.scale(2.0), 6.0);
+        assert_eq!(cam.grid_scale(), GRID_SIZE * 3.0);
+    }
 
     // The whole point of the grid-native anchor rework: every pin must sit on a
     // grid intersection. Since a pin's screen position is `top_left (grid-aligned)

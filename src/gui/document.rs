@@ -8,12 +8,12 @@
 //! `DocState` (see `OsmilogApp::take_active_state`/`put_active_state`) - no
 //! serialization, so no `ComponentSpec`/ROM deep-copy on a switch.
 
-use egui::Vec2;
 use slotmap::SlotMap;
 
 use crate::gui::app::{
     ClockControl, InteractionMode, PlacedCompKey, PlacedTunnel, PlacedTunnelKey, Selection,
 };
+use crate::gui::geometry::Camera;
 use crate::gui::history::History;
 use crate::gui::placed_component::PlacedComponent;
 use crate::gui::wiring::Wiring;
@@ -36,7 +36,7 @@ pub struct DocState {
     pub(crate) tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel>,
     pub(crate) wiring: Wiring,
     pub(crate) mode: InteractionMode,
-    pub(crate) pan: Vec2,
+    pub(crate) camera: Camera,
     pub(crate) selected: Option<Selection>,
     pub(crate) clock: ClockControl,
     pub(crate) rom_editor_open: Option<PlacedCompKey>,
@@ -53,7 +53,7 @@ impl DocState {
             tunnels: SlotMap::default(),
             wiring: Wiring::new(),
             mode: InteractionMode::Idle,
-            pan: Vec2::ZERO,
+            camera: Camera::default(),
             selected: None,
             clock: ClockControl::default(),
             rom_editor_open: None,

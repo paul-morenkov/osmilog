@@ -322,10 +322,14 @@ The `eframe::App` implementation, split into `logic` (pre-frame) and `ui` (paint
 - `mode: InteractionMode` - what the canvas is currently doing.
 - `selected: Option<Selected>`, `bulk_selection: Vec<Selected>` - single selection (drives the
   properties panel) and rectangle multi-select, kept separate.
-- `pan: Vec2` - canvas pan offset (present but not yet wired to any interaction - see In-Progress).
+- `camera: Camera` - the canvas view transform (`geometry::Camera { pan, zoom }`). `pan` (screen-px
+  offset) and `zoom` scale factor funnel through `Camera::grid_to_screen`/`screen_to_grid`/`scale`;
+  every draw/hit function takes a `Camera`, not a bare `pan`. Middle-mouse drag pans, Ctrl+scroll
+  (egui's `zoom_delta`, cursor-anchored, clamped `[ZOOM_MIN, ZOOM_MAX]`) zooms - both applied in
+  `handle_camera_input` before drawing. Not persisted (like the old `pan`).
 - `documents: SlotMap<DocId, CircuitDoc>`, `doc_order: Vec<DocId>`, `active: DocId` - every open
   circuit document and which one is live (see Documents / multiple circuits below). All of the
-  fields above (`circuit`, `history`, `components`, `tunnels`, `wiring`, `mode`, `pan`, `selected`,
+  fields above (`circuit`, `history`, `components`, `tunnels`, `wiring`, `mode`, `camera`, `selected`,
   `clock`, `rom_editor_open`) are *per-document* state; they hold the active document's state
   directly, and every other document parks the same fields in a `DocState`.
 
@@ -352,7 +356,7 @@ per-type/pin labels (`ComponentSpec::label()`, `ComponentShape::labels`).
 to reference. Exactly one is *active*: its state lives directly in the live per-circuit fields
 listed under OsmilogApp above; every other document parks the same set of fields in a `DocState`:
 
-    pub struct DocState { circuit, history, components, tunnels, wiring, mode, pan, selected, clock, rom_editor_open }
+    pub struct DocState { circuit, history, components, tunnels, wiring, mode, camera, selected, clock, rom_editor_open }
     pub struct CircuitDoc { name: String, state: Option<DocState> }   // state is None iff active
 
 Switching (`OsmilogApp::switch_circuit`) is a pair of `std::mem` moves - `take_active_state` empties
@@ -534,8 +538,9 @@ app state).
   gaps: **clock ticks are excluded from undo** (`Command::TickClock` is issued untracked, bypassing
   `apply`, since its `RestoreSeqState` replay is unimplemented), and undo/redo re-derives nets via
   `rebuild_circuit` rather than reversing net mutations.
-- **Canvas pan/zoom**: `OsmilogApp::pan` exists and is read everywhere geometry is drawn, but
-  nothing currently mutates it - there's no pan gesture, and no zoom at all.
+- **Canvas pan/zoom**: implemented (`OsmilogApp::camera: geometry::Camera`, see OsmilogApp above) -
+  middle-mouse drag pans, Ctrl+scroll zooms toward the cursor. No keyboard/scrollbar pan and no
+  "reset view" affordance yet.
 - **Whole-wire-run selection**: selecting/deleting a wire is still per-segment. `Wiring::groups()`
   already computes the connected sets a "select the whole net" gesture would need.
 - **Pin-index bounds checking**: `Component::net_of`/`Circuit::net_of`/`link` don't bounds-check

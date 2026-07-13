@@ -24,11 +24,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use egui::{Pos2, Vec2};
+use egui::Pos2;
 use slotmap::{new_key_type, SlotMap};
 
 use crate::gui::app::{PlacedCompKey, PlacedTunnelKey};
-use crate::gui::geometry::{snap_to_grid, GridPos, GRID_SIZE};
+use crate::gui::geometry::{Camera, GridPos};
 use crate::sim::component::PinId;
 
 new_key_type! {
@@ -146,15 +146,6 @@ impl Wiring {
 
     pub fn active_segments(&self) -> impl Iterator<Item = (WireSegKey, &WireSegment)> {
         self.segments.iter().filter(|(_, s)| s.active)
-    }
-
-    // ── Geometry helpers ────────────────────────────────────────────────────
-
-    fn to_screen(gp: GridPos, pan: Vec2) -> Pos2 {
-        egui::pos2(
-            gp.x as f32 * GRID_SIZE + pan.x,
-            gp.y as f32 * GRID_SIZE + pan.y,
-        )
     }
 
     fn node_at_grid(&self, gp: GridPos) -> Option<WireNodeKey> {
@@ -615,22 +606,24 @@ impl Wiring {
     // ── Hit testing (screen space) ──────────────────────────────────────────
 
     /// The active node under `pos`, if any (within the pin hit radius).
-    pub fn node_at_pos(&self, pos: Pos2, pan: Vec2) -> Option<WireNodeKey> {
+    pub fn node_at_pos(&self, pos: Pos2, camera: Camera) -> Option<WireNodeKey> {
+        let hit_r = camera.scale(HIT_RADIUS);
         self.active_nodes()
-            .find(|(_, n)| Self::to_screen(n.pos, pan).distance(pos) <= HIT_RADIUS)
+            .find(|(_, n)| camera.grid_to_screen(n.pos).distance(pos) <= hit_r)
             .map(|(k, _)| k)
     }
 
     /// The active segment nearest to `pos` (within the hit radius) and the
     /// on-grid point along it closest to `pos` - the point a branch would tap.
-    pub fn segment_at_pos(&self, pos: Pos2, pan: Vec2) -> Option<(WireSegKey, GridPos)> {
+    pub fn segment_at_pos(&self, pos: Pos2, camera: Camera) -> Option<(WireSegKey, GridPos)> {
+        let hit_r = camera.scale(HIT_RADIUS);
         let mut best: Option<(WireSegKey, GridPos, f32)> = None;
         for (k, s) in self.active_segments() {
-            let a = Self::to_screen(self.nodes[s.a].pos, pan);
-            let b = Self::to_screen(self.nodes[s.b].pos, pan);
+            let a = camera.grid_to_screen(self.nodes[s.a].pos);
+            let b = camera.grid_to_screen(self.nodes[s.b].pos);
             let (dist, proj) = point_segment(pos, a, b);
-            if dist <= HIT_RADIUS && best.as_ref().is_none_or(|(_, _, d)| dist < *d) {
-                let gp = snap_to_grid(proj, pan);
+            if dist <= hit_r && best.as_ref().is_none_or(|(_, _, d)| dist < *d) {
+                let gp = camera.screen_to_grid(proj);
                 best = Some((k, gp, dist));
             }
         }
