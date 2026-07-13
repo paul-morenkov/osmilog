@@ -65,6 +65,11 @@ const SHIFT_REG_W: u32 = 3;
 
 const ROM_W: u32 = 7;
 
+// Same width as Rom - the spec calls for a RAM box "similarly sized to the
+// ROM component" - taller instead of wider to fit the 4 stacked left-edge
+// pins (see ram_size).
+const RAM_W: u32 = ROM_W;
+
 // A subcircuit is a plain box carrying the referenced document's name; wide
 // enough for a short name and for pins to read as belonging to distinct sides.
 const SUBCIRCUIT_W: u32 = 6;
@@ -331,6 +336,12 @@ pub const fn encoder_size(sel_width: u8) -> Vec2 {
 // single A input on the left and D output on the right both center on grid row 2.
 pub const fn rom_size() -> Vec2 {
     vec2(px(ROM_W), px(stack_h(2)))
+}
+
+// Same width as Rom (RAM_W == ROM_W); height scales for the 4 stacked
+// left-edge pins (A/WE/LE/DI), one more stack level than Reg's D/WE pair.
+pub const fn ram_size() -> Vec2 {
+    vec2(px(RAM_W), px(stack_h(4)))
 }
 
 pub const fn io_size() -> Vec2 {
@@ -1069,6 +1080,69 @@ pub fn rom_shape() -> ComponentShape {
         fill_outline: None,
         input_anchors: vec![PinAnchor::left(center_row)],
         output_anchors: vec![PinAnchor::right(ROM_W, center_row)],
+        extra_strokes: vec![],
+        output_bubbles: vec![false],
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// A read/write memory block: address "A", write_enable "WE", load_enable
+// "LE" and data_in "DI" stack on the left edge (input order matches Ram's
+// fixed pin order); the registered data_out "DO" centers on the right, with
+// a "RAM" label in the body - same layout idea as rom_shape, just with 3
+// more left-edge control pins.
+pub fn ram_shape() -> ComponentShape {
+    let h_cells = stack_h(4); // 8
+    let center_row = h_cells / 2; // 4
+
+    let input_anchors = vec![
+        PinAnchor::left(pin_row(0)),
+        PinAnchor::left(pin_row(1)),
+        PinAnchor::left(pin_row(2)),
+        PinAnchor::left(pin_row(3)),
+    ];
+
+    let row_y = |r: u32| r as f32 / h_cells as f32;
+    let labels = vec![
+        ComponentLabel {
+            text: "RAM",
+            pos: vec2(0.5, 0.5),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "A",
+            pos: vec2(0.2, row_y(pin_row(0))),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "WE",
+            pos: vec2(0.24, row_y(pin_row(1))),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "LE",
+            pos: vec2(0.24, row_y(pin_row(2))),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "DI",
+            pos: vec2(0.24, row_y(pin_row(3))),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "DO",
+            pos: vec2(0.78, row_y(center_row)),
+            ..Default::default()
+        },
+    ];
+
+    ComponentShape {
+        size: ram_size(),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors: vec![PinAnchor::right(RAM_W, center_row)],
         extra_strokes: vec![],
         output_bubbles: vec![false],
         labels,

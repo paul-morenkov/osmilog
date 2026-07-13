@@ -323,3 +323,118 @@ impl ProjectFile {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::component::Input;
+
+    #[test]
+    fn test_from_json_upgrades_legacy_v2_to_single_circuit_project() {
+        // A hand-built v2 single-circuit file: Input(1) -> Output.
+        let v2 = LegacyV2File {
+            version: LEGACY_SINGLE_CIRCUIT_VERSION,
+            snapshot: CircuitSnapshot {
+                components: vec![
+                    ComponentEntry {
+                        spec: ComponentSpec::Input(Input { bits: 1, width: 1 }),
+                        grid_pos: GridPos::new(0, 0),
+                    },
+                    ComponentEntry {
+                        spec: ComponentSpec::Output,
+                        grid_pos: GridPos::new(5, 0),
+                    },
+                ],
+                tunnels: vec![],
+                nodes: vec![
+                    NodeEntry {
+                        pos: GridPos::new(0, 0),
+                        attach: NodeAttachEntry::Pin {
+                            comp: 0,
+                            is_input: false,
+                            pin_index: 0,
+                        },
+                    },
+                    NodeEntry {
+                        pos: GridPos::new(5, 0),
+                        attach: NodeAttachEntry::Pin {
+                            comp: 1,
+                            is_input: true,
+                            pin_index: 0,
+                        },
+                    },
+                ],
+                segments: vec![SegEntry { a: 0, b: 1 }],
+            },
+        };
+        let json = serde_json::to_string(&v2).unwrap();
+
+        // Parsing upgrades it to a one-circuit project named "Main", carrying
+        // the original snapshot through unchanged.
+        let project = ProjectFile::from_json(&json).unwrap();
+        assert_eq!(project.version, CURRENT_VERSION);
+        assert_eq!(project.circuits.len(), 1);
+        assert_eq!(project.active, 0);
+        assert_eq!(project.circuits[0].name, "Main");
+        assert!(project.circuits[0].subcircuits.is_empty());
+        assert_eq!(project.circuits[0].snapshot.components.len(), 2);
+        assert_eq!(project.circuits[0].snapshot.nodes.len(), 2);
+        assert_eq!(project.circuits[0].snapshot.segments.len(), 1);
+        project.validate().unwrap();
+    }
+
+    #[test]
+    fn test_project_file_validate_rejects_bad_files() {
+        let good_circuit = || CircuitEntry {
+            name: "Main".to_string(),
+            snapshot: CircuitSnapshot {
+                components: vec![],
+                tunnels: vec![],
+                nodes: vec![],
+                segments: vec![],
+            },
+            subcircuits: vec![],
+        };
+
+        // Unsupported version.
+        let f = ProjectFile {
+            version: CURRENT_VERSION + 1,
+            active: 0,
+            circuits: vec![good_circuit()],
+        };
+        assert_eq!(
+            f.validate(),
+            Err(LoadError::UnsupportedVersion {
+                found: CURRENT_VERSION + 1,
+                supported: CURRENT_VERSION,
+            })
+        );
+
+        // No circuits at all.
+        let f = ProjectFile::new(0, vec![]);
+        assert_eq!(f.validate(), Err(LoadError::EmptyProject));
+
+        // `active` out of range.
+        let f = ProjectFile::new(3, vec![good_circuit()]);
+        assert_eq!(
+            f.validate(),
+            Err(LoadError::CircuitIndexOutOfRange { index: 3, len: 1 })
+        );
+
+        // A subcircuit reference pointing at a non-existent circuit.
+        let mut c = good_circuit();
+        c.snapshot.components.push(ComponentEntry {
+            spec: ComponentSpec::Output,
+            grid_pos: GridPos::ZERO,
+        });
+        c.subcircuits.push(SubcircuitRef {
+            component: 0,
+            circuit: 9,
+        });
+        let f = ProjectFile::new(0, vec![c]);
+        assert_eq!(
+            f.validate(),
+            Err(LoadError::CircuitIndexOutOfRange { index: 9, len: 1 })
+        );
+    }
+}

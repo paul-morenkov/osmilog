@@ -114,12 +114,15 @@ impl History {
 
     /// Keep-set for tombstone GC: every wire node/segment key referenced by
     /// any WiringDelta in the history, including a pending open batch. See
-    /// `Wiring::remove_unreferenced_tombstones`. Not yet called anywhere.
-    #[allow(dead_code)]
+    /// `Wiring::remove_unreferenced_tombstones`.
     pub fn referenced_wire_keys(&self) -> (HashSet<WireNodeKey>, HashSet<WireSegKey>) {
         let mut nodes = HashSet::new();
         let mut segs = HashSet::new();
-        fn walk(entry: &HistoryEntry, nodes: &mut HashSet<WireNodeKey>, segs: &mut HashSet<WireSegKey>) {
+        fn walk(
+            entry: &HistoryEntry,
+            nodes: &mut HashSet<WireNodeKey>,
+            segs: &mut HashSet<WireSegKey>,
+        ) {
             match entry {
                 HistoryEntry::Gui(GuiUndoAction::WiringDelta { delta, .. }) => {
                     delta.collect_keys(nodes, segs);

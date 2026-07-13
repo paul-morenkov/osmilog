@@ -40,6 +40,7 @@ pub struct DocState {
     pub(crate) selected: Option<Selection>,
     pub(crate) clock: ClockControl,
     pub(crate) rom_editor_open: Option<PlacedCompKey>,
+    pub(crate) ram_editor_open: Option<PlacedCompKey>,
 }
 
 impl DocState {
@@ -56,6 +57,7 @@ impl DocState {
             selected: None,
             clock: ClockControl::default(),
             rom_editor_open: None,
+            ram_editor_open: None,
         }
     }
 }
@@ -66,6 +68,15 @@ impl DocState {
 pub struct CircuitDoc {
     pub(crate) name: String,
     pub(crate) state: Option<DocState>,
+}
+
+impl CircuitDoc {
+    pub(crate) fn blank(name: String) -> Self {
+        Self {
+            name,
+            state: Some(DocState::blank()),
+        }
+    }
 }
 
 /// Default name suggested for a new circuit, e.g. "Circuit 2" for the second

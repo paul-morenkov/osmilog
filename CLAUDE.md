@@ -28,8 +28,9 @@ WASM adds `wasm-bindgen`/`wasm-bindgen-futures`/`js-sys`/`web-sys`.
     src/sim/circuit.rs                Circuit - the simulation graph, evaluation engine, tunnels
     src/sim/command.rs                Command/CommandOutput/UndoAction - the undo-recordable mutation layer
 
-    src/gui.rs                       pub mod app / geometry / gui_undo / history / placed_component / shape / theme / wiring
+    src/gui.rs                       pub mod app / document / geometry / gui_undo / history / placed_component / shape / theme / wiring
     src/gui/app.rs                    OsmilogApp (eframe::App) - state, interaction modes, rendering, menu
+    src/gui/document.rs               DocId/CircuitDoc/DocState - the multiple-open-circuits model
     src/gui/placed_component.rs       PlacedComponent - visual record; GUI-only display methods on ComponentSpec
     src/gui/wiring.rs                 Wiring - GUI's own connectivity graph (grid nodes + segments), + WiringDelta undo
     src/gui/gui_undo.rs               GuiUndoAction (Wiring delta / drag-move) + OsmilogApp::edit_wiring/commit_move
@@ -167,7 +168,7 @@ references. The remaining real inverses: `DeactivateComponent`/`DeactivateTunnel
 ### Component model (`component.rs` + `component/*.rs`)
 
     pub struct Component { pub pins: Pins, pub logic: Logic }
-    pub enum Logic { Comb(LogicComb), Seq(LogicSeq) }
+    pub enum Logic { Comb(LogicComb), Seq(LogicSeq), Sub(SubCircuit) }
 
     pub trait CombLogic {
         fn n_inputs(&self) -> usize;
@@ -178,10 +179,10 @@ references. The remaining real inverses: `DeactivateComponent`/`DeactivateTunnel
     }
 
 Every combinational component type (`Gate`, `Mux`, `Demux`, `Splitter`/`Combine`, `Encoder`,
-`Adder`, `Subtractor`, `Multiplier`, `Divider`, `Comparator`, `Rom` - one struct per file under
-`component/`) implements `CombLogic`, bundling its construction params, pin arity, and evaluation
-logic in one place so they can't drift apart. `Input` and `Output` are the two sourceless/sinkless
-special cases.
+`Adder`, `Subtractor`, `Multiplier`, `Divider`, `Comparator`, `Rom`, `Constant` - one struct per
+file under `component/`) implements `CombLogic`, bundling its construction params, pin arity, and
+evaluation logic in one place so they can't drift apart. `Input` and `Output` are the two
+sourceless/sinkless special cases.
 
 `Rom` (read-only memory: one address input "A", one data output "D") is the one combinational type
 carrying *bulk* state - its `Vec<u32>` contents (length `2^address_width`) are the construction
@@ -226,9 +227,10 @@ free-floating window.
         fn output_width(&self, i: usize) -> Option<u8>;
     }
 
-Sequential component types (`Logic::Seq`; currently `Reg`, with more - e.g. `DFlipFlop` - being
-added the same way) implement `SeqLogic` instead, and each one splits in two: a `*Conf` struct
-(`RegConf`) holding only static construction params, and a runtime struct (`Reg`) that wraps a
+Sequential component types (`Logic::Seq`: `Reg`, `ShiftReg`, `DFlipFlop`, `TFlipFlop`,
+`JKFlipFlop`, `SRFlipFlop`, `Counter`) implement `SeqLogic` instead, and each one splits in two: a
+`*Conf` struct (`RegConf`) holding only static construction params, and a runtime struct (`Reg`)
+that wraps a
 `conf: RegConf` plus the mutable latched `Value`. This mirrors `CombLogic`'s "one struct, config +
 logic together" idea while keeping the params embeddable in `ComponentSpec` (see below) without
 runtime state riding along - `LogicSeq::Reg(Reg)` holds the runtime struct; `ComponentSpec::Reg`
@@ -248,6 +250,38 @@ and *not* undoable - like clock ticks (see the Command layer / In-Progress notes
 changes happen in `settle()`/derived-rebuild rather than through a recorded `Command`. See each file
 under `src/sim/component/` for a given type's specific behavior.
 
+### Subcircuits (`Logic::Sub` / `SubCircuit`, `component.rs`)
+
+A whole other `Circuit` simulated as one component - a third `Logic` variant alongside `Comb` and
+`Seq`, because it both propagates combinationally (its inner circuit needs `&mut` to `settle()`)
+and holds clocked state (it forwards clock ticks inward):
+
+    pub enum Logic { Comb(LogicComb), Seq(LogicSeq), Sub(SubCircuit) }
+    pub struct SubCircuit { pub inner: Circuit, pub inputs: Vec<CompKey>, pub outputs: Vec<CompKey> }
+
+`inputs`/`outputs` are the inner boundary `Input`/`Output` component keys, in the pin order this
+component exposes outward (the GUI derives that order top-down from grid position). `SubCircuit`
+reuses the same `apply_async`-then-`evaluate` shape `Seq` components use: `apply_async`
+(`drive_and_settle`, `&mut`) drives the boundary `Input`s via `Circuit::drive_input` (injects a
+`Value` onto an `Input`'s `out_cache`; idempotent - re-driving the same values marks nothing dirty)
+and calls `inner.settle()`; `evaluate`/`observe` (`&self`) then just reads the boundary `Output`s,
+already settled. `tick`/`reset` forward to `inner.tick_clock()`/`inner.reset_sequential()`.
+`Component::is_stateful()` (`Seq(_) | Sub(_)`) is what the engine's whole-component sweeps
+(`eval_component`'s `apply_async`, `tick_clock`, `reset_sequential`) key on rather than
+`is_sequential()` (`Seq(_)` only), since a subcircuit needs the same per-settle/per-tick treatment
+a sequential component does despite not being one.
+
+`Component::subcircuit(inner, inputs, outputs)` builds a real one; `Component::
+subcircuit_placeholder(n_inputs, n_outputs)` builds a correctly-pinned one with an empty inner
+`Circuit` (settles to all-`Floating` outputs) - the safe fallback `ComponentSpec::to_component()`
+uses on a `Subcircuit` spec, since building the *real* inner circuit needs the GUI's document
+registry that `sim` doesn't have (see `gui::app::instantiate` below, the actual path the GUI uses).
+
+`DocId` (a `slotmap` key) is defined in `sim::component` rather than the GUI, so `ComponentSpec`
+can embed it without `sim` depending on `gui` - it's re-exported from `gui::document`, where the
+document registry (`SlotMap<DocId, CircuitDoc>`) actually lives. The simulator never dereferences
+it.
+
 ### ComponentSpec (`component.rs`)
 
     pub enum ComponentSpec { Input(Input), Gate(Gate), Mux(Mux), Reg(RegConf), .. }
@@ -261,6 +295,16 @@ like `ComponentSpec::Reg` holds the bare `RegConf`, never the runtime `Reg`. It'
 methods to this same type). There is no `Component -> ComponentSpec` inverse: undo tombstones live
 components rather than snapshotting them into specs, so nothing needs to reconstruct a spec from a
 live `Component`.
+
+`ComponentSpec::Subcircuit { doc: DocId, name: String, input_widths: Vec<u8>, output_widths:
+Vec<u8> }` is the one variant that can't build its live `Component` from its own fields alone (see
+Subcircuits above) - `doc` is the link, and `name`/the widths are a *cached derived interface*
+(mirroring how `Rom` caches its bulk contents in the spec) so every `&self` spec method
+(`n_inputs`/`size`/`shape`/...) works with no document registry in scope. `doc` is `#[serde(skip)]`
+since a `DocId` is an ephemeral slotmap key with no cross-reload meaning - see Save/Load below for
+how the cross-circuit link actually persists. The cache is refreshed against the referenced
+document by `gui::app::refresh_subcircuits` (called on every switch back to a document, so edits
+made to a child circuit while it was active show up in its parent's placed instances).
 
 ## GUI (`src/gui/`)
 
@@ -279,6 +323,11 @@ The `eframe::App` implementation, split into `logic` (pre-frame) and `ui` (paint
 - `selected: Option<Selected>`, `bulk_selection: Vec<Selected>` - single selection (drives the
   properties panel) and rectangle multi-select, kept separate.
 - `pan: Vec2` - canvas pan offset (present but not yet wired to any interaction - see In-Progress).
+- `documents: SlotMap<DocId, CircuitDoc>`, `doc_order: Vec<DocId>`, `active: DocId` - every open
+  circuit document and which one is live (see Documents / multiple circuits below). All of the
+  fields above (`circuit`, `history`, `components`, `tunnels`, `wiring`, `mode`, `pan`, `selected`,
+  `clock`, `rom_editor_open`) are *per-document* state; they hold the active document's state
+  directly, and every other document parks the same fields in a `DocState`.
 
 `InteractionMode` covers `Idle`, `Placing { spec: ComponentSpec }`, `PlacingTunnel`, `WireDraw`
 (hybrid drag-elbow / click-polyline wire drawing), `ComponentDrag`, and `BulkSelect` (rubber-band
@@ -296,6 +345,70 @@ key: TunnelKey, label: String, role: TunnelRole, grid_pos: GridPos }` are the GU
 records - a circuit-layer key plus enough to draw and place the thing. `PlacedTunnel` is the one
 entity with a user-editable display label; components only have hardcoded, non-editable
 per-type/pin labels (`ComponentSpec::label()`, `ComponentShape::labels`).
+
+### Documents / multiple circuits (`document.rs`, `app.rs`)
+
+`OsmilogApp` can hold several circuit documents in memory at once, so a subcircuit has something
+to reference. Exactly one is *active*: its state lives directly in the live per-circuit fields
+listed under OsmilogApp above; every other document parks the same set of fields in a `DocState`:
+
+    pub struct DocState { circuit, history, components, tunnels, wiring, mode, pan, selected, clock, rom_editor_open }
+    pub struct CircuitDoc { name: String, state: Option<DocState> }   // state is None iff active
+
+Switching (`OsmilogApp::switch_circuit`) is a pair of `std::mem` moves - `take_active_state` empties
+the live fields into a `DocState` parked on the outgoing document, `put_active_state` installs the
+incoming document's parked `DocState` into the live fields - never serialization, so switching
+never deep-copies a `ComponentSpec` or a ROM's contents. Because a parked circuit already holds its
+settled nets, no net rebuild is needed on switch; what *is* needed is `refresh_subcircuits()` (see
+below), since child circuits may have changed while this document was inactive. `doc_order: Vec<
+DocId>` fixes the display order for the palette and the persisted circuit order (`SlotMap`
+iteration order is unspecified); `create_circuit_doc` parks the current document, allocates a new
+blank one via `DocState::blank()`, and appends it to `doc_order`. There is currently no UI to
+rename or delete a circuit document (see In-Progress).
+
+### Subcircuits (`app.rs`)
+
+Placing a document as a component inside another. The GUI is the *only* place that can build a
+subcircuit's real inner `Circuit` (see the Simulator's Subcircuits section above for why
+`ComponentSpec::to_component()` alone can't - it has no document registry):
+
+- `OsmilogApp::instantiate(spec)` is the one spec->component build path the GUI itself uses
+  (`place_component`, `reconfigure_component`) - identical to `spec.to_component()` for every
+  primitive type, but for `ComponentSpec::Subcircuit` it calls `build_doc_circuit` to build a real
+  inner `Circuit` instead of a placeholder. `instantiate_with`'s `visited: &mut Vec<DocId>` breaks
+  an accidental reference cycle during the recursive build (real cycles are already refused at
+  placement time by `would_cycle`) by yielding an empty placeholder instead of recursing forever.
+- `build_doc_circuit(doc, visited)` builds a fresh standalone `Circuit` from a referenced
+  document's parked records (components/tunnels/wiring), translating them the same way
+  `rebuild_circuit` translates the *live* document - but into a new `Circuit`, untracked, and
+  recursing through `instantiate_with` for nested subcircuits. It returns the inner boundary
+  `Input`/`Output` `CompKey`s ordered top-down (then left-to-right by `grid_pos`), which fixes the
+  outer pin order a placed subcircuit exposes.
+- `derive_subcircuit_interface(doc)` returns `(name, input_widths, output_widths)` by actually
+  building the doc's circuit and reading its boundary widths - the source of truth
+  `ComponentSpec::Subcircuit`'s cache is refreshed from.
+- `refresh_subcircuits()` (called by `switch_circuit` on every switch *back* to a document) walks
+  every placed `Subcircuit` in the now-active document and reconciles it against its referenced
+  document: if the boundary (pin count) changed, it goes through the normal undoable
+  `reconfigure_component` path (prunes wires to dropped pins, same positional binding as any other
+  reconfigure); if the boundary is unchanged, it just rebuilds the inner `Circuit` in place
+  (`rebuild_subcircuit_inner`) and refreshes the cached name, then does one final
+  `rebuild_circuit()` so the re-derived inner outputs settle outward.
+- `doc_references(doc)`/`would_cycle(target)` walk placed-`Subcircuit` references (transitively) to
+  refuse placing a document into itself, directly or through a chain of subcircuits - checked
+  before every placement, in the component palette.
+
+**Pin binding is positional**, like any other reconfigure: outer pins map to inner boundary
+`Input`/`Output`s top-down by grid position, and an inner I/O edit that changes the boundary prunes
+stale wires exactly like `reconfigure_component` does for any other type.
+
+**Placement UX**: the left panel's "User Created" list (`show_component_palette`) shows one
+selectable entry per document. A single click enters `InteractionMode::Placing` with a
+`subcircuit_spec(doc)` ghost that follows the cursor - nothing is placed until a canvas click, same
+as any other palette item. A double click instead calls `switch_circuit` to open that document for
+editing (cancelling any placement the double-click's first click started, so a double-click never
+also drops a stray component). An entry that would create a cycle is disabled with a tooltip
+instead of removed, so the list's shape doesn't shift as you edit.
 
 ### Wiring (`wiring.rs`)
 
@@ -431,4 +544,9 @@ app state).
   downstream.
 - **`set_input` error handling**: silently no-ops on a non-`Input` component instead of returning
   a `Result` (marked with a `TODO` in `circuit.rs`).
-- **Subcircuits / hierarchical components**: not started.
+- **Circuit document management**: subcircuits (see the Documents / Subcircuits sections under GUI)
+  are implemented end-to-end, including project-file persistence - but there's no UI yet to rename
+  or delete a circuit document once created (`create_circuit_doc` is the only mutator). Undo/redo
+  is also scoped per-document (`History` lives inside each `DocState`), so it does not span a
+  circuit switch - undoing in a parent after editing and switching back out of a child only undoes
+  the parent's own edits, never reaches into the child's history.

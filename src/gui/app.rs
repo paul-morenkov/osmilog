@@ -243,12 +243,16 @@ pub struct OsmilogApp {
     // Set by the "Edit contents…" button in the properties panel; the window
     // (show_rom_editor) closes it on ✕ or if the component goes away.
     rom_editor_open: Option<PlacedCompKey>,
+    // Same as rom_editor_open, for RAM's near-identical contents editor
+    // (show_ram_editor).
+    ram_editor_open: Option<PlacedCompKey>,
     // ── Multiple circuits ──────────────────────────────────────────────────
     // All circuit documents held in memory. Exactly one is *active*: its
     // per-circuit state (circuit/history/components/tunnels/wiring/mode/pan/
-    // selected/clock/rom_editor_open, above) lives directly in those live
-    // fields, and its `CircuitDoc::state` is None. Every other document parks
-    // its state in `CircuitDoc::state` until switched to. See DocState.
+    // selected/clock/rom_editor_open/ram_editor_open, above) lives directly in
+    // those live fields, and its `CircuitDoc::state` is None. Every other
+    // document parks its state in `CircuitDoc::state` until switched to. See
+    // DocState.
     documents: SlotMap<DocId, CircuitDoc>,
     // Stable palette display order for `documents` (SlotMap iteration order is
     // unspecified). Grows as circuits are created.
@@ -299,10 +303,12 @@ impl OsmilogApp {
             selected: None,
             clipboard: Clipboard::new(),
             last_settle_error: None,
+            #[allow(clippy::default_constructed_unit_structs)]
             io: platform::IoState::default(),
             show_profiler: false,
             clock: ClockControl::default(),
             rom_editor_open: None,
+            ram_editor_open: None,
             documents,
             doc_order: vec![active],
             active,
@@ -332,6 +338,7 @@ impl OsmilogApp {
             selected: self.selected.take(),
             clock: std::mem::take(&mut self.clock),
             rom_editor_open: self.rom_editor_open.take(),
+            ram_editor_open: self.ram_editor_open.take(),
         }
     }
 
@@ -348,6 +355,7 @@ impl OsmilogApp {
         self.selected = state.selected;
         self.clock = state.clock;
         self.rom_editor_open = state.rom_editor_open;
+        self.ram_editor_open = state.ram_editor_open;
     }
 
     // Make `target` the active document: park the current active's live state
@@ -395,6 +403,16 @@ impl OsmilogApp {
     // is true. Only Stop (which resets sequential state) returns to editable.
     pub fn editing_locked(&self) -> bool {
         self.clock.run != ClockRun::Stopped
+    }
+
+    // True while live *value* edits must be blocked - an Input's bits, a ROM's
+    // or RAM's contents. Unlike the blanket editing_locked(), these are carved
+    // out of the lock while Paused: a paused run is frozen structurally, but an
+    // Input can still be driven to new stimulus and memory poked between steps,
+    // so this is true only while actively Playing. Structural edits (widths,
+    // wiring, add/delete) stay gated on editing_locked().
+    pub fn value_editing_locked(&self) -> bool {
+        self.clock.run == ClockRun::Playing
     }
 
     // Advances the clock exactly one tick, untracked (bypassing self.apply) so
@@ -1112,6 +1130,8 @@ impl OsmilogApp {
 
         self.install_circuit_records(snapshot, &[], &[]);
         self.rebuild_circuit();
+        // Clear undo stack that results from `rebuild_circuit()`
+        self.history = History::default();
         Ok(())
     }
 
@@ -1135,12 +1155,7 @@ impl OsmilogApp {
         let doc_ids: Vec<DocId> = file
             .circuits
             .iter()
-            .map(|c| {
-                documents.insert(CircuitDoc {
-                    name: c.name.clone(),
-                    state: Some(DocState::blank()),
-                })
-            })
+            .map(|c| documents.insert(CircuitDoc::blank(c.name.clone())))
             .collect();
 
         self.documents = documents;
@@ -1190,6 +1205,9 @@ impl OsmilogApp {
     fn load_circuit_entry(&mut self, entry: &CircuitEntry, doc_ids: &[DocId]) {
         self.install_circuit_records(&entry.snapshot, &entry.subcircuits, doc_ids);
         self.rebuild_circuit();
+        // See load_snapshot: placement records undo entries that loading a
+        // fresh document should not carry.
+        self.history = History::default();
     }
 
     // Places one circuit's records (components, tunnels, wire nodes/segments)
@@ -1229,7 +1247,7 @@ impl OsmilogApp {
             .map(|entry| self.place_tunnel_labeled(entry.label.clone(), entry.role, entry.grid_pos))
             .collect();
 
-        let node_keys: Vec<crate::gui::wiring::WireNodeKey> = snapshot
+        let node_keys: Vec<_> = snapshot
             .nodes
             .iter()
             .map(|entry| {
@@ -1283,23 +1301,23 @@ impl OsmilogApp {
             }
             Some(Selection::Single(sel)) => *sel,
         };
-        // The whole editor is read-only during a run session. Future
-        // runtime-drivable components (e.g. a Button, or live Input toggles)
-        // would carve their specific widgets out of this lock - e.g. via a
-        // `spec.accepts_runtime_input()` predicate consulted inside the
-        // per-component editors - rather than being blanket-disabled here.
-        let locked = self.editing_locked();
-        ui.add_enabled_ui(!locked, |ui| {
-            match sel {
-                Selected::Component(key) => self.show_component_properties(key, ui),
-                Selected::Tunnel(key) => self.show_tunnel_properties(key, ui),
-                Selected::Wire(_) => {
-                    ui.heading("WIRE");
-                    ui.label("A wire segment. Press Backspace or Delete to remove it.");
-                }
+        // A run session makes structural edits read-only, but value edits
+        // (an Input's bits, ROM/RAM contents) stay live while Paused. Rather
+        // than blanket-disabling the panel, each per-component editor gates its
+        // own widgets - structural ones on editing_locked(), value ones on
+        // value_editing_locked() - so the carve-out lands on exactly those.
+        match sel {
+            Selected::Component(key) => self.show_component_properties(key, ui),
+            Selected::Tunnel(key) => self.show_tunnel_properties(key, ui),
+            Selected::Wire(_) => {
+                ui.heading("WIRE");
+                ui.label("A wire segment. Press Backspace or Delete to remove it.");
             }
+        }
 
-            ui.separator();
+        ui.separator();
+        // Delete is structural: disabled for the whole run session.
+        ui.add_enabled_ui(!self.editing_locked(), |ui| {
             if ui.button("Delete").clicked() {
                 match sel {
                     Selected::Component(key) => self.delete_component(key),
@@ -1319,124 +1337,123 @@ impl OsmilogApp {
             TunnelRole::Pull => "TUNNEL (PULL)",
         });
         ui.separator();
-        ui.label("Label:");
-        let mut label = self.tunnels[key].label.clone();
-        let response = ui.text_edit_singleline(&mut label);
-        if response.changed() {
-            self.tunnels[key].label = label.clone();
-        }
-
-        // Commit on any focus loss (Enter/Tab/click-away), not just Enter: the
-        // record label is already updated live above (on `changed()`), but the
-        // circuit's hasn't committed yet, so read the old label from the
-        // circuit to both detect a real change and capture undo's restore
-        // value. (rebuild_circuit also reconciles as a backstop.)
-        if response.lost_focus() {
-            let old_label = self
-                .circuit
-                .tunnels
-                .get(tunnel_key)
-                .map(|t| t.label.clone());
-            if old_label.as_deref() != Some(label.as_str()) {
-                self.history.begin_batch();
-                self.apply(Command::RenameTunnel {
-                    tunnel: tunnel_key,
-                    new_label: label.clone(),
-                });
-                // Record the record-side label change's undo (the Sim
-                // RenameTunnel above only reverses the circuit's copy).
-                if let Some(old) = old_label {
-                    self.history
-                        .push_gui(GuiUndoAction::SetTunnelLabel { key, label: old });
-                }
-                self.tunnels[key].label = label;
-                self.history.end_batch();
-                let result = self.circuit.settle();
-                self.record_settle_result(result);
+        // A tunnel's label is structural (it rewires nets): read-only for the
+        // whole run session.
+        ui.add_enabled_ui(!self.editing_locked(), |ui| {
+            ui.label("Label:");
+            let mut label = self.tunnels[key].label.clone();
+            let response = ui.text_edit_singleline(&mut label);
+            if response.changed() {
+                self.tunnels[key].label = label.clone();
             }
-        }
+
+            // Commit on any focus loss (Enter/Tab/click-away), not just Enter:
+            // the record label is already updated live above (on `changed()`),
+            // but the circuit's hasn't committed yet, so read the old label
+            // from the circuit to both detect a real change and capture undo's
+            // restore value. (rebuild_circuit also reconciles as a backstop.)
+            if response.lost_focus() {
+                let old_label = self
+                    .circuit
+                    .tunnels
+                    .get(tunnel_key)
+                    .map(|t| t.label.clone());
+                if old_label.as_deref() != Some(label.as_str()) {
+                    self.history.begin_batch();
+                    self.apply(Command::RenameTunnel {
+                        tunnel: tunnel_key,
+                        new_label: label.clone(),
+                    });
+                    // Record the record-side label change's undo (the Sim
+                    // RenameTunnel above only reverses the circuit's copy).
+                    if let Some(old) = old_label {
+                        self.history
+                            .push_gui(GuiUndoAction::SetTunnelLabel { key, label: old });
+                    }
+                    self.tunnels[key].label = label;
+                    self.history.end_batch();
+                    let result = self.circuit.settle();
+                    self.record_settle_result(result);
+                }
+            }
+        });
     }
 
     fn show_component_properties(&mut self, key: PlacedCompKey, ui: &mut egui::Ui) {
-        let pc = &self.components[key];
-        let comp_key = pc.key;
+        let comp_key = self.components[key].key;
 
-        ui.heading(pc.spec.label());
+        ui.heading(self.components[key].spec.label());
         ui.separator();
 
-        // ROM is handled before the generic `pc.spec.clone()` below: a ROM's
-        // spec carries its whole contents buffer, and Clone deep-copies it (see
-        // Rom), so cloning it every frame the panel is shown would be a large
-        // per-frame copy. Read only its (Copy) widths by reference instead.
-        if matches!(self.components[key].spec, ComponentSpec::Rom(_)) {
-            let (mut data_width, mut address_width) = match &self.components[key].spec {
-                ComponentSpec::Rom(rom) => (rom.data_width, rom.address_width),
-                _ => unreachable!(),
-            };
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                ui.label("Data width:");
-                changed |= ui
-                    .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                    .changed();
-            });
-            ui.horizontal(|ui| {
-                ui.label("Address width:");
-                changed |= ui
-                    .add(egui::DragValue::new(&mut address_width).range(1..=MAX_ADDRESS_WIDTH))
-                    .changed();
-            });
-            ui.label(format!("{} words", 1usize << address_width));
-            if changed {
-                // Preserve+fit: resize/mask the existing contents rather than
-                // wiping them, then reconfigure through the normal (undoable)
-                // path. resized() owns a fresh buffer, so the immutable borrow
-                // ends before reconfigure_component takes &mut self.
-                let resized = match &self.components[key].spec {
-                    ComponentSpec::Rom(rom) => rom.resized(data_width, address_width),
-                    _ => unreachable!(),
-                };
-                self.reconfigure_component(key, ComponentSpec::Rom(resized));
-            }
-            if ui.button("Edit contents…").clicked() {
-                self.rom_editor_open = Some(key);
-            }
-            return;
-        }
+        // A run session locks *structural* edits (widths, arity, wiring) for its
+        // whole duration, but carves out live *value* edits - an Input's bits and
+        // ROM/RAM contents - which stay pokeable while Paused (blocked only while
+        // actively Playing). Every editable widget below is gated on whichever
+        // predicate applies; read-only value displays stay ungated so a running
+        // circuit's state remains observable.
+        let structural_ok = !self.editing_locked();
+        let value_ok = !self.value_editing_locked();
 
-        let spec = pc.spec.clone();
-        match spec {
+        // The spec is matched *by reference*: a ROM/RAM spec carries its whole
+        // contents buffer (up to tens of MiB), so cloning it every frame just to
+        // own the match scrutinee is out. Borrowing it means the arms can't call
+        // the &mut self mutators (reconfigure/switch/open-editor) while the match
+        // is live, so each records a deferred PropEdit that we apply once the
+        // borrow ends, just past the match.
+        enum PropEdit {
+            Reconfigure(ComponentSpec),
+            OpenRom,
+            OpenRam,
+            OpenCircuit(DocId),
+        }
+        let mut edit: Option<PropEdit> = None;
+
+        let fmt_val = |v: Value| match v {
+            Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
+            Value::Floating => "Floating".to_string(),
+            Value::Invalid => "Invalid (width mismatch)".to_string(),
+        };
+
+        match &self.components[key].spec {
             ComponentSpec::Input(Input {
                 mut bits,
                 mut width,
             }) => {
                 let mut changed = false;
                 ui.label(format!("Value: 0x{:X}", bits));
-
-                // `bits` controlled by checkbox or textfield depending on `width`
-                if width == 1 {
-                    let mut high = bits != 0;
-                    if ui.checkbox(&mut high, "Toggle").clicked() {
-                        bits = high as u32;
-                        changed = true;
+                // `bits` is the live value: editable while Paused.
+                ui.add_enabled_ui(value_ok, |ui| {
+                    // `bits` controlled by checkbox or textfield depending on `width`
+                    if width == 1 {
+                        let mut high = bits != 0;
+                        if ui.checkbox(&mut high, "Toggle").clicked() {
+                            bits = high as u32;
+                            changed = true;
+                        }
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("Bits:");
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut bits).range(0..=Value::mask(width)))
+                                .changed();
+                        });
                     }
-                } else {
+                });
+                // `width` is structural: locked for the whole run session.
+                ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Bits:");
+                        ui.label("Width:");
                         changed |= ui
-                            .add(egui::DragValue::new(&mut bits).range(0..=Value::mask(width)))
+                            .add(egui::DragValue::new(&mut width).range(1..=32))
                             .changed();
                     });
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut width).range(1..=32))
-                        .changed();
                 });
                 if changed {
                     bits &= Value::mask(width); // In case width was changed below max `bits` value
-                    self.reconfigure_component(key, ComponentSpec::Input(Input { bits, width }));
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Input(Input {
+                        bits,
+                        width,
+                    })));
                 }
             }
             ComponentSpec::Constant(Constant {
@@ -1445,74 +1462,70 @@ impl OsmilogApp {
             }) => {
                 let mut changed = false;
                 ui.label(format!("Value: 0x{:X}", bits));
-
-                // `bits` controlled by checkbox or textfield depending on `width`
-                if width == 1 {
-                    let mut high = bits != 0;
-                    if ui.checkbox(&mut high, "Toggle").clicked() {
-                        bits = high as u32;
-                        changed = true;
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    // `bits` controlled by checkbox or textfield depending on `width`
+                    if width == 1 {
+                        let mut high = bits != 0;
+                        if ui.checkbox(&mut high, "Toggle").clicked() {
+                            bits = high as u32;
+                            changed = true;
+                        }
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("Bits:");
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut bits).range(0..=Value::mask(width)))
+                                .changed();
+                        });
                     }
-                } else {
                     ui.horizontal(|ui| {
-                        ui.label("Bits:");
+                        ui.label("Width:");
                         changed |= ui
-                            .add(egui::DragValue::new(&mut bits).range(0..=Value::mask(width)))
+                            .add(egui::DragValue::new(&mut width).range(1..=32))
                             .changed();
                     });
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut width).range(1..=32))
-                        .changed();
                 });
                 if changed {
                     bits &= Value::mask(width); // In case width was changed below max `bits` value
-                    self.reconfigure_component(
-                        key,
-                        ComponentSpec::Constant(Constant { bits, width }),
-                    );
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Constant(Constant {
+                        bits,
+                        width,
+                    })));
                 }
             }
             ComponentSpec::Output => {
                 let val = self.circuit.read_output(comp_key);
-                let val_str = match val {
-                    Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
-                    Value::Floating => "Floating".to_string(),
-                    Value::Invalid => "Invalid (width mismatch)".to_string(),
-                };
-                ui.label(format!("Value: {}", val_str));
+                ui.label(format!("Value: {}", fmt_val(val)));
             }
             ComponentSpec::Gate(Gate {
                 op,
                 mut n_inputs,
                 mut width,
             }) => {
+                let op = *op;
                 let mut changed = false;
-                if op != GateOp::Not {
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    if op != GateOp::Not {
+                        ui.horizontal(|ui| {
+                            ui.label("Inputs:");
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut n_inputs).range(2..=8))
+                                .changed();
+                        });
+                    }
                     ui.horizontal(|ui| {
-                        ui.label("Inputs:");
+                        ui.label("Width:");
                         changed |= ui
-                            .add(egui::DragValue::new(&mut n_inputs).range(2..=8))
+                            .add(egui::DragValue::new(&mut width).range(1..=32))
                             .changed();
                     });
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut width).range(1..=32))
-                        .changed();
                 });
                 if changed {
-                    self.reconfigure_component(
-                        key,
-                        ComponentSpec::Gate(Gate {
-                            op,
-                            n_inputs,
-                            width,
-                        }),
-                    );
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Gate(Gate {
+                        op,
+                        n_inputs,
+                        width,
+                    })));
                 }
             }
             ComponentSpec::Mux(Mux {
@@ -1520,26 +1533,25 @@ impl OsmilogApp {
                 mut sel_width,
             }) => {
                 let mut changed = false;
-                ui.horizontal(|ui| {
-                    ui.label("Data width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Sel width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut sel_width).range(1..=4))
-                        .changed();
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Sel width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut sel_width).range(1..=4))
+                            .changed();
+                    });
                 });
                 if changed {
-                    self.reconfigure_component(
-                        key,
-                        ComponentSpec::Mux(Mux {
-                            data_width,
-                            sel_width,
-                        }),
-                    );
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Mux(Mux {
+                        data_width,
+                        sel_width,
+                    })));
                 }
             }
             ComponentSpec::Demux(Demux {
@@ -1547,47 +1559,45 @@ impl OsmilogApp {
                 mut sel_width,
             }) => {
                 let mut changed = false;
-                ui.horizontal(|ui| {
-                    ui.label("Data width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Sel width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut sel_width).range(1..=4))
-                        .changed();
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Sel width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut sel_width).range(1..=4))
+                            .changed();
+                    });
                 });
                 if changed {
-                    self.reconfigure_component(
-                        key,
-                        ComponentSpec::Demux(Demux {
-                            data_width,
-                            sel_width,
-                        }),
-                    );
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Demux(Demux {
+                        data_width,
+                        sel_width,
+                    })));
                 }
             }
             ComponentSpec::Reg(RegConf { mut data_width }) => {
                 let mut changed = false;
-                ui.horizontal(|ui| {
-                    ui.label("Data width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                        .changed();
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                            .changed();
+                    });
                 });
                 if changed {
-                    self.reconfigure_component(key, ComponentSpec::Reg(RegConf { data_width }));
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Reg(RegConf {
+                        data_width,
+                    })));
                 }
 
                 let cur = self.circuit.components[comp_key].pins.out_cache[0];
-                let val_str = match cur {
-                    Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
-                    Value::Floating => "Floating".to_string(),
-                    Value::Invalid => "Invalid (width mismatch)".to_string(),
-                };
-                ui.label(format!("Value: {}", val_str));
+                ui.label(format!("Value: {}", fmt_val(cur)));
             }
             ComponentSpec::ShiftReg(ShiftRegConf {
                 mut data_width,
@@ -1595,44 +1605,40 @@ impl OsmilogApp {
                 mut parallel_load,
             }) => {
                 let mut changed = false;
-                ui.horizontal(|ui| {
-                    ui.label("Data width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Stages:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut num_stages).range(1..=16))
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    changed |= ui.checkbox(&mut parallel_load, "Parallel load").changed();
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Stages:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut num_stages).range(1..=16))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        changed |= ui.checkbox(&mut parallel_load, "Parallel load").changed();
+                    });
                 });
                 if changed {
-                    self.reconfigure_component(
-                        key,
-                        ComponentSpec::ShiftReg(ShiftRegConf {
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::ShiftReg(
+                        ShiftRegConf {
                             data_width,
                             num_stages,
                             parallel_load,
-                        }),
-                    );
+                        },
+                    )));
                 }
 
-                let val_str = |v: Value| match v {
-                    Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
-                    Value::Floating => "Floating".to_string(),
-                    Value::Invalid => "Invalid (width mismatch)".to_string(),
-                };
                 for (i, v) in self.circuit.components[comp_key]
                     .pins
                     .out_cache
                     .iter()
                     .enumerate()
                 {
-                    ui.label(format!("Stage {i}: {}", val_str(*v)));
+                    ui.label(format!("Stage {i}: {}", fmt_val(*v)));
                 }
             }
             ComponentSpec::Counter(CounterConf {
@@ -1641,240 +1647,340 @@ impl OsmilogApp {
                 mut overflow_action,
             }) => {
                 let mut changed = false;
-                ui.horizontal(|ui| {
-                    ui.label("Data width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Max value:");
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut max_value).range(0..=Value::mask(data_width)),
-                        )
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Overflow action:");
-                    egui::ComboBox::from_id_salt(key)
-                        .selected_text(format!("{overflow_action:?}"))
-                        .show_ui(ui, |ui| {
-                            for action in [
-                                OverflowAction::Wrap,
-                                OverflowAction::StayMax,
-                                OverflowAction::PassMax,
-                                OverflowAction::LoadNext,
-                            ] {
-                                changed |= ui
-                                    .selectable_value(
-                                        &mut overflow_action,
-                                        action,
-                                        format!("{action:?}"),
-                                    )
-                                    .changed();
-                            }
-                        });
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Max value:");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut max_value)
+                                    .range(0..=Value::mask(data_width)),
+                            )
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Overflow action:");
+                        egui::ComboBox::from_id_salt(key)
+                            .selected_text(format!("{overflow_action:?}"))
+                            .show_ui(ui, |ui| {
+                                for action in [
+                                    OverflowAction::Wrap,
+                                    OverflowAction::StayMax,
+                                    OverflowAction::PassMax,
+                                    OverflowAction::LoadNext,
+                                ] {
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut overflow_action,
+                                            action,
+                                            format!("{action:?}"),
+                                        )
+                                        .changed();
+                                }
+                            });
+                    });
                 });
                 if changed {
                     max_value = max_value.min(Value::mask(data_width)); // Re-cap in case data_width shrank below max_value
-                    self.reconfigure_component(
-                        key,
-                        ComponentSpec::Counter(CounterConf {
-                            data_width,
-                            max_value,
-                            overflow_action,
-                        }),
-                    );
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Counter(CounterConf {
+                        data_width,
+                        max_value,
+                        overflow_action,
+                    })));
                 }
 
                 let q = self.circuit.components[comp_key].pins.out_cache[0];
                 let carry = self.circuit.components[comp_key].pins.out_cache[1];
-                let val_str = |v: Value| match v {
-                    Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
-                    Value::Floating => "Floating".to_string(),
-                    Value::Invalid => "Invalid (width mismatch)".to_string(),
-                };
-                ui.label(format!("Q: {}", val_str(q)));
-                ui.label(format!("Carry: {}", val_str(carry)));
+                ui.label(format!("Q: {}", fmt_val(q)));
+                ui.label(format!("Carry: {}", fmt_val(carry)));
             }
             ComponentSpec::DFlipFlop(_)
             | ComponentSpec::TFlipFlop(_)
             | ComponentSpec::JKFlipFlop(_)
             | ComponentSpec::SRFlipFlop(_) => {
                 let cur = self.circuit.components[comp_key].pins.out_cache[0];
-                let val_str = match cur {
-                    Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
-                    Value::Floating => "Floating".to_string(),
-                    Value::Invalid => "Invalid (width mismatch)".to_string(),
-                };
-                ui.label(format!("Value: {}", val_str));
+                ui.label(format!("Value: {}", fmt_val(cur)));
             }
             ComponentSpec::Encoder(Encoder { mut sel_width }) => {
                 let mut changed = false;
-                ui.horizontal(|ui| {
-                    ui.label("Sel width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut sel_width).range(0..=4))
-                        .changed();
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Sel width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut sel_width).range(0..=4))
+                            .changed();
+                    });
                 });
                 if changed {
-                    self.reconfigure_component(key, ComponentSpec::Encoder(Encoder { sel_width }));
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Encoder(Encoder {
+                        sel_width,
+                    })));
                 }
             }
             ComponentSpec::Adder(Adder { mut data_width }) => {
                 let mut changed = false;
-                ui.horizontal(|ui| {
-                    ui.label("Data width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                        .changed();
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                            .changed();
+                    });
                 });
                 if changed {
-                    self.reconfigure_component(key, ComponentSpec::Adder(Adder { data_width }));
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Adder(Adder {
+                        data_width,
+                    })));
                 }
             }
             ComponentSpec::Subtractor(Subtractor { mut data_width }) => {
                 let mut changed = false;
-                ui.horizontal(|ui| {
-                    ui.label("Data width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                        .changed();
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                            .changed();
+                    });
                 });
                 if changed {
-                    self.reconfigure_component(
-                        key,
-                        ComponentSpec::Subtractor(Subtractor { data_width }),
-                    );
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Subtractor(
+                        Subtractor { data_width },
+                    )));
                 }
             }
             ComponentSpec::Multiplier(Multiplier { mut data_width }) => {
                 let mut changed = false;
-                ui.horizontal(|ui| {
-                    ui.label("Data width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                        .changed();
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                            .changed();
+                    });
                 });
                 if changed {
-                    self.reconfigure_component(
-                        key,
-                        ComponentSpec::Multiplier(Multiplier { data_width }),
-                    );
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Multiplier(
+                        Multiplier { data_width },
+                    )));
                 }
             }
             ComponentSpec::Divider(Divider { mut data_width }) => {
                 let mut changed = false;
-                ui.horizontal(|ui| {
-                    ui.label("Data width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                        .changed();
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                            .changed();
+                    });
                 });
                 if changed {
-                    self.reconfigure_component(key, ComponentSpec::Divider(Divider { data_width }));
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Divider(Divider {
+                        data_width,
+                    })));
                 }
             }
             ComponentSpec::Comparator(Comparator { mut data_width }) => {
                 let mut changed = false;
-                ui.horizontal(|ui| {
-                    ui.label("Data width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                        .changed();
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                            .changed();
+                    });
                 });
                 if changed {
-                    self.reconfigure_component(
-                        key,
-                        ComponentSpec::Comparator(Comparator { data_width }),
-                    );
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Comparator(
+                        Comparator { data_width },
+                    )));
                 }
             }
-            // ComponentSpec::Rom is handled before this match (see the top of
-            // this fn) to avoid deep-cloning its contents buffer every frame.
-            ComponentSpec::Rom(_) => unreachable!("Rom handled before the spec clone"),
-            ComponentSpec::Splitter {
-                mut width,
-                mut arm_bits,
-                mut direction,
-            } => {
+            // A ROM's contents buffer is huge, so its spec is matched by
+            // reference here (never cloned per-frame) - the whole reason the spec
+            // match above borrows rather than owns. Widths are structural;
+            // rom.resized() preserve-and-fits the contents into a fresh owned
+            // buffer, and editing the contents is a value edit (live while Paused).
+            ComponentSpec::Rom(
+                rom @ Rom {
+                    mut data_width,
+                    mut address_width,
+                    ..
+                },
+            ) => {
                 let mut changed = false;
-
-                let before_dir = direction;
-                ui.horizontal(|ui| {
-                    ui.label("Fan Direction:");
-                    ui.selectable_value(&mut direction, FanDirection::Right, "Split");
-                    ui.selectable_value(&mut direction, FanDirection::Left, "Combine");
-                });
-                changed |= direction != before_dir;
-
-                ui.horizontal(|ui| {
-                    ui.label("Data width:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut width).range(1..=32))
-                        .changed();
-                });
-                let mut arms = arm_bits.len() as u8;
-                ui.horizontal(|ui| {
-                    ui.label("Arms:");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut arms).range(1..=16))
-                        .changed();
-                });
-
-                // Apply width/arms bookkeeping before rendering bit rows below,
-                // so a shrink is reflected the same frame; truncating drops
-                // any bits assigned to a removed arm.
-                arm_bits.resize_with(arms as usize, Vec::new);
-                for list in &mut arm_bits {
-                    list.retain(|&b| b < width);
-                }
-
-                for bit in 0..width {
-                    let mut current_arm = arm_bits
-                        .iter()
-                        .position(|list| list.contains(&bit))
-                        .map(|i| i as u8);
-                    let before = current_arm;
+                ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(format!("Bit {bit}:"));
-                        egui::ComboBox::from_id_salt((key, bit))
-                            .selected_text(match current_arm {
-                                Some(a) => format!("Arm {a}"),
-                                None => "None".to_string(),
-                            })
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Address width:");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut address_width)
+                                    .range(1..=MAX_ADDRESS_WIDTH),
+                            )
+                            .changed();
+                    });
+                    ui.label(format!("{} words", 1usize << address_width));
+                });
+                if changed {
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Rom(
+                        rom.resized(data_width, address_width),
+                    )));
+                }
+                ui.add_enabled_ui(value_ok, |ui| {
+                    if ui.button("Edit contents…").clicked() {
+                        edit = Some(PropEdit::OpenRom);
+                    }
+                });
+            }
+            // Same reasoning as Rom, above (huge contents buffer, matched by
+            // reference); read behavior joins the widths as structural.
+            ComponentSpec::Ram(
+                ram @ Ram {
+                    mut data_width,
+                    mut address_width,
+                    mut read_behavior,
+                    ..
+                },
+            ) => {
+                let mut changed = false;
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Address width:");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut address_width)
+                                    .range(1..=MAX_ADDRESS_WIDTH),
+                            )
+                            .changed();
+                    });
+                    ui.label(format!("{} words", 1usize << address_width));
+                    ui.horizontal(|ui| {
+                        ui.label("Read behavior:");
+                        egui::ComboBox::from_id_salt(key)
+                            .selected_text(format!("{read_behavior:?}"))
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut current_arm, None, "None");
-                                for a in 0..arms {
-                                    ui.selectable_value(
-                                        &mut current_arm,
-                                        Some(a),
-                                        format!("Arm {a}"),
-                                    );
+                                for rb in
+                                    [ReadBehavior::ReadAfterWrite, ReadBehavior::WriteAfterRead]
+                                {
+                                    changed |= ui
+                                        .selectable_value(&mut read_behavior, rb, format!("{rb:?}"))
+                                        .changed();
                                 }
                             });
                     });
-                    if current_arm != before {
-                        for list in &mut arm_bits {
-                            list.retain(|&b| b != bit);
-                        }
-                        if let Some(a) = current_arm {
-                            arm_bits[a as usize].push(bit);
-                        }
-                        changed = true;
-                    }
-                }
-
+                });
                 if changed {
-                    self.reconfigure_component(
-                        key,
-                        ComponentSpec::Splitter {
-                            width,
-                            arm_bits,
-                            direction,
-                        },
-                    );
+                    let mut resized = ram.resized(data_width, address_width);
+                    resized.read_behavior = read_behavior;
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Ram(resized)));
+                }
+                ui.add_enabled_ui(value_ok, |ui| {
+                    if ui.button("Edit contents…").clicked() {
+                        edit = Some(PropEdit::OpenRam);
+                    }
+                });
+
+                let cur = self.circuit.components[comp_key].pins.out_cache[0];
+                ui.label(format!("DO: {}", fmt_val(cur)));
+            }
+            ComponentSpec::Splitter {
+                mut width,
+                arm_bits,
+                mut direction,
+            } => {
+                // let mut width = *width;
+                let mut arm_bits = arm_bits.clone();
+                let mut changed = false;
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    let before_dir = direction;
+                    ui.horizontal(|ui| {
+                        ui.label("Fan Direction:");
+                        ui.selectable_value(&mut direction, FanDirection::Right, "Split");
+                        ui.selectable_value(&mut direction, FanDirection::Left, "Combine");
+                    });
+                    changed |= direction != before_dir;
+
+                    ui.horizontal(|ui| {
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut width).range(1..=32))
+                            .changed();
+                    });
+                    let mut arms = arm_bits.len() as u8;
+                    ui.horizontal(|ui| {
+                        ui.label("Arms:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut arms).range(1..=16))
+                            .changed();
+                    });
+
+                    // Apply width/arms bookkeeping before rendering bit rows below,
+                    // so a shrink is reflected the same frame; truncating drops
+                    // any bits assigned to a removed arm.
+                    arm_bits.resize_with(arms as usize, Vec::new);
+                    for list in &mut arm_bits {
+                        list.retain(|&b| b < width);
+                    }
+
+                    for bit in 0..width {
+                        let mut current_arm = arm_bits
+                            .iter()
+                            .position(|list| list.contains(&bit))
+                            .map(|i| i as u8);
+                        let before = current_arm;
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Bit {bit}:"));
+                            egui::ComboBox::from_id_salt((key, bit))
+                                .selected_text(match current_arm {
+                                    Some(a) => format!("Arm {a}"),
+                                    None => "None".to_string(),
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut current_arm, None, "None");
+                                    for a in 0..arms {
+                                        ui.selectable_value(
+                                            &mut current_arm,
+                                            Some(a),
+                                            format!("Arm {a}"),
+                                        );
+                                    }
+                                });
+                        });
+                        if current_arm != before {
+                            for list in &mut arm_bits {
+                                list.retain(|&b| b != bit);
+                            }
+                            if let Some(a) = current_arm {
+                                arm_bits[a as usize].push(bit);
+                            }
+                            changed = true;
+                        }
+                    }
+                });
+                if changed {
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Splitter {
+                        width,
+                        arm_bits,
+                        direction,
+                    }));
                 }
             }
             // Read-only: a subcircuit's interface is derived from the referenced
@@ -1887,16 +1993,29 @@ impl OsmilogApp {
                 input_widths,
                 output_widths,
             } => {
+                let doc = *doc;
                 ui.label(format!("Circuit: {name}"));
                 ui.label(format!(
                     "{} input(s), {} output(s)",
                     input_widths.len(),
                     output_widths.len()
                 ));
-                if ui.button("Open circuit").clicked() {
-                    self.switch_circuit(doc);
-                }
+                // Navigating into the child circuit is a structural action
+                // (it switches the active document): locked during a run.
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    if ui.button("Open circuit").clicked() {
+                        edit = Some(PropEdit::OpenCircuit(doc));
+                    }
+                });
             }
+        }
+
+        match edit {
+            Some(PropEdit::Reconfigure(spec)) => self.reconfigure_component(key, spec),
+            Some(PropEdit::OpenRom) => self.rom_editor_open = Some(key),
+            Some(PropEdit::OpenRam) => self.ram_editor_open = Some(key),
+            Some(PropEdit::OpenCircuit(doc)) => self.switch_circuit(doc),
+            None => {}
         }
     }
 
@@ -1983,6 +2102,11 @@ impl OsmilogApp {
         };
         let total_rows = len.div_ceil(WORDS_PER_ROW);
 
+        // Contents are a value edit: pokeable while Paused, frozen while
+        // Playing. The window can only be *opened* while value edits are
+        // allowed, but one left open from Stopped/Paused survives into Play,
+        // so gate the fields (they stay visible for observation, just dimmed).
+        let values_enabled = !self.value_editing_locked();
         let mut open = true;
         let mut edits: Vec<(usize, u32)> = Vec::new();
         egui::Window::new("ROM contents")
@@ -1991,35 +2115,36 @@ impl OsmilogApp {
             .resizable(true)
             .show(ctx, |ui| {
                 let row_height = ui.spacing().interact_size.y;
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show_rows(ui, row_height, total_rows, |ui, range| {
-                        for row in range {
-                            let base = row * WORDS_PER_ROW;
-                            ui.horizontal(|ui| {
-                                ui.monospace(format!("0x{base:0addr_nibbles$X}:"));
-                                for col in 0..WORDS_PER_ROW {
-                                    let i = base + col;
-                                    if i >= len {
-                                        break;
-                                    }
-                                    let mut val = match &self.components[pc].spec {
-                                        ComponentSpec::Rom(rom) => rom.word(i),
-                                        _ => 0,
-                                    };
-                                    let resp =
-                                        ui.add(
+                ui.add_enabled_ui(values_enabled, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show_rows(ui, row_height, total_rows, |ui, range| {
+                            for row in range {
+                                let base = row * WORDS_PER_ROW;
+                                ui.horizontal(|ui| {
+                                    ui.monospace(format!("0x{base:0addr_nibbles$X}:"));
+                                    for col in 0..WORDS_PER_ROW {
+                                        let i = base + col;
+                                        if i >= len {
+                                            break;
+                                        }
+                                        let mut val = match &self.components[pc].spec {
+                                            ComponentSpec::Rom(rom) => rom.word(i),
+                                            _ => 0,
+                                        };
+                                        let resp = ui.add(
                                             egui::DragValue::new(&mut val)
                                                 .range(0..=mask)
                                                 .hexadecimal(word_nibbles, false, true),
                                         );
-                                    if resp.changed() {
-                                        edits.push((i, val));
+                                        if resp.changed() {
+                                            edits.push((i, val));
+                                        }
                                     }
-                                }
-                            });
-                        }
-                    });
+                                });
+                            }
+                        });
+                });
             });
 
         for (i, v) in edits {
@@ -2027,6 +2152,104 @@ impl OsmilogApp {
         }
         if !open {
             self.rom_editor_open = None;
+        }
+    }
+
+    // Writes one word directly into a placed RAM's contents. Unlike
+    // write_rom_cell this never needs a settle(): RAM's data_out is a
+    // registered output only updated by tick_clock (see RamCell), so a
+    // direct memory edit here has nothing downstream to propagate until the
+    // next tick. The placed spec and the live component share one buffer
+    // (see Ram::shared), so this mutates what the spec sees too. Not routed
+    // through Command/History: RAM contents are mutated in place and are not
+    // undoable, like a ROM's.
+    fn write_ram_cell(&mut self, pc: PlacedCompKey, index: usize, value: u32) {
+        let comp_key = self.components[pc].key;
+        self.circuit.write_ram(comp_key, index, value);
+    }
+
+    // Draws the RAM contents editor window while `ram_editor_open` names a
+    // live RAM - near-identical to show_rom_editor (same hex-dump/virtualized
+    // layout), differing only in which field supplies the widths/word access
+    // and that edits don't need a settle() afterward.
+    fn show_ram_editor(&mut self, ctx: &egui::Context, pc: PlacedCompKey) {
+        const WORDS_PER_ROW: usize = 8;
+
+        // Close if the RAM was deleted or undone away (or the key now names
+        // something else after a reconfigure to a different type).
+        let (data_width, len) = match self.components.get(pc) {
+            Some(c) if c.active => match &c.spec {
+                ComponentSpec::Ram(ram) => (ram.data_width, ram.len()),
+                _ => {
+                    self.ram_editor_open = None;
+                    return;
+                }
+            },
+            _ => {
+                self.ram_editor_open = None;
+                return;
+            }
+        };
+
+        let word_nibbles = data_width.div_ceil(4) as usize;
+        let addr_nibbles = (usize::BITS - (len.max(1) - 1).leading_zeros())
+            .div_ceil(4)
+            .max(1) as usize;
+        let mask = if data_width >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << data_width) - 1
+        };
+        let total_rows = len.div_ceil(WORDS_PER_ROW);
+
+        // Contents are a value edit: pokeable while Paused, frozen while
+        // Playing (same gating as the ROM editor above).
+        let values_enabled = !self.value_editing_locked();
+        let mut open = true;
+        let mut edits: Vec<(usize, u32)> = Vec::new();
+        egui::Window::new("RAM contents")
+            .open(&mut open)
+            .default_size([440.0, 480.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                let row_height = ui.spacing().interact_size.y;
+                ui.add_enabled_ui(values_enabled, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show_rows(ui, row_height, total_rows, |ui, range| {
+                            for row in range {
+                                let base = row * WORDS_PER_ROW;
+                                ui.horizontal(|ui| {
+                                    ui.monospace(format!("0x{base:0addr_nibbles$X}:"));
+                                    for col in 0..WORDS_PER_ROW {
+                                        let i = base + col;
+                                        if i >= len {
+                                            break;
+                                        }
+                                        let mut val = match &self.components[pc].spec {
+                                            ComponentSpec::Ram(ram) => ram.word(i),
+                                            _ => 0,
+                                        };
+                                        let resp = ui.add(
+                                            egui::DragValue::new(&mut val)
+                                                .range(0..=mask)
+                                                .hexadecimal(word_nibbles, false, true),
+                                        );
+                                        if resp.changed() {
+                                            edits.push((i, val));
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                });
+            });
+
+        for (i, v) in edits {
+            self.write_ram_cell(pc, i, v);
+        }
+        if !open {
+            self.ram_editor_open = None;
         }
     }
 
@@ -2636,6 +2859,11 @@ impl OsmilogApp {
                         spec: ComponentSpec::Rom(Rom::new(8, 8)),
                     };
                 }
+                if ui.button("RAM").clicked() {
+                    self.mode = InteractionMode::Placing {
+                        spec: ComponentSpec::Ram(Ram::new(8, 8, ReadBehavior::default())),
+                    };
+                }
             });
             egui::CollapsingHeader::new("Tunnel").show(ui, |ui| {
                 if ui.button("Feed").clicked() {
@@ -2657,6 +2885,7 @@ impl OsmilogApp {
     // ClockRun); entering Play locks editing for the whole session and Stop
     // resets sequential state. All ticks are issued untracked (see tick_once).
     fn show_clock_controls(&mut self, ui: &mut egui::Ui) {
+        const MAX_CLOCK_TPS: f32 = 100.0;
         let run = self.clock.run;
 
         // Speed is only adjustable while stopped - locked during a run session.
@@ -2664,7 +2893,7 @@ impl OsmilogApp {
             run == ClockRun::Stopped,
             egui::DragValue::new(&mut self.clock.ticks_per_second)
                 .speed(0.1)
-                .range(1.0..=60.0)
+                .range(1.0..=MAX_CLOCK_TPS)
                 .suffix(" tick/s"),
         );
 
@@ -3259,6 +3488,11 @@ impl eframe::App for OsmilogApp {
         // ROM contents editor window, drawn while a ROM's editor is open.
         if let Some(pc) = self.rom_editor_open {
             self.show_rom_editor(&ctx, pc);
+        }
+
+        // RAM contents editor window, drawn while a RAM's editor is open.
+        if let Some(pc) = self.ram_editor_open {
+            self.show_ram_editor(&ctx, pc);
         }
 
         // "New Circuit" name dialog, drawn while it's open.
@@ -3888,7 +4122,6 @@ fn draw_tunnel_ghost(
 mod tests {
     use super::*;
     use crate::gui::wiring::NodeAttach;
-    use crate::io::CURRENT_VERSION;
     use crate::sim::component::GateOp;
 
     fn place(app: &mut OsmilogApp, spec: ComponentSpec) -> PlacedCompKey {
@@ -4090,6 +4323,39 @@ mod tests {
             .unwrap()
             .key;
         assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::ONE);
+    }
+
+    #[test]
+    fn test_load_snapshot_clears_undo_history() {
+        // Loading a snapshot places components/tunnels through the ordinary
+        // undo-recordable path; a fresh load must not leave those placements
+        // sitting on the undo stack, or undo would delete the just-loaded
+        // circuit one piece at a time instead of being a no-op.
+        let mut app = OsmilogApp::empty();
+        place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        place(&mut app, ComponentSpec::Output);
+        app.place_tunnel(TunnelRole::Pull, GridPos::new(0, 0));
+        let snap = app.to_snapshot();
+
+        let mut loaded = OsmilogApp::empty();
+        loaded.load_snapshot(&snap).unwrap();
+
+        assert!(!loaded.history.can_undo());
+        assert!(!loaded.history.can_redo());
+    }
+
+    #[test]
+    fn test_load_project_file_clears_undo_history() {
+        let mut app = OsmilogApp::empty();
+        place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        place(&mut app, ComponentSpec::Output);
+        let file = app.to_project_file();
+
+        let mut loaded = OsmilogApp::empty();
+        loaded.load_project_file(&file).unwrap();
+
+        assert!(!loaded.history.can_undo());
+        assert!(!loaded.history.can_redo());
     }
 
     #[test]
@@ -4872,6 +5138,26 @@ mod tests {
     }
 
     #[test]
+    fn test_value_editing_locked_only_while_playing() {
+        let mut app = OsmilogApp::empty();
+        // Stopped: fully editable, so value edits are allowed.
+        assert!(!app.value_editing_locked());
+
+        // Paused carves value edits (Input bits, ROM/RAM contents) out of the
+        // structural lock: still not value-locked, even though editing_locked().
+        app.clock.run = ClockRun::Paused;
+        assert!(app.editing_locked());
+        assert!(!app.value_editing_locked());
+
+        // Playing blocks everything, values included.
+        app.clock.run = ClockRun::Playing;
+        assert!(app.value_editing_locked());
+
+        app.stop_clock();
+        assert!(!app.value_editing_locked());
+    }
+
+    #[test]
     fn test_stop_clock_resets_register_through_gui() {
         let mut app = OsmilogApp::empty();
         let data = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
@@ -5124,8 +5410,11 @@ mod tests {
     }
 
     #[test]
-    fn test_project_file_loads_legacy_v2_as_single_circuit() {
-        // A hand-built v2 single-circuit file: Input(1) -> Output.
+    fn test_load_project_file_upgrades_legacy_v2() {
+        // A hand-built v2 single-circuit file: Input(1) -> Output. (The
+        // upgrade itself - LegacyV2File -> one-circuit ProjectFile - is
+        // covered in crate::io's own tests; this checks that OsmilogApp loads
+        // the upgraded project and simulates it correctly.)
         let v2 = crate::io::LegacyV2File {
             version: crate::io::LEGACY_SINGLE_CIRCUIT_VERSION,
             snapshot: CircuitSnapshot {
@@ -5162,14 +5451,7 @@ mod tests {
             },
         };
         let json = serde_json::to_string(&v2).unwrap();
-
-        // Parsing upgrades it to a one-circuit project named "Main".
         let project = ProjectFile::from_json(&json).unwrap();
-        assert_eq!(project.version, CURRENT_VERSION);
-        assert_eq!(project.circuits.len(), 1);
-        assert_eq!(project.active, 0);
-        assert_eq!(project.circuits[0].name, "Main");
-        assert!(project.circuits[0].subcircuits.is_empty());
 
         let mut loaded = OsmilogApp::empty();
         loaded.load_project_file(&project).unwrap();
@@ -5284,60 +5566,5 @@ mod tests {
             .unwrap()
             .key;
         assert_eq!(loaded.circuit.read_output(y_key), Value::ONE);
-    }
-
-    #[test]
-    fn test_project_file_validate_rejects_bad_files() {
-        let good_circuit = || CircuitEntry {
-            name: "Main".to_string(),
-            snapshot: CircuitSnapshot {
-                components: vec![],
-                tunnels: vec![],
-                nodes: vec![],
-                segments: vec![],
-            },
-            subcircuits: vec![],
-        };
-
-        // Unsupported version.
-        let f = ProjectFile {
-            version: CURRENT_VERSION + 1,
-            active: 0,
-            circuits: vec![good_circuit()],
-        };
-        assert_eq!(
-            f.validate(),
-            Err(LoadError::UnsupportedVersion {
-                found: CURRENT_VERSION + 1,
-                supported: CURRENT_VERSION,
-            })
-        );
-
-        // No circuits at all.
-        let f = ProjectFile::new(0, vec![]);
-        assert_eq!(f.validate(), Err(LoadError::EmptyProject));
-
-        // `active` out of range.
-        let f = ProjectFile::new(3, vec![good_circuit()]);
-        assert_eq!(
-            f.validate(),
-            Err(LoadError::CircuitIndexOutOfRange { index: 3, len: 1 })
-        );
-
-        // A subcircuit reference pointing at a non-existent circuit.
-        let mut c = good_circuit();
-        c.snapshot.components.push(ComponentEntry {
-            spec: ComponentSpec::Output,
-            grid_pos: GridPos::ZERO,
-        });
-        c.subcircuits.push(SubcircuitRef {
-            component: 0,
-            circuit: 9,
-        });
-        let f = ProjectFile::new(0, vec![c]);
-        assert_eq!(
-            f.validate(),
-            Err(LoadError::CircuitIndexOutOfRange { index: 9, len: 1 })
-        );
     }
 }

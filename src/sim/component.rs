@@ -16,6 +16,7 @@ mod input;
 mod jk_flip_flop;
 mod multiplier;
 mod mux;
+mod ram;
 mod reg;
 mod rom;
 mod shift_reg;
@@ -37,6 +38,7 @@ pub use input::Input;
 pub use jk_flip_flop::{JKFlipFlop, JKFlipFlopConf};
 pub use multiplier::Multiplier;
 pub use mux::Mux;
+pub use ram::{Ram, RamCell, ReadBehavior};
 pub use reg::{Reg, RegConf};
 pub use rom::{Rom, MAX_ADDRESS_WIDTH};
 pub use shift_reg::{ShiftReg, ShiftRegConf};
@@ -223,6 +225,13 @@ impl Component {
         Self::from_comb(LogicComb::Rom(rom))
     }
 
+    // Builds a RAM from a full Ram record (widths + read_behavior + shared
+    // contents handle). Takes the record by value, same as rom() - see Ram's
+    // docs for why the buffer aliases the placed spec instead of copying it.
+    pub fn ram(ram: Ram) -> Self {
+        Self::from_seq(LogicSeq::Ram(RamCell::new(ram)))
+    }
+
     // Reads the current Value of every input pin from net state, without mutating
     // anything. Used by evaluate() and by Circuit::tick_clock()'s input-collection stage.
     pub fn read_inputs(&self, nets: &SlotMap<NetKey, Net>) -> Vec<Value> {
@@ -380,6 +389,7 @@ pub enum ComponentSpec {
     Divider(Divider),
     Comparator(Comparator),
     Rom(Rom),
+    Ram(Ram),
     DFlipFlop(DFlipFlopConf),
     TFlipFlop(TFlipFlopConf),
     JKFlipFlop(JKFlipFlopConf),
@@ -432,6 +442,7 @@ impl ComponentSpec {
             Self::Divider(d) => d.n_inputs(),
             Self::Comparator(c) => c.n_inputs(),
             Self::Rom(r) => r.n_inputs(),
+            Self::Ram(r) => r.n_inputs(),
             Self::DFlipFlop(ff) => ff.n_inputs(),
             Self::TFlipFlop(ff) => ff.n_inputs(),
             Self::JKFlipFlop(ff) => ff.n_inputs(),
@@ -466,6 +477,7 @@ impl ComponentSpec {
             Self::Divider(d) => d.n_outputs(),
             Self::Comparator(c) => c.n_outputs(),
             Self::Rom(r) => r.n_outputs(),
+            Self::Ram(r) => r.n_outputs(),
             Self::DFlipFlop(ff) => ff.n_outputs(),
             Self::TFlipFlop(ff) => ff.n_outputs(),
             Self::JKFlipFlop(ff) => ff.n_outputs(),
@@ -506,6 +518,8 @@ impl ComponentSpec {
             // spec->component build owns its params outright, but a ROM's bulk
             // contents are too big to duplicate.
             Self::Rom(r) => Component::rom(r.shared()),
+            // Same aliasing as Rom above (see Ram's docs).
+            Self::Ram(r) => Component::ram(r.shared()),
             Self::DFlipFlop(_) => Component::d_flip_flop(),
             Self::TFlipFlop(_) => Component::t_flip_flop(),
             Self::JKFlipFlop(_) => Component::jk_flip_flop(),
@@ -820,6 +834,7 @@ pub enum LogicSeq {
     JKFlipFlop(JKFlipFlop),
     SRFlipFlop(SRFlipFlop),
     Counter(Counter),
+    Ram(RamCell),
 }
 
 // Generic reflection of LogicSeq's persisted state - one arm per LogicSeq
@@ -831,6 +846,7 @@ pub enum SeqState {
     ShiftReg(Vec<Value>),
     FlipFlop(Value),
     Counter { value: Value, carry: Value },
+    Ram(Value),
 }
 
 impl LogicSeq {
@@ -843,6 +859,7 @@ impl LogicSeq {
             Self::JKFlipFlop(ff) => ff.n_inputs(),
             Self::SRFlipFlop(ff) => ff.n_inputs(),
             Self::Counter(c) => c.n_inputs(),
+            Self::Ram(r) => r.n_inputs(),
         }
     }
 
@@ -855,6 +872,7 @@ impl LogicSeq {
             Self::JKFlipFlop(ff) => ff.n_outputs(),
             Self::SRFlipFlop(ff) => ff.n_outputs(),
             Self::Counter(c) => c.n_outputs(),
+            Self::Ram(r) => r.n_outputs(),
         }
     }
 
@@ -867,6 +885,7 @@ impl LogicSeq {
             Self::JKFlipFlop(ff) => ff.tick(inputs),
             Self::SRFlipFlop(ff) => ff.tick(inputs),
             Self::Counter(c) => c.tick(inputs),
+            Self::Ram(r) => r.tick(inputs),
         }
     }
 
@@ -879,6 +898,7 @@ impl LogicSeq {
             Self::JKFlipFlop(ff) => ff.apply_async(inputs),
             Self::SRFlipFlop(ff) => ff.apply_async(inputs),
             Self::Counter(c) => c.apply_async(inputs),
+            Self::Ram(r) => r.apply_async(inputs),
         }
     }
 
@@ -891,6 +911,7 @@ impl LogicSeq {
             Self::JKFlipFlop(ff) => ff.observe(),
             Self::SRFlipFlop(ff) => ff.observe(),
             Self::Counter(c) => c.observe(),
+            Self::Ram(r) => r.observe(),
         }
     }
 
@@ -903,6 +924,7 @@ impl LogicSeq {
             Self::JKFlipFlop(ff) => ff.reset(),
             Self::SRFlipFlop(ff) => ff.reset(),
             Self::Counter(c) => c.reset(),
+            Self::Ram(r) => r.reset(),
         }
     }
 
@@ -919,6 +941,7 @@ impl LogicSeq {
             Self::JKFlipFlop(ff) => ff.snapshot(),
             Self::SRFlipFlop(ff) => ff.snapshot(),
             Self::Counter(c) => c.snapshot(),
+            Self::Ram(r) => r.snapshot(),
         }
     }
 
@@ -931,6 +954,7 @@ impl LogicSeq {
             Self::JKFlipFlop(ff) => ff.input_width(i),
             Self::SRFlipFlop(ff) => ff.input_width(i),
             Self::Counter(c) => c.input_width(i),
+            Self::Ram(r) => r.input_width(i),
         }
     }
 
@@ -943,6 +967,7 @@ impl LogicSeq {
             Self::JKFlipFlop(ff) => ff.output_width(i),
             Self::SRFlipFlop(ff) => ff.output_width(i),
             Self::Counter(c) => c.output_width(i),
+            Self::Ram(r) => r.output_width(i),
         }
     }
 }
