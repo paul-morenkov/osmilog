@@ -1,5 +1,5 @@
-// Copy/paste: `Clipboard` holds an index-based `CircuitFile` snapshot of a
-// copied selection (the same format Save/Load uses), not live SlotMap keys,
+// Copy/paste: `Clipboard` holds a `CircuitSnapshot` of a copied selection (the
+// same index-based records Save/Load uses), not live SlotMap keys,
 // so it survives further edits/undo-redo to the originals. Wiring scope on
 // copy is strict-selection-only: exactly the components/tunnels/wire
 // segments in the selection passed to `copy`, mirroring `delete_bulk`'s
@@ -20,8 +20,7 @@ use crate::gui::geometry::GridPos;
 use crate::gui::placed_component::PlacedComponent;
 use crate::gui::wiring::{NodeAttach, WireSegKey, Wiring};
 use crate::io::{
-    CircuitFile, ComponentEntry, NodeAttachEntry, NodeEntry, SegEntry, TunnelEntry,
-    CURRENT_VERSION,
+    CircuitSnapshot, ComponentEntry, NodeAttachEntry, NodeEntry, SegEntry, TunnelEntry,
 };
 use crate::sim::component::{InIdx, OutIdx, PinId};
 
@@ -40,14 +39,14 @@ fn base_offset() -> GridPos {
 }
 
 /// Holds a snapshot of a copied selection, independent of any live
-/// PlacedCompKey/PlacedTunnelKey/WireNodeKey/WireSegKey - an index-based
-/// CircuitFile, the same format io.rs uses for whole-document save/load,
-/// scoped to just the copied subset. Surviving edits/undo-redo to the
-/// originals is the entire point: paste only ever reads this snapshot, so it
-/// can't be invalidated by anything that happens to the copied items
-/// afterward. Also owns the walking paste offset (see `plan_paste`).
+/// PlacedCompKey/PlacedTunnelKey/WireNodeKey/WireSegKey - a `CircuitSnapshot`,
+/// the same index-based records io.rs uses for save/load, scoped to just the
+/// copied subset. Surviving edits/undo-redo to the originals is the entire
+/// point: paste only ever reads this snapshot, so it can't be invalidated by
+/// anything that happens to the copied items afterward. Also owns the walking
+/// paste offset (see `plan_paste`).
 pub struct Clipboard {
-    snapshot: Option<CircuitFile>,
+    snapshot: Option<CircuitSnapshot>,
     next_offset: GridPos,
 }
 
@@ -181,8 +180,7 @@ impl Clipboard {
             })
             .collect();
 
-        self.snapshot = Some(CircuitFile {
-            version: CURRENT_VERSION,
+        self.snapshot = Some(CircuitSnapshot {
             components: comp_entries,
             tunnels: tunnel_entries,
             nodes: node_entries,
@@ -197,11 +195,10 @@ impl Clipboard {
     /// offset for the *next* call, so repeated calls without an intervening
     /// `copy` step further each time (a diagonal "staircase"). `None` if
     /// nothing has been copied yet.
-    pub fn plan_paste(&mut self) -> Option<CircuitFile> {
+    pub fn plan_paste(&mut self) -> Option<CircuitSnapshot> {
         let file = self.snapshot.as_ref()?;
         let offset = self.next_offset;
-        let shifted = CircuitFile {
-            version: file.version,
+        let shifted = CircuitSnapshot {
             components: file
                 .components
                 .iter()

@@ -14,7 +14,8 @@ use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
 use crate::gui::theme::Theme;
 use crate::gui::wiring::{NodeAttach, WireNode, WireNodeKey, WireSegKey, WireSegment, Wiring};
 use crate::io::{
-    CircuitFile, ComponentEntry, LoadError, NodeAttachEntry, NodeEntry, SegEntry, TunnelEntry,
+    CircuitEntry, CircuitSnapshot, ComponentEntry, LoadError, NodeAttachEntry, NodeEntry,
+    ProjectFile, SegEntry, SubcircuitRef, TunnelEntry,
 };
 use crate::platform;
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
@@ -275,7 +276,7 @@ struct CanvasCtx<'a> {
 }
 
 impl OsmilogApp {
-    // Split out from `new` so tests (and `load_circuit_file`) can construct
+    // Split out from `new` so tests (and `load_snapshot`) can construct
     // a fresh app without an eframe::CreationContext, which isn't
     // constructible outside a running eframe host.
     pub fn empty() -> Self {
@@ -537,7 +538,7 @@ impl OsmilogApp {
         self.place_tunnel_labeled(label, role, grid_pos)
     }
 
-    // Shared by place_tunnel (auto-generated label) and load_circuit_file
+    // Shared by place_tunnel (auto-generated label) and install_circuit_records
     // (label restored from a saved file - tunnels connect to each other by
     // matching label, so a loaded tunnel must keep its exact saved label).
     fn place_tunnel_labeled(
@@ -580,15 +581,6 @@ impl OsmilogApp {
 
     fn active_tunnels(&self) -> impl Iterator<Item = (PlacedTunnelKey, &PlacedTunnel)> {
         self.tunnels.iter().filter(|(_, pt)| pt.active)
-    }
-
-    // Whether the active document contains any placed subcircuit. Subcircuit
-    // persistence is deferred (a serialized DocId is meaningless across a
-    // reload), so the save path uses this to refuse rather than write a file
-    // that can't round-trip.
-    fn active_has_subcircuit(&self) -> bool {
-        self.active_components()
-            .any(|(_, pc)| matches!(pc.spec, ComponentSpec::Subcircuit { .. }))
     }
 
     // Rebuilds every circuit net from the GUI wiring graph: clear_nets() drops
@@ -683,7 +675,18 @@ impl OsmilogApp {
                 visited.push(*doc);
                 let (inner, inputs, outputs) = self.build_doc_circuit(*doc, visited);
                 visited.pop();
-                Component::subcircuit(inner, inputs, outputs)
+                // The outer pin arity is always the cached interface. If the
+                // referenced document isn't fully available (e.g. mid-load, a
+                // forward reference to a not-yet-populated doc, or a null/unbound
+                // `doc`), its derived boundary won't match - fall back to a
+                // correctly-sized placeholder so wiring to these pins never goes
+                // out of bounds. refresh_subcircuits rebuilds the real inner once
+                // every document is populated.
+                if inputs.len() == input_widths.len() && outputs.len() == output_widths.len() {
+                    Component::subcircuit(inner, inputs, outputs)
+                } else {
+                    Component::subcircuit_placeholder(input_widths.len(), output_widths.len())
+                }
             }
             _ => spec.to_component(),
         }
@@ -1031,91 +1034,73 @@ impl OsmilogApp {
 
     // ── Save / load ──────────────────────────────────────────────────────
 
-    pub fn to_circuit_file(&self) -> CircuitFile {
-        // PlacedCompKey/PlacedTunnelKey -> position in the emitted Vec, so
-        // wire nodes reference components/tunnels by index instead of a
-        // slotmap key. Only live records are persisted - tombstones never
-        // reach the save file.
-        let mut comp_index: HashMap<PlacedCompKey, usize> = HashMap::new();
-        let components: Vec<ComponentEntry> = self
-            .active_components()
-            .enumerate()
-            .map(|(i, (pck, pc))| {
-                comp_index.insert(pck, i);
-                ComponentEntry {
-                    spec: pc.spec.clone(),
-                    grid_pos: pc.grid_pos,
-                }
-            })
-            .collect();
-
-        let mut tunnel_index: HashMap<PlacedTunnelKey, usize> = HashMap::new();
-        let tunnels: Vec<TunnelEntry> = self
-            .active_tunnels()
-            .enumerate()
-            .map(|(i, (ptk, pt))| {
-                tunnel_index.insert(ptk, i);
-                TunnelEntry {
-                    label: pt.label.clone(),
-                    role: pt.role,
-                    grid_pos: pt.grid_pos,
-                }
-            })
-            .collect();
-
-        // WireNodeKey -> position in `nodes`, so segments can reference nodes by
-        // index. Built before `segments` reads it.
-        let mut node_index: HashMap<crate::gui::wiring::WireNodeKey, usize> = HashMap::new();
-        // Only live nodes/segments are persisted - tombstones (kept for undo)
-        // never reach the save file. Active segments only reference active
-        // nodes, so every SegEntry lookup below resolves.
-        let nodes: Vec<NodeEntry> = self
-            .wiring
-            .active_nodes()
-            .enumerate()
-            .map(|(i, (nk, node))| {
-                node_index.insert(nk, i);
-                let attach = match node.attach {
-                    NodeAttach::Free => NodeAttachEntry::Free,
-                    NodeAttach::Pin(pck, pin) => {
-                        let (is_input, pin_index) = match pin {
-                            PinId::In(InIdx(p)) => (true, p),
-                            PinId::Out(OutIdx(p)) => (false, p),
-                        };
-                        NodeAttachEntry::Pin {
-                            comp: comp_index[&pck],
-                            is_input,
-                            pin_index,
-                        }
-                    }
-                    NodeAttach::Tunnel(ptk) => NodeAttachEntry::Tunnel {
-                        tunnel: tunnel_index[&ptk],
-                    },
-                };
-                NodeEntry {
-                    pos: node.pos,
-                    attach,
-                }
-            })
-            .collect();
-
-        let segments = self
-            .wiring
-            .active_segments()
-            .map(|(_, s)| SegEntry {
-                a: node_index[&s.a],
-                b: node_index[&s.b],
-            })
-            .collect();
-
-        CircuitFile::new(components, tunnels, nodes, segments)
+    pub fn to_snapshot(&self) -> CircuitSnapshot {
+        extract_records(&self.components, &self.tunnels, &self.wiring).0
     }
 
-    // Replaces the current circuit with the one described by `file`.
-    // Validates first so a malformed file is rejected before any existing
-    // state is touched.
-    pub fn load_circuit_file(&mut self, file: &CircuitFile) -> Result<(), LoadError> {
-        file.validate()?;
+    // Serializes the whole workspace - every circuit document, not just the
+    // active one - into a ProjectFile, with each placed subcircuit's
+    // cross-circuit link emitted as an index into `circuits` (see
+    // `circuit_entry_of`). `doc_order` fixes both the emitted circuit order and
+    // the index every reference resolves against.
+    pub fn to_project_file(&self) -> ProjectFile {
+        let doc_index: HashMap<DocId, usize> = self
+            .doc_order
+            .iter()
+            .enumerate()
+            .map(|(i, &d)| (d, i))
+            .collect();
+        let active = doc_index[&self.active];
+        let circuits = self
+            .doc_order
+            .iter()
+            .map(|&doc| self.circuit_entry_of(doc, &doc_index))
+            .collect();
+        ProjectFile::new(active, circuits)
+    }
+
+    // Builds one document's CircuitEntry. Reads the live per-circuit fields for
+    // the active document, the parked DocState otherwise. Subcircuit references
+    // map each placed Subcircuit component (by its emitted index) to the index
+    // of the document it references, via `doc_index`.
+    fn circuit_entry_of(&self, doc: DocId, doc_index: &HashMap<DocId, usize>) -> CircuitEntry {
+        let name = self.documents[doc].name.clone();
+        let (components_map, tunnels_map, wiring) = if doc == self.active {
+            (&self.components, &self.tunnels, &self.wiring)
+        } else {
+            let st = self.documents[doc]
+                .state
+                .as_ref()
+                .expect("inactive document must have parked state");
+            (&st.components, &st.tunnels, &st.wiring)
+        };
+        let (snapshot, comp_index) = extract_records(components_map, tunnels_map, wiring);
+        let subcircuits = components_map
+            .iter()
+            .filter(|(_, pc)| pc.active)
+            .filter_map(|(pck, pc)| match &pc.spec {
+                ComponentSpec::Subcircuit { doc, .. } => {
+                    doc_index.get(doc).map(|&circuit| SubcircuitRef {
+                        component: comp_index[&pck],
+                        circuit,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        CircuitEntry {
+            name,
+            snapshot,
+            subcircuits,
+        }
+    }
+
+    // Replaces the active document's circuit with the one described by
+    // `snapshot`. Validates first so a malformed snapshot is rejected before any
+    // existing state is touched. Single-document path (no subcircuit references);
+    // the whole-workspace load is `load_project_file`.
+    pub fn load_snapshot(&mut self, snapshot: &CircuitSnapshot) -> Result<(), LoadError> {
+        snapshot.validate()?;
 
         self.circuit = Circuit::new();
         self.components = SlotMap::default();
@@ -1125,21 +1110,126 @@ impl OsmilogApp {
         self.mode = InteractionMode::Idle;
         self.last_settle_error = None;
 
+        self.install_circuit_records(snapshot, &[], &[]);
+        self.rebuild_circuit();
+        Ok(())
+    }
+
+    // Replaces the whole workspace with the circuits described by `file`,
+    // restoring its active document. Validates first so a malformed file is
+    // rejected before any existing state is touched.
+    //
+    // Every document is allocated (blank) up front, so a stable DocId exists for
+    // each circuit before any records are placed - subcircuit references then
+    // resolve by index regardless of the order documents are populated in.
+    // Circuits are loaded one at a time into the live fields (parking the
+    // previous), which reuses the ordinary placement machinery. A placed
+    // subcircuit's inner Circuit is left as a placeholder here and rebuilt
+    // against its (now fully-populated) referenced document by the final
+    // `refresh_subcircuits`; parked documents' subcircuits are likewise rebuilt
+    // when they're later switched to.
+    pub fn load_project_file(&mut self, file: &ProjectFile) -> Result<(), LoadError> {
+        file.validate()?;
+
+        let mut documents: SlotMap<DocId, CircuitDoc> = SlotMap::with_key();
+        let doc_ids: Vec<DocId> = file
+            .circuits
+            .iter()
+            .map(|c| {
+                documents.insert(CircuitDoc {
+                    name: c.name.clone(),
+                    state: Some(DocState::blank()),
+                })
+            })
+            .collect();
+
+        self.documents = documents;
+        self.doc_order = doc_ids.clone();
+        self.last_settle_error = None;
+        // Start with circuit 0 live: move its blank state into the live fields.
+        self.active = doc_ids[0];
+        self.documents[self.active].state = None;
+        self.put_active_state(DocState::blank());
+
+        for (i, entry) in file.circuits.iter().enumerate() {
+            self.make_live_for_load(doc_ids[i]);
+            self.load_circuit_entry(entry, &doc_ids);
+        }
+
+        // Restore the saved active document and reconcile its placed subcircuits
+        // against the now fully-populated referenced documents.
+        self.make_live_for_load(doc_ids[file.active]);
+        self.selected = None;
+        self.mode = InteractionMode::Idle;
+        self.refresh_subcircuits();
+        self.rebuild_circuit();
+        Ok(())
+    }
+
+    // Parks the current active document and makes `target` live, without the
+    // `refresh_subcircuits` a normal `switch_circuit` runs - during a load the
+    // referenced documents aren't all populated yet, so subcircuit rebuilding is
+    // deferred to the end of `load_project_file`. No-op if already active.
+    fn make_live_for_load(&mut self, target: DocId) {
+        if target == self.active {
+            return;
+        }
+        let parked = self.take_active_state();
+        self.documents[self.active].state = Some(parked);
+        let incoming = self.documents[target]
+            .state
+            .take()
+            .expect("document being loaded must have parked state");
+        self.put_active_state(incoming);
+        self.active = target;
+    }
+
+    // Loads one circuit's records into the (blank) live fields, then rebuilds
+    // its nets. Assumes the live fields are the fresh blank state for this
+    // document (as arranged by `load_project_file`).
+    fn load_circuit_entry(&mut self, entry: &CircuitEntry, doc_ids: &[DocId]) {
+        self.install_circuit_records(&entry.snapshot, &entry.subcircuits, doc_ids);
+        self.rebuild_circuit();
+    }
+
+    // Places one circuit's records (components, tunnels, wire nodes/segments)
+    // into the live fields and re-binds subcircuit references. Shared by the
+    // single-document `load_snapshot` (which passes no subcircuit refs) and the
+    // per-circuit `load_circuit_entry`. Does not rebuild nets - the caller does,
+    // once its records are in.
+    fn install_circuit_records(
+        &mut self,
+        snapshot: &CircuitSnapshot,
+        subcircuits: &[SubcircuitRef],
+        doc_ids: &[DocId],
+    ) {
         // File indices -> the freshly placed GUI keys (wiring nodes reference
         // components/tunnels by these).
-        let comp_keys: Vec<PlacedCompKey> = file
+        let comp_keys: Vec<PlacedCompKey> = snapshot
             .components
             .iter()
             .map(|entry| self.place_component(entry.spec.clone(), entry.grid_pos))
             .collect();
 
-        let tunnel_keys: Vec<PlacedTunnelKey> = file
+        // Re-bind each Subcircuit's `doc` (serde-skipped, so it loaded as a null
+        // DocId) to the DocId allocated for the circuit it references.
+        for sub in subcircuits {
+            if let (Some(&pck), Some(&doc)) =
+                (comp_keys.get(sub.component), doc_ids.get(sub.circuit))
+            {
+                if let ComponentSpec::Subcircuit { doc: d, .. } = &mut self.components[pck].spec {
+                    *d = doc;
+                }
+            }
+        }
+
+        let tunnel_keys: Vec<PlacedTunnelKey> = snapshot
             .tunnels
             .iter()
             .map(|entry| self.place_tunnel_labeled(entry.label.clone(), entry.role, entry.grid_pos))
             .collect();
 
-        let node_keys: Vec<crate::gui::wiring::WireNodeKey> = file
+        let node_keys: Vec<crate::gui::wiring::WireNodeKey> = snapshot
             .nodes
             .iter()
             .map(|entry| {
@@ -1167,16 +1257,13 @@ impl OsmilogApp {
             })
             .collect();
 
-        for s in &file.segments {
+        for s in &snapshot.segments {
             self.wiring.segments.insert(WireSegment {
                 a: node_keys[s.a],
                 b: node_keys[s.b],
                 active: true,
             });
         }
-
-        self.rebuild_circuit();
-        Ok(())
     }
 
     /// Shows the properties panel for the selected item. Edits call
@@ -2200,8 +2287,8 @@ impl OsmilogApp {
         };
         self.history.begin_batch();
 
-        // File indices -> the freshly placed GUI keys, mirroring
-        // load_circuit_file (wiring nodes reference components/tunnels by
+        // Snapshot indices -> the freshly placed GUI keys, mirroring
+        // install_circuit_records (wiring nodes reference components/tunnels by
         // these).
         let comp_keys: Vec<PlacedCompKey> = file
             .components
@@ -2280,20 +2367,10 @@ impl OsmilogApp {
             ui.horizontal(|ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Save").clicked() {
-                        if self.active_has_subcircuit() {
-                            // Deferred: a circuit containing subcircuits can't
-                            // round-trip yet (the DocId reference isn't
-                            // persisted). Refuse rather than write a broken file.
-                            self.last_settle_error = Some(
-                                "Saving a circuit that contains subcircuits isn't supported yet."
-                                    .to_string(),
-                            );
-                        } else {
-                            // Native opens the OS "Save As" dialog and writes
-                            // synchronously; web opens an in-app filename modal
-                            // (completed by drive_save_dialog on a later frame).
-                            self.with_io(|io, app| io.request_save(app));
-                        }
+                        // Native opens the OS "Save As" dialog and writes
+                        // synchronously; web opens an in-app filename modal
+                        // (completed by drive_save_dialog on a later frame).
+                        self.with_io(|io, app| io.request_save(app));
                         ui.close();
                     }
                     if ui.add_enabled(!locked, egui::Button::new("Load")).clicked() {
@@ -3244,6 +3321,99 @@ impl eframe::App for OsmilogApp {
 
 // ── Geometry ─────────────────────────────────────────────────────────────────
 
+// Extracts one document's live (non-tombstoned) visual records into the
+// index-based entry vectors io.rs persists: PlacedCompKey/PlacedTunnelKey/
+// WireNodeKey become positions in the emitted Vecs, so cross-references are
+// plain indices rather than ephemeral slotmap keys. Tombstones (kept for undo)
+// never reach a file. Also returns the PlacedCompKey -> component-index map, so
+// a caller can emit per-component references (subcircuit links) by index.
+// Shared by `to_snapshot` and `circuit_entry_of`.
+fn extract_records(
+    components: &SlotMap<PlacedCompKey, PlacedComponent>,
+    tunnels: &SlotMap<PlacedTunnelKey, PlacedTunnel>,
+    wiring: &Wiring,
+) -> (CircuitSnapshot, HashMap<PlacedCompKey, usize>) {
+    let mut comp_index: HashMap<PlacedCompKey, usize> = HashMap::new();
+    let comp_entries: Vec<ComponentEntry> = components
+        .iter()
+        .filter(|(_, pc)| pc.active)
+        .enumerate()
+        .map(|(i, (pck, pc))| {
+            comp_index.insert(pck, i);
+            ComponentEntry {
+                spec: pc.spec.clone(),
+                grid_pos: pc.grid_pos,
+            }
+        })
+        .collect();
+
+    let mut tunnel_index: HashMap<PlacedTunnelKey, usize> = HashMap::new();
+    let tunnel_entries: Vec<TunnelEntry> = tunnels
+        .iter()
+        .filter(|(_, pt)| pt.active)
+        .enumerate()
+        .map(|(i, (ptk, pt))| {
+            tunnel_index.insert(ptk, i);
+            TunnelEntry {
+                label: pt.label.clone(),
+                role: pt.role,
+                grid_pos: pt.grid_pos,
+            }
+        })
+        .collect();
+
+    // WireNodeKey -> position in `nodes`, so segments can reference nodes by
+    // index. Built before `segments` reads it. Active segments only reference
+    // active nodes, so every SegEntry lookup below resolves.
+    let mut node_index: HashMap<crate::gui::wiring::WireNodeKey, usize> = HashMap::new();
+    let node_entries: Vec<NodeEntry> = wiring
+        .active_nodes()
+        .enumerate()
+        .map(|(i, (nk, node))| {
+            node_index.insert(nk, i);
+            let attach = match node.attach {
+                NodeAttach::Free => NodeAttachEntry::Free,
+                NodeAttach::Pin(pck, pin) => {
+                    let (is_input, pin_index) = match pin {
+                        PinId::In(InIdx(p)) => (true, p),
+                        PinId::Out(OutIdx(p)) => (false, p),
+                    };
+                    NodeAttachEntry::Pin {
+                        comp: comp_index[&pck],
+                        is_input,
+                        pin_index,
+                    }
+                }
+                NodeAttach::Tunnel(ptk) => NodeAttachEntry::Tunnel {
+                    tunnel: tunnel_index[&ptk],
+                },
+            };
+            NodeEntry {
+                pos: node.pos,
+                attach,
+            }
+        })
+        .collect();
+
+    let seg_entries: Vec<SegEntry> = wiring
+        .active_segments()
+        .map(|(_, s)| SegEntry {
+            a: node_index[&s.a],
+            b: node_index[&s.b],
+        })
+        .collect();
+
+    (
+        CircuitSnapshot {
+            components: comp_entries,
+            tunnels: tunnel_entries,
+            nodes: node_entries,
+            segments: seg_entries,
+        },
+        comp_index,
+    )
+}
+
 fn component_bounding_rect(pc: &PlacedComponent, pan: Vec2) -> Rect {
     let size = pc.shape.size;
     let tl = egui::pos2(
@@ -3805,12 +3975,12 @@ mod tests {
 
         // Save -> JSON -> parse -> load into a fresh app, and confirm the
         // loaded circuit behaves identically.
-        let file = app.to_circuit_file();
-        let json = file.to_json().unwrap();
-        let file2 = CircuitFile::from_json(&json).unwrap();
+        let snap = app.to_snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let snap2: CircuitSnapshot = serde_json::from_str(&json).unwrap();
 
         let mut loaded = OsmilogApp::empty();
-        loaded.load_circuit_file(&file2).unwrap();
+        loaded.load_snapshot(&snap2).unwrap();
 
         assert_eq!(loaded.components.len(), 4);
         assert_eq!(loaded.wiring.segments.len(), 3);
@@ -3857,16 +4027,16 @@ mod tests {
         app.delete_wire(seg);
         assert!(app.wiring.segments.len() > app.wiring.active_segments().count());
 
-        // The file carries only live entries, and the reload matches the live
-        // graph exactly.
-        let file = app.to_circuit_file();
-        assert_eq!(file.segments.len(), app.wiring.active_segments().count());
-        assert_eq!(file.nodes.len(), app.wiring.active_nodes().count());
+        // The snapshot carries only live entries, and the reload matches the
+        // live graph exactly.
+        let snap = app.to_snapshot();
+        assert_eq!(snap.segments.len(), app.wiring.active_segments().count());
+        assert_eq!(snap.nodes.len(), app.wiring.active_nodes().count());
 
-        let json = file.to_json().unwrap();
-        let file2 = CircuitFile::from_json(&json).unwrap();
+        let json = serde_json::to_string(&snap).unwrap();
+        let snap2: CircuitSnapshot = serde_json::from_str(&json).unwrap();
         let mut loaded = OsmilogApp::empty();
-        loaded.load_circuit_file(&file2).unwrap();
+        loaded.load_snapshot(&snap2).unwrap();
         assert_eq!(
             loaded.wiring.active_segments().count(),
             app.wiring.active_segments().count()
@@ -3905,12 +4075,12 @@ mod tests {
         let out_key = app.components[out].key;
         assert_eq!(app.circuit.read_output(out_key), Value::ONE);
 
-        let file = app.to_circuit_file();
-        let json = file.to_json().unwrap();
-        let file2 = CircuitFile::from_json(&json).unwrap();
+        let snap = app.to_snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let snap2: CircuitSnapshot = serde_json::from_str(&json).unwrap();
 
         let mut loaded = OsmilogApp::empty();
-        loaded.load_circuit_file(&file2).unwrap();
+        loaded.load_snapshot(&snap2).unwrap();
 
         assert_eq!(loaded.tunnels.len(), 2);
         let loaded_out_key = loaded
@@ -3923,9 +4093,8 @@ mod tests {
     }
 
     #[test]
-    fn test_load_circuit_file_rejects_bad_component_index() {
-        let file = CircuitFile {
-            version: CURRENT_VERSION,
+    fn test_load_snapshot_rejects_bad_component_index() {
+        let snap = CircuitSnapshot {
             components: vec![ComponentEntry {
                 spec: ComponentSpec::Output,
                 grid_pos: GridPos::ZERO,
@@ -3944,30 +4113,13 @@ mod tests {
 
         let mut app = OsmilogApp::empty();
         let before = app.components.len();
-        assert!(app.load_circuit_file(&file).is_err());
-        // A rejected file must not leave the app half-overwritten.
+        assert!(app.load_snapshot(&snap).is_err());
+        // A rejected snapshot must not leave the app half-overwritten.
         assert_eq!(app.components.len(), before);
     }
 
-    #[test]
-    fn test_load_circuit_file_rejects_unsupported_version() {
-        let file = CircuitFile {
-            version: CURRENT_VERSION + 1,
-            components: vec![],
-            tunnels: vec![],
-            nodes: vec![],
-            segments: vec![],
-        };
-
-        let mut app = OsmilogApp::empty();
-        assert_eq!(
-            app.load_circuit_file(&file),
-            Err(LoadError::UnsupportedVersion {
-                found: CURRENT_VERSION + 1,
-                supported: CURRENT_VERSION,
-            })
-        );
-    }
+    // (Unsupported-version rejection is a project-file concern now that a
+    // snapshot carries no version - see test_project_file_validate_rejects_bad_files.)
 
     #[test]
     fn test_delete_component_drops_wire_nodes_and_refreshes_downstream() {
@@ -4901,5 +5053,291 @@ mod tests {
         let c3 = app.active;
         app.switch_circuit(main);
         assert!(!app.would_cycle(c3));
+    }
+
+    // ── ProjectFile (multi-circuit) save/load ───────────────────────────────
+
+    #[test]
+    fn test_project_file_round_trip_multiple_circuits() {
+        let mut app = OsmilogApp::empty();
+
+        // Main: Input(1) -> NOT -> Output, which settles a 0.
+        let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let n = place(
+            &mut app,
+            ComponentSpec::Gate(Gate {
+                op: GateOp::Not,
+                n_inputs: 1,
+                width: 1,
+            }),
+        );
+        let o = place(&mut app, ComponentSpec::Output);
+        connect_pins(&mut app, (a, PinId::output(0)), (n, PinId::input(0)));
+        connect_pins(&mut app, (n, PinId::output(0)), (o, PinId::input(0)));
+        app.rebuild_circuit();
+
+        // C2 (now active): Input(1) -> Output, a passthrough settling a 1.
+        app.create_circuit_doc("C2".to_string());
+        let x = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let y = place(&mut app, ComponentSpec::Output);
+        connect_pins(&mut app, (x, PinId::output(0)), (y, PinId::input(0)));
+        app.rebuild_circuit();
+
+        // Save the whole workspace (C2 is the active document) and reload it.
+        let file = app.to_project_file();
+        assert_eq!(file.circuits.len(), 2);
+        assert_eq!(file.active, 1); // C2 is second in doc_order and active.
+        let json = file.to_json().unwrap();
+        let file2 = ProjectFile::from_json(&json).unwrap();
+
+        let mut loaded = OsmilogApp::empty();
+        loaded.load_project_file(&file2).unwrap();
+
+        // Both documents restored, in order, with C2 active.
+        let names: Vec<String> = loaded
+            .doc_order
+            .iter()
+            .map(|&d| loaded.documents[d].name.clone())
+            .collect();
+        assert_eq!(names, vec!["Main".to_string(), "C2".to_string()]);
+        assert_eq!(loaded.active, loaded.doc_order[1]);
+
+        // The active document (C2) simulates: its Output reads 1.
+        let c2_out = loaded
+            .components
+            .values()
+            .find(|pc| matches!(pc.spec, ComponentSpec::Output))
+            .unwrap()
+            .key;
+        assert_eq!(loaded.circuit.read_output(c2_out), Value::ONE);
+
+        // Switching to Main brings its (independent) state back: Output reads 0.
+        let main = loaded.doc_order[0];
+        loaded.switch_circuit(main);
+        let main_out = loaded
+            .components
+            .values()
+            .find(|pc| matches!(pc.spec, ComponentSpec::Output))
+            .unwrap()
+            .key;
+        assert_eq!(loaded.circuit.read_output(main_out), Value::ZERO);
+    }
+
+    #[test]
+    fn test_project_file_loads_legacy_v2_as_single_circuit() {
+        // A hand-built v2 single-circuit file: Input(1) -> Output.
+        let v2 = crate::io::LegacyV2File {
+            version: crate::io::LEGACY_SINGLE_CIRCUIT_VERSION,
+            snapshot: CircuitSnapshot {
+                components: vec![
+                    ComponentEntry {
+                        spec: ComponentSpec::Input(Input { bits: 1, width: 1 }),
+                        grid_pos: GridPos::new(0, 0),
+                    },
+                    ComponentEntry {
+                        spec: ComponentSpec::Output,
+                        grid_pos: GridPos::new(5, 0),
+                    },
+                ],
+                tunnels: vec![],
+                nodes: vec![
+                    NodeEntry {
+                        pos: GridPos::new(0, 0),
+                        attach: NodeAttachEntry::Pin {
+                            comp: 0,
+                            is_input: false,
+                            pin_index: 0,
+                        },
+                    },
+                    NodeEntry {
+                        pos: GridPos::new(5, 0),
+                        attach: NodeAttachEntry::Pin {
+                            comp: 1,
+                            is_input: true,
+                            pin_index: 0,
+                        },
+                    },
+                ],
+                segments: vec![SegEntry { a: 0, b: 1 }],
+            },
+        };
+        let json = serde_json::to_string(&v2).unwrap();
+
+        // Parsing upgrades it to a one-circuit project named "Main".
+        let project = ProjectFile::from_json(&json).unwrap();
+        assert_eq!(project.version, CURRENT_VERSION);
+        assert_eq!(project.circuits.len(), 1);
+        assert_eq!(project.active, 0);
+        assert_eq!(project.circuits[0].name, "Main");
+        assert!(project.circuits[0].subcircuits.is_empty());
+
+        let mut loaded = OsmilogApp::empty();
+        loaded.load_project_file(&project).unwrap();
+        assert_eq!(loaded.documents.len(), 1);
+        let out = loaded
+            .components
+            .values()
+            .find(|pc| matches!(pc.spec, ComponentSpec::Output))
+            .unwrap()
+            .key;
+        assert_eq!(loaded.circuit.read_output(out), Value::ONE);
+    }
+
+    #[test]
+    fn test_project_file_subcircuit_round_trip() {
+        let mut app = OsmilogApp::empty();
+        let main = app.active;
+
+        // Main: Input(1) -> Output, a passthrough.
+        let in_main = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let out_main = place(&mut app, ComponentSpec::Output);
+        connect_pins(
+            &mut app,
+            (in_main, PinId::output(0)),
+            (out_main, PinId::input(0)),
+        );
+        app.rebuild_circuit();
+
+        // C2: Input(1) -> [Main as subcircuit] -> Output.
+        app.create_circuit_doc("C2".to_string());
+        let spec = app.subcircuit_spec(main);
+        let sub = app.place_component(spec, GridPos::new(5, 5));
+        let x = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let y = place(&mut app, ComponentSpec::Output);
+        connect_pins(&mut app, (x, PinId::output(0)), (sub, PinId::input(0)));
+        connect_pins(&mut app, (sub, PinId::output(0)), (y, PinId::input(0)));
+        app.rebuild_circuit();
+
+        // The subcircuit reference is emitted as an index into `circuits`.
+        let file = app.to_project_file();
+        let c2 = &file.circuits[file.active];
+        assert_eq!(c2.subcircuits.len(), 1);
+        assert_eq!(c2.subcircuits[0].circuit, 0); // Main is circuit 0.
+
+        let json = file.to_json().unwrap();
+        let file2 = ProjectFile::from_json(&json).unwrap();
+
+        // After reload (C2 active), the subcircuit rebinds to the reloaded Main
+        // and the whole thing still settles a 1 through the boundary.
+        let mut loaded = OsmilogApp::empty();
+        loaded.load_project_file(&file2).unwrap();
+        let sub_reloaded = loaded
+            .components
+            .values()
+            .find(|pc| matches!(pc.spec, ComponentSpec::Subcircuit { .. }))
+            .expect("subcircuit component restored");
+        assert_eq!(sub_reloaded.spec.n_inputs(), 1);
+        assert_eq!(sub_reloaded.spec.n_outputs(), 1);
+        let y_key = loaded
+            .components
+            .values()
+            .find(|pc| matches!(pc.spec, ComponentSpec::Output))
+            .unwrap()
+            .key;
+        assert_eq!(loaded.circuit.read_output(y_key), Value::ONE);
+    }
+
+    #[test]
+    fn test_project_file_subcircuit_forward_reference_round_trip() {
+        // The referencing circuit (Main, index 0) refers to a *later*-indexed
+        // circuit (C2, index 1), so on load Main is populated while C2 is still
+        // blank. The placed subcircuit must still get its cached pin arity (not
+        // a 0-pin placeholder) or wiring to it panics.
+        let mut app = OsmilogApp::empty();
+        let main = app.active;
+
+        // C2: Input(1) -> Output passthrough.
+        app.create_circuit_doc("C2".to_string());
+        let c2 = app.active;
+        let c2_in = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let c2_out = place(&mut app, ComponentSpec::Output);
+        connect_pins(
+            &mut app,
+            (c2_in, PinId::output(0)),
+            (c2_out, PinId::input(0)),
+        );
+        app.rebuild_circuit();
+
+        // Back on Main: Input(1) -> [C2 as subcircuit] -> Output.
+        app.switch_circuit(main);
+        let spec = app.subcircuit_spec(c2);
+        let sub = app.place_component(spec, GridPos::new(5, 5));
+        let x = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let y = place(&mut app, ComponentSpec::Output);
+        connect_pins(&mut app, (x, PinId::output(0)), (sub, PinId::input(0)));
+        connect_pins(&mut app, (sub, PinId::output(0)), (y, PinId::input(0)));
+        app.rebuild_circuit();
+
+        let file = app.to_project_file();
+        assert_eq!(file.active, 0); // Main active.
+        assert_eq!(file.circuits[0].subcircuits[0].circuit, 1); // refers to C2.
+
+        let json = file.to_json().unwrap();
+        let file2 = ProjectFile::from_json(&json).unwrap();
+
+        let mut loaded = OsmilogApp::empty();
+        loaded.load_project_file(&file2).unwrap();
+        let y_key = loaded
+            .components
+            .values()
+            .find(|pc| matches!(pc.spec, ComponentSpec::Output))
+            .unwrap()
+            .key;
+        assert_eq!(loaded.circuit.read_output(y_key), Value::ONE);
+    }
+
+    #[test]
+    fn test_project_file_validate_rejects_bad_files() {
+        let good_circuit = || CircuitEntry {
+            name: "Main".to_string(),
+            snapshot: CircuitSnapshot {
+                components: vec![],
+                tunnels: vec![],
+                nodes: vec![],
+                segments: vec![],
+            },
+            subcircuits: vec![],
+        };
+
+        // Unsupported version.
+        let f = ProjectFile {
+            version: CURRENT_VERSION + 1,
+            active: 0,
+            circuits: vec![good_circuit()],
+        };
+        assert_eq!(
+            f.validate(),
+            Err(LoadError::UnsupportedVersion {
+                found: CURRENT_VERSION + 1,
+                supported: CURRENT_VERSION,
+            })
+        );
+
+        // No circuits at all.
+        let f = ProjectFile::new(0, vec![]);
+        assert_eq!(f.validate(), Err(LoadError::EmptyProject));
+
+        // `active` out of range.
+        let f = ProjectFile::new(3, vec![good_circuit()]);
+        assert_eq!(
+            f.validate(),
+            Err(LoadError::CircuitIndexOutOfRange { index: 3, len: 1 })
+        );
+
+        // A subcircuit reference pointing at a non-existent circuit.
+        let mut c = good_circuit();
+        c.snapshot.components.push(ComponentEntry {
+            spec: ComponentSpec::Output,
+            grid_pos: GridPos::ZERO,
+        });
+        c.subcircuits.push(SubcircuitRef {
+            component: 0,
+            circuit: 9,
+        });
+        let f = ProjectFile::new(0, vec![c]);
+        assert_eq!(
+            f.validate(),
+            Err(LoadError::CircuitIndexOutOfRange { index: 9, len: 1 })
+        );
     }
 }

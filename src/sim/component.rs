@@ -401,8 +401,10 @@ pub enum ComponentSpec {
     // refreshed from the referenced document on switch-back
     // (gui::app::refresh_subcircuits). The live inner Circuit is NOT here - it's
     // built GUI-side (gui::app::build_circuit_from_doc) into Logic::Sub. `doc`
-    // is #[serde(skip)] because a DocId is not meaningful across a reload;
-    // subcircuit persistence is deferred (see CLAUDE.md / the save guard).
+    // is #[serde(skip)] because a DocId is an ephemeral slotmap key with no
+    // cross-reload meaning: on save the cross-circuit link is emitted as a plain
+    // index (io::SubcircuitRef, into ProjectFile::circuits) and re-bound to a
+    // freshly-allocated DocId on load (gui::app::load_project_file).
     Subcircuit {
         #[serde(skip)]
         doc: DocId,

@@ -12,12 +12,12 @@ use wasm_bindgen::JsCast;
 use web_sys::{Blob, BlobPropertyBag, HtmlAnchorElement, Url};
 
 use crate::gui::app::OsmilogApp;
-use crate::io::{CircuitFile, CIRCUIT_FILE_EXT};
+use crate::io::{ProjectFile, CIRCUIT_FILE_EXT};
 
 // The browser has no synchronous file dialogs, so a spawned load task delivers
 // its outcome into this shared slot; `poll_pending_load` drains it on a later
 // frame.
-type PendingLoad = Rc<RefCell<Option<Result<CircuitFile, String>>>>;
+type PendingLoad = Rc<RefCell<Option<Result<ProjectFile, String>>>>;
 
 // Web-only IO state: the async-load delivery slot plus the in-app "Save As"
 // modal's contents. native::IoState is a ZST with this same method surface -
@@ -59,7 +59,7 @@ impl IoState {
                     .ok_or_else(|| "no file selected".to_string())?;
                 let bytes = handle.read().await;
                 let text = String::from_utf8(bytes).map_err(|e| e.to_string())?;
-                let file = CircuitFile::from_json(&text).map_err(|e| e.to_string())?;
+                let file = ProjectFile::from_json(&text).map_err(|e| e.to_string())?;
                 file.validate().map_err(|e| e.to_string())?;
                 Ok(file)
             }
@@ -76,7 +76,7 @@ impl IoState {
         };
         match outcome {
             Ok(file) => {
-                if let Err(e) = app.load_circuit_file(&file) {
+                if let Err(e) = app.load_project_file(&file) {
                     app.last_settle_error = Some(format!("load failed: {e}"));
                 }
             }
@@ -117,7 +117,7 @@ impl IoState {
 
         if confirmed {
             let filename = save_filename(name);
-            match app.to_circuit_file().to_json() {
+            match app.to_project_file().to_json() {
                 Ok(json) => trigger_download(&json, &filename),
                 Err(e) => app.last_settle_error = Some(format!("save failed: {e}")),
             }

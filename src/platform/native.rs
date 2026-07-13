@@ -3,7 +3,7 @@
 // async browser APIs; see platform.rs for how the two are swapped.
 
 use crate::gui::app::OsmilogApp;
-use crate::io::{CircuitFile, CIRCUIT_FILE_EXT};
+use crate::io::{ProjectFile, CIRCUIT_FILE_EXT};
 
 // Native dialogs are synchronous, so there's no cross-frame IO state to hold -
 // this is a zero-sized placeholder that mirrors web::IoState's method surface.
@@ -19,7 +19,7 @@ impl IoState {
     // filename field) and writes the serialized circuit. Cancelling is a
     // silent no-op; a serialize/write failure surfaces in the menu-bar status.
     pub fn request_save(&mut self, app: &mut OsmilogApp) {
-        let json = match app.to_circuit_file().to_json() {
+        let json = match app.to_project_file().to_json() {
             Ok(json) => json,
             Err(e) => {
                 app.last_settle_error = Some(format!("save failed: {e}"));
@@ -50,13 +50,13 @@ impl IoState {
         };
         let loaded = (|| {
             let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let file = CircuitFile::from_json(&text).map_err(|e| e.to_string())?;
+            let file = ProjectFile::from_json(&text).map_err(|e| e.to_string())?;
             file.validate().map_err(|e| e.to_string())?;
             Ok::<_, String>(file)
         })();
         match loaded {
             Ok(file) => {
-                if let Err(e) = app.load_circuit_file(&file) {
+                if let Err(e) = app.load_project_file(&file) {
                     app.last_settle_error = Some(format!("load failed: {e}"));
                 }
             }
