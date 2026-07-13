@@ -68,6 +68,15 @@ pub struct CircuitDoc {
     pub(crate) state: Option<DocState>,
 }
 
+impl CircuitDoc {
+    pub(crate) fn blank(name: String) -> Self {
+        Self {
+            name,
+            state: Some(DocState::blank()),
+        }
+    }
+}
+
 /// Default name suggested for a new circuit, e.g. "Circuit 2" for the second
 /// document. Only a suggestion (prefilled into the dialog / used when the user
 /// clears the field) - names aren't required to be unique; identity is the `DocId`.

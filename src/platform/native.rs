@@ -9,8 +9,6 @@ use crate::io::{ProjectFile, CIRCUIT_FILE_EXT};
 // this is a zero-sized placeholder that mirrors web::IoState's method surface.
 // `poll_pending_load`/`drive_save_dialog` are no-ops here because nothing async
 // is ever left to finish on a later frame.
-// TODO: Figure out how to stop the clippy warning of this having a Default impl, since the web
-// version requires it.
 #[derive(Default)]
 pub struct IoState;
 

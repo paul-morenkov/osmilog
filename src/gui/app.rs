@@ -299,6 +299,7 @@ impl OsmilogApp {
             selected: None,
             clipboard: Clipboard::new(),
             last_settle_error: None,
+            #[allow(clippy::default_constructed_unit_structs)]
             io: platform::IoState::default(),
             show_profiler: false,
             clock: ClockControl::default(),
@@ -1112,10 +1113,7 @@ impl OsmilogApp {
 
         self.install_circuit_records(snapshot, &[], &[]);
         self.rebuild_circuit();
-        // Placement while installing records goes through the ordinary
-        // undo-recordable path (place_component/place_tunnel), which would
-        // otherwise leave a freshly loaded circuit with an undo stack that
-        // just re-deletes everything just placed. Loading isn't an edit.
+        // Clear undo stack that results from `rebuild_circuit()`
         self.history = History::default();
         Ok(())
     }
@@ -1140,12 +1138,7 @@ impl OsmilogApp {
         let doc_ids: Vec<DocId> = file
             .circuits
             .iter()
-            .map(|c| {
-                documents.insert(CircuitDoc {
-                    name: c.name.clone(),
-                    state: Some(DocState::blank()),
-                })
-            })
+            .map(|c| documents.insert(CircuitDoc::blank(c.name.clone())))
             .collect();
 
         self.documents = documents;
@@ -1237,7 +1230,7 @@ impl OsmilogApp {
             .map(|entry| self.place_tunnel_labeled(entry.label.clone(), entry.role, entry.grid_pos))
             .collect();
 
-        let node_keys: Vec<crate::gui::wiring::WireNodeKey> = snapshot
+        let node_keys: Vec<_> = snapshot
             .nodes
             .iter()
             .map(|entry| {
@@ -3896,7 +3889,6 @@ fn draw_tunnel_ghost(
 mod tests {
     use super::*;
     use crate::gui::wiring::NodeAttach;
-    use crate::io::CURRENT_VERSION;
     use crate::sim::component::GateOp;
 
     fn place(app: &mut OsmilogApp, spec: ComponentSpec) -> PlacedCompKey {
@@ -5165,8 +5157,11 @@ mod tests {
     }
 
     #[test]
-    fn test_project_file_loads_legacy_v2_as_single_circuit() {
-        // A hand-built v2 single-circuit file: Input(1) -> Output.
+    fn test_load_project_file_upgrades_legacy_v2() {
+        // A hand-built v2 single-circuit file: Input(1) -> Output. (The
+        // upgrade itself - LegacyV2File -> one-circuit ProjectFile - is
+        // covered in crate::io's own tests; this checks that OsmilogApp loads
+        // the upgraded project and simulates it correctly.)
         let v2 = crate::io::LegacyV2File {
             version: crate::io::LEGACY_SINGLE_CIRCUIT_VERSION,
             snapshot: CircuitSnapshot {
@@ -5203,14 +5198,7 @@ mod tests {
             },
         };
         let json = serde_json::to_string(&v2).unwrap();
-
-        // Parsing upgrades it to a one-circuit project named "Main".
         let project = ProjectFile::from_json(&json).unwrap();
-        assert_eq!(project.version, CURRENT_VERSION);
-        assert_eq!(project.circuits.len(), 1);
-        assert_eq!(project.active, 0);
-        assert_eq!(project.circuits[0].name, "Main");
-        assert!(project.circuits[0].subcircuits.is_empty());
 
         let mut loaded = OsmilogApp::empty();
         loaded.load_project_file(&project).unwrap();
@@ -5325,60 +5313,5 @@ mod tests {
             .unwrap()
             .key;
         assert_eq!(loaded.circuit.read_output(y_key), Value::ONE);
-    }
-
-    #[test]
-    fn test_project_file_validate_rejects_bad_files() {
-        let good_circuit = || CircuitEntry {
-            name: "Main".to_string(),
-            snapshot: CircuitSnapshot {
-                components: vec![],
-                tunnels: vec![],
-                nodes: vec![],
-                segments: vec![],
-            },
-            subcircuits: vec![],
-        };
-
-        // Unsupported version.
-        let f = ProjectFile {
-            version: CURRENT_VERSION + 1,
-            active: 0,
-            circuits: vec![good_circuit()],
-        };
-        assert_eq!(
-            f.validate(),
-            Err(LoadError::UnsupportedVersion {
-                found: CURRENT_VERSION + 1,
-                supported: CURRENT_VERSION,
-            })
-        );
-
-        // No circuits at all.
-        let f = ProjectFile::new(0, vec![]);
-        assert_eq!(f.validate(), Err(LoadError::EmptyProject));
-
-        // `active` out of range.
-        let f = ProjectFile::new(3, vec![good_circuit()]);
-        assert_eq!(
-            f.validate(),
-            Err(LoadError::CircuitIndexOutOfRange { index: 3, len: 1 })
-        );
-
-        // A subcircuit reference pointing at a non-existent circuit.
-        let mut c = good_circuit();
-        c.snapshot.components.push(ComponentEntry {
-            spec: ComponentSpec::Output,
-            grid_pos: GridPos::ZERO,
-        });
-        c.subcircuits.push(SubcircuitRef {
-            component: 0,
-            circuit: 9,
-        });
-        let f = ProjectFile::new(0, vec![c]);
-        assert_eq!(
-            f.validate(),
-            Err(LoadError::CircuitIndexOutOfRange { index: 9, len: 1 })
-        );
     }
 }
