@@ -1352,6 +1352,42 @@ impl OsmilogApp {
                     self.reconfigure_component(key, ComponentSpec::Input(Input { bits, width }));
                 }
             }
+            ComponentSpec::Constant(Constant {
+                mut bits,
+                mut width,
+            }) => {
+                let mut changed = false;
+                ui.label(format!("Value: 0x{:X}", bits));
+
+                // `bits` controlled by checkbox or textfield depending on `width`
+                if width == 1 {
+                    let mut high = bits != 0;
+                    if ui.checkbox(&mut high, "Toggle").clicked() {
+                        bits = high as u32;
+                        changed = true;
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Bits:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut bits).range(0..=Value::mask(width)))
+                            .changed();
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Width:");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut width).range(1..=32))
+                        .changed();
+                });
+                if changed {
+                    bits &= Value::mask(width); // In case width was changed below max `bits` value
+                    self.reconfigure_component(
+                        key,
+                        ComponentSpec::Constant(Constant { bits, width }),
+                    );
+                }
+            }
             ComponentSpec::Output => {
                 let val = self.circuit.read_output(comp_key);
                 let val_str = match val {
@@ -1830,12 +1866,9 @@ impl OsmilogApp {
     // then a hex DragValue per word. The row list is virtualized (show_rows) so a
     // 2^24-word ROM only builds the handful of rows actually on screen. Edits are
     // collected during the (self-immutable) draw pass and applied afterward.
-    fn show_rom_editor(&mut self, ctx: &egui::Context) {
+    fn show_rom_editor(&mut self, ctx: &egui::Context, pc: PlacedCompKey) {
         const WORDS_PER_ROW: usize = 8;
 
-        let Some(pc) = self.rom_editor_open else {
-            return;
-        };
         // Close if the ROM was deleted or undone away (or the key now names
         // something else after a reconfigure to a different type).
         let (data_width, len) = match self.components.get(pc) {
@@ -2355,10 +2388,8 @@ impl OsmilogApp {
                 let mut place_target = None;
                 for &doc_id in &self.doc_order {
                     let cyclic = self.would_cycle(doc_id);
-                    let resp = ui.selectable_label(
-                        doc_id == self.active,
-                        &self.documents[doc_id].name,
-                    );
+                    let resp =
+                        ui.selectable_label(doc_id == self.active, &self.documents[doc_id].name);
                     let resp = resp.on_hover_text(if cyclic {
                         "Can't nest: would create a cycle"
                     } else {
@@ -2384,6 +2415,11 @@ impl OsmilogApp {
             if ui.button("Input").clicked() {
                 self.mode = InteractionMode::Placing {
                     spec: ComponentSpec::Input(Input { bits: 0, width: 1 }),
+                };
+            }
+            if ui.button("Constant").clicked() {
+                self.mode = InteractionMode::Placing {
+                    spec: ComponentSpec::Constant(Constant { bits: 0, width: 1 }),
                 };
             }
             if ui.button("Output").clicked() {
@@ -3144,7 +3180,9 @@ impl eframe::App for OsmilogApp {
         self.show_menu_bar(ui, theme);
 
         // ROM contents editor window, drawn while a ROM's editor is open.
-        self.show_rom_editor(&ctx);
+        if let Some(pc) = self.rom_editor_open {
+            self.show_rom_editor(&ctx, pc);
+        }
 
         // "New Circuit" name dialog, drawn while it's open.
         self.create_new_circuit_dialog(&ctx);
@@ -3484,6 +3522,23 @@ fn draw_component(
             label_pos,
             Align2::CENTER_CENTER,
             name,
+            FontId::monospace(LABEL_FONT_SIZE),
+            theme.label_text,
+        );
+    }
+
+    // A Constant's on-canvas label is its current value, drawn dynamically
+    // for the same reason a Subcircuit's name is - distinguishing it visually
+    // from an Input at a glance, without a boundary pin to inspect.
+    if let ComponentSpec::Constant(Constant { bits, .. }) = &pc.spec {
+        let label_pos = egui::pos2(
+            rect.left() + shape.dynamic_label_pos.x * rect.width(),
+            rect.top() + shape.dynamic_label_pos.y * rect.height(),
+        );
+        painter.text(
+            label_pos,
+            Align2::CENTER_CENTER,
+            format!("0x{:X}", bits),
             FontId::monospace(LABEL_FONT_SIZE),
             theme.label_text,
         );
@@ -4834,7 +4889,10 @@ mod tests {
 
         // Back on Main: placing C2 here would form Main -> C2 -> Main. Rejected.
         app.switch_circuit(main);
-        assert!(app.would_cycle(c2), "C2 references Main, so nesting it cycles");
+        assert!(
+            app.would_cycle(c2),
+            "C2 references Main, so nesting it cycles"
+        );
         assert!(app.would_cycle(main), "a circuit can't contain itself");
 
         // A fresh, unrelated circuit is fine to nest.

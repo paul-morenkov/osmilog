@@ -51,6 +51,7 @@ impl ComponentSpec {
     pub fn size(&self) -> Vec2 {
         match self {
             Self::Input(_) | Self::Output => io_size(),
+            Self::Constant(_) => constant_size(),
             Self::Gate(g) => gate_size(g.op, g.n_inputs),
             Self::Mux(m) => mux_size(m.sel_width),
             Self::Demux(d) => demux_size(d.sel_width),
@@ -79,6 +80,11 @@ impl ComponentSpec {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Input(_) => "IN",
+            // The on-canvas label is the current value, drawn dynamically
+            // from the spec (see draw_component); this static fallback is
+            // only used where a &'static str is required (properties panel
+            // heading).
+            Self::Constant(_) => "CONST",
             Self::Output => "OUT",
             Self::Gate(g) => match g.op {
                 GateOp::And => "AND",
@@ -121,6 +127,7 @@ impl ComponentSpec {
         puffin::profile_function!();
         match self {
             Self::Input(_) => input_shape(),
+            Self::Constant(_) => constant_shape(),
             Self::Output => output_shape(),
             Self::Gate(g) => gate_shape(g.op, g.n_inputs),
             Self::Mux(m) => mux_shape(m.sel_width),

@@ -5,6 +5,7 @@ use slotmap::{new_key_type, SlotMap};
 
 mod adder;
 mod comparator;
+mod constant;
 mod counter;
 mod d_flip_flop;
 mod demux;
@@ -25,6 +26,7 @@ mod t_flip_flop;
 
 pub use adder::Adder;
 pub use comparator::Comparator;
+pub use constant::Constant;
 pub use counter::{Counter, CounterConf, OverflowAction};
 pub use d_flip_flop::{DFlipFlop, DFlipFlopConf};
 pub use demux::Demux;
@@ -88,6 +90,9 @@ impl Component {
 
     pub fn input(bits: u32, width: u8) -> Self {
         Self::from_comb(LogicComb::Input(Input { bits, width }))
+    }
+    pub fn constant(bits: u32, width: u8) -> Self {
+        Self::from_comb(LogicComb::Constant(Constant { bits, width }))
     }
     pub fn output() -> Self {
         Self::from_comb(LogicComb::Output)
@@ -361,6 +366,7 @@ impl Component {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ComponentSpec {
     Input(Input),
+    Constant(Constant),
     Output,
     Gate(Gate),
     Mux(Mux),
@@ -410,6 +416,7 @@ impl ComponentSpec {
     pub fn n_inputs(&self) -> usize {
         match self {
             Self::Input(_) => 0,
+            Self::Constant(_) => 0,
             Self::Output => 1,
             Self::Gate(g) => g.n_inputs(),
             Self::Mux(m) => m.n_inputs(),
@@ -443,6 +450,7 @@ impl ComponentSpec {
     pub fn n_outputs(&self) -> usize {
         match self {
             Self::Input(_) => 1,
+            Self::Constant(_) => 1,
             Self::Output => 0,
             Self::Gate(g) => g.n_outputs(),
             Self::Mux(m) => m.n_outputs(),
@@ -476,6 +484,7 @@ impl ComponentSpec {
     pub(crate) fn to_component(&self) -> Component {
         match self {
             Self::Input(p) => Component::input(p.bits, p.width),
+            Self::Constant(c) => Component::constant(c.bits, c.width),
             Self::Output => Component::output(),
             Self::Gate(g) => Component::gate(g.op, g.n_inputs, g.width),
             Self::Mux(m) => Component::mux(m.data_width, m.sel_width),
@@ -656,6 +665,7 @@ pub trait CombLogic {
 #[derive(Debug)]
 pub enum LogicComb {
     Input(Input),
+    Constant(Constant),
     Output,
     Gate(Gate),
     Mux(Mux),
@@ -674,6 +684,7 @@ impl LogicComb {
     pub fn n_inputs(&self) -> usize {
         match self {
             Self::Input(p) => p.n_inputs(),
+            Self::Constant(c) => c.n_inputs(),
             Self::Output => 1,
             Self::Gate(g) => g.n_inputs(),
             Self::Mux(m) => m.n_inputs(),
@@ -692,6 +703,7 @@ impl LogicComb {
     pub fn n_outputs(&self) -> usize {
         match self {
             Self::Input(p) => p.n_outputs(),
+            Self::Constant(c) => c.n_outputs(),
             Self::Output => 0,
             Self::Gate(g) => g.n_outputs(),
             Self::Mux(m) => m.n_outputs(),
@@ -710,6 +722,7 @@ impl LogicComb {
     pub fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
         match self {
             Self::Input(p) => p.evaluate(inputs),
+            Self::Constant(c) => c.evaluate(inputs),
             Self::Output => vec![],
             Self::Gate(g) => g.evaluate(inputs),
             Self::Mux(m) => m.evaluate(inputs),
@@ -728,6 +741,7 @@ impl LogicComb {
     pub fn input_width(&self, i: usize) -> Option<u8> {
         match self {
             Self::Input(p) => p.input_width(i),
+            Self::Constant(c) => c.input_width(i),
             Self::Output => None,
             Self::Gate(g) => g.input_width(i),
             Self::Mux(m) => m.input_width(i),
@@ -746,6 +760,7 @@ impl LogicComb {
     pub fn output_width(&self, i: usize) -> Option<u8> {
         match self {
             Self::Input(p) => p.output_width(i),
+            Self::Constant(c) => c.output_width(i),
             Self::Output => None,
             Self::Gate(g) => g.output_width(i),
             Self::Mux(m) => m.output_width(i),

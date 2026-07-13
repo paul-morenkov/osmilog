@@ -52,6 +52,11 @@ const SPLITTER_BODY_X: (f32, f32) = (0.25, 0.60);
 // Tunnels have their own width to account for a potentially long label.
 const TUNNEL_W: u32 = 4;
 
+// Constant carries its current value as a dynamic on-canvas label (like a
+// Tunnel's), so it gets the same wider footprint rather than Input/Output's
+// bare IO_W box.
+const CONST_W: u32 = 4;
+
 const REG_W: u32 = 3;
 
 // Same width as Reg (fits "D"/"LD"/"SH"/"0" labels); ShiftReg's height instead
@@ -333,6 +338,10 @@ pub const fn io_size() -> Vec2 {
     vec2(px(IO_W), px(stack_h(1)))
 }
 
+pub const fn constant_size() -> Vec2 {
+    vec2(px(CONST_W), px(stack_h(1)))
+}
+
 // Height scales off whichever boundary side (inputs on the left, outputs on the
 // right) has more pins; each side packs top-down from row 1 with its own pitch.
 // Both pitch heights are even, so their max is too.
@@ -375,6 +384,24 @@ fn io_shape(is_input: bool) -> ComponentShape {
         output_bubbles,
         labels: vec![],
         dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// A single-output source, like Input, but its current value is drawn as a
+// dynamic label (see draw_component) rather than left blank - so it gets its
+// own wider box (CONST_W) to fit that text instead of reusing io_shape.
+pub fn constant_shape() -> ComponentShape {
+    let center_row = stack_h(1) / 2; // 1
+    ComponentShape {
+        size: constant_size(),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors: vec![],
+        output_anchors: vec![PinAnchor::right(CONST_W, center_row)],
+        extra_strokes: vec![],
+        output_bubbles: vec![false],
+        labels: vec![],
+        dynamic_label_pos: vec2(0.5, 0.5),
     }
 }
 
