@@ -38,7 +38,7 @@ WASM adds `wasm-bindgen`/`wasm-bindgen-futures`/`js-sys`/`web-sys`.
     src/gui/geometry.rs               per-component-type shape builders + grid/pixel geometry constants
     src/gui/theme.rs                  Theme - canvas/signal colors derived from ambient egui Visuals
 
-    src/io.rs                        CircuitFile save/load format (JSON) + native/wasm file-dialog submodules
+    src/io.rs                        ProjectFile/CircuitSnapshot save/load format (JSON), v2->v3 upgrade
 
 ## Simulator / GUI separation
 
@@ -201,7 +201,7 @@ circuit component must not each hold their own `Vec`. `Rom::data` is therefore a
 so a `write_rom` through the component is visible to the spec (what the editor reads and what's
 saved) with no mirror write. This forces a hand-written `Clone` for `Rom` that **deep-copies** the
 buffer (a fresh `Rc`): the codebase treats `ComponentSpec: Clone` as "independent copy" everywhere
-that matters (paste, undo snapshots, save via `clipboard.rs`/`CircuitFile`), and a shallow `Rc`-bump
+that matters (paste, undo snapshots, save via `clipboard.rs`/`CircuitSnapshot`), and a shallow `Rc`-bump
 clone would make a pasted ROM alias the original's contents. So: `shared()` = alias (exactly one
 seam), `clone()` = independent (everywhere else). On disk the `Rc<RefCell<..>>` is transparent -
 it serializes as a plain word array (needs serde's `rc` feature), so the save format is unchanged.
@@ -380,15 +380,31 @@ geometry.
 
 ## Save / Load (`src/io.rs`)
 
-`CircuitFile { version, components: Vec<ComponentEntry>, tunnels: Vec<TunnelEntry>, nodes:
-Vec<NodeEntry>, segments: Vec<SegEntry> }` mirrors the GUI's visual state (placed components/
-tunnels + the `Wiring` graph), not `Circuit`'s internal `SlotMap`s - every cross-reference is a
-plain `usize` index into one of the file's own vectors, since slotmap keys are ephemeral and not
-worth persisting. `version` is bumped whenever the shape changes incompatibly; `validate()` checks
-version and index bounds before a load replaces the current app state. Native and WASM get
-separate submodules (`io::native`, `io::wasm`) for the actual file I/O, since blocking `rfd`
+The top-level on-disk unit (v3) is `ProjectFile { version, active: usize, circuits:
+Vec<CircuitEntry> }` - the *whole workspace*, every circuit document, not just the active one -
+so subcircuits round-trip (see below). Each `CircuitEntry { name, #[serde(flatten)]
+snapshot: CircuitSnapshot, subcircuits: Vec<SubcircuitRef> }` names one document and carries its
+records as a `CircuitSnapshot { components: Vec<ComponentEntry>, tunnels: Vec<TunnelEntry>, nodes:
+Vec<NodeEntry>, segments: Vec<SegEntry> }` - one document's GUI visual state (placed
+components/tunnels + the `Wiring` graph), not `Circuit`'s internal `SlotMap`s - every
+cross-reference a plain `usize` index into one of the snapshot's own vectors, since slotmap keys
+are ephemeral and not worth persisting. `CircuitSnapshot` is the reusable payload the clipboard
+(`gui::clipboard`) also holds. That indexing convention is exactly how cross-*circuit* links persist too: a
+placed subcircuit's `ComponentSpec::Subcircuit::doc` (a runtime-only, serde-skipped `DocId`) is
+emitted as a `SubcircuitRef { component, circuit }` (component index within the entry → circuit
+index within the project) and re-bound to a freshly-allocated `DocId` on load. `active` records
+which document was open.
+
+`version` is bumped whenever the shape changes incompatibly; `ProjectFile::validate()` checks
+version, `active`, and every index bound before a load replaces the current app state.
+`ProjectFile::from_json` transparently upgrades a legacy **v2** single-circuit file (deserialized
+via `io::LegacyV2File`, a versioned `CircuitSnapshot`) into a one-circuit project named "Main". The
+App↔file conversion lives in `gui::app` (`to_project_file`/`load_project_file`, plus
+`extract_records` / `install_circuit_records` shared with the single-doc `to_snapshot`/`load_snapshot`
+helpers). Native and WASM get separate
+submodules (`platform::native`, `platform::web`) for the actual file I/O, since blocking `rfd`
 dialogs and browser Promise-based APIs are different enough mechanically to not share one
-`#[cfg]`-sprinkled function; both stay `OsmilogApp`-agnostic (they take/return `CircuitFile`, not
+`#[cfg]`-sprinkled function; both stay `OsmilogApp`-agnostic (they take/return `ProjectFile`, not
 app state).
 
 ## In-Progress / Not Yet Implemented
@@ -411,7 +427,7 @@ app state).
   already computes the connected sets a "select the whole net" gesture would need.
 - **Pin-index bounds checking**: `Component::net_of`/`Circuit::net_of`/`link` don't bounds-check
   pin indices, so an out-of-range pin (including from a hand-edited save file, which
-  `CircuitFile::validate()` doesn't check against a component's actual arity) can panic
+  `CircuitSnapshot::validate()` doesn't check against a component's actual arity) can panic
   downstream.
 - **`set_input` error handling**: silently no-ops on a non-`Input` component instead of returning
   a `Result` (marked with a `TODO` in `circuit.rs`).
