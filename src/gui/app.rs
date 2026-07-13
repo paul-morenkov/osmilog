@@ -1415,9 +1415,10 @@ impl OsmilogApp {
         };
 
         match &self.components[key].spec {
-            ComponentSpec::Input(input) => {
-                let mut bits = input.bits;
-                let mut width = input.width;
+            ComponentSpec::Input(Input {
+                mut bits,
+                mut width,
+            }) => {
                 let mut changed = false;
                 ui.label(format!("Value: 0x{:X}", bits));
                 // `bits` is the live value: editable while Paused.
@@ -1455,9 +1456,10 @@ impl OsmilogApp {
                     })));
                 }
             }
-            ComponentSpec::Constant(constant) => {
-                let mut bits = constant.bits;
-                let mut width = constant.width;
+            ComponentSpec::Constant(Constant {
+                mut bits,
+                mut width,
+            }) => {
                 let mut changed = false;
                 ui.label(format!("Value: 0x{:X}", bits));
                 ui.add_enabled_ui(structural_ok, |ui| {
@@ -1495,10 +1497,12 @@ impl OsmilogApp {
                 let val = self.circuit.read_output(comp_key);
                 ui.label(format!("Value: {}", fmt_val(val)));
             }
-            ComponentSpec::Gate(gate) => {
-                let op = gate.op;
-                let mut n_inputs = gate.n_inputs;
-                let mut width = gate.width;
+            ComponentSpec::Gate(Gate {
+                op,
+                mut n_inputs,
+                mut width,
+            }) => {
+                let op = *op;
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     if op != GateOp::Not {
@@ -1524,9 +1528,10 @@ impl OsmilogApp {
                     })));
                 }
             }
-            ComponentSpec::Mux(mux) => {
-                let mut data_width = mux.data_width;
-                let mut sel_width = mux.sel_width;
+            ComponentSpec::Mux(Mux {
+                mut data_width,
+                mut sel_width,
+            }) => {
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
@@ -1549,9 +1554,10 @@ impl OsmilogApp {
                     })));
                 }
             }
-            ComponentSpec::Demux(demux) => {
-                let mut data_width = demux.data_width;
-                let mut sel_width = demux.sel_width;
+            ComponentSpec::Demux(Demux {
+                mut data_width,
+                mut sel_width,
+            }) => {
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
@@ -1574,8 +1580,7 @@ impl OsmilogApp {
                     })));
                 }
             }
-            ComponentSpec::Reg(reg) => {
-                let mut data_width = reg.data_width;
+            ComponentSpec::Reg(RegConf { mut data_width }) => {
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
@@ -1586,16 +1591,19 @@ impl OsmilogApp {
                     });
                 });
                 if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Reg(RegConf { data_width })));
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Reg(RegConf {
+                        data_width,
+                    })));
                 }
 
                 let cur = self.circuit.components[comp_key].pins.out_cache[0];
                 ui.label(format!("Value: {}", fmt_val(cur)));
             }
-            ComponentSpec::ShiftReg(shift_reg) => {
-                let mut data_width = shift_reg.data_width;
-                let mut num_stages = shift_reg.num_stages;
-                let mut parallel_load = shift_reg.parallel_load;
+            ComponentSpec::ShiftReg(ShiftRegConf {
+                mut data_width,
+                mut num_stages,
+                mut parallel_load,
+            }) => {
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
@@ -1615,11 +1623,13 @@ impl OsmilogApp {
                     });
                 });
                 if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::ShiftReg(ShiftRegConf {
-                        data_width,
-                        num_stages,
-                        parallel_load,
-                    })));
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::ShiftReg(
+                        ShiftRegConf {
+                            data_width,
+                            num_stages,
+                            parallel_load,
+                        },
+                    )));
                 }
 
                 for (i, v) in self.circuit.components[comp_key]
@@ -1631,10 +1641,11 @@ impl OsmilogApp {
                     ui.label(format!("Stage {i}: {}", fmt_val(*v)));
                 }
             }
-            ComponentSpec::Counter(counter) => {
-                let mut data_width = counter.data_width;
-                let mut max_value = counter.max_value;
-                let mut overflow_action = counter.overflow_action;
+            ComponentSpec::Counter(CounterConf {
+                mut data_width,
+                mut max_value,
+                mut overflow_action,
+            }) => {
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
@@ -1695,8 +1706,7 @@ impl OsmilogApp {
                 let cur = self.circuit.components[comp_key].pins.out_cache[0];
                 ui.label(format!("Value: {}", fmt_val(cur)));
             }
-            ComponentSpec::Encoder(encoder) => {
-                let mut sel_width = encoder.sel_width;
+            ComponentSpec::Encoder(Encoder { mut sel_width }) => {
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
@@ -1712,8 +1722,7 @@ impl OsmilogApp {
                     })));
                 }
             }
-            ComponentSpec::Adder(adder) => {
-                let mut data_width = adder.data_width;
+            ComponentSpec::Adder(Adder { mut data_width }) => {
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
@@ -1724,28 +1733,12 @@ impl OsmilogApp {
                     });
                 });
                 if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Adder(Adder { data_width })));
-                }
-            }
-            ComponentSpec::Subtractor(subtractor) => {
-                let mut data_width = subtractor.data_width;
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                            .changed();
-                    });
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Subtractor(Subtractor {
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Adder(Adder {
                         data_width,
                     })));
                 }
             }
-            ComponentSpec::Multiplier(multiplier) => {
-                let mut data_width = multiplier.data_width;
+            ComponentSpec::Subtractor(Subtractor { mut data_width }) => {
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
@@ -1756,13 +1749,28 @@ impl OsmilogApp {
                     });
                 });
                 if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Multiplier(Multiplier {
-                        data_width,
-                    })));
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Subtractor(
+                        Subtractor { data_width },
+                    )));
                 }
             }
-            ComponentSpec::Divider(divider) => {
-                let mut data_width = divider.data_width;
+            ComponentSpec::Multiplier(Multiplier { mut data_width }) => {
+                let mut changed = false;
+                ui.add_enabled_ui(structural_ok, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Data width:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
+                            .changed();
+                    });
+                });
+                if changed {
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Multiplier(
+                        Multiplier { data_width },
+                    )));
+                }
+            }
+            ComponentSpec::Divider(Divider { mut data_width }) => {
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
@@ -1778,8 +1786,7 @@ impl OsmilogApp {
                     })));
                 }
             }
-            ComponentSpec::Comparator(comparator) => {
-                let mut data_width = comparator.data_width;
+            ComponentSpec::Comparator(Comparator { mut data_width }) => {
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
@@ -1790,9 +1797,9 @@ impl OsmilogApp {
                     });
                 });
                 if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Comparator(Comparator {
-                        data_width,
-                    })));
+                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Comparator(
+                        Comparator { data_width },
+                    )));
                 }
             }
             // A ROM's contents buffer is huge, so its spec is matched by
@@ -1800,9 +1807,13 @@ impl OsmilogApp {
             // match above borrows rather than owns. Widths are structural;
             // rom.resized() preserve-and-fits the contents into a fresh owned
             // buffer, and editing the contents is a value edit (live while Paused).
-            ComponentSpec::Rom(rom) => {
-                let mut data_width = rom.data_width;
-                let mut address_width = rom.address_width;
+            ComponentSpec::Rom(
+                rom @ Rom {
+                    mut data_width,
+                    mut address_width,
+                    ..
+                },
+            ) => {
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
@@ -1814,7 +1825,10 @@ impl OsmilogApp {
                     ui.horizontal(|ui| {
                         ui.label("Address width:");
                         changed |= ui
-                            .add(egui::DragValue::new(&mut address_width).range(1..=MAX_ADDRESS_WIDTH))
+                            .add(
+                                egui::DragValue::new(&mut address_width)
+                                    .range(1..=MAX_ADDRESS_WIDTH),
+                            )
                             .changed();
                     });
                     ui.label(format!("{} words", 1usize << address_width));
@@ -1832,10 +1846,14 @@ impl OsmilogApp {
             }
             // Same reasoning as Rom, above (huge contents buffer, matched by
             // reference); read behavior joins the widths as structural.
-            ComponentSpec::Ram(ram) => {
-                let mut data_width = ram.data_width;
-                let mut address_width = ram.address_width;
-                let mut read_behavior = ram.read_behavior;
+            ComponentSpec::Ram(
+                ram @ Ram {
+                    mut data_width,
+                    mut address_width,
+                    mut read_behavior,
+                    ..
+                },
+            ) => {
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     ui.horizontal(|ui| {
@@ -1847,7 +1865,10 @@ impl OsmilogApp {
                     ui.horizontal(|ui| {
                         ui.label("Address width:");
                         changed |= ui
-                            .add(egui::DragValue::new(&mut address_width).range(1..=MAX_ADDRESS_WIDTH))
+                            .add(
+                                egui::DragValue::new(&mut address_width)
+                                    .range(1..=MAX_ADDRESS_WIDTH),
+                            )
                             .changed();
                     });
                     ui.label(format!("{} words", 1usize << address_width));
@@ -1856,7 +1877,8 @@ impl OsmilogApp {
                         egui::ComboBox::from_id_salt(key)
                             .selected_text(format!("{read_behavior:?}"))
                             .show_ui(ui, |ui| {
-                                for rb in [ReadBehavior::ReadAfterWrite, ReadBehavior::WriteAfterRead]
+                                for rb in
+                                    [ReadBehavior::ReadAfterWrite, ReadBehavior::WriteAfterRead]
                                 {
                                     changed |= ui
                                         .selectable_value(&mut read_behavior, rb, format!("{rb:?}"))
@@ -1880,13 +1902,12 @@ impl OsmilogApp {
                 ui.label(format!("DO: {}", fmt_val(cur)));
             }
             ComponentSpec::Splitter {
-                width,
+                mut width,
                 arm_bits,
-                direction,
+                mut direction,
             } => {
-                let mut width = *width;
+                // let mut width = *width;
                 let mut arm_bits = arm_bits.clone();
-                let mut direction = *direction;
                 let mut changed = false;
                 ui.add_enabled_ui(structural_ok, |ui| {
                     let before_dir = direction;
@@ -1989,8 +2010,6 @@ impl OsmilogApp {
             }
         }
 
-        // The &self.components borrow is released now the match is over, so the
-        // one deferred mutation this frame's interaction produced can run.
         match edit {
             Some(PropEdit::Reconfigure(spec)) => self.reconfigure_component(key, spec),
             Some(PropEdit::OpenRom) => self.rom_editor_open = Some(key),
