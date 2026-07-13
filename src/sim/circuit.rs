@@ -96,6 +96,44 @@ impl Circuit {
         }
     }
 
+    /// Injects a Value directly onto a component's output pin 0, as if the
+    /// component had produced it, and dirties that output net. Used to feed a
+    /// subcircuit's boundary Input components from the enclosing circuit: unlike
+    /// set_input it can deliver any Value (including Floating), and because an
+    /// Input has no input nets, settle() never re-runs its evaluate() to
+    /// overwrite the injected value. Marks the net dirty only when the value
+    /// changes, so re-driving identical inputs is a no-op (keeps settle
+    /// convergent). No-op if `comp` is stale.
+    pub(crate) fn drive_input(&mut self, comp: CompKey, value: Value) {
+        if self.components.contains_key(comp) {
+            self.apply_output_values(comp, vec![value]);
+        }
+    }
+
+    /// Writes one word into a ROM component's contents in place, masked to its
+    /// data_width, and re-evaluates it so the change propagates on the next
+    /// settle(). No-op if `comp` isn't a ROM or `index` is out of range. Unlike
+    /// structural edits this bypasses the Command/undo layer entirely (like
+    /// set_input / clock ticks): ROM contents are mutated live, not undoable.
+    pub fn write_rom(&mut self, comp: CompKey, index: usize, value: u32) {
+        // set_word takes &self (interior mutability), so this needs only a shared
+        // borrow to write; re-evaluate afterward, once that borrow has ended, to
+        // dirty the output net.
+        let wrote = if let Logic::Comb(LogicComb::Rom(rom)) = &self.components[comp].logic {
+            if index < rom.len() {
+                rom.set_word(index, value);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if wrote {
+            self.eval_component(comp);
+        }
+    }
+
     /// The current value on `comp`'s input, if it's an Output component;
     /// `Value::Floating` otherwise.
     pub fn read_output(&self, comp: CompKey) -> Value {
@@ -590,7 +628,7 @@ impl Circuit {
         // settle() mutates latched state; it's sound because apply_async is
         // idempotent, so re-evaluating a component any number of times before
         // the queue drains converges to the same state.
-        if self.components[comp].is_sequential() {
+        if self.components[comp].is_stateful() {
             let inputs = self.components[comp].read_inputs(&self.nets);
             self.components[comp].apply_async(&inputs);
         }
@@ -632,7 +670,7 @@ impl Circuit {
         let seq_comps: Vec<CompKey> = self
             .components
             .iter()
-            .filter(|(_, c)| c.active && c.is_sequential())
+            .filter(|(_, c)| c.active && c.is_stateful())
             .map(|(key, _)| key)
             .collect();
 
@@ -662,7 +700,7 @@ impl Circuit {
         let seq_comps: Vec<CompKey> = self
             .components
             .iter()
-            .filter(|(_, c)| c.active && c.is_sequential())
+            .filter(|(_, c)| c.active && c.is_stateful())
             .map(|(key, _)| key)
             .collect();
 
@@ -1587,5 +1625,163 @@ mod tests {
                                                           // (per Value::Not), and that net's own widths agree - so it resolves
                                                           // as ordinary Floating rather than carrying Invalid any further.
         assert_eq!(c.read_output(out), Value::Floating);
+    }
+
+    #[test]
+    fn test_rom_reads_and_write_rom_propagates() {
+        let mut c = Circuit::new();
+        // Address input (width 3) -> ROM (data_width 8, 8 words) -> Output.
+        let addr = c.add_component(Component::input(2, 3));
+        let rom = crate::sim::component::Rom::new(8, 3);
+        rom.set_word(2, 0x5A);
+        let rom_key = c.add_component(Component::rom(rom));
+        let out = c.add_component(Component::output());
+        c.link(addr, PinId::output(0), rom_key, PinId::input(0));
+        c.link(rom_key, PinId::output(0), out, PinId::input(0));
+        c.settle().unwrap();
+
+        // Reads the pre-loaded word at address 2.
+        assert_eq!(c.read_output(out), Value::new(0x5A, 8));
+
+        // An in-place content write at the addressed cell propagates on settle.
+        c.write_rom(rom_key, 2, 0xFF);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(0xFF, 8));
+
+        // Writing a *different* address leaves the current output untouched.
+        c.write_rom(rom_key, 5, 0x11);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(0xFF, 8));
+    }
+
+    // ── Subcircuits (Logic::Sub) ──────────────────────────────────────────────
+
+    // A fresh subcircuit component wrapping AND(a, b): two 1-bit inputs, one
+    // 1-bit output. Built anew each call (Circuit isn't Clone), so two calls
+    // yield independent instances.
+    fn and_subcircuit() -> Component {
+        let mut inner = Circuit::new();
+        let a = inner.add_component(Component::input(0, 1));
+        let b = inner.add_component(Component::input(0, 1));
+        let g = inner.add_component(Component::gate(GateOp::And, 2, 1));
+        let o = inner.add_component(Component::output());
+        inner.link(a, PinId::output(0), g, PinId::input(0));
+        inner.link(b, PinId::output(0), g, PinId::input(1));
+        inner.link(g, PinId::output(0), o, PinId::input(0));
+        inner.settle().unwrap();
+        Component::subcircuit(inner, vec![a, b], vec![o])
+    }
+
+    // A fresh subcircuit component wrapping a 4-bit register: inputs [D, WE],
+    // output [Q].
+    fn reg_subcircuit() -> Component {
+        let mut inner = Circuit::new();
+        let d = inner.add_component(Component::input(0, 4));
+        let we = inner.add_component(Component::input(0, 1));
+        let reg = inner.add_component(Component::reg(4));
+        let o = inner.add_component(Component::output());
+        inner.link(d, PinId::output(0), reg, PinId::input(0));
+        inner.link(we, PinId::output(0), reg, PinId::input(1));
+        inner.link(reg, PinId::output(0), o, PinId::input(0));
+        inner.settle().unwrap();
+        Component::subcircuit(inner, vec![d, we], vec![o])
+    }
+
+    #[test]
+    fn subcircuit_propagates_combinationally() {
+        let mut c = Circuit::new();
+        let x = c.add_component(Component::input(1, 1));
+        let y = c.add_component(Component::input(1, 1));
+        let sub = c.add_component(and_subcircuit());
+        let out = c.add_component(Component::output());
+        c.link(x, PinId::output(0), sub, PinId::input(0));
+        c.link(y, PinId::output(0), sub, PinId::input(1));
+        c.link(sub, PinId::output(0), out, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::ONE); // 1 AND 1
+
+        // An input change settles through the boundary with no clock tick.
+        c.set_input(x, 0, 1);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::ZERO); // 0 AND 1
+    }
+
+    #[test]
+    fn subcircuit_forwards_clock_tick() {
+        let mut c = Circuit::new();
+        let d = c.add_component(Component::input(7, 4));
+        let we = c.add_component(Component::input(1, 1));
+        let sub = c.add_component(reg_subcircuit());
+        let out = c.add_component(Component::output());
+        c.link(d, PinId::output(0), sub, PinId::input(0));
+        c.link(we, PinId::output(0), sub, PinId::input(1));
+        c.link(sub, PinId::output(0), out, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::new(0, 4)); // register power-on 0
+
+        // An outer clock tick drives the inner register one step.
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out), Value::new(7, 4));
+    }
+
+    #[test]
+    fn subcircuit_instances_have_independent_state() {
+        let mut c = Circuit::new();
+        // Instance 1: WE = 1 (latches its data).
+        let d1 = c.add_component(Component::input(5, 4));
+        let we1 = c.add_component(Component::input(1, 1));
+        let sub1 = c.add_component(reg_subcircuit());
+        let out1 = c.add_component(Component::output());
+        c.link(d1, PinId::output(0), sub1, PinId::input(0));
+        c.link(we1, PinId::output(0), sub1, PinId::input(1));
+        c.link(sub1, PinId::output(0), out1, PinId::input(0));
+
+        // Instance 2: WE = 0 (holds its power-on value).
+        let d2 = c.add_component(Component::input(9, 4));
+        let we2 = c.add_component(Component::input(0, 1));
+        let sub2 = c.add_component(reg_subcircuit());
+        let out2 = c.add_component(Component::output());
+        c.link(d2, PinId::output(0), sub2, PinId::input(0));
+        c.link(we2, PinId::output(0), sub2, PinId::input(1));
+        c.link(sub2, PinId::output(0), out2, PinId::input(0));
+
+        c.settle().unwrap();
+        c.tick_clock().unwrap();
+        assert_eq!(c.read_output(out1), Value::new(5, 4)); // latched
+        assert_eq!(c.read_output(out2), Value::new(0, 4)); // held initial
+    }
+
+    #[test]
+    fn nested_subcircuit_settles() {
+        // A subcircuit whose inner circuit itself contains a subcircuit:
+        // outer -> mid(sub) -> and(sub).
+        let mut mid = Circuit::new();
+        let ma = mid.add_component(Component::input(0, 1));
+        let mb = mid.add_component(Component::input(0, 1));
+        let inner_and = mid.add_component(and_subcircuit());
+        let mo = mid.add_component(Component::output());
+        mid.link(ma, PinId::output(0), inner_and, PinId::input(0));
+        mid.link(mb, PinId::output(0), inner_and, PinId::input(1));
+        mid.link(inner_and, PinId::output(0), mo, PinId::input(0));
+        mid.settle().unwrap();
+        let mid_sub = Component::subcircuit(mid, vec![ma, mb], vec![mo]);
+
+        let mut c = Circuit::new();
+        let x = c.add_component(Component::input(1, 1));
+        let y = c.add_component(Component::input(1, 1));
+        let sub = c.add_component(mid_sub);
+        let out = c.add_component(Component::output());
+        c.link(x, PinId::output(0), sub, PinId::input(0));
+        c.link(y, PinId::output(0), sub, PinId::input(1));
+        c.link(sub, PinId::output(0), out, PinId::input(0));
+
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::ONE); // 1 AND 1 through two levels
+
+        c.set_input(x, 0, 1);
+        c.settle().unwrap();
+        assert_eq!(c.read_output(out), Value::ZERO);
     }
 }

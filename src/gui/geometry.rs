@@ -52,11 +52,22 @@ const SPLITTER_BODY_X: (f32, f32) = (0.25, 0.60);
 // Tunnels have their own width to account for a potentially long label.
 const TUNNEL_W: u32 = 4;
 
+// Constant carries its current value as a dynamic on-canvas label (like a
+// Tunnel's), so it gets the same wider footprint rather than Input/Output's
+// bare IO_W box.
+const CONST_W: u32 = 4;
+
 const REG_W: u32 = 3;
 
 // Same width as Reg (fits "D"/"LD"/"SH"/"0" labels); ShiftReg's height instead
 // scales with num_stages, so it stays a dedicated constant.
 const SHIFT_REG_W: u32 = 3;
+
+const ROM_W: u32 = 7;
+
+// A subcircuit is a plain box carrying the referenced document's name; wide
+// enough for a short name and for pins to read as belonging to distinct sides.
+const SUBCIRCUIT_W: u32 = 6;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(from = "[i32; 2]", into = "[i32; 2]")]
@@ -148,11 +159,23 @@ const fn sel_pitch(sel_width: u8) -> Pitch {
     }
 }
 
+/// A subcircuit's boundary pins (variable count, derived from the referenced
+/// document's Input/Output components) pack tightly once a roomy spread would
+/// make the body needlessly tall - same threshold as gates.
+const fn sub_pitch(k: usize) -> Pitch {
+    if k > 3 {
+        Pitch::Tight
+    } else {
+        Pitch::Spread
+    }
+}
+
 // Spread is the default layout; these terse wrappers keep the many spread call
 // sites readable (Spread ignores the pin count, so the `0` below is a placeholder).
 fn pin_row(i: usize) -> u32 {
     Pitch::Spread.row(i, 0)
 }
+
 const fn stack_h(k: usize) -> u32 {
     Pitch::Spread.height(k)
 }
@@ -304,9 +327,27 @@ pub const fn encoder_size(sel_width: u8) -> Vec2 {
     vec2(px(MUX_W), px(sel_pitch(sel_width).height(k)))
 }
 
+// A plain box, same footprint as reg_size (REG_W wide, 4 cells tall) so the
+// single A input on the left and D output on the right both center on grid row 2.
+pub const fn rom_size() -> Vec2 {
+    vec2(px(ROM_W), px(stack_h(2)))
+}
+
 pub const fn io_size() -> Vec2 {
     // 1-pin edge → 2 cells tall, so the single side-pin centers on grid row 1.
     vec2(px(IO_W), px(stack_h(1)))
+}
+
+pub const fn constant_size() -> Vec2 {
+    vec2(px(CONST_W), px(stack_h(1)))
+}
+
+// Height scales off whichever boundary side (inputs on the left, outputs on the
+// right) has more pins; each side packs top-down from row 1 with its own pitch.
+// Both pitch heights are even, so their max is too.
+pub fn subcircuit_size(n_in: usize, n_out: usize) -> Vec2 {
+    let h_cells = sub_pitch(n_in).height(n_in).max(sub_pitch(n_out).height(n_out));
+    vec2(px(SUBCIRCUIT_W), px(h_cells))
 }
 
 // ── Shape builders ────────────────────────────────────────────────────────────
@@ -343,6 +384,24 @@ fn io_shape(is_input: bool) -> ComponentShape {
         output_bubbles,
         labels: vec![],
         dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// A single-output source, like Input, but its current value is drawn as a
+// dynamic label (see draw_component) rather than left blank - so it gets its
+// own wider box (CONST_W) to fit that text instead of reusing io_shape.
+pub fn constant_shape() -> ComponentShape {
+    let center_row = stack_h(1) / 2; // 1
+    ComponentShape {
+        size: constant_size(),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors: vec![],
+        output_anchors: vec![PinAnchor::right(CONST_W, center_row)],
+        extra_strokes: vec![],
+        output_bubbles: vec![false],
+        labels: vec![],
+        dynamic_label_pos: vec2(0.5, 0.5),
     }
 }
 
@@ -536,6 +595,37 @@ pub fn counter_shape() -> ComponentShape {
         output_bubbles: vec![false, false],
         labels,
         dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
+// A subcircuit: a plain box with `n_in` inputs on the left edge and `n_out`
+// outputs on the right, each side packed top-down from row 1 in the pin order
+// the component exposes (the GUI derives that from the inner Input/Output
+// component positions). The referenced document's name is drawn at
+// `dynamic_label_pos` (like a tunnel label) since it isn't known at 'static
+// time; `labels` therefore stays empty.
+pub fn subcircuit_shape(n_in: usize, n_out: usize) -> ComponentShape {
+    let in_pitch = sub_pitch(n_in);
+    let out_pitch = sub_pitch(n_out);
+    let h_cells = in_pitch.height(n_in).max(out_pitch.height(n_out));
+
+    let input_anchors = (0..n_in)
+        .map(|i| PinAnchor::left(in_pitch.row(i, n_in)))
+        .collect();
+    let output_anchors = (0..n_out)
+        .map(|i| PinAnchor::right(SUBCIRCUIT_W, out_pitch.row(i, n_out)))
+        .collect();
+
+    ComponentShape {
+        size: vec2(px(SUBCIRCUIT_W), px(h_cells)),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors,
+        output_anchors,
+        extra_strokes: vec![],
+        output_bubbles: vec![false; n_out],
+        labels: vec![],
+        dynamic_label_pos: vec2(0.5, 0.5),
     }
 }
 
@@ -948,6 +1038,44 @@ fn op2_shape(
     }
 }
 
+// A memory block: single address input "A" on the left edge, single data output
+// "D" on the right edge, both centered vertically, with a "ROM" label in the body.
+pub fn rom_shape() -> ComponentShape {
+    let h_cells = stack_h(2); // 4
+    let center_row = h_cells / 2; // 2
+    let row_y = center_row as f32 / h_cells as f32;
+
+    let labels = vec![
+        ComponentLabel {
+            text: "ROM",
+            pos: vec2(0.5, 0.5),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "A",
+            pos: vec2(0.2, row_y),
+            ..Default::default()
+        },
+        ComponentLabel {
+            text: "D",
+            pos: vec2(0.8, row_y),
+            ..Default::default()
+        },
+    ];
+
+    ComponentShape {
+        size: rom_size(),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors: vec![PinAnchor::left(center_row)],
+        output_anchors: vec![PinAnchor::right(ROM_W, center_row)],
+        extra_strokes: vec![],
+        output_bubbles: vec![false],
+        labels,
+        dynamic_label_pos: Vec2::ZERO,
+    }
+}
+
 // Pin layout matches Component::comparator's fixed order: input[0]/[1] = the two
 // compared operands (left edge, centered on the output stack); output[0] = greater-than,
 // output[1] = equal, output[2] = less-than (right edge, evenly spaced, each labeled).
@@ -1230,6 +1358,25 @@ mod tests {
 
         assert_shape_on_grid("tunnel feed", &tunnel_shape(TunnelRole::Feed));
         assert_shape_on_grid("tunnel pull", &tunnel_shape(TunnelRole::Pull));
+
+        // Subcircuits have a variable, independent pin count on each edge
+        // (derived from the referenced circuit's Input/Output components).
+        for n_in in 0..=6usize {
+            for n_out in 0..=6usize {
+                let shape = subcircuit_shape(n_in, n_out);
+                assert_eq!(
+                    shape.input_anchors.len(),
+                    n_in,
+                    "subcircuit {n_in}x{n_out}: input anchor count",
+                );
+                assert_eq!(
+                    shape.output_anchors.len(),
+                    n_out,
+                    "subcircuit {n_in}x{n_out}: output anchor count",
+                );
+                assert_shape_on_grid(&format!("subcircuit {n_in}x{n_out}"), &shape);
+            }
+        }
     }
 
     // Bubble output pins sit one cell beyond the right edge (col == width + 1) so

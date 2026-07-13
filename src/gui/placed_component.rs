@@ -51,6 +51,7 @@ impl ComponentSpec {
     pub fn size(&self) -> Vec2 {
         match self {
             Self::Input(_) | Self::Output => io_size(),
+            Self::Constant(_) => constant_size(),
             Self::Gate(g) => gate_size(g.op, g.n_inputs),
             Self::Mux(m) => mux_size(m.sel_width),
             Self::Demux(d) => demux_size(d.sel_width),
@@ -66,13 +67,24 @@ impl ComponentSpec {
             Self::Multiplier(_) => op2_size(),
             Self::Divider(_) => op2_size(),
             Self::Comparator(_) => comparator_size(),
+            Self::Rom(_) => rom_size(),
             Self::Splitter { arm_bits, .. } => splitter_size(arm_bits.len() as u8),
+            Self::Subcircuit {
+                input_widths,
+                output_widths,
+                ..
+            } => subcircuit_size(input_widths.len(), output_widths.len()),
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
             Self::Input(_) => "IN",
+            // The on-canvas label is the current value, drawn dynamically
+            // from the spec (see draw_component); this static fallback is
+            // only used where a &'static str is required (properties panel
+            // heading).
+            Self::Constant(_) => "CONST",
             Self::Output => "OUT",
             Self::Gate(g) => match g.op {
                 GateOp::And => "AND",
@@ -98,10 +110,16 @@ impl ComponentSpec {
             Self::Multiplier(_) => "MUL",
             Self::Divider(_) => "DIV",
             Self::Comparator(_) => "CMP",
+            Self::Rom(_) => "ROM",
             Self::Splitter { direction, .. } => match direction {
                 FanDirection::Right => "SPLIT",
                 FanDirection::Left => "COMBINE",
             },
+            // The on-canvas label is the referenced document's name, drawn
+            // dynamically from the spec (see draw_component); this static
+            // fallback is only used where a &'static str is required (e.g. the
+            // properties-panel heading).
+            Self::Subcircuit { .. } => "SUB",
         }
     }
 
@@ -109,6 +127,7 @@ impl ComponentSpec {
         puffin::profile_function!();
         match self {
             Self::Input(_) => input_shape(),
+            Self::Constant(_) => constant_shape(),
             Self::Output => output_shape(),
             Self::Gate(g) => gate_shape(g.op, g.n_inputs),
             Self::Mux(m) => mux_shape(m.sel_width),
@@ -126,11 +145,17 @@ impl ComponentSpec {
             Self::Multiplier(_) => multiplier_shape(),
             Self::Divider(_) => divider_shape(),
             Self::Comparator(_) => comparator_shape(),
+            Self::Rom(_) => rom_shape(),
             Self::Splitter {
                 arm_bits,
                 direction,
                 ..
             } => splitter_shape(arm_bits.len() as u8, *direction),
+            Self::Subcircuit {
+                input_widths,
+                output_widths,
+                ..
+            } => subcircuit_shape(input_widths.len(), output_widths.len()),
         }
     }
 }

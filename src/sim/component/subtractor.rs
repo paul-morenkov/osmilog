@@ -27,19 +27,21 @@ impl CombLogic for Subtractor {
 
     fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
         let width = self.data_width;
+        // A Floating borrow-in behaves the same as a zero borrow-in; anything else
+        // non-Fixed, or a Fixed borrow-in at the wrong width, falls through to Floating.
+        let borrow_in = match inputs[Self::BORROW_IN_PIN] {
+            Value::Floating => Some(0u32),
+            Value::Fixed { bits, width: 1 } => Some(bits),
+            _ => None,
+        };
         match (
             inputs[Self::MINUEND_PIN],
             inputs[Self::SUBTRAHEND_PIN],
-            inputs[Self::BORROW_IN_PIN],
+            borrow_in,
         ) {
-            (
-                Value::Fixed { bits: a, width: aw },
-                Value::Fixed { bits: b, width: bw },
-                Value::Fixed {
-                    bits: bin,
-                    width: bw_in,
-                },
-            ) if aw == width && bw == width && bw_in == 1 => {
+            (Value::Fixed { bits: a, width: aw }, Value::Fixed { bits: b, width: bw }, Some(bin))
+                if aw == width && bw == width =>
+            {
                 // Wraps mod 2^32 then masks to `width` bits, which equals mod
                 // 2^width since 2^width divides 2^32 - no signed/widened
                 // intermediate needed, unlike the borrow-out check below.
@@ -90,6 +92,15 @@ mod tests {
         assert_eq!(
             s.evaluate(&[Value::new(5, 4), Value::new(3, 4), Value::ONE]),
             vec![Value::new(1, 4), Value::ZERO]
+        );
+    }
+
+    #[test]
+    fn test_floating_borrow_in_behaves_as_zero() {
+        let s = subtractor(4);
+        assert_eq!(
+            s.evaluate(&[Value::new(5, 4), Value::new(3, 4), Value::Floating]),
+            vec![Value::new(2, 4), Value::ZERO]
         );
     }
 

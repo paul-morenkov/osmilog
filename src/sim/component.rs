@@ -1,9 +1,11 @@
+use crate::sim::circuit::Circuit;
 use crate::sim::net::{Net, NetKey};
 use crate::sim::value::Value;
 use slotmap::{new_key_type, SlotMap};
 
 mod adder;
 mod comparator;
+mod constant;
 mod counter;
 mod d_flip_flop;
 mod demux;
@@ -15,6 +17,7 @@ mod jk_flip_flop;
 mod multiplier;
 mod mux;
 mod reg;
+mod rom;
 mod shift_reg;
 mod splitter;
 mod sr_flip_flop;
@@ -23,6 +26,7 @@ mod t_flip_flop;
 
 pub use adder::Adder;
 pub use comparator::Comparator;
+pub use constant::Constant;
 pub use counter::{Counter, CounterConf, OverflowAction};
 pub use d_flip_flop::{DFlipFlop, DFlipFlopConf};
 pub use demux::Demux;
@@ -34,6 +38,7 @@ pub use jk_flip_flop::{JKFlipFlop, JKFlipFlopConf};
 pub use multiplier::Multiplier;
 pub use mux::Mux;
 pub use reg::{Reg, RegConf};
+pub use rom::{Rom, MAX_ADDRESS_WIDTH};
 pub use shift_reg::{ShiftReg, ShiftRegConf};
 pub use splitter::{FanDirection, Splitter};
 pub use sr_flip_flop::{SRFlipFlop, SRFlipFlopConf};
@@ -42,6 +47,16 @@ pub use t_flip_flop::{TFlipFlop, TFlipFlopConf};
 
 new_key_type! {
     pub struct CompKey;
+}
+
+new_key_type! {
+    /// Opaque reference to another circuit document, embedded in
+    /// `ComponentSpec::Subcircuit`. The simulator never dereferences it: the GUI
+    /// owns the document registry (`SlotMap<DocId, CircuitDoc>`) and builds a
+    /// subcircuit's inner `Circuit` from the referenced document. Defined here
+    /// (not in the GUI) so `ComponentSpec` can carry it without `sim` depending
+    /// on `gui`; re-exported from `gui::document`.
+    pub struct DocId;
 }
 
 #[derive(Debug)]
@@ -75,6 +90,9 @@ impl Component {
 
     pub fn input(bits: u32, width: u8) -> Self {
         Self::from_comb(LogicComb::Input(Input { bits, width }))
+    }
+    pub fn constant(bits: u32, width: u8) -> Self {
+        Self::from_comb(LogicComb::Constant(Constant { bits, width }))
     }
     pub fn output() -> Self {
         Self::from_comb(LogicComb::Output)
@@ -142,6 +160,39 @@ impl Component {
         Self::from_comb(LogicComb::Splitter(Splitter::new(arm_bits, direction)))
     }
 
+    // Builds a subcircuit component wrapping a whole inner Circuit. `inputs` /
+    // `outputs` are the inner Input / Output component keys in the pin order
+    // this component exposes (the GUI derives that top-down); pin arity comes
+    // straight from their lengths. See Logic::Sub / SubCircuit.
+    pub fn subcircuit(inner: Circuit, inputs: Vec<CompKey>, outputs: Vec<CompKey>) -> Self {
+        let pins = Pins::new(inputs.len(), outputs.len());
+        Self {
+            pins,
+            logic: Logic::Sub(SubCircuit {
+                inner,
+                inputs,
+                outputs,
+            }),
+            active: true,
+        }
+    }
+
+    // A subcircuit component with the given pin arity but an empty inner
+    // circuit (no boundary keys), so it settles to all-Floating outputs. Only a
+    // safe fallback for ComponentSpec::to_component() on a Subcircuit spec; the
+    // GUI builds real subcircuits via gui::app::instantiate.
+    pub fn subcircuit_placeholder(n_inputs: usize, n_outputs: usize) -> Self {
+        Self {
+            pins: Pins::new(n_inputs, n_outputs),
+            logic: Logic::Sub(SubCircuit {
+                inner: Circuit::new(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+            }),
+            active: true,
+        }
+    }
+
     pub fn priority_encoder(sel_width: u8) -> Self {
         Self::from_comb(LogicComb::Encoder(Encoder { sel_width }))
     }
@@ -166,6 +217,12 @@ impl Component {
         Self::from_comb(LogicComb::Comparator(Comparator { data_width }))
     }
 
+    // Builds a ROM from a full Rom record (widths + contents). Takes the record
+    // by value so to_component() can hand over a clone of the placed spec's data.
+    pub fn rom(rom: Rom) -> Self {
+        Self::from_comb(LogicComb::Rom(rom))
+    }
+
     // Reads the current Value of every input pin from net state, without mutating
     // anything. Used by evaluate() and by Circuit::tick_clock()'s input-collection stage.
     pub fn read_inputs(&self, nets: &SlotMap<NetKey, Net>) -> Vec<Value> {
@@ -187,6 +244,10 @@ impl Component {
             // input effect (e.g. a reset) was already folded into that state by
             // apply_async(), and clocked changes only happen in tick().
             Logic::Seq(seq) => seq.observe(),
+            // A subcircuit's inner Circuit was already driven+settled by
+            // apply_async() (settle-time) or tick() (clock-time), so this is a
+            // pure read of its boundary Output components.
+            Logic::Sub(sub) => sub.observe(),
         }
     }
 
@@ -196,8 +257,13 @@ impl Component {
     // input can take effect without a clock tick; must be idempotent (see
     // SeqLogic::apply_async).
     pub fn apply_async(&mut self, inputs: &[Value]) {
-        if let Logic::Seq(seq) = &mut self.logic {
-            seq.apply_async(inputs);
+        match &mut self.logic {
+            Logic::Seq(seq) => seq.apply_async(inputs),
+            // Drive the boundary Input components with the current inputs and
+            // settle the inner circuit. Idempotent: driving the same values
+            // marks nothing dirty and settle() becomes a no-op.
+            Logic::Sub(sub) => sub.drive_and_settle(inputs),
+            Logic::Comb(_) => {}
         }
     }
 
@@ -209,6 +275,7 @@ impl Component {
         match &self.logic {
             Logic::Comb(_) => unreachable!("observe() called on a combinational component"),
             Logic::Seq(seq) => seq.observe(),
+            Logic::Sub(sub) => sub.observe(),
         }
     }
 
@@ -219,6 +286,9 @@ impl Component {
         match &mut self.logic {
             Logic::Comb(_) => unreachable!("tick() called on a combinational component"),
             Logic::Seq(seq) => seq.tick(inputs),
+            // Forward the clock edge into the inner circuit, then read its
+            // boundary Output components as the new latched values.
+            Logic::Sub(sub) => sub.tick(inputs),
         }
     }
 
@@ -228,6 +298,7 @@ impl Component {
         match &mut self.logic {
             Logic::Comb(_) => unreachable!("reset() called on a combinational component"),
             Logic::Seq(seq) => seq.reset(),
+            Logic::Sub(sub) => sub.reset(),
         }
     }
 
@@ -249,10 +320,23 @@ impl Component {
         matches!(self.logic, Logic::Seq(_))
     }
 
+    pub fn is_subcircuit(&self) -> bool {
+        matches!(self.logic, Logic::Sub(_))
+    }
+
+    // Components whose state advances on a clock tick and whose async effects
+    // run inside settle(): sequential components and subcircuits. The engine's
+    // whole-component sweeps (eval_component's apply_async, tick_clock,
+    // reset_sequential) key on this rather than is_sequential().
+    pub fn is_stateful(&self) -> bool {
+        matches!(self.logic, Logic::Seq(_) | Logic::Sub(_))
+    }
+
     pub fn input_width(&self, i: InIdx) -> Option<u8> {
         match &self.logic {
             Logic::Comb(c) => c.input_width(i.0 as usize),
             Logic::Seq(s) => s.input_width(i.0 as usize),
+            Logic::Sub(sub) => sub.input_width(i.0 as usize),
         }
     }
 
@@ -260,6 +344,7 @@ impl Component {
         match &self.logic {
             Logic::Comb(c) => c.output_width(i.0 as usize),
             Logic::Seq(s) => s.output_width(i.0 as usize),
+            Logic::Sub(sub) => sub.output_width(i.0 as usize),
         }
     }
 
@@ -281,6 +366,7 @@ impl Component {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ComponentSpec {
     Input(Input),
+    Constant(Constant),
     Output,
     Gate(Gate),
     Mux(Mux),
@@ -293,6 +379,7 @@ pub enum ComponentSpec {
     Multiplier(Multiplier),
     Divider(Divider),
     Comparator(Comparator),
+    Rom(Rom),
     DFlipFlop(DFlipFlopConf),
     TFlipFlop(TFlipFlopConf),
     JKFlipFlop(JKFlipFlopConf),
@@ -307,12 +394,29 @@ pub enum ComponentSpec {
         arm_bits: Vec<Vec<u8>>,
         direction: FanDirection,
     },
+    // A whole other circuit document, placed as a component. `doc` is the link;
+    // `name` and the per-pin widths are a *cached derived interface* (like a
+    // Rom caching its contents in the spec) so all the `&self` spec methods
+    // (n_inputs/size/shape/...) work without a document registry. The cache is
+    // refreshed from the referenced document on switch-back
+    // (gui::app::refresh_subcircuits). The live inner Circuit is NOT here - it's
+    // built GUI-side (gui::app::build_circuit_from_doc) into Logic::Sub. `doc`
+    // is #[serde(skip)] because a DocId is not meaningful across a reload;
+    // subcircuit persistence is deferred (see CLAUDE.md / the save guard).
+    Subcircuit {
+        #[serde(skip)]
+        doc: DocId,
+        name: String,
+        input_widths: Vec<u8>,
+        output_widths: Vec<u8>,
+    },
 }
 
 impl ComponentSpec {
     pub fn n_inputs(&self) -> usize {
         match self {
             Self::Input(_) => 0,
+            Self::Constant(_) => 0,
             Self::Output => 1,
             Self::Gate(g) => g.n_inputs(),
             Self::Mux(m) => m.n_inputs(),
@@ -325,6 +429,7 @@ impl ComponentSpec {
             Self::Multiplier(m) => m.n_inputs(),
             Self::Divider(d) => d.n_inputs(),
             Self::Comparator(c) => c.n_inputs(),
+            Self::Rom(r) => r.n_inputs(),
             Self::DFlipFlop(ff) => ff.n_inputs(),
             Self::TFlipFlop(ff) => ff.n_inputs(),
             Self::JKFlipFlop(ff) => ff.n_inputs(),
@@ -338,12 +443,14 @@ impl ComponentSpec {
                 FanDirection::Right => 1,
                 FanDirection::Left => arm_bits.len(),
             },
+            Self::Subcircuit { input_widths, .. } => input_widths.len(),
         }
     }
 
     pub fn n_outputs(&self) -> usize {
         match self {
             Self::Input(_) => 1,
+            Self::Constant(_) => 1,
             Self::Output => 0,
             Self::Gate(g) => g.n_outputs(),
             Self::Mux(m) => m.n_outputs(),
@@ -356,6 +463,7 @@ impl ComponentSpec {
             Self::Multiplier(m) => m.n_outputs(),
             Self::Divider(d) => d.n_outputs(),
             Self::Comparator(c) => c.n_outputs(),
+            Self::Rom(r) => r.n_outputs(),
             Self::DFlipFlop(ff) => ff.n_outputs(),
             Self::TFlipFlop(ff) => ff.n_outputs(),
             Self::JKFlipFlop(ff) => ff.n_outputs(),
@@ -369,12 +477,14 @@ impl ComponentSpec {
                 FanDirection::Right => arm_bits.len(),
                 FanDirection::Left => 1,
             },
+            Self::Subcircuit { output_widths, .. } => output_widths.len(),
         }
     }
 
     pub(crate) fn to_component(&self) -> Component {
         match self {
             Self::Input(p) => Component::input(p.bits, p.width),
+            Self::Constant(c) => Component::constant(c.bits, c.width),
             Self::Output => Component::output(),
             Self::Gate(g) => Component::gate(g.op, g.n_inputs, g.width),
             Self::Mux(m) => Component::mux(m.data_width, m.sel_width),
@@ -389,6 +499,11 @@ impl ComponentSpec {
             Self::Multiplier(m) => Component::multiplier(m.data_width),
             Self::Divider(d) => Component::divider(d.data_width),
             Self::Comparator(c) => Component::comparator(c.data_width),
+            // shared(), not clone(): the live component and the placed spec
+            // deliberately share one buffer (see Rom's docs). Every other
+            // spec->component build owns its params outright, but a ROM's bulk
+            // contents are too big to duplicate.
+            Self::Rom(r) => Component::rom(r.shared()),
             Self::DFlipFlop(_) => Component::d_flip_flop(),
             Self::TFlipFlop(_) => Component::t_flip_flop(),
             Self::JKFlipFlop(_) => Component::jk_flip_flop(),
@@ -399,6 +514,17 @@ impl ComponentSpec {
                 direction,
                 ..
             } => Component::splitter(arm_bits.clone(), *direction),
+            // A real subcircuit needs its inner Circuit built from the
+            // referenced document, which requires the GUI's document registry;
+            // that build goes through gui::app::instantiate, not here. This
+            // arm is only reached if to_component() is called on a Subcircuit
+            // spec directly - it yields a correctly-pinned but empty (all
+            // outputs Floating) placeholder rather than panicking.
+            Self::Subcircuit {
+                input_widths,
+                output_widths,
+                ..
+            } => Component::subcircuit_placeholder(input_widths.len(), output_widths.len()),
         }
     }
 }
@@ -445,6 +571,79 @@ impl Pins {
 pub enum Logic {
     Comb(LogicComb),
     Seq(LogicSeq),
+    // A whole Circuit simulated as one component - a third kind alongside
+    // combinational and sequential, because it both propagates combinationally
+    // (its inner circuit needs &mut to settle) and holds clocked state (it
+    // forwards clock ticks inward). See SubCircuit.
+    Sub(SubCircuit),
+}
+
+// The runtime state of a subcircuit component: the owned inner Circuit plus the
+// boundary Input / Output component keys, in this component's pin order (the
+// GUI derives that order top-down from the inner Input/Output positions). Built
+// GUI-side from a referenced document; never cloned or serialized, because
+// Circuit is neither - the authoritative, persistable form lives at the
+// ComponentSpec::Subcircuit / Wiring layer, and the inner Circuit is rebuilt
+// from it (see gui::app::build_circuit_from_doc).
+#[derive(Debug)]
+pub struct SubCircuit {
+    pub inner: Circuit,
+    pub inputs: Vec<CompKey>,
+    pub outputs: Vec<CompKey>,
+}
+
+impl SubCircuit {
+    // Feed each boundary Input with the enclosing circuit's input values and
+    // settle. drive_input marks a net dirty only when the value actually
+    // changes, so re-running this with identical inputs settles nothing - the
+    // idempotence apply_async() requires. A settle error is swallowed here; it
+    // surfaces on the enclosing circuit's own settle() via the same nets.
+    fn drive_and_settle(&mut self, inputs: &[Value]) {
+        self.drive_inputs(inputs);
+        let _ = self.inner.settle();
+    }
+
+    fn drive_inputs(&mut self, inputs: &[Value]) {
+        for (i, &key) in self.inputs.iter().enumerate() {
+            let value = inputs.get(i).copied().unwrap_or(Value::Floating);
+            self.inner.drive_input(key, value);
+        }
+    }
+
+    // The current values on the boundary Output components. Pure read (&self):
+    // the inner circuit is already settled by the time evaluate()/observe()
+    // call this.
+    fn observe(&self) -> Vec<Value> {
+        self.outputs
+            .iter()
+            .map(|&key| self.inner.read_output(key))
+            .collect()
+    }
+
+    fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
+        self.drive_inputs(inputs);
+        let _ = self.inner.tick_clock();
+        self.observe()
+    }
+
+    fn reset(&mut self) {
+        let _ = self.inner.reset_sequential();
+    }
+
+    // Boundary input width = the inner Input component's own output width.
+    fn input_width(&self, i: usize) -> Option<u8> {
+        self.inputs
+            .get(i)
+            .and_then(|&key| self.inner.components.get(key))
+            .and_then(|c| c.output_width(OutIdx(0)))
+    }
+
+    // Boundary output widths are left unconstrained (like a bare Output): the
+    // driven Value carries its own width, and the inner Output declares no
+    // fixed width to check against.
+    fn output_width(&self, _i: usize) -> Option<u8> {
+        None
+    }
 }
 
 // Each LogicComb variant (besides Output) wraps a struct implementing
@@ -466,6 +665,7 @@ pub trait CombLogic {
 #[derive(Debug)]
 pub enum LogicComb {
     Input(Input),
+    Constant(Constant),
     Output,
     Gate(Gate),
     Mux(Mux),
@@ -477,12 +677,14 @@ pub enum LogicComb {
     Multiplier(Multiplier),
     Divider(Divider),
     Comparator(Comparator),
+    Rom(Rom),
 }
 
 impl LogicComb {
     pub fn n_inputs(&self) -> usize {
         match self {
             Self::Input(p) => p.n_inputs(),
+            Self::Constant(c) => c.n_inputs(),
             Self::Output => 1,
             Self::Gate(g) => g.n_inputs(),
             Self::Mux(m) => m.n_inputs(),
@@ -494,12 +696,14 @@ impl LogicComb {
             Self::Multiplier(m) => m.n_inputs(),
             Self::Divider(d) => d.n_inputs(),
             Self::Comparator(c) => c.n_inputs(),
+            Self::Rom(r) => r.n_inputs(),
         }
     }
 
     pub fn n_outputs(&self) -> usize {
         match self {
             Self::Input(p) => p.n_outputs(),
+            Self::Constant(c) => c.n_outputs(),
             Self::Output => 0,
             Self::Gate(g) => g.n_outputs(),
             Self::Mux(m) => m.n_outputs(),
@@ -511,12 +715,14 @@ impl LogicComb {
             Self::Multiplier(m) => m.n_outputs(),
             Self::Divider(d) => d.n_outputs(),
             Self::Comparator(c) => c.n_outputs(),
+            Self::Rom(r) => r.n_outputs(),
         }
     }
 
     pub fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
         match self {
             Self::Input(p) => p.evaluate(inputs),
+            Self::Constant(c) => c.evaluate(inputs),
             Self::Output => vec![],
             Self::Gate(g) => g.evaluate(inputs),
             Self::Mux(m) => m.evaluate(inputs),
@@ -528,12 +734,14 @@ impl LogicComb {
             Self::Multiplier(m) => m.evaluate(inputs),
             Self::Divider(d) => d.evaluate(inputs),
             Self::Comparator(c) => c.evaluate(inputs),
+            Self::Rom(r) => r.evaluate(inputs),
         }
     }
 
     pub fn input_width(&self, i: usize) -> Option<u8> {
         match self {
             Self::Input(p) => p.input_width(i),
+            Self::Constant(c) => c.input_width(i),
             Self::Output => None,
             Self::Gate(g) => g.input_width(i),
             Self::Mux(m) => m.input_width(i),
@@ -545,12 +753,14 @@ impl LogicComb {
             Self::Multiplier(m) => m.input_width(i),
             Self::Divider(d) => d.input_width(i),
             Self::Comparator(c) => c.input_width(i),
+            Self::Rom(r) => r.input_width(i),
         }
     }
 
     pub fn output_width(&self, i: usize) -> Option<u8> {
         match self {
             Self::Input(p) => p.output_width(i),
+            Self::Constant(c) => c.output_width(i),
             Self::Output => None,
             Self::Gate(g) => g.output_width(i),
             Self::Mux(m) => m.output_width(i),
@@ -562,6 +772,7 @@ impl LogicComb {
             Self::Multiplier(m) => m.output_width(i),
             Self::Divider(d) => d.output_width(i),
             Self::Comparator(c) => c.output_width(i),
+            Self::Rom(r) => r.output_width(i),
         }
     }
 }
