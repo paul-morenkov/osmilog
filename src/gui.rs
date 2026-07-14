@@ -8,6 +8,7 @@ pub mod gui_undo;
 pub mod history;
 pub mod memory_editor;
 pub mod placed_component;
+pub mod properties;
 pub mod shape;
 pub mod theme;
 pub mod wiring;
