@@ -20,7 +20,7 @@ impl IoState {
         let json = match app.to_project_file().to_json() {
             Ok(json) => json,
             Err(e) => {
-                app.last_settle_error = Some(format!("save failed: {e}"));
+                app.io_error = Some(format!("save failed: {e}"));
                 return;
             }
         };
@@ -32,7 +32,7 @@ impl IoState {
             return; // user cancelled
         };
         if let Err(e) = std::fs::write(path, json) {
-            app.last_settle_error = Some(format!("save failed: {e}"));
+            app.io_error = Some(format!("save failed: {e}"));
         }
     }
 
@@ -55,10 +55,10 @@ impl IoState {
         match loaded {
             Ok(file) => {
                 if let Err(e) = app.load_project_file(&file) {
-                    app.last_settle_error = Some(format!("load failed: {e}"));
+                    app.io_error = Some(format!("load failed: {e}"));
                 }
             }
-            Err(e) => app.last_settle_error = Some(format!("load failed: {e}")),
+            Err(e) => app.io_error = Some(format!("load failed: {e}")),
         }
     }
 

@@ -1,9 +1,12 @@
 pub mod app;
+pub mod canvas_draw;
 pub mod clipboard;
+pub mod clock;
 pub mod document;
 pub mod geometry;
 pub mod gui_undo;
 pub mod history;
+pub mod memory_editor;
 pub mod placed_component;
 pub mod shape;
 pub mod theme;
