@@ -239,10 +239,11 @@ mod tests {
     fn edit_wiring_pushes_nothing_for_empty_delta() {
         let mut app = OsmilogApp::empty();
         // A sub-two-point route is a no-op, producing an empty delta.
-        let delta = app
-            .active_mut()
-            .wiring
-            .add_route(&[GridPos::new(0, 0)], NodeAttach::Free, NodeAttach::Free);
+        let delta = app.active_mut().wiring.add_route(
+            &[GridPos::new(0, 0)],
+            NodeAttach::Free,
+            NodeAttach::Free,
+        );
         app.active_mut().edit_wiring(delta);
         assert_eq!(app.active().history.len(), 0);
     }

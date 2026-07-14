@@ -720,8 +720,11 @@ impl OsmilogApp {
             .tunnels
             .iter()
             .map(|entry| {
-                self.active_mut()
-                    .place_tunnel_labeled(entry.label.clone(), entry.role, entry.grid_pos)
+                self.active_mut().place_tunnel_labeled(
+                    entry.label.clone(),
+                    entry.role,
+                    entry.grid_pos,
+                )
             })
             .collect();
 
@@ -1622,14 +1625,20 @@ impl OsmilogApp {
                 ui.add_enabled_ui(!locked, |ui| {
                     ui.menu_button("Edit", |ui| {
                         if ui
-                            .add_enabled(self.active().history.can_undo(), egui::Button::new("Undo"))
+                            .add_enabled(
+                                self.active().history.can_undo(),
+                                egui::Button::new("Undo"),
+                            )
                             .clicked()
                         {
                             self.active_mut().undo();
                             ui.close();
                         }
                         if ui
-                            .add_enabled(self.active().history.can_redo(), egui::Button::new("Redo"))
+                            .add_enabled(
+                                self.active().history.can_redo(),
+                                egui::Button::new("Redo"),
+                            )
                             .clicked()
                         {
                             self.active_mut().redo();
@@ -1637,7 +1646,10 @@ impl OsmilogApp {
                         }
                         ui.separator();
                         if ui
-                            .add_enabled(self.active().selected.is_some(), egui::Button::new("Copy"))
+                            .add_enabled(
+                                self.active().selected.is_some(),
+                                egui::Button::new("Copy"),
+                            )
                             .clicked()
                         {
                             self.copy_selection();
@@ -1659,7 +1671,11 @@ impl OsmilogApp {
                 self.show_clock_controls(ui);
                 // I/O errors take priority (they're rarer and more actionable);
                 // otherwise show the active document's own settle() error.
-                if let Some(err) = self.io_error.as_ref().or(self.active().settle_error.as_ref()) {
+                if let Some(err) = self
+                    .io_error
+                    .as_ref()
+                    .or(self.active().settle_error.as_ref())
+                {
                     ui.colored_label(theme.error_text, err);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2226,8 +2242,7 @@ impl OsmilogApp {
                             let items: Vec<(Selected, GridPos)> = sels
                                 .iter()
                                 .filter_map(|sel| {
-                                    doc.drag_grid_pos(*sel, cc.camera)
-                                        .map(|(_, gp)| (*sel, gp))
+                                    doc.drag_grid_pos(*sel, cc.camera).map(|(_, gp)| (*sel, gp))
                                 })
                                 .collect();
                             let free_nodes = doc.free_wire_nodes(sels);
@@ -2941,7 +2956,10 @@ mod tests {
         // the live graph exactly.
         let file = app.to_project_file();
         let snap = &file.circuits[0].snapshot;
-        assert_eq!(snap.segments.len(), app.active().wiring.active_segments().count());
+        assert_eq!(
+            snap.segments.len(),
+            app.active().wiring.active_segments().count()
+        );
         assert_eq!(snap.nodes.len(), app.active().wiring.active_nodes().count());
 
         let json = file.to_json().unwrap();
@@ -3045,7 +3063,12 @@ mod tests {
         assert!(!app.active().components[g].active);
         // Circuit-side removal tombstones (keeps the CompKey for undo), so the
         // component is inactive rather than gone.
-        assert!(app.active().circuit.components.get(g_key).is_some_and(|c| !c.active));
+        assert!(app
+            .active()
+            .circuit
+            .components
+            .get(g_key)
+            .is_some_and(|c| !c.active));
         // No wire node references the deleted component; orphan neighbours were
         // cleaned up too, leaving no segments.
         assert!(app
@@ -3065,7 +3088,9 @@ mod tests {
         // nodes and clears the selection.
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
-        let t = app.active_mut().place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
+        let t = app
+            .active_mut()
+            .place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
         let t_key = app.active().tunnels[t].key;
         connect_pin_tunnel(&mut app, (a, PinId::output(0)), t);
         app.active_mut().rebuild_circuit();
@@ -3077,7 +3102,12 @@ mod tests {
         assert!(app.active().tunnels.contains_key(t));
         assert!(!app.active().tunnels[t].active);
         // Tombstoned circuit-side (TunnelKey kept for undo): inactive, not gone.
-        assert!(app.active().circuit.tunnels.get(t_key).is_some_and(|t| !t.active));
+        assert!(app
+            .active()
+            .circuit
+            .tunnels
+            .get(t_key)
+            .is_some_and(|t| !t.active));
         assert!(app
             .active()
             .wiring
@@ -3096,8 +3126,12 @@ mod tests {
         let mut app = OsmilogApp::empty();
         let inp = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let out = place(&mut app, ComponentSpec::Output);
-        let pull = app.active_mut().place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
-        let feed = app.active_mut().place_tunnel(TunnelRole::Feed, GridPos::new(2, 2));
+        let pull = app
+            .active_mut()
+            .place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
+        let feed = app
+            .active_mut()
+            .place_tunnel(TunnelRole::Feed, GridPos::new(2, 2));
 
         connect_pin_tunnel(&mut app, (inp, PinId::output(0)), pull);
         connect_pin_tunnel(&mut app, (out, PinId::input(0)), feed);
@@ -3203,7 +3237,13 @@ mod tests {
         connect_pins(&mut app, (a, PinId::output(0)), (g, PinId::input(0)));
         app.active_mut().rebuild_circuit();
 
-        let seg = app.active().wiring.active_segments().next().map(|(k, _)| k).unwrap();
+        let seg = app
+            .active()
+            .wiring
+            .active_segments()
+            .next()
+            .map(|(k, _)| k)
+            .unwrap();
         let stack_before = app.active().history.len();
         app.active_mut().delete_wire(seg);
 
@@ -3222,12 +3262,14 @@ mod tests {
         let stack_before = app.active().history.len();
 
         // No movement: nothing pushed.
-        app.active_mut().commit_move(Selected::Component(a), original);
+        app.active_mut()
+            .commit_move(Selected::Component(a), original);
         assert_eq!(app.active().history.len(), stack_before);
 
         // Moved: pushes one MoveComponent entry with the correct old_pos.
         app.active_mut().components[a].grid_pos = GridPos::new(original.x + 3, original.y + 1);
-        app.active_mut().commit_move(Selected::Component(a), original);
+        app.active_mut()
+            .commit_move(Selected::Component(a), original);
         assert_eq!(app.active().history.len(), stack_before + 1);
         match app.active().history.last() {
             Some(HistoryEntry::Gui(GuiUndoAction::MoveComponent { key, old_pos })) => {
@@ -3262,7 +3304,10 @@ mod tests {
 
         // One batch entry for the whole gesture, not one per item.
         assert_eq!(app.active().history.len(), stack_before + 1);
-        assert!(matches!(app.active().history.last(), Some(HistoryEntry::Batch(_))));
+        assert!(matches!(
+            app.active().history.last(),
+            Some(HistoryEntry::Batch(_))
+        ));
 
         // One undo restores every item's original position at once.
         app.active_mut().undo();
@@ -3332,7 +3377,12 @@ mod tests {
             .find(|(_, n)| matches!(n.attach, NodeAttach::Free))
             .map(|(k, _)| k)
             .unwrap();
-        let seg_keys: Vec<WireSegKey> = app.active().wiring.active_segments().map(|(k, _)| k).collect();
+        let seg_keys: Vec<WireSegKey> = app
+            .active()
+            .wiring
+            .active_segments()
+            .map(|(k, _)| k)
+            .collect();
         (a, b, elbow_key, seg_keys)
     }
 
@@ -3384,7 +3434,10 @@ mod tests {
         app.active_mut().commit_wire_node_move(elbow, orig_elbow);
         app.active_mut().history.end_batch();
         assert_eq!(app.active().history.len(), stack_before + 1);
-        assert!(matches!(app.active().history.last(), Some(HistoryEntry::Batch(_))));
+        assert!(matches!(
+            app.active().history.last(),
+            Some(HistoryEntry::Batch(_))
+        ));
 
         // One undo restores the components AND the elbow together.
         app.active_mut().undo();
@@ -3420,7 +3473,10 @@ mod tests {
         assert!(app.active().circuit.components[comp_key].active);
 
         app.active_mut().undo();
-        assert!(!app.active().components[g].active, "record tombstoned by undo");
+        assert!(
+            !app.active().components[g].active,
+            "record tombstoned by undo"
+        );
         assert!(
             !app.active().circuit.components[comp_key].active,
             "circuit component deactivated by undo"
@@ -3451,7 +3507,11 @@ mod tests {
 
         app.active_mut().undo();
         assert!(
-            app.active().wiring.groups().iter().all(|grp| grp.pins.len() < 2),
+            app.active()
+                .wiring
+                .groups()
+                .iter()
+                .all(|grp| grp.pins.len() < 2),
             "wire removed: no group ties both pins together"
         );
         assert_eq!(app.active().circuit.read_output(o_key), Value::Floating);
@@ -3523,7 +3583,11 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(app.active().components[g].key, old_key, "old CompKey restored");
+        assert_eq!(
+            app.active().components[g].key,
+            old_key,
+            "old CompKey restored"
+        );
 
         app.active_mut().redo();
         assert!(matches!(
@@ -3542,7 +3606,8 @@ mod tests {
         let original = app.active().components[a].grid_pos;
         let moved = GridPos::new(original.x + 4, original.y + 2);
         app.active_mut().components[a].grid_pos = moved;
-        app.active_mut().commit_move(Selected::Component(a), original);
+        app.active_mut()
+            .commit_move(Selected::Component(a), original);
 
         app.active_mut().undo();
         assert_eq!(app.active().components[a].grid_pos, original);
@@ -3565,7 +3630,9 @@ mod tests {
     #[test]
     fn undo_redo_tunnel_rename_restores_label() {
         let mut app = OsmilogApp::empty();
-        let t = app.active_mut().place_tunnel(TunnelRole::Feed, GridPos::new(0, 0));
+        let t = app
+            .active_mut()
+            .place_tunnel(TunnelRole::Feed, GridPos::new(0, 0));
         let tunnel_key = app.active().tunnels[t].key;
         let original = app.active().tunnels[t].label.clone();
 
@@ -3577,10 +3644,12 @@ mod tests {
             tunnel: tunnel_key,
             new_label: "RENAMED".to_string(),
         });
-        app.active_mut().history.push_gui(GuiUndoAction::SetTunnelLabel {
-            key: t,
-            label: original.clone(),
-        });
+        app.active_mut()
+            .history
+            .push_gui(GuiUndoAction::SetTunnelLabel {
+                key: t,
+                label: original.clone(),
+            });
         app.active_mut().history.end_batch();
 
         app.active_mut().undo();
@@ -3717,7 +3786,6 @@ mod tests {
         assert_eq!(app.active().components.len(), before);
         assert_eq!(app.active().selected, None);
     }
-
 
     #[test]
     fn test_editing_locked_tracks_run_state() {
