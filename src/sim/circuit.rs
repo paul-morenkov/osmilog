@@ -2,12 +2,16 @@ use crate::sim::component::{CompKey, Component, Input, Logic, LogicComb, LogicSe
 use crate::sim::net::{Net, NetKey};
 use crate::sim::value::Value;
 
-use slotmap::{new_key_type, SecondaryMap, SlotMap};
+use slotmap::{SecondaryMap, SlotMap};
 use std::collections::{HashMap, VecDeque};
 
-new_key_type! {
-    pub struct TunnelKey;
-}
+/// Stable, app-assigned identifier for a `Tunnel`. Like [`CompKey`], it survives
+/// a remove + re-insert so undo can restore a deleted tunnel under its original
+/// key; ids come from a monotonic counter and are never reused.
+///
+/// [`CompKey`]: crate::sim::component::CompKey
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct TunnelKey(pub(crate) u64);
 
 // Ties all Tunnels sharing a Label into one virtual net without a drawn wire
 // (a schematic "net label" / off-page connector). Feed tunnels drive their
@@ -24,10 +28,6 @@ pub struct Tunnel {
     pub label: String,
     pub role: TunnelRole,
     pub net: Option<NetKey>,
-    // `false` marks a tombstone (see Component::active). Dropped from
-    // `tunnel_labels` while inactive, so it joins no label group until
-    // reactivated.
-    pub active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,11 +58,17 @@ impl std::error::Error for SettleError {}
 #[derive(Debug, Default)]
 pub struct Circuit {
     pub(crate) nets: SlotMap<NetKey, Net>,
-    pub(crate) components: SlotMap<CompKey, Component>,
+    pub(crate) components: HashMap<CompKey, Component>,
     pub(crate) dirty: VecDeque<NetKey>,
     queued: SecondaryMap<NetKey, bool>,
-    pub(crate) tunnels: SlotMap<TunnelKey, Tunnel>,
+    pub(crate) tunnels: HashMap<TunnelKey, Tunnel>,
     tunnel_labels: HashMap<String, Vec<TunnelKey>>,
+    // Monotonic id allocators for the two stable-key maps above. Never reused,
+    // so a removed key is never handed to a different entity (no ABA); undo
+    // re-inserts a deleted entity under its original key with a plain
+    // `HashMap::insert`.
+    next_comp: u64,
+    next_tunnel: u64,
 }
 
 impl Circuit {
@@ -80,15 +86,26 @@ impl Circuit {
     }
 
     pub fn add_component(&mut self, comp: Component) -> CompKey {
-        let key = self.components.insert(comp);
+        let key = CompKey(self.next_comp);
+        self.next_comp += 1;
+        self.components.insert(key, comp);
         self.eval_component(key);
         key
+    }
+
+    /// Re-inserts a previously-removed component under its original key - the
+    /// undo of `remove_component`. Re-evaluates it so its `out_cache` refreshes;
+    /// the caller re-establishes nets (via rebuild) and settles. A moved-in
+    /// `Reg`'s latched state comes back exactly as it was at removal.
+    pub(crate) fn insert_component(&mut self, key: CompKey, comp: Component) {
+        self.components.insert(key, comp);
+        self.eval_component(key);
     }
 
     pub fn set_input(&mut self, comp: CompKey, bits: u32, width: u8) {
         // TODO: Make this return a result
         if let Logic::Comb(LogicComb::Input(Input { bits: b, width: w })) =
-            &mut self.components[comp].logic
+            &mut self.components.get_mut(&comp).unwrap().logic
         {
             *b = bits;
             *w = width;
@@ -105,7 +122,7 @@ impl Circuit {
     /// changes, so re-driving identical inputs is a no-op (keeps settle
     /// convergent). No-op if `comp` is stale.
     pub(crate) fn drive_input(&mut self, comp: CompKey, value: Value) {
-        if self.components.contains_key(comp) {
+        if self.components.contains_key(&comp) {
             self.apply_output_values(comp, vec![value]);
         }
     }
@@ -119,7 +136,7 @@ impl Circuit {
         // set_word takes &self (interior mutability), so this needs only a shared
         // borrow to write; re-evaluate afterward, once that borrow has ended, to
         // dirty the output net.
-        let wrote = if let Logic::Comb(LogicComb::Rom(rom)) = &self.components[comp].logic {
+        let wrote = if let Logic::Comb(LogicComb::Rom(rom)) = &self.components[&comp].logic {
             if index < rom.len() {
                 rom.set_word(index, value);
                 true
@@ -142,7 +159,7 @@ impl Circuit {
     /// is out of range. Like write_rom, bypasses the Command/undo layer
     /// entirely - RAM contents are mutated live, not undoable.
     pub fn write_ram(&mut self, comp: CompKey, index: usize, value: u32) {
-        if let Logic::Seq(LogicSeq::Ram(ram)) = &self.components[comp].logic {
+        if let Logic::Seq(LogicSeq::Ram(ram)) = &self.components[&comp].logic {
             let contents = ram.contents();
             if index < contents.len() {
                 contents.set_word(index, value);
@@ -153,7 +170,7 @@ impl Circuit {
     /// The current value on `comp`'s input, if it's an Output component;
     /// `Value::Floating` otherwise.
     pub fn read_output(&self, comp: CompKey) -> Value {
-        let comp = &self.components[comp];
+        let comp = &self.components[&comp];
 
         match comp.logic {
             Logic::Comb(LogicComb::Output) => match comp.pins.inputs[0] {
@@ -183,19 +200,14 @@ impl Circuit {
         // Every input pin now reads Floating, so re-evaluate each component to
         // refresh its out_cache - otherwise a component would keep a stale
         // output that a subsequent relink could read back as live.
-        let keys: Vec<CompKey> = self
-            .components
-            .iter()
-            .filter(|(_, c)| c.active)
-            .map(|(k, _)| k)
-            .collect();
+        let keys: Vec<CompKey> = self.components.keys().copied().collect();
         for key in keys {
             self.eval_component(key);
         }
     }
 
     fn net_of(&self, comp: CompKey, pin: PinId) -> Option<NetKey> {
-        self.components.get(comp).and_then(|c| c.net_of(pin))
+        self.components.get(&comp).and_then(|c| c.net_of(pin))
     }
 
     // Returns the net already attached to (comp, pin), or creates and
@@ -218,7 +230,7 @@ impl Circuit {
             PinId::In(i) => self.nets[net].sinks.push((comp, i)),
             PinId::Out(i) => self.nets[net].sources.push((comp, i)),
         }
-        self.components[comp].set_pin_net(pin, net);
+        self.components.get_mut(&comp).unwrap().set_pin_net(pin, net);
         // If attaching a sink pin, immediately evaluate the component since no Net's have changed
         // so nothing will call eval_component automatically.
         if let PinId::In(_) = pin {
@@ -263,7 +275,7 @@ impl Circuit {
 
         // Correct backreferences on Net B, then add them into Net A
         for (comp, i) in b_net.sinks {
-            self.components[comp].set_pin_net(PinId::In(i), a);
+            self.components.get_mut(&comp).unwrap().set_pin_net(PinId::In(i), a);
             self.nets[a].sinks.push((comp, i));
         }
 
@@ -271,7 +283,7 @@ impl Circuit {
         // more than one source and resolve_net will surface it as Invalid
         // (a driver conflict), rather than silently dropping one.
         for (comp, i) in b_net.sources {
-            self.components[comp].set_pin_net(PinId::Out(i), a);
+            self.components.get_mut(&comp).unwrap().set_pin_net(PinId::Out(i), a);
             self.nets[a].sources.push((comp, i));
         }
 
@@ -288,12 +300,16 @@ impl Circuit {
     }
 
     pub fn add_tunnel(&mut self, label: String, role: TunnelRole) -> TunnelKey {
-        let key = self.tunnels.insert(Tunnel {
-            label: label.clone(),
-            role,
-            net: None,
-            active: true,
-        });
+        let key = TunnelKey(self.next_tunnel);
+        self.next_tunnel += 1;
+        self.tunnels.insert(
+            key,
+            Tunnel {
+                label: label.clone(),
+                role,
+                net: None,
+            },
+        );
         self.tunnel_labels.entry(label).or_default().push(key);
         key
     }
@@ -306,9 +322,9 @@ impl Circuit {
     }
 
     fn attach_tunnel(&mut self, tunnel: TunnelKey, net: NetKey) {
-        let old_net = self.tunnels[tunnel].net;
-        let label = self.tunnels[tunnel].label.clone();
-        self.tunnels[tunnel].net = Some(net);
+        let old_net = self.tunnels[&tunnel].net;
+        let label = self.tunnels[&tunnel].label.clone();
+        self.tunnels.get_mut(&tunnel).unwrap().net = Some(net);
         // Rewiring away from a previous net: that net must be re-resolved
         // too, or it keeps showing a stale tunnel-contributed value forever.
         if let Some(old) = old_net {
@@ -325,24 +341,18 @@ impl Circuit {
     }
 
     pub fn detach_tunnel(&mut self, tunnel: TunnelKey) {
-        let label = self.tunnels[tunnel].label.clone();
-        if let Some(old) = self.tunnels[tunnel].net.take() {
+        let label = self.tunnels[&tunnel].label.clone();
+        if let Some(old) = self.tunnels.get_mut(&tunnel).unwrap().net.take() {
             self.mark_dirty(old);
         }
         self.dirty_label_feed_nets(&label);
     }
 
-    pub fn remove_tunnel(&mut self, tunnel: TunnelKey) {
-        // Tombstone rather than remove, mirroring remove_component: dropped
-        // from its label group with its net binding cleared, so it
-        // contributes nothing until reactivated.
-        let Some(t) = self.tunnels.get_mut(tunnel) else {
-            return;
-        };
-        if !t.active {
-            return;
-        }
-        t.active = false;
+    /// Removes a tunnel outright and returns it (the caller moves it into the
+    /// undo entry). Dropped from its label group with its net binding cleared,
+    /// so it contributes nothing once gone. `None` if the key is already gone.
+    pub fn remove_tunnel(&mut self, tunnel: TunnelKey) -> Option<Tunnel> {
+        let mut t = self.tunnels.remove(&tunnel)?;
         let label = t.label.clone();
         let net = t.net.take();
         if let Some(keys) = self.tunnel_labels.get_mut(&label) {
@@ -355,58 +365,29 @@ impl Circuit {
             self.mark_dirty(net);
         }
         self.dirty_label_feed_nets(&label);
+        Some(t)
     }
 
-    // Undo of remove_component: flip the tombstone back. Pins were nulled on
-    // removal, so the caller must re-establish nets and settle(); a Reg's
-    // latched state was preserved untouched, so it returns exactly as before.
-    pub(crate) fn reactivate_component(&mut self, key: CompKey) {
-        if let Some(c) = self.components.get_mut(key) {
-            c.active = true;
-            self.eval_component(key);
-        }
-    }
-
-    // Undo of remove_tunnel: flip the tombstone back and rejoin its label
-    // group. Its net binding is re-established by the caller's relink.
-    pub(crate) fn reactivate_tunnel(&mut self, tunnel: TunnelKey) {
-        let Some(t) = self.tunnels.get_mut(tunnel) else {
-            return;
-        };
-        if t.active {
-            return;
-        }
-        t.active = true;
-        let label = t.label.clone();
+    /// Re-inserts a previously-removed tunnel under its original key - the undo
+    /// of `remove_tunnel` - rejoining its label group. Its net binding is
+    /// re-established by the caller's relink.
+    pub(crate) fn insert_tunnel(&mut self, key: TunnelKey, tunnel: Tunnel) {
+        let label = tunnel.label.clone();
+        self.tunnels.insert(key, tunnel);
         self.tunnel_labels
             .entry(label.clone())
             .or_default()
-            .push(tunnel);
+            .push(key);
         self.dirty_label_feed_nets(&label);
-    }
-
-    // Reclaim tombstones: remove any inactive component/tunnel not in
-    // `keep_components`/`keep_tunnels` (keys still referenced by undo
-    // history). The sim-side counterpart of
-    // Wiring::remove_unreferenced_tombstones; not yet called anywhere.
-    pub fn remove_unreferenced_tombstones(
-        &mut self,
-        keep_components: &std::collections::HashSet<CompKey>,
-        keep_tunnels: &std::collections::HashSet<TunnelKey>,
-    ) {
-        self.components
-            .retain(|k, c| c.active || keep_components.contains(&k));
-        self.tunnels
-            .retain(|k, t| t.active || keep_tunnels.contains(&k));
     }
 
     /// The current label of a tunnel, or `None` if the key is stale.
     pub fn tunnel_label(&self, tunnel: TunnelKey) -> Option<&str> {
-        self.tunnels.get(tunnel).map(|t| t.label.as_str())
+        self.tunnels.get(&tunnel).map(|t| t.label.as_str())
     }
 
     pub fn rename_tunnel(&mut self, tunnel: TunnelKey, new_label: String) {
-        let Some(t) = self.tunnels.get_mut(tunnel) else {
+        let Some(t) = self.tunnels.get_mut(&tunnel) else {
             return;
         };
         if t.label == new_label {
@@ -450,7 +431,7 @@ impl Circuit {
         let nets: Vec<NetKey> = keys
             .iter()
             .filter_map(|&tk| {
-                let t = &self.tunnels[tk];
+                let t = &self.tunnels[&tk];
                 (t.role == TunnelRole::Feed).then_some(t.net).flatten()
             })
             .collect();
@@ -470,7 +451,7 @@ impl Circuit {
         };
         let mut result = Value::Floating;
         for &tk in keys {
-            let t = &self.tunnels[tk];
+            let t = &self.tunnels[&tk];
             if t.role != TunnelRole::Pull {
                 continue;
             }
@@ -597,11 +578,11 @@ impl Circuit {
         let mut widths = n
             .sources
             .iter()
-            .filter_map(|&(comp, i)| self.components[comp].output_width(i))
+            .filter_map(|&(comp, i)| self.components[&comp].output_width(i))
             .chain(
                 n.sinks
                     .iter()
-                    .filter_map(|&(comp, i)| self.components[comp].input_width(i)),
+                    .filter_map(|&(comp, i)| self.components[&comp].input_width(i)),
             );
         let Some(first) = widths.next() else {
             return false;
@@ -622,7 +603,7 @@ impl Circuit {
         } else {
             match self.nets[net].sources.first() {
                 // Net takes value from pins.out_cache, which is updated in eval_component
-                Some(&(comp, i)) => self.components[comp].pins.out_cache[i.0 as usize],
+                Some(&(comp, i)) => self.components[&comp].pins.out_cache[i.0 as usize],
                 // A component driver always takes priority; only fall back to a
                 // Feed tunnel's group value when this net has no real driver.
                 None => self.tunnel_feed_value(net),
@@ -644,11 +625,11 @@ impl Circuit {
         // settle() mutates latched state; it's sound because apply_async is
         // idempotent, so re-evaluating a component any number of times before
         // the queue drains converges to the same state.
-        if self.components[comp].is_stateful() {
-            let inputs = self.components[comp].read_inputs(&self.nets);
-            self.components[comp].apply_async(&inputs);
+        if self.components[&comp].is_stateful() {
+            let inputs = self.components[&comp].read_inputs(&self.nets);
+            self.components.get_mut(&comp).unwrap().apply_async(&inputs);
         }
-        let new_values = self.components[comp].evaluate(&self.nets);
+        let new_values = self.components[&comp].evaluate(&self.nets);
         self.apply_output_values(comp, new_values);
     }
 
@@ -657,7 +638,7 @@ impl Circuit {
     // and tick_clock (sequential path).
     fn apply_output_values(&mut self, comp: CompKey, new_values: Vec<Value>) {
         puffin::profile_function!();
-        let c = &mut self.components[comp];
+        let c = self.components.get_mut(&comp).unwrap();
         let mut dirty_nets = Vec::new();
 
         for (i, new_val) in new_values.into_iter().enumerate() {
@@ -686,20 +667,20 @@ impl Circuit {
         let seq_comps: Vec<CompKey> = self
             .components
             .iter()
-            .filter(|(_, c)| c.active && c.is_stateful())
-            .map(|(key, _)| key)
+            .filter(|(_, c)| c.is_stateful())
+            .map(|(key, _)| *key)
             .collect();
 
         let collected_inputs: Vec<(CompKey, Vec<Value>)> = seq_comps
             .into_iter()
             .map(|key| {
-                let inputs = self.components[key].read_inputs(&self.nets);
+                let inputs = self.components[&key].read_inputs(&self.nets);
                 (key, inputs)
             })
             .collect();
 
         for (key, inputs) in collected_inputs {
-            let new_values = self.components[key].tick(&inputs);
+            let new_values = self.components.get_mut(&key).unwrap().tick(&inputs);
             self.apply_output_values(key, new_values);
         }
 
@@ -716,23 +697,21 @@ impl Circuit {
         let seq_comps: Vec<CompKey> = self
             .components
             .iter()
-            .filter(|(_, c)| c.active && c.is_stateful())
-            .map(|(key, _)| key)
+            .filter(|(_, c)| c.is_stateful())
+            .map(|(key, _)| *key)
             .collect();
 
         for key in seq_comps {
-            self.components[key].reset();
-            let values = self.components[key].observe();
+            self.components.get_mut(&key).unwrap().reset();
+            let values = self.components[&key].observe();
             self.apply_output_values(key, values);
         }
 
         self.settle()
     }
 
-    pub fn remove_component(&mut self, key: CompKey) {
-        let Some(comp) = self.components.get(key) else {
-            return;
-        };
+    pub fn remove_component(&mut self, key: CompKey) -> Option<Component> {
+        let comp = self.components.get(&key)?;
         let output_nets: Vec<NetKey> = comp.pins.outputs.iter().filter_map(|&n| n).collect();
         let input_nets: Vec<NetKey> = comp.pins.inputs.iter().filter_map(|&n| n).collect();
 
@@ -759,7 +738,7 @@ impl Circuit {
             }
             let sinks = net.sinks.clone();
             for (sink_comp, sink_pin) in sinks {
-                if let Some(sc) = self.components.get_mut(sink_comp) {
+                if let Some(sc) = self.components.get_mut(&sink_comp) {
                     sc.pins.inputs[sink_pin.0 as usize] = None;
                 }
                 if sink_comp != key {
@@ -786,12 +765,14 @@ impl Circuit {
         self.dirty.clear();
         self.queued.clear();
 
-        // Tombstone rather than remove: the CompKey (and a Reg's latched
-        // state) survives for undo to reactivate. Pins are nulled here so it
-        // holds no dangling NetKeys; whole-component sweeps skip it via
-        // `active`. remove_unreferenced_tombstones reclaims it later.
-        if let Some(c) = self.components.get_mut(key) {
-            c.active = false;
+        // Remove outright and hand the owned Component back to the caller,
+        // which moves it into the undo entry; undo re-inserts it under this
+        // same key (see insert_component). Its pins are nulled so the moved-out
+        // copy holds no dangling NetKeys - the caller rebuilds nets on re-insert.
+        // A Reg's latched state (kept apart from pins) rides along untouched, so
+        // an undone deletion restores it.
+        let mut removed = self.components.remove(&key);
+        if let Some(c) = &mut removed {
             c.clear_pins();
         }
 
@@ -799,7 +780,7 @@ impl Circuit {
         // propagates: eval_component recomputes out_cache and marks any changed
         // output net dirty for the caller's settle() to carry downstream.
         for sink in affected_sinks {
-            if self.components.contains_key(sink) {
+            if self.components.contains_key(&sink) {
                 self.eval_component(sink);
             }
         }
@@ -815,6 +796,8 @@ impl Circuit {
         for net_key in retained_nets {
             self.mark_dirty(net_key);
         }
+
+        removed
     }
 }
 
@@ -853,7 +836,7 @@ mod tests {
         let mut c = Circuit::new();
         let i = c.add_component(Component::input(5, 3));
         // add_component eagerly evaluates, before any link() or settle().
-        assert_eq!(c.components[i].pins.out_cache[0], Value::new(5, 3));
+        assert_eq!(c.components[&i].pins.out_cache[0], Value::new(5, 3));
     }
 
     #[test]

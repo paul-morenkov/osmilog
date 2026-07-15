@@ -71,7 +71,8 @@ pub(crate) fn draw_grid(painter: &Painter, clip_rect: Rect, camera: Camera, them
     let stride = grid_dot_stride(step);
     let cell_x1 = ((clip_rect.right() - camera.pan.x) / step).ceil() as i32;
     let cell_y1 = ((clip_rect.bottom() - camera.pan.y) / step).ceil() as i32;
-    let x0 = (((clip_rect.left() - camera.pan.x) / step).floor() as i32).div_euclid(stride) * stride;
+    let x0 =
+        (((clip_rect.left() - camera.pan.x) / step).floor() as i32).div_euclid(stride) * stride;
     let y0 = (((clip_rect.top() - camera.pan.y) / step).floor() as i32).div_euclid(stride) * stride;
 
     let mut gx = x0;
@@ -228,14 +229,14 @@ pub(crate) fn draw_component(
     let pin_r = camera.scale(PIN_RADIUS);
     for i in 0..pc.spec.n_inputs() {
         let pos = comp_pin_pos(shape, pc.grid_pos, camera, PinId::input(i as u8));
-        let val = circuit.components[pc.key].pins.inputs[i]
+        let val = circuit.components[&pc.key].pins.inputs[i]
             .map(|nk| circuit.nets[nk].value)
             .unwrap_or(Value::Floating);
         painter.circle_filled(pos, pin_r, value_stroke(theme, val).color);
     }
     for i in 0..pc.spec.n_outputs() {
         let pos = comp_pin_pos(shape, pc.grid_pos, camera, PinId::output(i as u8));
-        let val = circuit.components[pc.key].pins.out_cache[i];
+        let val = circuit.components[&pc.key].pins.out_cache[i];
         painter.circle_filled(pos, pin_r, value_stroke(theme, val).color);
     }
 }
@@ -290,7 +291,7 @@ pub(crate) fn draw_tunnel(
 
     let val = circuit
         .tunnels
-        .get(pt.key)
+        .get(&pt.key)
         .and_then(|t| t.net)
         .map(|nk| circuit.nets[nk].value)
         .unwrap_or(Value::Floating);

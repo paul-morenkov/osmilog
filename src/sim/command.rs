@@ -1,4 +1,4 @@
-use crate::sim::circuit::{Circuit, SettleError, TunnelKey, TunnelRole};
+use crate::sim::circuit::{Circuit, SettleError, Tunnel, TunnelKey, TunnelRole};
 use crate::sim::component::{CompKey, Component, Input, Logic, LogicComb, PinId, SeqState};
 use crate::sim::net::NetKey;
 
@@ -100,29 +100,32 @@ impl CommandOutput {
 // (ClearNets/Link/LinkTunnel/DetachTunnel) capture NoOp; only commands that
 // change authoritative state capture a real inverse.
 //
-// Component/tunnel removal tombstones (see Circuit::remove_component) rather
-// than deletes, so its inverse is a stable-key reactivation - no new keys, and
-// a removed Reg's latched state is preserved for reactivation to restore.
+// Component/tunnel removal genuinely removes the entity, moving the owned
+// `Component`/`Tunnel` into the `Insert*` inverse; undo re-inserts it under its
+// original (stable, app-assigned) key. A removed Reg's latched state rides
+// along inside the moved `Component`, so an undone deletion restores it exactly.
 #[derive(Debug)]
 pub enum UndoAction {
     /// No-op, or a derived-net command that undo re-derives instead.
     NoOp,
-    /// Undoes `Command::comp`: tombstone the component that was added.
-    DeactivateComponent(CompKey),
-    /// Undoes `Command::RemoveComponent`: reactivate the tombstoned component
-    /// in place (its `CompKey` and any `Reg` state were preserved).
-    ReactivateComponent(CompKey),
+    /// Undoes `Command::comp`: remove the component that was added (applying
+    /// this hands its owned `Component` back on the returned `InsertComponent`).
+    RemoveComponent(CompKey),
+    /// Undoes `Command::RemoveComponent`: re-insert the removed component under
+    /// its original key, carrying the moved-out `Component` (a `Reg`'s latched
+    /// state comes back with it).
+    InsertComponent(CompKey, Box<Component>),
     /// Undoes `Command::SetInput`.
     SetInput {
         comp: CompKey,
         old_bits: u32,
         old_width: u8,
     },
-    /// Undoes `Command::AddTunnel`: tombstone the tunnel that was added.
-    DeactivateTunnel(TunnelKey),
-    /// Undoes `Command::RemoveTunnel`: reactivate the tombstoned tunnel in
-    /// place (its `TunnelKey` is preserved).
-    ReactivateTunnel(TunnelKey),
+    /// Undoes `Command::AddTunnel`: remove the tunnel that was added.
+    RemoveTunnel(TunnelKey),
+    /// Undoes `Command::RemoveTunnel`: re-insert the removed tunnel under its
+    /// original key, carrying the moved-out `Tunnel`.
+    InsertTunnel(TunnelKey, Box<Tunnel>),
     /// Undoes `Command::RenameTunnel`.
     RenameTunnel {
         tunnel: TunnelKey,
@@ -143,13 +146,10 @@ impl Circuit {
         match command {
             Command::AddComponent(comp) => {
                 let key = self.add_component(*comp);
-                (
-                    CommandOutput::Comp(key),
-                    UndoAction::DeactivateComponent(key),
-                )
+                (CommandOutput::Comp(key), UndoAction::RemoveComponent(key))
             }
             Command::SetInput { comp, bits, width } => {
-                let old = match &self.components[comp].logic {
+                let old = match &self.components[&comp].logic {
                     Logic::Comb(LogicComb::Input(Input { bits: b, width: w })) => Some((*b, *w)),
                     _ => None,
                 };
@@ -177,10 +177,7 @@ impl Circuit {
             }
             Command::AddTunnel { label, role } => {
                 let key = self.add_tunnel(label, role);
-                (
-                    CommandOutput::Tunnel(key),
-                    UndoAction::DeactivateTunnel(key),
-                )
+                (CommandOutput::Tunnel(key), UndoAction::RemoveTunnel(key))
             }
             Command::LinkTunnel { tunnel, comp, pin } => {
                 let net = self.link_tunnel(tunnel, comp, pin);
@@ -191,17 +188,14 @@ impl Circuit {
                 (CommandOutput::None, UndoAction::NoOp)
             }
             Command::RemoveTunnel(tunnel) => {
-                let was_active = self.tunnels.get(tunnel).is_some_and(|t| t.active);
-                self.remove_tunnel(tunnel);
-                let undo = if was_active {
-                    UndoAction::ReactivateTunnel(tunnel)
-                } else {
-                    UndoAction::NoOp
+                let undo = match self.remove_tunnel(tunnel) {
+                    Some(t) => UndoAction::InsertTunnel(tunnel, Box::new(t)),
+                    None => UndoAction::NoOp,
                 };
                 (CommandOutput::None, undo)
             }
             Command::RenameTunnel { tunnel, new_label } => {
-                let old_label = self.tunnels.get(tunnel).map(|t| t.label.clone());
+                let old_label = self.tunnels.get(&tunnel).map(|t| t.label.clone());
                 self.rename_tunnel(tunnel, new_label.clone());
                 let undo = match old_label {
                     Some(old) if old != new_label => UndoAction::RenameTunnel {
@@ -217,7 +211,7 @@ impl Circuit {
                     .components
                     .iter()
                     .filter_map(|(k, c)| match &c.logic {
-                        Logic::Seq(seq) if c.active => Some((k, seq.snapshot())),
+                        Logic::Seq(seq) => Some((*k, seq.snapshot())),
                         _ => None,
                     })
                     .collect();
@@ -234,12 +228,9 @@ impl Circuit {
                 UndoAction::NoOp,
             ),
             Command::RemoveComponent(key) => {
-                let was_active = self.components.get(key).is_some_and(|c| c.active);
-                self.remove_component(key);
-                let undo = if was_active {
-                    UndoAction::ReactivateComponent(key)
-                } else {
-                    UndoAction::NoOp
+                let undo = match self.remove_component(key) {
+                    Some(comp) => UndoAction::InsertComponent(key, Box::new(comp)),
+                    None => UndoAction::NoOp,
                 };
                 (CommandOutput::None, undo)
             }
@@ -253,21 +244,21 @@ impl Circuit {
     pub fn apply_undo(&mut self, action: UndoAction) -> UndoAction {
         match action {
             UndoAction::NoOp => UndoAction::NoOp,
-            UndoAction::DeactivateComponent(key) => {
-                self.remove_component(key);
-                UndoAction::ReactivateComponent(key)
+            UndoAction::RemoveComponent(key) => match self.remove_component(key) {
+                Some(comp) => UndoAction::InsertComponent(key, Box::new(comp)),
+                None => UndoAction::NoOp,
+            },
+            UndoAction::InsertComponent(key, comp) => {
+                self.insert_component(key, *comp);
+                UndoAction::RemoveComponent(key)
             }
-            UndoAction::ReactivateComponent(key) => {
-                self.reactivate_component(key);
-                UndoAction::DeactivateComponent(key)
-            }
-            UndoAction::DeactivateTunnel(key) => {
-                self.remove_tunnel(key);
-                UndoAction::ReactivateTunnel(key)
-            }
-            UndoAction::ReactivateTunnel(key) => {
-                self.reactivate_tunnel(key);
-                UndoAction::DeactivateTunnel(key)
+            UndoAction::RemoveTunnel(key) => match self.remove_tunnel(key) {
+                Some(t) => UndoAction::InsertTunnel(key, Box::new(t)),
+                None => UndoAction::NoOp,
+            },
+            UndoAction::InsertTunnel(key, t) => {
+                self.insert_tunnel(key, *t);
+                UndoAction::RemoveTunnel(key)
             }
             UndoAction::SetInput {
                 comp,
@@ -276,7 +267,7 @@ impl Circuit {
             } => {
                 // Capture the current value first so the returned inverse can
                 // restore it on redo.
-                let current = match &self.components[comp].logic {
+                let current = match &self.components[&comp].logic {
                     Logic::Comb(LogicComb::Input(Input { bits, width })) => (*bits, *width),
                     _ => (old_bits, old_width),
                 };
@@ -290,7 +281,7 @@ impl Circuit {
             UndoAction::RenameTunnel { tunnel, old_label } => {
                 let current = self
                     .tunnels
-                    .get(tunnel)
+                    .get(&tunnel)
                     .map(|t| t.label.clone())
                     .unwrap_or_else(|| old_label.clone());
                 self.rename_tunnel(tunnel, old_label);
@@ -328,7 +319,7 @@ mod tests {
             .0
             .unwrap_comp();
         // add_component eagerly evaluates, before any link()/settle().
-        assert_eq!(c.components[key].pins.out_cache[0], Value::new(5, 3));
+        assert_eq!(c.components[&key].pins.out_cache[0], Value::new(5, 3));
     }
 
     #[test]
@@ -516,8 +507,8 @@ mod tests {
 
         c.apply(Command::ClearNets);
         assert!(c.nets.is_empty());
-        assert!(c.components.contains_key(a));
-        assert!(c.components.contains_key(g));
+        assert!(c.components.contains_key(&a));
+        assert!(c.components.contains_key(&g));
     }
 
     #[test]
@@ -534,25 +525,24 @@ mod tests {
     // ---- UndoAction capture ----
 
     #[test]
-    fn test_apply_add_component_undo_is_deactivate() {
+    fn test_apply_add_component_undo_is_remove() {
         let mut c = Circuit::new();
         let (output, undo) = c.apply(Command::comp(Component::input(1, 1)));
         let key = output.unwrap_comp();
-        assert!(matches!(undo, UndoAction::DeactivateComponent(k) if k == key));
+        assert!(matches!(undo, UndoAction::RemoveComponent(k) if k == key));
     }
 
     #[test]
-    fn test_apply_remove_component_undo_is_reactivate() {
+    fn test_apply_remove_component_undo_is_insert_with_payload() {
         let mut c = Circuit::new();
         let key = c
             .apply(Command::comp(Component::input(1, 1)))
             .0
             .unwrap_comp();
         let (_output, undo) = c.apply(Command::RemoveComponent(key));
-        assert!(matches!(undo, UndoAction::ReactivateComponent(k) if k == key));
-        // Removal tombstones rather than deletes: the key still resolves.
-        assert!(c.components.contains_key(key));
-        assert!(!c.components[key].active);
+        assert!(matches!(undo, UndoAction::InsertComponent(k, _) if k == key));
+        // Removal genuinely deletes: the key no longer resolves.
+        assert!(!c.components.contains_key(&key));
     }
 
     #[test]
@@ -568,11 +558,11 @@ mod tests {
     }
 
     #[test]
-    fn test_reactivate_component_preserves_reg_latched_state() {
-        // The gap this fixes: RestoreComponent rebuilt a removed Reg from its
-        // spec, which omits the latched value - so undoing a register deletion
-        // reset it to 0. Tombstoning keeps the live Component, so its latched
-        // state survives removal and comes back on reactivation.
+    fn test_insert_component_preserves_reg_latched_state() {
+        // A removed Reg's latched value rides along inside the moved-out
+        // Component that RemoveComponent's InsertComponent inverse carries, so
+        // re-inserting it (undo of the removal) restores the exact state - the
+        // regression a spec-based re-creation (which omits the latch) would hit.
         let mut c = Circuit::new();
         let data = c
             .apply(Command::comp(Component::input(1, 1)))
@@ -591,10 +581,12 @@ mod tests {
         c.apply(Command::TickClock); // latch 1 into reg
         assert_eq!(c.read_output(out), Value::ONE);
 
-        // Remove (tombstone) the register, then reactivate it and rewire its
-        // output; the previously latched 1 must return.
-        c.apply(Command::RemoveComponent(reg));
-        c.reactivate_component(reg);
+        // Remove the register (its undo carries the live Component with the
+        // latch), then re-insert it via that undo and rewire its output; the
+        // previously latched 1 must return.
+        let (_o, undo) = c.apply(Command::RemoveComponent(reg));
+        assert!(!c.components.contains_key(&reg));
+        c.apply_undo(undo);
         let out2 = c.apply(Command::comp(Component::output())).0.unwrap_comp();
         c.link(reg, PinId::output(0), out2, PinId::input(0));
         c.settle().unwrap();
@@ -645,18 +637,18 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_add_tunnel_undo_is_deactivate() {
+    fn test_apply_add_tunnel_undo_is_remove() {
         let mut c = Circuit::new();
         let (output, undo) = c.apply(Command::AddTunnel {
             label: "A".to_string(),
             role: TunnelRole::Pull,
         });
         let key = output.unwrap_tunnel();
-        assert!(matches!(undo, UndoAction::DeactivateTunnel(k) if k == key));
+        assert!(matches!(undo, UndoAction::RemoveTunnel(k) if k == key));
     }
 
     #[test]
-    fn test_apply_remove_tunnel_undo_is_reactivate() {
+    fn test_apply_remove_tunnel_undo_is_insert_with_payload() {
         let mut c = Circuit::new();
         let driver = c
             .apply(Command::comp(Component::input(1, 1)))
@@ -676,9 +668,9 @@ mod tests {
         });
 
         let (_output, undo) = c.apply(Command::RemoveTunnel(tunnel));
-        assert!(matches!(undo, UndoAction::ReactivateTunnel(k) if k == tunnel));
-        // Tombstoned: key still resolves, but the tunnel is inactive.
-        assert!(!c.tunnels[tunnel].active);
+        assert!(matches!(undo, UndoAction::InsertTunnel(k, _) if k == tunnel));
+        // Removal genuinely deletes: the key no longer resolves.
+        assert!(!c.tunnels.contains_key(&tunnel));
     }
 
     #[test]
@@ -816,9 +808,9 @@ mod tests {
     }
 
     #[test]
-    fn test_tick_clock_skips_tombstoned_reg() {
-        // A tombstoned Reg must not tick - its preserved state has to stay
-        // intact so a later reactivation restores it.
+    fn test_tick_clock_skips_removed_reg() {
+        // A removed Reg must not tick - its state (carried in the removal's
+        // undo payload) has to stay intact so re-inserting it restores it.
         let mut c = Circuit::new();
         let data = c
             .apply(Command::comp(Component::input(1, 1)))
@@ -833,16 +825,17 @@ mod tests {
         c.link(we, PinId::output(0), reg, PinId::input(1));
         c.settle().unwrap();
 
-        // Tombstone the register, then tick: its captured snapshot list must be
-        // empty (no active seq comps) and its state untouched.
-        c.apply(Command::RemoveComponent(reg));
+        // Remove the register, then tick: its captured snapshot list must be
+        // empty (no live seq comps) and the removed state untouched.
+        let (_o, remove_undo) = c.apply(Command::RemoveComponent(reg));
         let (_output, undo) = c.apply(Command::TickClock);
         match undo {
             UndoAction::RestoreSeqState { snapshots } => assert!(snapshots.is_empty()),
             other => panic!("expected RestoreSeqState, got {other:?}"),
         }
-        // Reactivate and read: still the initial 0, never latched the 1.
-        c.reactivate_component(reg);
+        // Re-insert (undo the removal) and read: still the initial 0, never
+        // latched the 1.
+        c.apply_undo(remove_undo);
         let out = c.apply(Command::comp(Component::output())).0.unwrap_comp();
         c.link(reg, PinId::output(0), out, PinId::input(0));
         c.settle().unwrap();

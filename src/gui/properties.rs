@@ -84,8 +84,8 @@ pub(crate) fn show_tunnel_properties(
     key: PlacedTunnelKey,
     ui: &mut egui::Ui,
 ) -> Option<PropGuiAction> {
-    let role = doc.tunnels[key].role;
-    let tunnel_key = doc.tunnels[key].key;
+    let role = doc.tunnels[&key].role;
+    let tunnel_key = doc.tunnels[&key].key;
 
     ui.heading(match role {
         TunnelRole::Feed => "TUNNEL (FEED)",
@@ -97,7 +97,7 @@ pub(crate) fn show_tunnel_properties(
     // whole run session.
     ui.add_enabled_ui(!doc.editing_locked(), |ui| {
         ui.label("Label:");
-        let mut label = doc.tunnels[key].label.clone();
+        let mut label = doc.tunnels[&key].label.clone();
         let response = ui.text_edit_singleline(&mut label);
         if response.changed() {
             // Persist the in-progress edit back to the record this frame (the
@@ -114,7 +114,7 @@ pub(crate) fn show_tunnel_properties(
             && doc
                 .circuit
                 .tunnels
-                .get(tunnel_key)
+                .get(&tunnel_key)
                 .map(|t| t.label.as_str())
                 != Some(label.as_str())
         {
@@ -165,9 +165,9 @@ pub(crate) fn show_component_properties(
     key: PlacedCompKey,
     ui: &mut egui::Ui,
 ) -> Option<PropGuiAction> {
-    let comp_key = doc.components[key].key;
+    let comp_key = doc.components[&key].key;
 
-    ui.heading(doc.components[key].spec.label());
+    ui.heading(doc.components[&key].spec.label());
     ui.separator();
 
     // A run session locks *structural* edits (widths, arity, wiring) for its
@@ -192,7 +192,7 @@ pub(crate) fn show_component_properties(
         Value::Invalid => "Invalid (width mismatch)".to_string(),
     };
 
-    match &doc.components[key].spec {
+    match &doc.components[&key].spec {
         ComponentSpec::Input(Input {
             mut bits,
             mut width,
@@ -311,7 +311,7 @@ pub(crate) fn show_component_properties(
                 ));
             }
 
-            let cur = doc.circuit.components[comp_key].pins.out_cache[0];
+            let cur = doc.circuit.components[&comp_key].pins.out_cache[0];
             ui.label(format!("Value: {}", fmt_val(cur)));
         }
         ComponentSpec::ShiftReg(ShiftRegConf {
@@ -338,7 +338,7 @@ pub(crate) fn show_component_properties(
                 ));
             }
 
-            for (i, v) in doc.circuit.components[comp_key]
+            for (i, v) in doc.circuit.components[&comp_key]
                 .pins
                 .out_cache
                 .iter()
@@ -395,8 +395,8 @@ pub(crate) fn show_component_properties(
                 ));
             }
 
-            let q = doc.circuit.components[comp_key].pins.out_cache[0];
-            let carry = doc.circuit.components[comp_key].pins.out_cache[1];
+            let q = doc.circuit.components[&comp_key].pins.out_cache[0];
+            let carry = doc.circuit.components[&comp_key].pins.out_cache[1];
             ui.label(format!("Q: {}", fmt_val(q)));
             ui.label(format!("Carry: {}", fmt_val(carry)));
         }
@@ -404,7 +404,7 @@ pub(crate) fn show_component_properties(
         | ComponentSpec::TFlipFlop(_)
         | ComponentSpec::JKFlipFlop(_)
         | ComponentSpec::SRFlipFlop(_) => {
-            let cur = doc.circuit.components[comp_key].pins.out_cache[0];
+            let cur = doc.circuit.components[&comp_key].pins.out_cache[0];
             ui.label(format!("Value: {}", fmt_val(cur)));
         }
         ComponentSpec::Encoder(Encoder { mut sel_width }) => {
@@ -558,7 +558,7 @@ pub(crate) fn show_component_properties(
                 }
             });
 
-            let cur = doc.circuit.components[comp_key].pins.out_cache[0];
+            let cur = doc.circuit.components[&comp_key].pins.out_cache[0];
             ui.label(format!("DO: {}", fmt_val(cur)));
         }
         ComponentSpec::Splitter {

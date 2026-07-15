@@ -11,7 +11,9 @@ The crate is a library (`src/lib.rs`: `pub mod gui / io / sim`) plus a thin bina
 (`src/main.rs`) that just constructs `OsmilogApp` and hands it to `eframe`. Tests live in
 `#[cfg(test)]` modules alongside the code they test.
 
-Dependencies: `slotmap` (generational-arena keys for nets/components/tunnels/placed-GUI-records),
+Dependencies: `slotmap` (generational-arena keys for `Circuit`'s nets - the one entity kind that is
+never delete-then-undone, so a generational key is fine; every other keyed entity uses stable
+app-assigned `u64` ids in plain `HashMap`s so undo can re-insert under the same key),
 `eframe`/`egui` (GUI), `serde`/`serde_json` (save/load), `rfd` (native + async file dialogs).
 WASM adds `wasm-bindgen`/`wasm-bindgen-futures`/`js-sys`/`web-sys`.
 
@@ -113,7 +115,11 @@ it never propagates past the one net where it's flagged.
 A `Net` (keyed by `NetKey`) connects one or more component pins: `sources: Vec<(CompKey,
 OutIdx)>`, `sinks: Vec<(CompKey, InIdx)>`. `Circuit` owns all `Net`s, `Component`s, and `Tunnel`s
 (a "net label" mechanism - components sharing a tunnel label are wired together without a drawn
-connection) in `SlotMap`s, plus a dirty-net queue that drives propagation.
+connection): `Net`s in a `SlotMap<NetKey, _>` (nets are derived state, cleared and rebuilt wholesale
+every edit and never delete-then-undone, so a generational key suits them), `Component`s and
+`Tunnel`s in `HashMap`s keyed by stable app-assigned `u64` ids (`CompKey`/`TunnelKey`, from `next_comp`/
+`next_tunnel` counters) so undo can re-insert a removed one under its original key. Plus a dirty-net
+queue that drives propagation.
 
 Circuit's public interface:
 
@@ -157,15 +163,20 @@ state**: the GUI rebuilds every net from its authoritative `Wiring`/component/tu
 any edit (`Document::rebuild_circuit`), so undo restores those records and re-derives the nets
 rather than reversing net mutations. Hence `ClearNets`/`Link`/`LinkTunnel`/`DetachTunnel` capture
 `NoOp` (no net snapshots, no `NetKey`s), and only the *authoritative* commands capture a real
-inverse. Component and tunnel removal **tombstones** (an `active: bool` on `Component`/`Tunnel`,
-mirroring `Wiring`) rather than deleting: `remove_component`/`remove_tunnel` flip `active` off (the
-engine's whole-component sweeps - `tick_clock`, `clear_nets`'s re-eval - skip inactive), and undo is
-a stable-key `reactivate_component`/`reactivate_tunnel` (`ReactivateComponent`/`ReactivateTunnel`).
-This keeps `CompKey`/`TunnelKey`s stable across undo (nothing else in the history needs remapping)
-and preserves a removed `Reg`'s latched state for reactivation - which a spec-based re-creation
-could not. `remove_unreferenced_tombstones` (unwired) reclaims tombstones no history entry
-references. The remaining real inverses: `DeactivateComponent`/`DeactivateTunnel` (undo of an add),
-`SetInput`, `RenameTunnel`, `RestoreSeqState` (undo of `TickClock`).
+inverse. Component and tunnel removal **genuinely removes** the entity and *moves the owned
+`Component`/`Tunnel` into the undo action*: `remove_component`/`remove_tunnel` `HashMap::remove` and
+hand the payload back, and undo (`InsertComponent`/`InsertTunnel`) re-inserts it under its original
+key. Keys stay stable across undo not because the entity lingers but because `CompKey`/`TunnelKey`
+are **app-assigned `u64`s** (allocated from monotonic counters on `Circuit`, never reused), so a
+re-insert reuses the exact key every history/wiring reference already holds - nothing needs
+remapping. A removed `Reg`'s latched state rides along *inside* the moved `Component` (`remove_component`
+nulls its pins first so it carries no dangling `NetKey`s, but the latch is kept apart from pins), so
+an undone deletion restores it - which a spec-based re-creation could not. The entity ping-pongs
+between the live map and exactly one (capped) history entry via a plain move, so no `Clone` is
+needed and deleted memory is reclaimed immediately. The pairs are `RemoveComponent(CompKey)` ⇄
+`InsertComponent(CompKey, Box<Component>)` and `RemoveTunnel(TunnelKey)` ⇄
+`InsertTunnel(TunnelKey, Box<Tunnel>)`; the remaining real inverses are `SetInput`, `RenameTunnel`,
+and `RestoreSeqState` (undo of `TickClock`).
 
 ### Component model (`component.rs` + `component/*.rs`)
 
@@ -294,9 +305,10 @@ The canonical "construction params" record - everything needed to build an equiv
 `Component`'s `NetKey`s, are never part of a `ComponentSpec`) - which is why a sequential variant
 like `ComponentSpec::Reg` holds the bare `RegConf`, never the runtime `Reg`. It's the GUI's
 `PlacedComponent` record (see Simulator/GUI separation above for how the GUI attaches its own
-methods to this same type). There is no `Component -> ComponentSpec` inverse: undo tombstones live
-components rather than snapshotting them into specs, so nothing needs to reconstruct a spec from a
-live `Component`.
+methods to this same type). There is no `Component -> ComponentSpec` inverse: undo of a deletion
+moves the live `Component` itself into the history entry and re-inserts it, rather than
+reconstructing it from a spec, so nothing needs to rebuild a spec from a live `Component` (and a
+`Reg`'s latch survives the round trip).
 
 `ComponentSpec::Subcircuit { doc: DocId, name: String, input_widths: Vec<u8>, output_widths:
 Vec<u8> }` is the one variant that can't build its live `Component` from its own fields alone (see
@@ -394,10 +406,12 @@ are:
 
 - `circuit: Circuit` - the simulation graph.
 - `history: History` - accumulated undo entries (see History below).
-- `components: SlotMap<PlacedCompKey, PlacedComponent>`, `tunnels: SlotMap<PlacedTunnelKey,
-  PlacedTunnel>` - visual records, keyed by their own generational keys (distinct from the
-  circuit's own `CompKey`/`TunnelKey`) so selection/drag state and `Wiring`'s node bindings stay
-  valid across a `reconfigure_component` (which changes the underlying `CompKey`).
+- `components: HashMap<PlacedCompKey, PlacedComponent>`, `tunnels: HashMap<PlacedTunnelKey,
+  PlacedTunnel>` (with sibling `next_placed_comp`/`next_placed_tunnel` `u64` id counters) - visual
+  records, keyed by their own app-assigned `u64` ids (distinct from the circuit's own
+  `CompKey`/`TunnelKey`) so selection/drag state and `Wiring`'s node bindings stay valid across a
+  `reconfigure_component` (which changes the underlying `CompKey`). Delete removes the record and
+  moves it into the undo entry; undo re-inserts under the same key (see History / GUI undo).
 - `wiring: Wiring` - the GUI's connectivity graph (see Wiring below).
 - `mode: InteractionMode` - what the canvas is currently doing.
 - `selected: Option<Selection>` - `Selection::Single` (drives the properties panel) or
@@ -482,14 +496,15 @@ over the active segment graph), and `Document::rebuild_circuit` is the only plac
 a `Wiring` state into `Circuit` calls (`clear_nets()` then `link`/`link_tunnel` per group). Wire
 selection/deletion is currently per-segment, not per-group (see In-Progress).
 
-**Tombstoning.** Editing never `remove()`s from the node/segment `SlotMap`s: a "deleted"
-`WireNode`/`WireSegment` is flagged `active = false` instead, so its key stays valid forever and an
-edit's undo record can be a compact list of `active`-bit flips rather than a whole-graph clone (see
-GUI undo below). Consequently every connectivity/hit/drawing/save read iterates `Wiring::
-active_nodes()`/`active_segments()`, never the raw maps (raw indexing `nodes[k]` is still fine - a
-tombstone is simply never iterated). Tombstones accumulate with cumulative edits (not circuit
-size); `Wiring::remove_unreferenced_tombstones` reclaims any not referenced by the live history
-(keys gathered by `History::referenced_wire_keys`) - defined but not yet called.
+**Stable keys, move-based undo.** Nodes and segments live in plain `HashMap`s keyed by app-assigned
+`u64` ids (`WireNodeKey`/`WireSegKey`, from monotonic counters on `Wiring`, never reused). A
+"deleted" `WireNode`/`WireSegment` is genuinely `remove()`d; the edit's `WiringDelta` op carries the
+removed payload so undo re-inserts it under the *same* key (keys never dangle because the app owns
+them). `Wiring::active_nodes()`/`active_segments()` are thin accessors that just iterate the whole
+map yielding owned keys (the old slotmap-style interface - callers unchanged); there are no
+tombstones to filter and no GC to run, so deleted memory is reclaimed on the spot. `insert_node_untracked`/
+`insert_segment_untracked` mint keys without recording an op, for the history-free snapshot/clipboard
+install paths.
 
 ### History / GUI undo (`history.rs`, `gui_undo.rs`, `wiring.rs`)
 
@@ -514,11 +529,13 @@ a batch (its net reconstruction is untracked derived state).
 
 The `Wiring` mutators (`add_route`, `delete_segment`, `remove_component_nodes`,
 `remove_tunnel_nodes`, `prune_stale_pins`) each **return** a `gui::wiring::WiringDelta` - an ordered
-list of invertible `WiringOp`s (`NodeActive`/`SegActive` bit flips, `SetAttach` swaps) whose stored
-size is proportional to the entries that edit touched, not the whole graph. Because deletes
-tombstone rather than remove, undo/redo are just `Wiring::undo_delta`/`redo_delta` replaying those
-flips (keys never move, so `add_route`'s mid-wire split - which the old whole-graph snapshot existed
-to sidestep - is captured precisely). `Document::edit_wiring(delta)` records a non-empty delta as
+list of invertible `WiringOp`s (`SetNode`/`SetSeg`, each carrying the `before`/`after` `Option<..>`
+value of one node/segment slot; `None` = absent, so one op uniformly covers insert, remove, and
+attach-change) whose stored size is proportional to the entries that edit touched, not the whole
+graph. `undo_delta`/`redo_delta` just install each op's `before`/`after` value; because keys are
+stable app-ids, a removed entry re-inserts under its own key, so `add_route`'s mid-wire split (remove
+the original segment, add a mid node + two halves) reverses precisely. `Document::edit_wiring(delta)`
+records a non-empty delta as
 `GuiUndoAction::WiringDelta { delta, forward: false }` (the `forward` flag picks `undo_delta` vs
 `redo_delta` so one delta serves both directions across the two stacks); there is no "GuiCommand"
 enum, since unlike `sim::command::Command` every `Wiring` edit's inverse is uniform. Component/tunnel
@@ -527,9 +544,11 @@ drag-moves (`GuiUndoAction::MoveComponent`/`MoveTunnel`) are recorded directly
 for live visual feedback - by the time the drag ends there's no "before" state left in the field to
 read, only the `original_grid_pos` captured once at drag-start. `GuiUndoAction` additionally carries
 the **GUI-authoritative record deltas** the sim-side `Command`/`UndoAction` path has no notion of:
-`SetComponentActive`/`SetTunnelActive` (place/delete tombstone toggle), `SwapComponentSpec`
-(reconfigure's whole-record swap), `SetTunnelLabel` (properties-panel rename) - all swap-style, i.e.
-they store the value to restore and return the value they displaced.
+`InsertComponent`/`RemoveComponent` and `InsertTunnel`/`RemoveTunnel` (place/delete of a `PlacedComponent`/
+`PlacedTunnel` record - the record is genuinely removed and its payload moved into the `Insert*`
+entry, mirroring the sim side; the GUI record maps are the same app-assigned-`u64`-keyed `HashMap`s),
+`SwapComponentSpec` (reconfigure's whole-record swap), `SetTunnelLabel` (properties-panel rename) -
+the swap-style ones store the value to restore and return the value they displaced.
 
 **Consuming the stack.** `Document::undo`/`redo` are one symmetric operation in opposite
 directions, built on `apply_entry(entry) -> HistoryEntry`: applying an entry performs the reversal
@@ -537,7 +556,7 @@ directions, built on `apply_entry(entry) -> HistoryEntry`: applying an entry per
 `Sim(a) -> Sim(circuit.apply_undo(a))`, `Gui(a) -> Gui(self.apply_gui_undo(a))`, and a `Batch` by
 applying its children last-first and collecting their inverses (so redo of an undone batch replays
 it forward). `Circuit::apply_undo` and `Document::apply_gui_undo` only touch authoritative state
-(active flags, input values, tunnel labels, records) - never nets; afterward
+(record insert/remove, input values, tunnel labels, specs) - never nets; afterward
 `Document::refresh_after_history` re-syncs every live record's wire-node geometry (needed for a
 move-undo, which carries no wiring delta), clears the selection, and `rebuild_circuit`s (re-deriving
 nets + settling). Exposed as an Edit menu (Undo / Redo, the latter `add_enabled`-gated on
@@ -562,9 +581,10 @@ so subcircuits round-trip (see below). Each `CircuitEntry { name, #[serde(flatte
 snapshot: CircuitSnapshot, subcircuits: Vec<SubcircuitRef> }` names one document and carries its
 records as a `CircuitSnapshot { components: Vec<ComponentEntry>, tunnels: Vec<TunnelEntry>, nodes:
 Vec<NodeEntry>, segments: Vec<SegEntry> }` - one document's GUI visual state (placed
-components/tunnels + the `Wiring` graph), not `Circuit`'s internal `SlotMap`s - every
-cross-reference a plain `usize` index into one of the snapshot's own vectors, since slotmap keys
-are ephemeral and not worth persisting. `CircuitSnapshot` is the reusable payload the clipboard
+components/tunnels + the `Wiring` graph), not `Circuit`'s internal maps - every
+cross-reference a plain `usize` index into one of the snapshot's own vectors, since the in-memory
+keys (slotmap-generational for nets, app-assigned `u64` elsewhere) are ephemeral and not worth
+persisting. `CircuitSnapshot` is the reusable payload the clipboard
 (`gui::clipboard`) also holds. That indexing convention is exactly how cross-*circuit* links persist too: a
 placed subcircuit's `ComponentSpec::Subcircuit::doc` (a runtime-only, serde-skipped `DocId`) is
 emitted as a `SubcircuitRef { component, circuit }` (component index within the entry → circuit
@@ -585,18 +605,15 @@ app state).
 
 ## In-Progress / Not Yet Implemented
 
-- **Undo/redo tombstone GC**: undo/redo itself is **implemented and wired** (see the "History / GUI
-  undo" section under GUI for the full mechanism) - `Document::undo`/`redo` consume the two-stack
-  `History` via a symmetric `apply_entry`, exposed as an Edit menu (Undo / Redo, the latter
-  `add_enabled`-gated on `can_redo`) and `Ctrl/Cmd+Z` / `Ctrl/Cmd+Y` / `Ctrl/Cmd+Shift+Z`. What
-  remains here is only the **tombstone garbage collection**: deletes and wiring edits tombstone
-  (`active: bool`) rather than remove, so tombstones accumulate with cumulative edit count. The GC
-  primitives (`Wiring::remove_unreferenced_tombstones`, `Circuit::remove_unreferenced_tombstones`,
-  fed by `History::referenced_wire_keys`) exist and are tested but are **still not called anywhere** -
-  nothing prunes tombstones the live history no longer references. Two deliberate scope limits, not
-  gaps: **clock ticks are excluded from undo** (`Command::TickClock` is issued untracked, bypassing
-  `apply`, since its `RestoreSeqState` replay is unimplemented), and undo/redo re-derives nets via
-  `rebuild_circuit` rather than reversing net mutations.
+- **Undo/redo** is fully implemented and wired (see the "History / GUI undo" section under GUI) -
+  `Document::undo`/`redo` consume the two-stack `History` via a symmetric `apply_entry`, exposed as
+  an Edit menu (Undo / Redo, the latter `add_enabled`-gated on `can_redo`) and `Ctrl/Cmd+Z` /
+  `Ctrl/Cmd+Y` / `Ctrl/Cmd+Shift+Z`. Deletes genuinely remove and move the payload into the history
+  entry (no tombstones, no GC to run - memory is reclaimed immediately, bounded only by the capped
+  history). Two deliberate scope limits, not gaps: **clock ticks are excluded from undo**
+  (`Command::TickClock` is issued untracked, bypassing `apply`, since its `RestoreSeqState` replay is
+  unimplemented), and undo/redo re-derives nets via `rebuild_circuit` rather than reversing net
+  mutations.
 - **Canvas pan/zoom**: implemented (`Document::camera: geometry::Camera`, see Documents / multiple
   circuits above) - middle-mouse drag pans, Ctrl+scroll zooms toward the cursor. No
   keyboard/scrollbar pan and no "reset view" affordance yet.

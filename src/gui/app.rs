@@ -1,6 +1,6 @@
 use eframe;
 use egui::{Pos2, Rect, Sense};
-use slotmap::{new_key_type, SecondaryMap, SlotMap};
+use slotmap::SlotMap;
 use std::collections::HashMap;
 
 use crate::gui::canvas_draw::draw_ghost;
@@ -14,7 +14,7 @@ use crate::gui::properties::PropGuiAction;
 use crate::gui::shape::ComponentShape;
 use crate::gui::theme::Theme;
 use crate::gui::utils::CanvasCtx;
-use crate::gui::wiring::{NodeAttach, WireNode, WireNodeKey, WireSegKey, WireSegment, Wiring};
+use crate::gui::wiring::{NodeAttach, WireNode, WireNodeKey, WireSegKey, Wiring};
 use crate::io::{
     CircuitEntry, CircuitSnapshot, ComponentEntry, LoadError, NodeAttachEntry, NodeEntry,
     ProjectFile, SegEntry, SubcircuitRef, TunnelEntry,
@@ -43,14 +43,12 @@ const GIT_SHA: &str = env!("OSMILOG_GIT_SHA");
 // mirrors circuit::Tunnel.label (editing it updates the text and calls
 // circuit.rename_tunnel) - Tunnels are the only entity with a user-editable
 // label; Components only show hardcoded per-type/pin labels.
+#[derive(Debug)]
 pub struct PlacedTunnel {
     pub key: TunnelKey,
     pub label: String,
     pub role: TunnelRole,
     pub grid_pos: GridPos,
-    // Tombstone flag; see PlacedComponent::active. A deleted tunnel is flagged
-    // inactive rather than removed so its PlacedTunnelKey survives for undo.
-    pub active: bool,
 }
 
 // ── Selected ──────────────────────────────────────────────────────────────────
@@ -123,10 +121,18 @@ pub(crate) enum PinKind {
 
 // ── OsmilogApp ────────────────────────────────────────────────────────────────
 
-new_key_type! {
-    pub struct PlacedCompKey;
-    pub struct PlacedTunnelKey;
-}
+/// Stable, app-assigned id for a [`PlacedComponent`] in a `Document`'s
+/// `components` map. Survives remove + re-insert so undo restores a deleted
+/// record under its original key (see the wiring/circuit key types); never
+/// reused. Distinct from the circuit-layer `CompKey` a record holds, so it
+/// stays valid across a `reconfigure_component` that swaps the underlying
+/// `CompKey`.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct PlacedCompKey(pub(crate) u64);
+
+/// Stable, app-assigned id for a [`PlacedTunnel`] (see [`PlacedCompKey`]).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct PlacedTunnelKey(pub(crate) u64);
 
 pub struct OsmilogApp {
     // Snapshot of the last copied selection, decoupled from live SlotMap
@@ -272,14 +278,18 @@ impl OsmilogApp {
                 // Persist the in-progress edit back to the record (the panel's
                 // text buffer is re-cloned from it next frame). Same-frame with
                 // the render, so the keystroke isn't lost.
-                self.active_mut().tunnels[key].label = label;
+                self.active_mut().tunnels.get_mut(&key).unwrap().label = label;
             }
             PropGuiAction::RenameTunnel(key, label) => {
                 let doc = self.active_mut();
-                let tunnel_key = doc.tunnels[key].key;
+                let tunnel_key = doc.tunnels[&key].key;
                 // Read the old label from the circuit (the record's copy was
                 // already updated live) to capture undo's restore value.
-                let old_label = doc.circuit.tunnels.get(tunnel_key).map(|t| t.label.clone());
+                let old_label = doc
+                    .circuit
+                    .tunnels
+                    .get(&tunnel_key)
+                    .map(|t| t.label.clone());
                 doc.history.begin_batch();
                 doc.apply(Command::RenameTunnel {
                     tunnel: tunnel_key,
@@ -291,7 +301,7 @@ impl OsmilogApp {
                     doc.history
                         .push_gui(GuiUndoAction::SetTunnelLabel { key, label: old });
                 }
-                doc.tunnels[key].label = label;
+                doc.tunnels.get_mut(&key).unwrap().label = label;
                 doc.history.end_batch();
                 let result = doc.circuit.settle();
                 doc.record_settle_result(result);
@@ -385,22 +395,22 @@ impl OsmilogApp {
         let state = &cdoc.state;
 
         let mut circuit = Circuit::new();
-        let mut comp_map: SecondaryMap<PlacedCompKey, CompKey> = SecondaryMap::new();
-        for (pck, pc) in state.components.iter().filter(|(_, pc)| pc.active) {
+        let mut comp_map: HashMap<PlacedCompKey, CompKey> = HashMap::new();
+        for (pck, pc) in state.components.iter() {
             let comp = self.instantiate_with(&pc.spec, visited);
-            comp_map.insert(pck, circuit.add_component(comp));
+            comp_map.insert(*pck, circuit.add_component(comp));
         }
 
-        let mut tunnel_map: SecondaryMap<PlacedTunnelKey, TunnelKey> = SecondaryMap::new();
-        for (ptk, pt) in state.tunnels.iter().filter(|(_, pt)| pt.active) {
-            tunnel_map.insert(ptk, circuit.add_tunnel(pt.label.clone(), pt.role));
+        let mut tunnel_map: HashMap<PlacedTunnelKey, TunnelKey> = HashMap::new();
+        for (ptk, pt) in state.tunnels.iter() {
+            tunnel_map.insert(*ptk, circuit.add_tunnel(pt.label.clone(), pt.role));
         }
 
         for group in state.wiring.groups() {
             let pins: Vec<(CompKey, PinId)> = group
                 .pins
                 .iter()
-                .filter_map(|&(pck, pin)| comp_map.get(pck).map(|&ck| (ck, pin)))
+                .filter_map(|&(pck, pin)| comp_map.get(&pck).map(|&ck| (ck, pin)))
                 .collect();
             let Some(&(anchor_comp, anchor_pin)) = pins.first() else {
                 continue;
@@ -409,7 +419,7 @@ impl OsmilogApp {
                 circuit.link(anchor_comp, anchor_pin, comp, pin);
             }
             for &ptk in &group.tunnels {
-                if let Some(&tk) = tunnel_map.get(ptk) {
+                if let Some(&tk) = tunnel_map.get(&ptk) {
                     circuit.link_tunnel(tk, anchor_comp, anchor_pin);
                 }
             }
@@ -419,7 +429,7 @@ impl OsmilogApp {
         // Input/Output components' grid positions.
         let mut inputs: Vec<(GridPos, CompKey)> = Vec::new();
         let mut outputs: Vec<(GridPos, CompKey)> = Vec::new();
-        for (pck, pc) in state.components.iter().filter(|(_, pc)| pc.active) {
+        for (pck, pc) in state.components.iter() {
             match pc.spec {
                 ComponentSpec::Input(_) => inputs.push((pc.grid_pos, comp_map[pck])),
                 ComponentSpec::Output => outputs.push((pc.grid_pos, comp_map[pck])),
@@ -455,7 +465,7 @@ impl OsmilogApp {
             .map(|&k| {
                 circuit
                     .components
-                    .get(k)
+                    .get(&k)
                     .and_then(|c| c.output_width(OutIdx(0)))
                     .unwrap_or(1)
             })
@@ -486,13 +496,13 @@ impl OsmilogApp {
     // CompKey, same outer pins), so inner edits that didn't change the boundary
     // are reflected. Used by refresh_subcircuits for the common case.
     fn rebuild_subcircuit_inner(&mut self, pck: PlacedCompKey) {
-        let ComponentSpec::Subcircuit { doc, .. } = self.active().components[pck].spec else {
+        let ComponentSpec::Subcircuit { doc, .. } = self.active().components[&pck].spec else {
             return;
         };
-        let comp_key = self.active().components[pck].key;
+        let comp_key = self.active().components[&pck].key;
         let mut visited = Vec::new();
         let (inner, inputs, outputs) = self.build_doc_circuit(doc, &mut visited);
-        if let Some(comp) = self.active_mut().circuit.components.get_mut(comp_key) {
+        if let Some(comp) = self.active_mut().circuit.components.get_mut(&comp_key) {
             if let Logic::Sub(sub) = &mut comp.logic {
                 sub.inner = inner;
                 sub.inputs = inputs;
@@ -521,7 +531,7 @@ impl OsmilogApp {
         let mut rebuilt_any = false;
         for (pck, doc) in subs {
             let (name, input_widths, output_widths) = self.derive_subcircuit_interface(doc);
-            let (old_in, old_out, old_name) = match &self.active().components[pck].spec {
+            let (old_in, old_out, old_name) = match &self.active().components[&pck].spec {
                 ComponentSpec::Subcircuit {
                     input_widths,
                     output_widths,
@@ -548,12 +558,13 @@ impl OsmilogApp {
                 // shape is unchanged since pin counts match) and rebuild the
                 // inner circuit in place.
                 if old_name != name {
-                    self.active_mut().components[pck].spec = ComponentSpec::Subcircuit {
-                        doc,
-                        name,
-                        input_widths,
-                        output_widths,
-                    };
+                    self.active_mut().components.get_mut(&pck).unwrap().spec =
+                        ComponentSpec::Subcircuit {
+                            doc,
+                            name,
+                            input_widths,
+                            output_widths,
+                        };
                 }
                 self.rebuild_subcircuit_inner(pck);
                 rebuilt_any = true;
@@ -574,7 +585,6 @@ impl OsmilogApp {
             .get(doc)
             .into_iter()
             .flat_map(|d| d.state.components.values())
-            .filter(|pc| pc.active)
             .filter_map(|pc| match &pc.spec {
                 ComponentSpec::Subcircuit { doc, .. } => Some(*doc),
                 _ => None,
@@ -641,11 +651,10 @@ impl OsmilogApp {
         let (snapshot, comp_index) = extract_records(components_map, tunnels_map, wiring);
         let subcircuits = components_map
             .iter()
-            .filter(|(_, pc)| pc.active)
             .filter_map(|(pck, pc)| match &pc.spec {
                 ComponentSpec::Subcircuit { doc, .. } => {
                     doc_index.get(doc).map(|&circuit| SubcircuitRef {
-                        component: comp_index[&pck],
+                        component: comp_index[pck],
                         circuit,
                     })
                 }
@@ -747,7 +756,7 @@ impl OsmilogApp {
                 (comp_keys.get(sub.component), doc_ids.get(sub.circuit))
             {
                 if let ComponentSpec::Subcircuit { doc: d, .. } =
-                    &mut self.active_mut().components[pck].spec
+                    &mut self.active_mut().components.get_mut(&pck).unwrap().spec
                 {
                     *d = doc;
                 }
@@ -786,20 +795,17 @@ impl OsmilogApp {
                     }
                     NodeAttachEntry::Tunnel { tunnel } => NodeAttach::Tunnel(tunnel_keys[tunnel]),
                 };
-                self.active_mut().wiring.nodes.insert(WireNode {
+                self.active_mut().wiring.insert_node_untracked(WireNode {
                     pos: entry.pos,
                     attach,
-                    active: true,
                 })
             })
             .collect();
 
         for s in &snapshot.segments {
-            self.active_mut().wiring.segments.insert(WireSegment {
-                a: node_keys[s.a],
-                b: node_keys[s.b],
-                active: true,
-            });
+            self.active_mut()
+                .wiring
+                .insert_segment_untracked(node_keys[s.a], node_keys[s.b]);
         }
     }
 
@@ -1291,14 +1297,16 @@ impl OsmilogApp {
                     for (key, original_grid_pos) in items {
                         match key {
                             Selected::Component(k) => {
-                                doc.components[*k].grid_pos = *original_grid_pos
+                                doc.components.get_mut(k).unwrap().grid_pos = *original_grid_pos
                             }
-                            Selected::Tunnel(k) => doc.tunnels[*k].grid_pos = *original_grid_pos,
+                            Selected::Tunnel(k) => {
+                                doc.tunnels.get_mut(k).unwrap().grid_pos = *original_grid_pos
+                            }
                             Selected::Wire(_) => {}
                         }
                     }
                     for (key, original_pos) in free_nodes {
-                        doc.wiring.nodes[*key].pos = *original_pos;
+                        doc.wiring.nodes.get_mut(key).unwrap().pos = *original_pos;
                     }
                 }
                 // Esc while drawing commits the polyline drawn so far as a
@@ -1401,16 +1409,25 @@ impl OsmilogApp {
                 start_attach,
                 cursor,
                 dragging,
-            } => self
-                .active_mut()
-                .interact_wire_draw(cc, pointer, points, start_attach, cursor, dragging),
+            } => self.active_mut().interact_wire_draw(
+                cc,
+                pointer,
+                points,
+                start_attach,
+                cursor,
+                dragging,
+            ),
             InteractionMode::SelectionDrag {
                 items,
                 free_nodes,
                 drag_origin,
-            } => self
-                .active_mut()
-                .interact_component_drag(cc, pointer, items, free_nodes, drag_origin),
+            } => self.active_mut().interact_component_drag(
+                cc,
+                pointer,
+                items,
+                free_nodes,
+                drag_origin,
+            ),
             InteractionMode::BulkSelect { start, current } => self
                 .active_mut()
                 .interact_bulk_select(cc, pointer, start, current),
@@ -1430,7 +1447,6 @@ impl OsmilogApp {
             }
         }
     }
-
 }
 
 impl eframe::App for OsmilogApp {
@@ -1534,25 +1550,25 @@ impl eframe::App for OsmilogApp {
 
 // ── Geometry ─────────────────────────────────────────────────────────────────
 
-// Extracts one document's live (non-tombstoned) visual records into the
+// Extracts one document's visual records into the
 // index-based entry vectors io.rs persists: PlacedCompKey/PlacedTunnelKey/
 // WireNodeKey become positions in the emitted Vecs, so cross-references are
 // plain indices rather than ephemeral slotmap keys. Tombstones (kept for undo)
 // never reach a file. Also returns the PlacedCompKey -> component-index map, so
 // `circuit_entry_of` can emit per-component references (subcircuit links) by
 // index.
+// FIXME: This doesn't use SlotMaps anymore
 fn extract_records(
-    components: &SlotMap<PlacedCompKey, PlacedComponent>,
-    tunnels: &SlotMap<PlacedTunnelKey, PlacedTunnel>,
+    components: &HashMap<PlacedCompKey, PlacedComponent>,
+    tunnels: &HashMap<PlacedTunnelKey, PlacedTunnel>,
     wiring: &Wiring,
 ) -> (CircuitSnapshot, HashMap<PlacedCompKey, usize>) {
     let mut comp_index: HashMap<PlacedCompKey, usize> = HashMap::new();
     let comp_entries: Vec<ComponentEntry> = components
         .iter()
-        .filter(|(_, pc)| pc.active)
         .enumerate()
         .map(|(i, (pck, pc))| {
-            comp_index.insert(pck, i);
+            comp_index.insert(*pck, i);
             ComponentEntry {
                 spec: pc.spec.clone(),
                 grid_pos: pc.grid_pos,
@@ -1563,10 +1579,9 @@ fn extract_records(
     let mut tunnel_index: HashMap<PlacedTunnelKey, usize> = HashMap::new();
     let tunnel_entries: Vec<TunnelEntry> = tunnels
         .iter()
-        .filter(|(_, pt)| pt.active)
         .enumerate()
         .map(|(i, (ptk, pt))| {
-            tunnel_index.insert(ptk, i);
+            tunnel_index.insert(*ptk, i);
             TunnelEntry {
                 label: pt.label.clone(),
                 role: pt.role,
@@ -1580,10 +1595,11 @@ fn extract_records(
     // active nodes, so every SegEntry lookup below resolves.
     let mut node_index: HashMap<crate::gui::wiring::WireNodeKey, usize> = HashMap::new();
     let node_entries: Vec<NodeEntry> = wiring
-        .active_nodes()
+        .nodes
+        .iter()
         .enumerate()
         .map(|(i, (nk, node))| {
-            node_index.insert(nk, i);
+            node_index.insert(*nk, i);
             let attach = match node.attach {
                 NodeAttach::Free => NodeAttachEntry::Free,
                 NodeAttach::Pin(pck, pin) => {
@@ -1757,36 +1773,30 @@ mod tests {
     // pin's grid cell, and return the two node keys.
     fn connect_pins(app: &mut OsmilogApp, a: (PlacedCompKey, PinId), b: (PlacedCompKey, PinId)) {
         let pa = pin_grid_pos(
-            &app.active().components[a.0].shape,
-            app.active().components[a.0].grid_pos,
+            &app.active().components[&a.0].shape,
+            app.active().components[&a.0].grid_pos,
             a.1,
         );
         let pb = pin_grid_pos(
-            &app.active().components[b.0].shape,
-            app.active().components[b.0].grid_pos,
+            &app.active().components[&b.0].shape,
+            app.active().components[&b.0].grid_pos,
             b.1,
         );
-        let na = app.active_mut().wiring.nodes.insert(WireNode {
+        let na = app.active_mut().wiring.insert_node_untracked(WireNode {
             pos: pa,
             attach: NodeAttach::Pin(a.0, a.1),
-            active: true,
         });
-        let nb = app.active_mut().wiring.nodes.insert(WireNode {
+        let nb = app.active_mut().wiring.insert_node_untracked(WireNode {
             pos: pb,
             attach: NodeAttach::Pin(b.0, b.1),
-            active: true,
         });
-        app.active_mut().wiring.segments.insert(WireSegment {
-            a: na,
-            b: nb,
-            active: true,
-        });
+        app.active_mut().wiring.insert_segment_untracked(na, nb);
     }
 
     #[test]
-    fn test_circuit_file_save_excludes_tombstones() {
-        // After a wiring edit leaves tombstones behind, the save file must
-        // reflect only the live graph - tombstones never reach disk.
+    fn test_circuit_file_save_reflects_live_graph_after_delete() {
+        // A wiring delete removes nodes/segments outright (no tombstones), and
+        // the save file reflects exactly the live graph.
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let g = place(
@@ -1802,20 +1812,23 @@ mod tests {
         connect_pins(&mut app, (g, PinId::output(0)), (o, PinId::input(0)));
         app.active_mut().rebuild_circuit();
 
-        // Delete the a->g wire; its nodes/segment become tombstones still held
-        // in the SlotMaps.
+        // Delete the a->g wire; its nodes/segment are removed outright, so the
+        // maps hold no leftover tombstones.
         let seg = app
             .active()
             .wiring
             .active_segments()
             .find(|(_, s)| {
-                matches!(app.active().wiring.nodes[s.a].attach, NodeAttach::Pin(k, _) if k == a)
-                    || matches!(app.active().wiring.nodes[s.b].attach, NodeAttach::Pin(k, _) if k == a)
+                matches!(app.active().wiring.nodes[&s.a].attach, NodeAttach::Pin(k, _) if k == a)
+                    || matches!(app.active().wiring.nodes[&s.b].attach, NodeAttach::Pin(k, _) if k == a)
             })
             .map(|(k, _)| k)
             .unwrap();
         app.active_mut().delete_wire(seg);
-        assert!(app.active().wiring.segments.len() > app.active().wiring.active_segments().count());
+        assert_eq!(
+            app.active().wiring.segments.len(),
+            app.active().wiring.active_segments().count()
+        );
 
         // The saved project carries only live entries, and the reload matches
         // the live graph exactly.
@@ -1825,7 +1838,7 @@ mod tests {
             snap.segments.len(),
             app.active().wiring.active_segments().count()
         );
-        assert_eq!(snap.nodes.len(), app.active().wiring.active_nodes().count());
+        assert_eq!(snap.nodes.len(), app.active().wiring.nodes.len());
 
         let json = file.to_json().unwrap();
         let file2 = ProjectFile::from_json(&json).unwrap();
@@ -1834,15 +1847,6 @@ mod tests {
         assert_eq!(
             loaded.active().wiring.active_segments().count(),
             app.active().wiring.active_segments().count()
-        );
-        // A fresh load has no tombstones: every stored entry is live.
-        assert_eq!(
-            loaded.active().wiring.segments.len(),
-            loaded.active().wiring.active_segments().count()
-        );
-        assert_eq!(
-            loaded.active().wiring.nodes.len(),
-            loaded.active().wiring.active_nodes().count()
         );
     }
 
@@ -1898,7 +1902,7 @@ mod tests {
     fn test_copy_single_component_then_paste_creates_offset_copy() {
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Output);
-        let original = app.active().components[a].grid_pos;
+        let original = app.active().components[&a].grid_pos;
 
         app.active_mut().selected = Some(Selection::Single(Selected::Component(a)));
         app.copy_selection();
@@ -1914,7 +1918,7 @@ mod tests {
             .map(|(k, _)| k)
             .unwrap();
         assert_eq!(
-            app.active().components[pasted].grid_pos,
+            app.active().components[&pasted].grid_pos,
             GridPos::new(original.x + 2, original.y + 2)
         );
         assert_eq!(
@@ -1930,9 +1934,9 @@ mod tests {
         app.active_mut().selected = Some(Selection::Single(Selected::Component(a)));
         app.copy_selection();
 
-        // Undo the original placement: it's now tombstoned.
+        // Undo the original placement: its record is now removed.
         app.active_mut().undo();
-        assert!(!app.active().components[a].active);
+        assert!(!app.active().components.contains_key(&a));
 
         app.paste_clipboard();
 
@@ -1950,12 +1954,12 @@ mod tests {
     fn test_paste_after_editing_original_is_unaffected() {
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Output);
-        let original_pos = app.active().components[a].grid_pos;
+        let original_pos = app.active().components[&a].grid_pos;
         app.active_mut().selected = Some(Selection::Single(Selected::Component(a)));
         app.copy_selection();
 
         // Move the original after copying.
-        app.active_mut().components[a].grid_pos = GridPos::new(100, 100);
+        app.active_mut().components.get_mut(&a).unwrap().grid_pos = GridPos::new(100, 100);
 
         app.paste_clipboard();
 
@@ -1968,7 +1972,7 @@ mod tests {
             .map(|(k, _)| k)
             .unwrap();
         assert_eq!(
-            app.active().components[pasted].grid_pos,
+            app.active().components[&pasted].grid_pos,
             GridPos::new(original_pos.x + 2, original_pos.y + 2)
         );
     }
@@ -2071,7 +2075,7 @@ mod tests {
         connect_pins(&mut app, (b, PinId::output(0)), (g, PinId::input(1)));
         connect_pins(&mut app, (g, PinId::output(0)), (o, PinId::input(0)));
         app.active_mut().rebuild_circuit();
-        let o_key = app.active().components[o].key;
+        let o_key = app.active().components[&o].key;
         assert_eq!(app.active().circuit.read_output(o_key), Value::ONE);
 
         // Create + switch to a blank second circuit: Main's contents vanish
@@ -2121,8 +2125,8 @@ mod tests {
         let sub = app.place_component(spec, GridPos::new(5, 5));
 
         // Interface derived from Main's one Input and one Output.
-        assert_eq!(app.active().components[sub].spec.n_inputs(), 1);
-        assert_eq!(app.active().components[sub].spec.n_outputs(), 1);
+        assert_eq!(app.active().components[&sub].spec.n_inputs(), 1);
+        assert_eq!(app.active().components[&sub].spec.n_outputs(), 1);
 
         // Drive it end-to-end: C2 Input(=1) -> sub -> C2 Output. The passthrough
         // subcircuit settles a 1 out through the boundary.
@@ -2131,7 +2135,7 @@ mod tests {
         connect_pins(&mut app, (x, PinId::output(0)), (sub, PinId::input(0)));
         connect_pins(&mut app, (sub, PinId::output(0)), (y, PinId::input(0)));
         app.active_mut().rebuild_circuit();
-        let y_key = app.active().components[y].key;
+        let y_key = app.active().components[&y].key;
         assert_eq!(app.active().circuit.read_output(y_key), Value::ONE);
     }
 

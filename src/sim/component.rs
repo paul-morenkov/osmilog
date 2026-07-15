@@ -47,9 +47,14 @@ pub use sr_flip_flop::{SRFlipFlop, SRFlipFlopConf};
 pub use subtractor::Subtractor;
 pub use t_flip_flop::{TFlipFlop, TFlipFlopConf};
 
-new_key_type! {
-    pub struct CompKey;
-}
+/// Stable, app-assigned identifier for a `Component` within a `Circuit`'s
+/// `components` map. Unlike a slotmap key, it survives a remove + re-insert:
+/// deleting a component genuinely removes it (moving the owned `Component` into
+/// the undo entry), and undo re-inserts it under this same key, so every
+/// history/wiring reference stays valid. Ids are allocated from a monotonic
+/// counter and never reused.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct CompKey(pub(crate) u64);
 
 new_key_type! {
     /// Opaque reference to another circuit document, embedded in
@@ -65,10 +70,6 @@ new_key_type! {
 pub struct Component {
     pub pins: Pins,
     pub logic: Logic,
-    // `false` marks a tombstone: kept so CompKey stays valid and a Reg's
-    // latched state survives, but skipped by whole-component sweeps
-    // (tick_clock, clear_nets). See Circuit::remove_component/reactivate_component.
-    pub(crate) active: bool,
 }
 
 impl Component {
@@ -77,7 +78,6 @@ impl Component {
         Self {
             pins,
             logic: Logic::Comb(logic),
-            active: true,
         }
     }
 
@@ -86,7 +86,6 @@ impl Component {
         Self {
             pins,
             logic: Logic::Seq(logic),
-            active: true,
         }
     }
 
@@ -170,12 +169,11 @@ impl Component {
         let pins = Pins::new(inputs.len(), outputs.len());
         Self {
             pins,
-            logic: Logic::Sub(SubCircuit {
+            logic: Logic::Sub(Box::new(SubCircuit {
                 inner,
                 inputs,
                 outputs,
-            }),
-            active: true,
+            })),
         }
     }
 
@@ -186,12 +184,11 @@ impl Component {
     pub fn subcircuit_placeholder(n_inputs: usize, n_outputs: usize) -> Self {
         Self {
             pins: Pins::new(n_inputs, n_outputs),
-            logic: Logic::Sub(SubCircuit {
+            logic: Logic::Sub(Box::new(SubCircuit {
                 inner: Circuit::new(),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
-            }),
-            active: true,
+            })),
         }
     }
 
@@ -582,8 +579,10 @@ pub enum Logic {
     // A whole Circuit simulated as one component - a third kind alongside
     // combinational and sequential, because it both propagates combinationally
     // (its inner circuit needs &mut to settle) and holds clocked state (it
-    // forwards clock ticks inward). See SubCircuit.
-    Sub(SubCircuit),
+    // forwards clock ticks inward). See SubCircuit. Boxed because a SubCircuit
+    // embeds a whole inner Circuit - far larger than Comb/Seq - so an unboxed
+    // variant would bloat every Component (and Logic) to that size.
+    Sub(Box<SubCircuit>),
 }
 
 // The runtime state of a subcircuit component: the owned inner Circuit plus the
@@ -642,7 +641,7 @@ impl SubCircuit {
     fn input_width(&self, i: usize) -> Option<u8> {
         self.inputs
             .get(i)
-            .and_then(|&key| self.inner.components.get(key))
+            .and_then(|&key| self.inner.components.get(&key))
             .and_then(|c| c.output_width(OutIdx(0)))
     }
 

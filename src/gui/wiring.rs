@@ -8,33 +8,34 @@
 //! another wire does not connect. `resolve_point` creates a junction by
 //! splitting a segment when a route starts/ends partway along it.
 //!
-//! ## Tombstoning
+//! ## Stable keys, move-based undo
 //!
-//! Editing never `remove()`s from the `SlotMap`s - a "deleted" node/segment
-//! is flagged `active = false` instead, so keys stay valid and every edit is
-//! a compact, invertible [`WiringDelta`] of bit flips ([`WiringOp`]) rather
-//! than a whole-graph snapshot. Every connectivity/hit/drawing read must go
-//! through [`active_nodes`]/[`active_segments`], never the raw maps.
-//! [`remove_unreferenced_tombstones`] reclaims tombstones no history entry
-//! references, but nothing calls it yet.
-//!
-//! [`active_nodes`]: Wiring::active_nodes
-//! [`active_segments`]: Wiring::active_segments
-//! [`remove_unreferenced_tombstones`]: Wiring::remove_unreferenced_tombstones
+//! Nodes and segments live in plain `HashMap`s keyed by app-assigned `u64`
+//! ids ([`WireNodeKey`]/[`WireSegKey`]) allocated from monotonic counters and
+//! never reused. Deleting genuinely `remove()`s the entry; undo re-inserts it
+//! under the *same* key, so keys never dangle. Each edit records a compact,
+//! invertible [`WiringDelta`] of [`WiringOp`]s that carry the before/after
+//! payloads for every node/segment slot they touched (`before`/`after` = the
+//! `Option<..>` map value on each side), so replaying the delta forward (redo)
+//! or backward (undo) reconstructs the exact graph - including `resolve_point`'s
+//! mid-wire split.
 
 use std::collections::{HashMap, HashSet};
 
 use egui::Pos2;
-use slotmap::{new_key_type, SlotMap};
 
 use crate::gui::app::{PlacedCompKey, PlacedTunnelKey};
 use crate::gui::geometry::{Camera, GridPos};
 use crate::sim::component::PinId;
 
-new_key_type! {
-    pub struct WireNodeKey;
-    pub struct WireSegKey;
-}
+/// Stable, app-assigned id for a [`WireNode`]. Survives remove + re-insert so
+/// undo restores a deleted node under its original key; never reused.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct WireNodeKey(pub(crate) u64);
+
+/// Stable, app-assigned id for a [`WireSegment`] (see [`WireNodeKey`]).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct WireSegKey(pub(crate) u64);
 
 // How close (in pixels) the cursor must be to a segment/node to hit it.
 const HIT_RADIUS: f32 = 5.0;
@@ -53,8 +54,6 @@ pub struct WireNode {
     /// Grid coordinates (same convention as `PlacedComponent::grid_pos`).
     pub pos: GridPos,
     pub attach: NodeAttach,
-    /// `false` marks a tombstone. See the module-level "Tombstoning" note.
-    pub active: bool,
 }
 
 /// An axis-aligned segment between two nodes (invariant: `a.pos` and `b.pos`
@@ -63,8 +62,6 @@ pub struct WireNode {
 pub struct WireSegment {
     pub a: WireNodeKey,
     pub b: WireNodeKey,
-    /// `false` marks a tombstone (see [`WireNode::active`]).
-    pub active: bool,
 }
 
 /// One connected group of wire nodes. `pins`/`tunnels` are what gets linked
@@ -76,23 +73,22 @@ pub struct Group {
 }
 
 /// One invertible change to a [`Wiring`], recorded into a [`WiringDelta`] and
-/// consumed by `undo_delta`/`redo_delta`. Since edits tombstone rather than
-/// remove, every change is just a bit flip or attach swap.
-#[derive(Clone, Debug)]
+/// consumed by `undo_delta`/`redo_delta`. Each op is the before/after value of
+/// a single node or segment slot (`None` = the slot is empty). `after` is what
+/// redo installs; `before` is what undo restores. This uniformly covers
+/// insertion (`before: None`), deletion (`after: None`), and in-place edits
+/// such as an attach change (both `Some`).
+#[derive(Clone, Copy, Debug)]
 pub enum WiringOp {
-    /// Covers both creation (`false`->`true`) and deletion (`true`->`false`).
-    NodeActive {
+    SetNode {
         key: WireNodeKey,
-        active: bool,
+        before: Option<WireNode>,
+        after: Option<WireNode>,
     },
-    SegActive {
+    SetSeg {
         key: WireSegKey,
-        active: bool,
-    },
-    SetAttach {
-        node: WireNodeKey,
-        old: NodeAttach,
-        new: NodeAttach,
+        before: Option<WireSegment>,
+        after: Option<WireSegment>,
     },
 }
 
@@ -105,30 +101,16 @@ impl WiringDelta {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-
-    /// Add every key this delta references into the given sets (used by
-    /// [`Wiring::remove_unreferenced_tombstones`] to decide what to keep).
-    pub fn collect_keys(&self, nodes: &mut HashSet<WireNodeKey>, segs: &mut HashSet<WireSegKey>) {
-        for op in &self.0 {
-            match op {
-                WiringOp::NodeActive { key, .. } => {
-                    nodes.insert(*key);
-                }
-                WiringOp::SegActive { key, .. } => {
-                    segs.insert(*key);
-                }
-                WiringOp::SetAttach { node, .. } => {
-                    nodes.insert(*node);
-                }
-            }
-        }
-    }
 }
 
 #[derive(Default, Clone, Debug)]
 pub struct Wiring {
-    pub nodes: SlotMap<WireNodeKey, WireNode>,
-    pub segments: SlotMap<WireSegKey, WireSegment>,
+    pub nodes: HashMap<WireNodeKey, WireNode>,
+    pub segments: HashMap<WireSegKey, WireSegment>,
+    // Monotonic id allocators; never reused, so undo re-inserts a removed
+    // node/segment under its original key with no risk of aliasing a later one.
+    next_node: u64,
+    next_seg: u64,
 }
 
 impl Wiring {
@@ -136,16 +118,45 @@ impl Wiring {
         Self::default()
     }
 
-    // ── Active (non-tombstone) iteration ────────────────────────────────────
-    // Every connectivity/hit/drawing read must go through these two, never the
-    // raw `nodes`/`segments` maps, so tombstones stay invisible.
+    fn next_node_key(&mut self) -> WireNodeKey {
+        let k = WireNodeKey(self.next_node);
+        self.next_node += 1;
+        k
+    }
+
+    fn next_seg_key(&mut self) -> WireSegKey {
+        let k = WireSegKey(self.next_seg);
+        self.next_seg += 1;
+        k
+    }
+
+    /// Inserts a node under a fresh key without recording an undo op - for the
+    /// history-free snapshot/clipboard install paths. Returns the key.
+    pub fn insert_node_untracked(&mut self, node: WireNode) -> WireNodeKey {
+        let key = self.next_node_key();
+        self.nodes.insert(key, node);
+        key
+    }
+
+    /// Inserts a segment under a fresh key without recording an undo op (see
+    /// `insert_node_untracked`). Returns the key.
+    pub fn insert_segment_untracked(&mut self, a: WireNodeKey, b: WireNodeKey) -> WireSegKey {
+        let key = self.next_seg_key();
+        self.segments.insert(key, WireSegment { a, b });
+        key
+    }
+
+    // ── Iteration ───────────────────────────────────────────────────────────
+    // Thin accessors yielding owned keys (like the old slotmap iterators), so
+    // callers stay unchanged. No tombstones exist any more, so these iterate
+    // the whole map.
 
     pub fn active_nodes(&self) -> impl Iterator<Item = (WireNodeKey, &WireNode)> {
-        self.nodes.iter().filter(|(_, n)| n.active)
+        self.nodes.iter().map(|(k, n)| (*k, n))
     }
 
     pub fn active_segments(&self) -> impl Iterator<Item = (WireSegKey, &WireSegment)> {
-        self.segments.iter().filter(|(_, s)| s.active)
+        self.segments.iter().map(|(k, s)| (*k, s))
     }
 
     fn node_at_grid(&self, gp: GridPos) -> Option<WireNodeKey> {
@@ -182,8 +193,8 @@ impl Wiring {
     // turns a mid-wire tap into a real junction.
     fn segment_through(&self, gp: GridPos) -> Option<WireSegKey> {
         self.active_segments().find_map(|(k, seg)| {
-            let a = self.nodes[seg.a].pos;
-            let b = self.nodes[seg.b].pos;
+            let a = self.nodes[&seg.a].pos;
+            let b = self.nodes[&seg.b].pos;
             let on = if a.x == b.x && gp.x == a.x {
                 let (lo, hi) = (a.y.min(b.y), a.y.max(b.y));
                 gp.y > lo && gp.y < hi
@@ -200,8 +211,32 @@ impl Wiring {
     // ── Editing primitives ──────────────────────────────────────────────────
     //
     // Each of these threads `&mut Vec<WiringOp>` so its caller (one of the five
-    // public mutators) accumulates a single delta. "Delete" means tombstone
-    // (`active = false`) plus a recorded flip - never `SlotMap::remove`.
+    // public mutators) accumulates a single delta. "Delete" genuinely removes
+    // the node/segment; the recorded op carries its payload so undo re-inserts
+    // it under the same key.
+
+    // Inserts a node under a fresh key and records the op. Returns the key.
+    fn insert_node(&mut self, node: WireNode, ops: &mut Vec<WiringOp>) -> WireNodeKey {
+        let key = self.next_node_key();
+        self.nodes.insert(key, node);
+        ops.push(WiringOp::SetNode {
+            key,
+            before: None,
+            after: Some(node),
+        });
+        key
+    }
+
+    // Removes a node (if present) and records the op.
+    fn take_node(&mut self, key: WireNodeKey, ops: &mut Vec<WiringOp>) {
+        if let Some(before) = self.nodes.remove(&key) {
+            ops.push(WiringOp::SetNode {
+                key,
+                before: Some(before),
+                after: None,
+            });
+        }
+    }
 
     fn add_segment(&mut self, a: WireNodeKey, b: WireNodeKey, ops: &mut Vec<WiringOp>) {
         if a == b {
@@ -211,45 +246,56 @@ impl Wiring {
             .active_segments()
             .any(|(_, s)| (s.a == a && s.b == b) || (s.a == b && s.b == a));
         if !exists {
-            let key = self.segments.insert(WireSegment { a, b, active: true });
-            ops.push(WiringOp::SegActive { key, active: true });
+            let key = self.next_seg_key();
+            let seg = WireSegment { a, b };
+            self.segments.insert(key, seg);
+            ops.push(WiringOp::SetSeg {
+                key,
+                before: None,
+                after: Some(seg),
+            });
         }
     }
 
-    // Find-or-create the active node at gp. If gp lands partway along an active
-    // segment, that segment is split so the returned node becomes a real
-    // junction. New nodes start `Free`.
+    // Removes a segment (if present) and records the op.
+    fn take_segment(&mut self, key: WireSegKey, ops: &mut Vec<WiringOp>) {
+        if let Some(before) = self.segments.remove(&key) {
+            ops.push(WiringOp::SetSeg {
+                key,
+                before: Some(before),
+                after: None,
+            });
+        }
+    }
+
+    // Find-or-create the node at gp. If gp lands partway along a segment, that
+    // segment is split so the returned node becomes a real junction. New nodes
+    // start `Free`.
     fn resolve_point(&mut self, gp: GridPos, ops: &mut Vec<WiringOp>) -> WireNodeKey {
         if let Some(k) = self.node_at_grid(gp) {
             return k;
         }
         if let Some(seg_key) = self.segment_through(gp) {
-            let seg = self.segments[seg_key];
-            self.segments[seg_key].active = false;
-            ops.push(WiringOp::SegActive {
-                key: seg_key,
-                active: false,
-            });
-            let mid = self.nodes.insert(WireNode {
-                pos: gp,
-                attach: NodeAttach::Free,
-                active: true,
-            });
-            ops.push(WiringOp::NodeActive {
-                key: mid,
-                active: true,
-            });
+            let seg = self.segments[&seg_key];
+            self.take_segment(seg_key, ops);
+            let mid = self.insert_node(
+                WireNode {
+                    pos: gp,
+                    attach: NodeAttach::Free,
+                },
+                ops,
+            );
             self.add_segment(seg.a, mid, ops);
             self.add_segment(mid, seg.b, ops);
             return mid;
         }
-        let key = self.nodes.insert(WireNode {
-            pos: gp,
-            attach: NodeAttach::Free,
-            active: true,
-        });
-        ops.push(WiringOp::NodeActive { key, active: true });
-        key
+        self.insert_node(
+            WireNode {
+                pos: gp,
+                attach: NodeAttach::Free,
+            },
+            ops,
+        )
     }
 
     // Only sets an attachment onto a node that is still Free, so a wire ending
@@ -261,13 +307,15 @@ impl Wiring {
         ops: &mut Vec<WiringOp>,
     ) {
         if attach != NodeAttach::Free {
-            let n = &mut self.nodes[node];
-            if n.attach == NodeAttach::Free {
-                n.attach = attach;
-                ops.push(WiringOp::SetAttach {
-                    node,
-                    old: NodeAttach::Free,
-                    new: attach,
+            let before = self.nodes[&node];
+            if before.attach == NodeAttach::Free {
+                let mut after = before;
+                after.attach = attach;
+                self.nodes.insert(node, after);
+                ops.push(WiringOp::SetNode {
+                    key: node,
+                    before: Some(before),
+                    after: Some(after),
                 });
             }
         }
@@ -309,43 +357,38 @@ impl Wiring {
         let mut ops = Vec::new();
         let mut keys = Vec::with_capacity(nodes.len());
         for &(pos, attach) in nodes {
-            let key = self.nodes.insert(WireNode {
-                pos,
-                attach,
-                active: true,
-            });
-            ops.push(WiringOp::NodeActive { key, active: true });
-            keys.push(key);
+            keys.push(self.insert_node(WireNode { pos, attach }, &mut ops));
         }
         let mut seg_keys = Vec::with_capacity(segments.len());
         for &(a, b) in segments {
-            let key = self.segments.insert(WireSegment {
+            let key = self.next_seg_key();
+            let seg = WireSegment {
                 a: keys[a],
                 b: keys[b],
-                active: true,
+            };
+            self.segments.insert(key, seg);
+            ops.push(WiringOp::SetSeg {
+                key,
+                before: None,
+                after: Some(seg),
             });
-            ops.push(WiringOp::SegActive { key, active: true });
             seg_keys.push(key);
         }
         (keys, seg_keys, WiringDelta(ops))
     }
 
-    /// Tombstone a segment, then any node left with no active segments.
+    /// Remove a segment, then any node left with no incident segments.
     pub fn delete_segment(&mut self, seg: WireSegKey) -> WiringDelta {
         let mut ops = Vec::new();
-        match self.segments.get_mut(seg) {
-            Some(s) if s.active => s.active = false,
-            _ => return WiringDelta(ops),
+        if !self.segments.contains_key(&seg) {
+            return WiringDelta(ops);
         }
-        ops.push(WiringOp::SegActive {
-            key: seg,
-            active: false,
-        });
+        self.take_segment(seg, &mut ops);
         self.cleanup(&mut ops);
         WiringDelta(ops)
     }
 
-    // Tombstone a node and every active segment touching it.
+    // Remove a node and every segment touching it.
     fn remove_node(&mut self, node: WireNodeKey, ops: &mut Vec<WiringOp>) {
         let touching: Vec<WireSegKey> = self
             .active_segments()
@@ -353,19 +396,9 @@ impl Wiring {
             .map(|(k, _)| k)
             .collect();
         for k in touching {
-            self.segments[k].active = false;
-            ops.push(WiringOp::SegActive {
-                key: k,
-                active: false,
-            });
+            self.take_segment(k, ops);
         }
-        if self.nodes[node].active {
-            self.nodes[node].active = false;
-            ops.push(WiringOp::NodeActive {
-                key: node,
-                active: false,
-            });
-        }
+        self.take_node(node, ops);
     }
 
     /// Drop all nodes bound to a removed component (and their segments).
@@ -450,8 +483,7 @@ impl Wiring {
         }
     }
 
-    // Tombstone nodes with no incident active segments (orphans left by a
-    // delete/split).
+    // Remove nodes with no incident segments (orphans left by a delete/split).
     fn cleanup(&mut self, ops: &mut Vec<WiringOp>) {
         let orphans: Vec<WireNodeKey> = self
             .active_nodes()
@@ -459,53 +491,46 @@ impl Wiring {
             .filter(|&k| self.degree(k) == 0)
             .collect();
         for k in orphans {
-            self.nodes[k].active = false;
-            ops.push(WiringOp::NodeActive {
-                key: k,
-                active: false,
-            });
+            self.take_node(k, ops);
         }
     }
 
     // ── Undo / redo replay ──────────────────────────────────────────────────
 
-    fn apply_op(&mut self, op: &WiringOp) {
-        match op {
-            WiringOp::NodeActive { key, active } => {
-                if let Some(n) = self.nodes.get_mut(*key) {
-                    n.active = *active;
-                }
+    // Install `val` into the node slot (`Some` inserts, `None` removes).
+    fn set_node_slot(&mut self, key: WireNodeKey, val: Option<WireNode>) {
+        match val {
+            Some(n) => {
+                self.nodes.insert(key, n);
             }
-            WiringOp::SegActive { key, active } => {
-                if let Some(s) = self.segments.get_mut(*key) {
-                    s.active = *active;
-                }
-            }
-            WiringOp::SetAttach { node, new, .. } => {
-                if let Some(n) = self.nodes.get_mut(*node) {
-                    n.attach = *new;
-                }
+            None => {
+                self.nodes.remove(&key);
             }
         }
     }
 
+    fn set_seg_slot(&mut self, key: WireSegKey, val: Option<WireSegment>) {
+        match val {
+            Some(s) => {
+                self.segments.insert(key, s);
+            }
+            None => {
+                self.segments.remove(&key);
+            }
+        }
+    }
+
+    fn apply_op(&mut self, op: &WiringOp) {
+        match *op {
+            WiringOp::SetNode { key, after, .. } => self.set_node_slot(key, after),
+            WiringOp::SetSeg { key, after, .. } => self.set_seg_slot(key, after),
+        }
+    }
+
     fn revert_op(&mut self, op: &WiringOp) {
-        match op {
-            WiringOp::NodeActive { key, active } => {
-                if let Some(n) = self.nodes.get_mut(*key) {
-                    n.active = !*active;
-                }
-            }
-            WiringOp::SegActive { key, active } => {
-                if let Some(s) = self.segments.get_mut(*key) {
-                    s.active = !*active;
-                }
-            }
-            WiringOp::SetAttach { node, old, .. } => {
-                if let Some(n) = self.nodes.get_mut(*node) {
-                    n.attach = *old;
-                }
-            }
+        match *op {
+            WiringOp::SetNode { key, before, .. } => self.set_node_slot(key, before),
+            WiringOp::SetSeg { key, before, .. } => self.set_seg_slot(key, before),
         }
     }
 
@@ -517,26 +542,13 @@ impl Wiring {
         }
     }
 
-    /// Reverse a delta (undo). Ops run in reverse order, so nodes are
-    /// restored before segments that reference them.
+    /// Reverse a delta (undo). Ops run in reverse order, so segments are
+    /// removed before the nodes they reference, and a split's original segment
+    /// is restored after its halves are gone.
     pub fn undo_delta(&mut self, delta: &WiringDelta) {
         for op in delta.0.iter().rev() {
             self.revert_op(op);
         }
-    }
-
-    /// Permanently remove any inactive node/segment not in `keep_nodes`/
-    /// `keep_segs` (the keys still referenced by undo history, see
-    /// `History::referenced_wire_keys`). Not yet called anywhere.
-    pub fn remove_unreferenced_tombstones(
-        &mut self,
-        keep_nodes: &HashSet<WireNodeKey>,
-        keep_segs: &HashSet<WireSegKey>,
-    ) {
-        self.segments
-            .retain(|k, s| s.active || keep_segs.contains(&k));
-        self.nodes
-            .retain(|k, n| n.active || keep_nodes.contains(&k));
     }
 
     // ── Connectivity ────────────────────────────────────────────────────────
@@ -619,8 +631,8 @@ impl Wiring {
         let hit_r = camera.scale(HIT_RADIUS);
         let mut best: Option<(WireSegKey, GridPos, f32)> = None;
         for (k, s) in self.active_segments() {
-            let a = camera.grid_to_screen(self.nodes[s.a].pos);
-            let b = camera.grid_to_screen(self.nodes[s.b].pos);
+            let a = camera.grid_to_screen(self.nodes[&s.a].pos);
+            let b = camera.grid_to_screen(self.nodes[&s.b].pos);
             let (dist, proj) = point_segment(pos, a, b);
             if dist <= hit_r && best.as_ref().is_none_or(|(_, _, d)| dist < *d) {
                 let gp = camera.screen_to_grid(proj);
@@ -649,8 +661,7 @@ mod tests {
 
     // Fabricate distinct PlacedCompKeys without a whole app.
     fn comp_keys(n: usize) -> Vec<PlacedCompKey> {
-        let mut sm: SlotMap<PlacedCompKey, ()> = SlotMap::with_key();
-        (0..n).map(|_| sm.insert(())).collect()
+        (0..n as u64).map(PlacedCompKey).collect()
     }
 
     // A stable fingerprint of the live graph, for asserting undo/redo returns
@@ -722,7 +733,7 @@ mod tests {
         // Delete the vertical branch segment (the one that is not horizontal).
         let branch = w
             .active_segments()
-            .find(|(_, s)| w.nodes[s.a].pos.x == w.nodes[s.b].pos.x)
+            .find(|(_, s)| w.nodes[&s.a].pos.x == w.nodes[&s.b].pos.x)
             .map(|(k, _)| k)
             .unwrap();
         w.delete_segment(branch);
@@ -754,7 +765,7 @@ mod tests {
 
         let branch = w
             .active_segments()
-            .find(|(_, s)| w.nodes[s.a].pos.x == w.nodes[s.b].pos.x)
+            .find(|(_, s)| w.nodes[&s.a].pos.x == w.nodes[&s.b].pos.x)
             .map(|(k, _)| k)
             .unwrap();
         let delta = w.delete_segment(branch);
@@ -898,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_unreferenced_tombstones_reclaims_only_unkept() {
+    fn test_delete_segment_then_undo_round_trips() {
         let mut w = Wiring::new();
         let c = comp_keys(2);
         w.add_route(
@@ -908,22 +919,11 @@ mod tests {
         );
         let seg = w.active_segments().next().map(|(k, _)| k).unwrap();
         let delta = w.delete_segment(seg);
-        // The map still holds the tombstoned entries.
-        assert!(!w.segments.is_empty());
-
-        // Keeping the delta's keys preserves them for a possible undo.
-        let mut keep_nodes = HashSet::new();
-        let mut keep_segs = HashSet::new();
-        delta.collect_keys(&mut keep_nodes, &mut keep_segs);
-        w.remove_unreferenced_tombstones(&keep_nodes, &keep_segs);
-        assert!(w.segments.contains_key(seg));
-        // Undo still works after a keep-everything GC.
+        // Deletion genuinely removes the entry (no tombstone left behind).
+        assert!(!w.segments.contains_key(&seg));
+        // Undo re-inserts it under the same key from the delta's payload.
         w.undo_delta(&delta);
         assert_eq!(w.active_segments().count(), 1);
-
-        // With nothing kept, GC drops the tombstones outright.
-        w.delete_segment(seg);
-        w.remove_unreferenced_tombstones(&HashSet::new(), &HashSet::new());
-        assert!(!w.segments.contains_key(seg));
+        assert!(w.segments.contains_key(&seg));
     }
 }

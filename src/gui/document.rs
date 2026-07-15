@@ -56,8 +56,12 @@ pub use crate::sim::component::DocId;
 pub struct Document {
     pub(crate) circuit: Circuit,
     pub(crate) history: History,
-    pub(crate) components: SlotMap<PlacedCompKey, PlacedComponent>,
-    pub(crate) tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel>,
+    pub(crate) components: HashMap<PlacedCompKey, PlacedComponent>,
+    pub(crate) tunnels: HashMap<PlacedTunnelKey, PlacedTunnel>,
+    // Monotonic id allocators for the two record maps; never reused, so undo
+    // re-inserts a deleted record under its original key with no aliasing.
+    pub(crate) next_placed_comp: u64,
+    pub(crate) next_placed_tunnel: u64,
     pub(crate) wiring: Wiring,
     pub(crate) mode: InteractionMode,
     pub(crate) camera: Camera,
@@ -77,8 +81,10 @@ impl Document {
         Self {
             circuit: Circuit::new(),
             history: History::default(),
-            components: SlotMap::default(),
-            tunnels: SlotMap::default(),
+            components: HashMap::default(),
+            tunnels: HashMap::default(),
+            next_placed_comp: 0,
+            next_placed_tunnel: 0,
             wiring: Wiring::new(),
             mode: InteractionMode::Idle,
             camera: Camera::default(),
@@ -250,14 +256,15 @@ impl Document {
         self.history.begin_batch();
         let key = self.apply(Command::comp(comp)).unwrap_comp();
         let pc = PlacedComponent::new(key, spec, grid_pos);
-        let pc_key = self.components.insert(pc);
-        // Record the placement's undo: tombstone this record. Paired with the
-        // Sim DeactivateComponent already recorded by apply() above, so undo
-        // both drops the circuit component and hides the visual record.
-        self.history.push_gui(GuiUndoAction::SetComponentActive {
-            key: pc_key,
-            active: false,
-        });
+        let pc_key = PlacedCompKey(self.next_placed_comp);
+        self.next_placed_comp += 1;
+        self.components.insert(pc_key, pc);
+        // Record the placement's undo: remove this record. Its InsertComponent
+        // inverse carries it back for redo. Paired with the Sim RemoveComponent
+        // already recorded by apply() above, so undo both drops the circuit
+        // component and removes the visual record.
+        self.history
+            .push_gui(GuiUndoAction::RemoveComponent { key: pc_key });
         self.history.end_batch();
         pc_key
     }
@@ -273,8 +280,8 @@ impl Document {
         new_spec: ComponentSpec,
         new_comp: Component,
     ) {
-        let old_key = self.components[pc_key].key;
-        let grid_pos = self.components[pc_key].grid_pos;
+        let old_key = self.components[&pc_key].key;
+        let grid_pos = self.components[&pc_key].grid_pos;
         let new_n_in = new_comp.pins.inputs.len();
         let new_n_out = new_comp.pins.outputs.len();
 
@@ -282,13 +289,13 @@ impl Document {
         self.apply(Command::RemoveComponent(old_key));
         let new_key = self.apply(Command::comp(new_comp)).unwrap_comp();
         // Record the record swap's undo before overwriting: restores the old
-        // CompKey + def (the Sim actions above reactivate the old circuit comp
-        // and deactivate the new one, but the record itself needs restoring).
-        let old_spec = std::mem::replace(
-            &mut self.components[pc_key],
-            PlacedComponent::new(new_key, new_spec, grid_pos),
-        )
-        .spec;
+        // CompKey + def (the Sim actions above re-insert the old circuit comp
+        // and remove the new one, but the record itself needs restoring).
+        let old_spec = self
+            .components
+            .insert(pc_key, PlacedComponent::new(new_key, new_spec, grid_pos))
+            .expect("reconfigure of a live component")
+            .spec;
         self.history.push_gui(GuiUndoAction::SwapComponentSpec {
             key: pc_key,
             comp_key: old_key,
@@ -329,15 +336,14 @@ impl Document {
             label,
             role,
             grid_pos,
-            active: true,
         };
-        let pt_key = self.tunnels.insert(pt);
-        // Record the placement's undo: tombstone this record (paired with the
-        // Sim DeactivateTunnel from apply() above).
-        self.history.push_gui(GuiUndoAction::SetTunnelActive {
-            key: pt_key,
-            active: false,
-        });
+        let pt_key = PlacedTunnelKey(self.next_placed_tunnel);
+        self.next_placed_tunnel += 1;
+        self.tunnels.insert(pt_key, pt);
+        // Record the placement's undo: remove this record (paired with the Sim
+        // RemoveTunnel from apply() above).
+        self.history
+            .push_gui(GuiUndoAction::RemoveTunnel { key: pt_key });
         self.history.end_batch();
         pt_key
     }
@@ -348,11 +354,11 @@ impl Document {
     pub(crate) fn active_components(
         &self,
     ) -> impl Iterator<Item = (PlacedCompKey, &PlacedComponent)> {
-        self.components.iter().filter(|(_, pc)| pc.active)
+        self.components.iter().map(|(k, pc)| (*k, pc))
     }
 
     pub(crate) fn active_tunnels(&self) -> impl Iterator<Item = (PlacedTunnelKey, &PlacedTunnel)> {
-        self.tunnels.iter().filter(|(_, pt)| pt.active)
+        self.tunnels.iter().map(|(k, pt)| (*k, pt))
     }
 
     // Rebuilds every circuit net from the GUI wiring graph: clear_nets() drops
@@ -382,12 +388,7 @@ impl Document {
             let pins: Vec<(CompKey, PinId)> = group
                 .pins
                 .iter()
-                .filter_map(|&(pck, pin)| {
-                    self.components
-                        .get(pck)
-                        .filter(|pc| pc.active)
-                        .map(|pc| (pc.key, pin))
-                })
+                .filter_map(|&(pck, pin)| self.components.get(&pck).map(|pc| (pc.key, pin)))
                 .collect();
             let Some(&(anchor_comp, anchor_pin)) = pins.first() else {
                 continue; // no component pin: nothing to drive a net
@@ -401,7 +402,7 @@ impl Document {
                 });
             }
             for &ptk in &group.tunnels {
-                if let Some(pt) = self.tunnels.get(ptk).filter(|pt| pt.active) {
+                if let Some(pt) = self.tunnels.get(&ptk) {
                     self.circuit.apply(Command::LinkTunnel {
                         tunnel: pt.key,
                         comp: anchor_comp,
@@ -417,7 +418,7 @@ impl Document {
     // Repositions the component's wire-anchor nodes to its current pin grid
     // positions (after a move or reconfigure). Segments to them stretch.
     pub(crate) fn sync_component_wire_nodes(&mut self, pck: PlacedCompKey) {
-        let Some(pc) = self.components.get(pck) else {
+        let Some(pc) = self.components.get(&pck) else {
             return;
         };
         let shape = &pc.shape;
@@ -427,7 +428,7 @@ impl Document {
     }
 
     pub(crate) fn sync_tunnel_wire_nodes(&mut self, ptk: PlacedTunnelKey) {
-        let Some(pt) = self.tunnels.get(ptk) else {
+        let Some(pt) = self.tunnels.get(&ptk) else {
             return;
         };
         self.wiring.sync_tunnel_nodes(ptk, tunnel_pin_grid(pt));
@@ -442,8 +443,8 @@ impl Document {
         for group in self.wiring.groups() {
             let mut val = Value::Floating;
             for &(pck, pin) in &group.pins {
-                if let Some(pc) = self.components.get(pck).filter(|pc| pc.active) {
-                    if let Some(nk) = self.circuit.components[pc.key].net_of(pin) {
+                if let Some(pc) = self.components.get(&pck) {
+                    if let Some(nk) = self.circuit.components[&pc.key].net_of(pin) {
                         val = self.circuit.nets[nk].value;
                         break;
                     }
@@ -451,8 +452,8 @@ impl Document {
             }
             if val == Value::Floating {
                 for &ptk in &group.tunnels {
-                    if let Some(pt) = self.tunnels.get(ptk).filter(|pt| pt.active) {
-                        if let Some(nk) = self.circuit.tunnels.get(pt.key).and_then(|t| t.net) {
+                    if let Some(pt) = self.tunnels.get(&ptk) {
+                        if let Some(nk) = self.circuit.tunnels.get(&pt.key).and_then(|t| t.net) {
                             val = self.circuit.nets[nk].value;
                             break;
                         }
@@ -479,8 +480,8 @@ impl Document {
         let node_value = self.wire_node_values();
 
         for (seg_key, seg) in self.wiring.active_segments() {
-            let a = self.wiring.nodes[seg.a];
-            let b = self.wiring.nodes[seg.b];
+            let a = self.wiring.nodes[&seg.a];
+            let b = self.wiring.nodes[&seg.b];
             let p0 = camera.grid_to_screen(a.pos);
             let p1 = camera.grid_to_screen(b.pos);
             let val = node_value.get(&seg.a).copied().unwrap_or(Value::Floating);
@@ -498,9 +499,9 @@ impl Document {
         // reads differently from a mere crossing. All degrees in one pass, not
         // a per-node scan of every segment.
         let degrees = self.wiring.degrees();
-        for (nk, node) in self.wiring.active_nodes() {
-            if degrees.get(&nk).copied().unwrap_or(0) >= 3 {
-                let val = node_value.get(&nk).copied().unwrap_or(Value::Floating);
+        for (nk, node) in &self.wiring.nodes {
+            if degrees.get(nk).copied().unwrap_or(0) >= 3 {
+                let val = node_value.get(nk).copied().unwrap_or(Value::Floating);
                 painter.circle_filled(
                     camera.grid_to_screen(node.pos),
                     camera.scale(PIN_RADIUS),
@@ -533,8 +534,8 @@ impl Document {
         if let Some((pck, pin)) = pin_at_pos(self.active_components(), camera, pos, PinKind::Output)
         {
             let gp = pin_grid_pos(
-                &self.components[pck].shape,
-                self.components[pck].grid_pos,
+                &self.components[&pck].shape,
+                self.components[&pck].grid_pos,
                 pin,
             );
             return (NodeAttach::Pin(pck, pin), gp, true);
@@ -542,8 +543,8 @@ impl Document {
         if let Some((pck, pin)) = pin_at_pos(self.active_components(), camera, pos, PinKind::Input)
         {
             let gp = pin_grid_pos(
-                &self.components[pck].shape,
-                self.components[pck].grid_pos,
+                &self.components[&pck].shape,
+                self.components[&pck].grid_pos,
                 pin,
             );
             return (NodeAttach::Pin(pck, pin), gp, true);
@@ -551,12 +552,12 @@ impl Document {
         if let Some(ptk) = tunnel_pin_at_pos(self.active_tunnels(), camera, pos) {
             return (
                 NodeAttach::Tunnel(ptk),
-                tunnel_pin_grid(&self.tunnels[ptk]),
+                tunnel_pin_grid(&self.tunnels[&ptk]),
                 true,
             );
         }
         if let Some(nk) = self.wiring.node_at_pos(pos, camera) {
-            return (NodeAttach::Free, self.wiring.nodes[nk].pos, true);
+            return (NodeAttach::Free, self.wiring.nodes[&nk].pos, true);
         }
         if let Some((_, gp)) = self.wiring.segment_at_pos(pos, camera) {
             return (NodeAttach::Free, gp, true);
@@ -577,7 +578,7 @@ impl Document {
     // mirror write. Deliberately not routed through Command/History: ROM contents
     // are mutated in place and are not undoable (like clock ticks).
     pub(crate) fn write_rom_cell(&mut self, pc: PlacedCompKey, index: usize, value: u32) {
-        let comp_key = self.components[pc].key;
+        let comp_key = self.components[&pc].key;
         self.circuit.write_rom(comp_key, index, value);
         let result = self.circuit.settle();
         self.record_settle_result(result);
@@ -592,7 +593,7 @@ impl Document {
     // through Command/History: RAM contents are mutated in place and are not
     // undoable, like a ROM's.
     pub(crate) fn write_ram_cell(&mut self, pc: PlacedCompKey, index: usize, value: u32) {
-        let comp_key = self.components[pc].key;
+        let comp_key = self.components[&pc].key;
         self.circuit.write_ram(comp_key, index, value);
     }
 
@@ -614,15 +615,18 @@ impl Document {
     // from the wiring graph, then rebuild the circuit's nets from what remains.
     pub(crate) fn delete_component(&mut self, key: PlacedCompKey) {
         self.history.begin_batch();
-        let comp_key = self.components[key].key;
+        let comp_key = self.components[&key].key;
         self.apply(Command::RemoveComponent(comp_key));
         let delta = self.wiring.remove_component_nodes(key);
         self.edit_wiring(delta);
-        // Tombstone rather than remove: keeps the PlacedCompKey valid so undo can
-        // reactivate this record (see PlacedComponent::active).
-        self.components[key].active = false;
-        self.history
-            .push_gui(GuiUndoAction::SetComponentActive { key, active: true });
+        // Remove the record outright, moving it into the undo entry; undo
+        // re-inserts it under this same PlacedCompKey (see apply_gui_undo).
+        if let Some(pc) = self.components.remove(&key) {
+            self.history.push_gui(GuiUndoAction::InsertComponent {
+                key,
+                comp: Box::new(pc),
+            });
+        }
         if self.selected == Some(Selection::Single(Selected::Component(key))) {
             self.selected = None;
         }
@@ -634,14 +638,18 @@ impl Document {
     // the wiring graph, then rebuild.
     pub(crate) fn delete_tunnel(&mut self, key: PlacedTunnelKey) {
         self.history.begin_batch();
-        let tunnel_key = self.tunnels[key].key;
+        let tunnel_key = self.tunnels[&key].key;
         self.apply(Command::RemoveTunnel(tunnel_key));
         let delta = self.wiring.remove_tunnel_nodes(key);
         self.edit_wiring(delta);
-        // Tombstone rather than remove (see delete_component).
-        self.tunnels[key].active = false;
-        self.history
-            .push_gui(GuiUndoAction::SetTunnelActive { key, active: true });
+        // Remove the record outright, moving it into the undo entry (see
+        // delete_component).
+        if let Some(pt) = self.tunnels.remove(&key) {
+            self.history.push_gui(GuiUndoAction::InsertTunnel {
+                key,
+                tunnel: Box::new(pt),
+            });
+        }
         if self.selected == Some(Selection::Single(Selected::Tunnel(key))) {
             self.selected = None;
         }
@@ -680,13 +688,11 @@ impl Document {
         match sel {
             Selected::Component(key) => self
                 .components
-                .get(key)
-                .filter(|pc| pc.active)
+                .get(&key)
                 .map(|pc| (component_bounding_rect(pc, camera), pc.grid_pos)),
             Selected::Tunnel(key) => self
                 .tunnels
-                .get(key)
-                .filter(|pt| pt.active)
+                .get(&key)
                 .map(|pt| (tunnel_bounding_rect(pt, camera), pt.grid_pos)),
             Selected::Wire(_) => None,
         }
@@ -703,14 +709,14 @@ impl Document {
         let mut out = Vec::new();
         for sel in sels {
             let Selected::Wire(seg) = sel else { continue };
-            let Some(segment) = self.wiring.segments.get(*seg) else {
+            let Some(segment) = self.wiring.segments.get(seg) else {
                 continue;
             };
             for node_key in [segment.a, segment.b] {
                 if !seen.insert(node_key) {
                     continue;
                 }
-                if let Some(node) = self.wiring.nodes.get(node_key) {
+                if let Some(node) = self.wiring.nodes.get(&node_key) {
                     if matches!(node.attach, NodeAttach::Free) {
                         out.push((node_key, node.pos));
                     }
@@ -737,8 +743,8 @@ impl Document {
             }
         }
         for (key, seg) in self.wiring.active_segments() {
-            let a = camera.grid_to_screen(self.wiring.nodes[seg.a].pos);
-            let b = camera.grid_to_screen(self.wiring.nodes[seg.b].pos);
+            let a = camera.grid_to_screen(self.wiring.nodes[&seg.a].pos);
+            let b = camera.grid_to_screen(self.wiring.nodes[&seg.b].pos);
             if rect.contains(a) && rect.contains(b) {
                 out.push(Selected::Wire(key));
             }
@@ -767,27 +773,31 @@ impl Document {
         for sel in &items {
             match *sel {
                 Selected::Component(key) => {
-                    // Guard on active, not just presence: a tombstoned record
-                    // (deleted earlier in this same batch) must not be redeleted.
-                    if let Some(pc) = self.components.get(key).filter(|pc| pc.active) {
-                        let comp_key = pc.key;
+                    // Guard on presence: a record already removed earlier in this
+                    // same batch (e.g. by a component deletion) must not be redeleted.
+                    if let Some(comp_key) = self.components.get(&key).map(|pc| pc.key) {
                         self.apply(Command::RemoveComponent(comp_key));
                         let delta = self.wiring.remove_component_nodes(key);
                         self.edit_wiring(delta);
-                        self.components[key].active = false;
-                        self.history
-                            .push_gui(GuiUndoAction::SetComponentActive { key, active: true });
+                        if let Some(pc) = self.components.remove(&key) {
+                            self.history.push_gui(GuiUndoAction::InsertComponent {
+                                key,
+                                comp: Box::new(pc),
+                            });
+                        }
                     }
                 }
                 Selected::Tunnel(key) => {
-                    if let Some(pt) = self.tunnels.get(key).filter(|pt| pt.active) {
-                        let tunnel_key = pt.key;
+                    if let Some(tunnel_key) = self.tunnels.get(&key).map(|pt| pt.key) {
                         self.apply(Command::RemoveTunnel(tunnel_key));
                         let delta = self.wiring.remove_tunnel_nodes(key);
                         self.edit_wiring(delta);
-                        self.tunnels[key].active = false;
-                        self.history
-                            .push_gui(GuiUndoAction::SetTunnelActive { key, active: true });
+                        if let Some(pt) = self.tunnels.remove(&key) {
+                            self.history.push_gui(GuiUndoAction::InsertTunnel {
+                                key,
+                                tunnel: Box::new(pt),
+                            });
+                        }
                     }
                 }
                 Selected::Wire(_) => {}
@@ -874,7 +884,8 @@ impl Document {
                             let items: Vec<(Selected, GridPos)> = sels
                                 .iter()
                                 .filter_map(|sel| {
-                                    self.drag_grid_pos(*sel, cc.camera).map(|(_, gp)| (*sel, gp))
+                                    self.drag_grid_pos(*sel, cc.camera)
+                                        .map(|(_, gp)| (*sel, gp))
                                 })
                                 .collect();
                             let free_nodes = self.free_wire_nodes(sels);
@@ -1074,11 +1085,11 @@ impl Document {
                 // Topology is unchanged, so no circuit rebuild is needed.
                 match key {
                     Selected::Component(k) => {
-                        self.components[k].grid_pos = new_grid_pos;
+                        self.components.get_mut(&k).unwrap().grid_pos = new_grid_pos;
                         self.sync_component_wire_nodes(k);
                     }
                     Selected::Tunnel(k) => {
-                        self.tunnels[k].grid_pos = new_grid_pos;
+                        self.tunnels.get_mut(&k).unwrap().grid_pos = new_grid_pos;
                         self.sync_tunnel_wire_nodes(k);
                     }
                     Selected::Wire(_) => {}
@@ -1089,7 +1100,7 @@ impl Document {
             // directly by the same delta - otherwise a selected wire run
             // with an interior corner would stay pinned while its ends move.
             for &(key, original_pos) in &free_nodes {
-                self.wiring.nodes[key].pos =
+                self.wiring.nodes.get_mut(&key).unwrap().pos =
                     GridPos::new(original_pos.x + delta_x, original_pos.y + delta_y);
             }
         }
@@ -1171,7 +1182,7 @@ fn route_elbow(from: GridPos, to: GridPos) -> Vec<GridPos> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gui::wiring::{WireNode, WireSegment};
+    use crate::gui::wiring::WireNode;
     use crate::sim::component::{Gate, GateOp, Input, RegConf};
 
     fn place(doc: &mut Document, spec: ComponentSpec) -> PlacedCompKey {
@@ -1186,44 +1197,44 @@ mod tests {
     // Insert a wire (one segment) between two component pins, positioned at each
     // pin's grid cell, and return the two node keys.
     fn connect_pins(doc: &mut Document, a: (PlacedCompKey, PinId), b: (PlacedCompKey, PinId)) {
-        let pa = pin_grid_pos(&doc.components[a.0].shape, doc.components[a.0].grid_pos, a.1);
-        let pb = pin_grid_pos(&doc.components[b.0].shape, doc.components[b.0].grid_pos, b.1);
-        let na = doc.wiring.nodes.insert(WireNode {
+        let pa = pin_grid_pos(
+            &doc.components[&a.0].shape,
+            doc.components[&a.0].grid_pos,
+            a.1,
+        );
+        let pb = pin_grid_pos(
+            &doc.components[&b.0].shape,
+            doc.components[&b.0].grid_pos,
+            b.1,
+        );
+        let na = doc.wiring.insert_node_untracked(WireNode {
             pos: pa,
             attach: NodeAttach::Pin(a.0, a.1),
-            active: true,
         });
-        let nb = doc.wiring.nodes.insert(WireNode {
+        let nb = doc.wiring.insert_node_untracked(WireNode {
             pos: pb,
             attach: NodeAttach::Pin(b.0, b.1),
-            active: true,
         });
-        doc.wiring.segments.insert(WireSegment {
-            a: na,
-            b: nb,
-            active: true,
-        });
+        doc.wiring.insert_segment_untracked(na, nb);
     }
 
     // Insert a wire (one segment) between a component pin and a tunnel.
     fn connect_pin_tunnel(doc: &mut Document, c: (PlacedCompKey, PinId), ptk: PlacedTunnelKey) {
-        let pc = pin_grid_pos(&doc.components[c.0].shape, doc.components[c.0].grid_pos, c.1);
-        let pt = tunnel_pin_grid(&doc.tunnels[ptk]);
-        let nc = doc.wiring.nodes.insert(WireNode {
+        let pc = pin_grid_pos(
+            &doc.components[&c.0].shape,
+            doc.components[&c.0].grid_pos,
+            c.1,
+        );
+        let pt = tunnel_pin_grid(&doc.tunnels[&ptk]);
+        let nc = doc.wiring.insert_node_untracked(WireNode {
             pos: pc,
             attach: NodeAttach::Pin(c.0, c.1),
-            active: true,
         });
-        let nt = doc.wiring.nodes.insert(WireNode {
+        let nt = doc.wiring.insert_node_untracked(WireNode {
             pos: pt,
             attach: NodeAttach::Tunnel(ptk),
-            active: true,
         });
-        doc.wiring.segments.insert(WireSegment {
-            a: nc,
-            b: nt,
-            active: true,
-        });
+        doc.wiring.insert_segment_untracked(nc, nt);
     }
 
     #[test]
@@ -1247,20 +1258,18 @@ mod tests {
         connect_pins(&mut doc, (g, PinId::output(0)), (o, PinId::input(0)));
         doc.rebuild_circuit();
 
-        let g_key = doc.components[g].key;
-        let o_key = doc.components[o].key;
+        let g_key = doc.components[&g].key;
+        let o_key = doc.components[&o].key;
         assert_eq!(doc.circuit.read_output(o_key), Value::ZERO); // NOT(1) = 0
         doc.selected = Some(Selection::Single(Selected::Component(g)));
 
         doc.delete_component(g);
 
-        // The placed record is tombstoned (kept for undo), so its key stays
-        // valid but the record is inactive rather than gone.
-        assert!(doc.components.contains_key(g));
-        assert!(!doc.components[g].active);
-        // Circuit-side removal tombstones (keeps the CompKey for undo), so the
-        // component is inactive rather than gone.
-        assert!(doc.circuit.components.get(g_key).is_some_and(|c| !c.active));
+        // The placed record is genuinely removed (its payload moved into the
+        // undo entry), so its key no longer resolves.
+        assert!(!doc.components.contains_key(&g));
+        // Circuit-side removal also deletes the component outright.
+        assert!(!doc.circuit.components.contains_key(&g_key));
         // No wire node references the deleted component; orphan neighbours were
         // cleaned up too, leaving no segments.
         assert!(doc
@@ -1280,18 +1289,17 @@ mod tests {
         let mut doc = Document::blank();
         let a = place(&mut doc, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let t = doc.place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
-        let t_key = doc.tunnels[t].key;
+        let t_key = doc.tunnels[&t].key;
         connect_pin_tunnel(&mut doc, (a, PinId::output(0)), t);
         doc.rebuild_circuit();
         doc.selected = Some(Selection::Single(Selected::Tunnel(t)));
 
         doc.delete_tunnel(t);
 
-        // Placed record tombstoned (kept for undo): key valid, record inactive.
-        assert!(doc.tunnels.contains_key(t));
-        assert!(!doc.tunnels[t].active);
-        // Tombstoned circuit-side (TunnelKey kept for undo): inactive, not gone.
-        assert!(doc.circuit.tunnels.get(t_key).is_some_and(|t| !t.active));
+        // Placed record genuinely removed (payload moved into the undo entry).
+        assert!(!doc.tunnels.contains_key(&t));
+        // Circuit-side removal also deletes the tunnel outright.
+        assert!(!doc.circuit.tunnels.contains_key(&t_key));
         assert!(doc
             .wiring
             .active_nodes()
@@ -1316,12 +1324,12 @@ mod tests {
         connect_pin_tunnel(&mut doc, (out, PinId::input(0)), feed);
         doc.rebuild_circuit();
 
-        let out_key = doc.components[out].key;
+        let out_key = doc.components[&out].key;
         assert_eq!(doc.circuit.read_output(out_key), Value::Floating);
 
         // GUI label changed only; circuit.rename_tunnel deliberately NOT called.
-        let shared = doc.tunnels[pull].label.clone();
-        doc.tunnels[feed].label = shared;
+        let shared = doc.tunnels[&pull].label.clone();
+        doc.tunnels.get_mut(&feed).unwrap().label = shared;
         doc.rebuild_circuit();
 
         assert_eq!(doc.circuit.read_output(out_key), Value::ONE);
@@ -1350,9 +1358,9 @@ mod tests {
         doc.delete_bulk();
 
         // Deleted records are tombstoned (inactive), the untouched one stays active.
-        assert!(!doc.components[a].active);
-        assert!(!doc.components[b].active);
-        assert!(doc.components[far].active);
+        assert!(!doc.components.contains_key(&a));
+        assert!(!doc.components.contains_key(&b));
+        assert!(doc.components.contains_key(&far));
         assert_eq!(doc.selected, None);
         // The wire between a and b went with them.
         assert_eq!(doc.wiring.active_segments().count(), 0);
@@ -1376,7 +1384,7 @@ mod tests {
         connect_pins(&mut doc, (a, PinId::output(0)), (g, PinId::input(0)));
         connect_pins(&mut doc, (g, PinId::output(0)), (o, PinId::input(0)));
         doc.rebuild_circuit();
-        let o_key = doc.components[o].key;
+        let o_key = doc.components[&o].key;
         assert_eq!(doc.circuit.read_output(o_key), Value::ZERO);
 
         // Delete the a->g segment (the one touching a's output pin node).
@@ -1385,10 +1393,10 @@ mod tests {
             .segments
             .iter()
             .find(|(_, s)| {
-                matches!(doc.wiring.nodes[s.a].attach, NodeAttach::Pin(k, _) if k == a)
-                    || matches!(doc.wiring.nodes[s.b].attach, NodeAttach::Pin(k, _) if k == a)
+                matches!(doc.wiring.nodes[&s.a].attach, NodeAttach::Pin(k, _) if k == a)
+                    || matches!(doc.wiring.nodes[&s.b].attach, NodeAttach::Pin(k, _) if k == a)
             })
-            .map(|(k, _)| k)
+            .map(|(k, _)| *k)
             .unwrap();
         doc.delete_wire(seg);
 
@@ -1430,7 +1438,7 @@ mod tests {
     fn test_commit_move_pushes_undo_only_when_position_changed() {
         let mut doc = Document::blank();
         let a = place(&mut doc, ComponentSpec::Input(Input { bits: 1, width: 1 }));
-        let original = doc.components[a].grid_pos;
+        let original = doc.components[&a].grid_pos;
         let stack_before = doc.history.len();
 
         // No movement: nothing pushed.
@@ -1438,7 +1446,7 @@ mod tests {
         assert_eq!(doc.history.len(), stack_before);
 
         // Moved: pushes one MoveComponent entry with the correct old_pos.
-        doc.components[a].grid_pos = GridPos::new(original.x + 3, original.y + 1);
+        doc.components.get_mut(&a).unwrap().grid_pos = GridPos::new(original.x + 3, original.y + 1);
         doc.commit_move(Selected::Component(a), original);
         assert_eq!(doc.history.len(), stack_before + 1);
         match doc.history.last() {
@@ -1455,8 +1463,8 @@ mod tests {
         let mut doc = Document::blank();
         let a = place_at(&mut doc, ComponentSpec::Output, GridPos::new(0, 0));
         let b = place_at(&mut doc, ComponentSpec::Output, GridPos::new(10, 0));
-        let orig_a = doc.components[a].grid_pos;
-        let orig_b = doc.components[b].grid_pos;
+        let orig_a = doc.components[&a].grid_pos;
+        let orig_b = doc.components[&b].grid_pos;
         let stack_before = doc.history.len();
 
         // Mirrors what interact_component_drag's drag_stopped branch does for
@@ -1464,8 +1472,8 @@ mod tests {
         // a time, by the same pointer delta - simulated here directly since
         // driving the gesture needs a live egui::Response), then the whole
         // set is committed inside one begin_batch/end_batch.
-        doc.components[a].grid_pos = GridPos::new(orig_a.x + 3, orig_a.y + 2);
-        doc.components[b].grid_pos = GridPos::new(orig_b.x + 3, orig_b.y + 2);
+        doc.components.get_mut(&a).unwrap().grid_pos = GridPos::new(orig_a.x + 3, orig_a.y + 2);
+        doc.components.get_mut(&b).unwrap().grid_pos = GridPos::new(orig_b.x + 3, orig_b.y + 2);
 
         doc.history.begin_batch();
         doc.commit_move(Selected::Component(a), orig_a);
@@ -1478,17 +1486,17 @@ mod tests {
 
         // One undo restores every item's original position at once.
         doc.undo();
-        assert_eq!(doc.components[a].grid_pos, orig_a);
-        assert_eq!(doc.components[b].grid_pos, orig_b);
+        assert_eq!(doc.components[&a].grid_pos, orig_a);
+        assert_eq!(doc.components[&b].grid_pos, orig_b);
 
         // One redo replays the whole move again.
         doc.redo();
         assert_eq!(
-            doc.components[a].grid_pos,
+            doc.components[&a].grid_pos,
             GridPos::new(orig_a.x + 3, orig_a.y + 2)
         );
         assert_eq!(
-            doc.components[b].grid_pos,
+            doc.components[&b].grid_pos,
             GridPos::new(orig_b.x + 3, orig_b.y + 2)
         );
     }
@@ -1498,7 +1506,10 @@ mod tests {
         let mut doc = Document::blank();
         let a = place(&mut doc, ComponentSpec::Output);
         assert!(doc
-            .drag_grid_pos(Selected::Wire(Default::default()), Camera::default())
+            .drag_grid_pos(
+                Selected::Wire(crate::gui::wiring::WireSegKey(0)),
+                Camera::default()
+            )
             .is_none());
         assert!(doc
             .drag_grid_pos(Selected::Component(a), Camera::default())
@@ -1517,8 +1528,16 @@ mod tests {
             GridPos::new(0, 0),
         );
         let b = place_at(doc, ComponentSpec::Output, GridPos::new(10, 0));
-        let pa = pin_grid_pos(&doc.components[a].shape, doc.components[a].grid_pos, PinId::output(0));
-        let pb = pin_grid_pos(&doc.components[b].shape, doc.components[b].grid_pos, PinId::input(0));
+        let pa = pin_grid_pos(
+            &doc.components[&a].shape,
+            doc.components[&a].grid_pos,
+            PinId::output(0),
+        );
+        let pb = pin_grid_pos(
+            &doc.components[&b].shape,
+            doc.components[&b].grid_pos,
+            PinId::input(0),
+        );
         let elbow = GridPos::new(pa.x + 2, pb.y + 4);
         let delta = doc.wiring.add_route(
             &[pa, elbow, pb],
@@ -1551,16 +1570,16 @@ mod tests {
         // and the two Pin-attached endpoints must not appear at all.
         assert_eq!(free_nodes.len(), 1);
         assert_eq!(free_nodes[0].0, elbow);
-        assert_eq!(free_nodes[0].1, doc.wiring.nodes[elbow].pos);
+        assert_eq!(free_nodes[0].1, doc.wiring.nodes[&elbow].pos);
     }
 
     #[test]
     fn test_bulk_drag_batch_restores_free_wire_node_alongside_components() {
         let mut doc = Document::blank();
         let (a, b, elbow, _segs) = place_route_with_elbow(&mut doc);
-        let orig_a = doc.components[a].grid_pos;
-        let orig_b = doc.components[b].grid_pos;
-        let orig_elbow = doc.wiring.nodes[elbow].pos;
+        let orig_a = doc.components[&a].grid_pos;
+        let orig_b = doc.components[&b].grid_pos;
+        let orig_elbow = doc.wiring.nodes[&elbow].pos;
 
         // What interact_component_drag does for one drag frame of a bulk
         // selection covering both components and the whole wire run: move
@@ -1569,14 +1588,14 @@ mod tests {
         let new_a = GridPos::new(orig_a.x + 3, orig_a.y + 2);
         let new_b = GridPos::new(orig_b.x + 3, orig_b.y + 2);
         let new_elbow = GridPos::new(orig_elbow.x + 3, orig_elbow.y + 2);
-        doc.components[a].grid_pos = new_a;
+        doc.components.get_mut(&a).unwrap().grid_pos = new_a;
         doc.sync_component_wire_nodes(a);
-        doc.components[b].grid_pos = new_b;
+        doc.components.get_mut(&b).unwrap().grid_pos = new_b;
         doc.sync_component_wire_nodes(b);
-        doc.wiring.nodes[elbow].pos = new_elbow;
+        doc.wiring.nodes.get_mut(&elbow).unwrap().pos = new_elbow;
 
         // Wire geometry moved as a whole - the elbow isn't left behind.
-        assert_eq!(doc.wiring.nodes[elbow].pos, new_elbow);
+        assert_eq!(doc.wiring.nodes[&elbow].pos, new_elbow);
 
         // drag_stopped: commit every moved item and node as one undo batch.
         let stack_before = doc.history.len();
@@ -1590,15 +1609,15 @@ mod tests {
 
         // One undo restores the components AND the elbow together.
         doc.undo();
-        assert_eq!(doc.components[a].grid_pos, orig_a);
-        assert_eq!(doc.components[b].grid_pos, orig_b);
-        assert_eq!(doc.wiring.nodes[elbow].pos, orig_elbow);
+        assert_eq!(doc.components[&a].grid_pos, orig_a);
+        assert_eq!(doc.components[&b].grid_pos, orig_b);
+        assert_eq!(doc.wiring.nodes[&elbow].pos, orig_elbow);
 
         // One redo replays the whole move again.
         doc.redo();
-        assert_eq!(doc.components[a].grid_pos, new_a);
-        assert_eq!(doc.components[b].grid_pos, new_b);
-        assert_eq!(doc.wiring.nodes[elbow].pos, new_elbow);
+        assert_eq!(doc.components[&a].grid_pos, new_a);
+        assert_eq!(doc.components[&b].grid_pos, new_b);
+        assert_eq!(doc.wiring.nodes[&elbow].pos, new_elbow);
     }
 
     // ── undo / redo ────────────────────────────────────────────────────────
@@ -1615,24 +1634,27 @@ mod tests {
     fn undo_redo_place_component_toggles_both_records() {
         let mut doc = Document::blank();
         let g = place(&mut doc, and2());
-        let comp_key = doc.components[g].key;
+        let comp_key = doc.components[&g].key;
         assert!(doc.history.can_undo());
         assert!(!doc.history.can_redo());
-        assert!(doc.components[g].active);
-        assert!(doc.circuit.components[comp_key].active);
+        assert!(doc.components.contains_key(&g));
+        assert!(doc.circuit.components.contains_key(&comp_key));
 
         doc.undo();
-        assert!(!doc.components[g].active, "record tombstoned by undo");
         assert!(
-            !doc.circuit.components[comp_key].active,
+            !doc.components.contains_key(&g),
+            "record tombstoned by undo"
+        );
+        assert!(
+            !doc.circuit.components.contains_key(&comp_key),
             "circuit component deactivated by undo"
         );
         assert!(doc.history.can_redo());
         assert!(!doc.history.can_undo());
 
         doc.redo();
-        assert!(doc.components[g].active);
-        assert!(doc.circuit.components[comp_key].active);
+        assert!(doc.components.contains_key(&g));
+        assert!(doc.circuit.components.contains_key(&comp_key));
         assert!(doc.history.can_undo());
         assert!(!doc.history.can_redo());
     }
@@ -1647,7 +1669,7 @@ mod tests {
             NodeAttach::Pin(a, PinId::output(0)),
             NodeAttach::Pin(o, PinId::input(0)),
         );
-        let o_key = doc.components[o].key;
+        let o_key = doc.components[&o].key;
         assert_eq!(doc.circuit.read_output(o_key), Value::ONE);
         assert_eq!(doc.wiring.groups().len(), 1);
 
@@ -1673,17 +1695,17 @@ mod tests {
             NodeAttach::Pin(a, PinId::output(0)),
             NodeAttach::Pin(o, PinId::input(0)),
         );
-        let o_key = doc.components[o].key;
+        let o_key = doc.components[&o].key;
         assert_eq!(doc.circuit.read_output(o_key), Value::ONE);
 
         doc.delete_component(a);
-        assert!(!doc.components[a].active);
+        assert!(!doc.components.contains_key(&a));
         assert_eq!(doc.circuit.read_output(o_key), Value::Floating);
 
         doc.undo();
-        assert!(doc.components[a].active);
-        let a_key = doc.components[a].key;
-        assert!(doc.circuit.components[a_key].active);
+        assert!(doc.components.contains_key(&a));
+        let a_key = doc.components[&a].key;
+        assert!(doc.circuit.components.contains_key(&a_key));
         assert_eq!(
             doc.circuit.read_output(o_key),
             Value::ONE,
@@ -1691,7 +1713,7 @@ mod tests {
         );
 
         doc.redo();
-        assert!(!doc.components[a].active);
+        assert!(!doc.components.contains_key(&a));
         assert_eq!(doc.circuit.read_output(o_key), Value::Floating);
     }
 
@@ -1699,7 +1721,7 @@ mod tests {
     fn undo_redo_reconfigure_restores_def_and_key() {
         let mut doc = Document::blank();
         let g = place(&mut doc, and2());
-        let old_key = doc.components[g].key;
+        let old_key = doc.components[&g].key;
         let new_spec = ComponentSpec::Gate(Gate {
             op: GateOp::Not,
             n_inputs: 1,
@@ -1708,7 +1730,7 @@ mod tests {
         let new_comp = new_spec.to_component();
         doc.reconfigure_component(g, new_spec, new_comp);
         assert!(matches!(
-            doc.components[g].spec,
+            doc.components[&g].spec,
             ComponentSpec::Gate(Gate {
                 op: GateOp::Not,
                 ..
@@ -1717,18 +1739,18 @@ mod tests {
 
         doc.undo();
         assert!(matches!(
-            doc.components[g].spec,
+            doc.components[&g].spec,
             ComponentSpec::Gate(Gate {
                 op: GateOp::And,
                 n_inputs: 2,
                 ..
             })
         ));
-        assert_eq!(doc.components[g].key, old_key, "old CompKey restored");
+        assert_eq!(doc.components[&g].key, old_key, "old CompKey restored");
 
         doc.redo();
         assert!(matches!(
-            doc.components[g].spec,
+            doc.components[&g].spec,
             ComponentSpec::Gate(Gate {
                 op: GateOp::Not,
                 ..
@@ -1740,16 +1762,16 @@ mod tests {
     fn undo_redo_move_restores_grid_pos() {
         let mut doc = Document::blank();
         let a = place(&mut doc, and2());
-        let original = doc.components[a].grid_pos;
+        let original = doc.components[&a].grid_pos;
         let moved = GridPos::new(original.x + 4, original.y + 2);
-        doc.components[a].grid_pos = moved;
+        doc.components.get_mut(&a).unwrap().grid_pos = moved;
         doc.commit_move(Selected::Component(a), original);
 
         doc.undo();
-        assert_eq!(doc.components[a].grid_pos, original);
+        assert_eq!(doc.components[&a].grid_pos, original);
 
         doc.redo();
-        assert_eq!(doc.components[a].grid_pos, moved);
+        assert_eq!(doc.components[&a].grid_pos, moved);
     }
 
     #[test]
@@ -1767,12 +1789,12 @@ mod tests {
     fn undo_redo_tunnel_rename_restores_label() {
         let mut doc = Document::blank();
         let t = doc.place_tunnel(TunnelRole::Feed, GridPos::new(0, 0));
-        let tunnel_key = doc.tunnels[t].key;
-        let original = doc.tunnels[t].label.clone();
+        let tunnel_key = doc.tunnels[&t].key;
+        let original = doc.tunnels[&t].label.clone();
 
         // Simulate a rename commit: record label change live, then the batched
         // Sim rename + record-label undo (mirrors show_tunnel_properties).
-        doc.tunnels[t].label = "RENAMED".to_string();
+        doc.tunnels.get_mut(&t).unwrap().label = "RENAMED".to_string();
         doc.history.begin_batch();
         doc.apply(Command::RenameTunnel {
             tunnel: tunnel_key,
@@ -1785,12 +1807,12 @@ mod tests {
         doc.history.end_batch();
 
         doc.undo();
-        assert_eq!(doc.tunnels[t].label, original);
-        assert_eq!(doc.circuit.tunnels[tunnel_key].label, original);
+        assert_eq!(doc.tunnels[&t].label, original);
+        assert_eq!(doc.circuit.tunnels[&tunnel_key].label, original);
 
         doc.redo();
-        assert_eq!(doc.tunnels[t].label, "RENAMED");
-        assert_eq!(doc.circuit.tunnels[tunnel_key].label, "RENAMED");
+        assert_eq!(doc.tunnels[&t].label, "RENAMED");
+        assert_eq!(doc.circuit.tunnels[&tunnel_key].label, "RENAMED");
     }
 
     // ── clock lock predicates ─────────────────────────────────────────────
@@ -1846,7 +1868,7 @@ mod tests {
         connect_pins(&mut doc, (reg, PinId::output(0)), (out, PinId::input(0)));
         doc.rebuild_circuit();
 
-        let out_key = doc.components[out].key;
+        let out_key = doc.components[&out].key;
         // Register powers on at 0.
         assert_eq!(doc.circuit.read_output(out_key), Value::ZERO);
 
@@ -1859,5 +1881,43 @@ mod tests {
         doc.stop_clock();
         assert_eq!(doc.clock.run, ClockRun::Stopped);
         assert_eq!(doc.circuit.read_output(out_key), Value::ZERO);
+    }
+
+    #[test]
+    fn undo_redo_delete_register_preserves_latched_state() {
+        // The move-based model: deleting a register moves its live Component
+        // (latch and all) into the undo entry, so undo restores the exact
+        // latched value - what a spec-based re-creation would lose.
+        let mut doc = Document::blank();
+        let data = place(&mut doc, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let we = place(&mut doc, ComponentSpec::Input(Input { bits: 1, width: 1 }));
+        let reg = place(&mut doc, ComponentSpec::Reg(RegConf { data_width: 1 }));
+        let out = place(&mut doc, ComponentSpec::Output);
+        connect_pins(&mut doc, (data, PinId::output(0)), (reg, PinId::input(0)));
+        connect_pins(&mut doc, (we, PinId::output(0)), (reg, PinId::input(1)));
+        connect_pins(&mut doc, (reg, PinId::output(0)), (out, PinId::input(0)));
+        doc.rebuild_circuit();
+
+        let out_key = doc.components[&out].key;
+        doc.tick_once(); // latch 1 into the register
+        assert_eq!(doc.circuit.read_output(out_key), Value::ONE);
+
+        // Delete the register: its record and circuit component are gone.
+        doc.delete_component(reg);
+        assert!(!doc.components.contains_key(&reg));
+
+        // Undo restores it under the same PlacedCompKey with its latch intact:
+        // the output reads 1 again with no re-tick.
+        doc.undo();
+        assert!(doc.components.contains_key(&reg));
+        assert_eq!(
+            doc.circuit.read_output(out_key),
+            Value::ONE,
+            "moved-in Component carried the latched 1 back"
+        );
+
+        // Redo removes it again.
+        doc.redo();
+        assert!(!doc.components.contains_key(&reg));
     }
 }

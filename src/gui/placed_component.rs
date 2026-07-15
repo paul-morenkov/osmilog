@@ -6,6 +6,7 @@ use crate::sim::component::{CompKey, ComponentSpec, FanDirection, GateOp};
 
 // ── PlacedComponent ───────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct PlacedComponent {
     pub key: CompKey,
     pub spec: ComponentSpec,
@@ -16,11 +17,6 @@ pub struct PlacedComponent {
     // every read. Kept in lockstep with `spec` by only constructing through
     // `PlacedComponent::new` - `reconfigure_component` rebuilds via that path.
     pub shape: ComponentShape,
-    // Tombstone flag, mirroring sim::Component::active and wiring::WireNode::active:
-    // a deleted PlacedComponent is flagged inactive rather than removed, so
-    // its PlacedCompKey stays valid for Wiring/selection/drag state that
-    // reference it. Reads iterate OsmilogApp::active_components.
-    pub active: bool,
 }
 
 impl PlacedComponent {
@@ -34,7 +30,6 @@ impl PlacedComponent {
             spec,
             grid_pos,
             shape,
-            active: true,
         }
     }
 }

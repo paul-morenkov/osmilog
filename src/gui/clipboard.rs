@@ -13,7 +13,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use slotmap::SlotMap;
 
 use crate::gui::app::{PlacedCompKey, PlacedTunnel, PlacedTunnelKey, Selected};
 use crate::gui::geometry::GridPos;
@@ -69,8 +68,8 @@ impl Clipboard {
     /// Resets the walking paste offset back to the base step.
     pub fn copy(
         &mut self,
-        components: &SlotMap<PlacedCompKey, PlacedComponent>,
-        tunnels: &SlotMap<PlacedTunnelKey, PlacedTunnel>,
+        components: &HashMap<PlacedCompKey, PlacedComponent>,
+        tunnels: &HashMap<PlacedTunnelKey, PlacedTunnel>,
         wiring: &Wiring,
         selected: &[Selected],
     ) {
@@ -98,10 +97,10 @@ impl Clipboard {
         let mut comp_index: HashMap<PlacedCompKey, usize> = HashMap::new();
         let comp_entries: Vec<ComponentEntry> = components
             .iter()
-            .filter(|(k, pc)| pc.active && included_components.contains(k))
+            .filter(|(k, _)| included_components.contains(k))
             .enumerate()
             .map(|(i, (k, pc))| {
-                comp_index.insert(k, i);
+                comp_index.insert(*k, i);
                 ComponentEntry {
                     spec: pc.spec.clone(),
                     grid_pos: pc.grid_pos,
@@ -112,10 +111,10 @@ impl Clipboard {
         let mut tunnel_index: HashMap<PlacedTunnelKey, usize> = HashMap::new();
         let tunnel_entries: Vec<TunnelEntry> = tunnels
             .iter()
-            .filter(|(k, pt)| pt.active && included_tunnels.contains(k))
+            .filter(|(k, _)| included_tunnels.contains(k))
             .enumerate()
             .map(|(i, (k, pt))| {
-                tunnel_index.insert(k, i);
+                tunnel_index.insert(*k, i);
                 TunnelEntry {
                     label: pt.label.clone(),
                     role: pt.role,
@@ -136,7 +135,7 @@ impl Clipboard {
                 if node_index.contains_key(&nk) {
                     continue;
                 }
-                let node = &wiring.nodes[nk];
+                let node = &wiring.nodes[&nk];
                 // A node's Pin/Tunnel attach only survives into the copy if
                 // its owning component/tunnel is *also* included; otherwise
                 // it would reference an index that doesn't exist in this
@@ -246,23 +245,42 @@ mod tests {
 
     fn placed_component(grid_pos: GridPos) -> PlacedComponent {
         let spec = ComponentSpec::Input(Input { bits: 0, width: 1 });
-        PlacedComponent::new(crate::sim::component::CompKey::default(), spec, grid_pos)
+        PlacedComponent::new(crate::sim::component::CompKey(0), spec, grid_pos)
     }
 
     fn placed_tunnel(label: &str, grid_pos: GridPos) -> PlacedTunnel {
         PlacedTunnel {
-            key: crate::sim::circuit::TunnelKey::default(),
+            key: crate::sim::circuit::TunnelKey(0),
             label: label.to_string(),
             role: TunnelRole::Feed,
             grid_pos,
-            active: true,
         }
+    }
+
+    // Append a record under a fresh stable key (tests build maps by hand;
+    // append-only, so map length is a fine monotonic id source).
+    fn add_comp(
+        map: &mut HashMap<PlacedCompKey, PlacedComponent>,
+        pc: PlacedComponent,
+    ) -> PlacedCompKey {
+        let key = PlacedCompKey(map.len() as u64);
+        map.insert(key, pc);
+        key
+    }
+
+    fn add_tunnel(
+        map: &mut HashMap<PlacedTunnelKey, PlacedTunnel>,
+        pt: PlacedTunnel,
+    ) -> PlacedTunnelKey {
+        let key = PlacedTunnelKey(map.len() as u64);
+        map.insert(key, pt);
+        key
     }
 
     #[test]
     fn test_copy_noop_when_selected_empty() {
-        let components: SlotMap<PlacedCompKey, PlacedComponent> = SlotMap::default();
-        let tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel> = SlotMap::default();
+        let components: HashMap<PlacedCompKey, PlacedComponent> = HashMap::new();
+        let tunnels: HashMap<PlacedTunnelKey, PlacedTunnel> = HashMap::new();
         let wiring = Wiring::new();
         let mut clip = Clipboard::new();
         clip.copy(&components, &tunnels, &wiring, &[]);
@@ -271,9 +289,9 @@ mod tests {
 
     #[test]
     fn test_copy_single_component_snapshot_shape() {
-        let mut components: SlotMap<PlacedCompKey, PlacedComponent> = SlotMap::default();
-        let key = components.insert(placed_component(GridPos::new(3, 4)));
-        let tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel> = SlotMap::default();
+        let mut components: HashMap<PlacedCompKey, PlacedComponent> = HashMap::new();
+        let key = add_comp(&mut components, placed_component(GridPos::new(3, 4)));
+        let tunnels: HashMap<PlacedTunnelKey, PlacedTunnel> = HashMap::new();
         let wiring = Wiring::new();
 
         let mut clip = Clipboard::new();
@@ -290,10 +308,10 @@ mod tests {
 
     #[test]
     fn test_copy_wire_only_downgrades_dangling_pin_attach() {
-        let mut components: SlotMap<PlacedCompKey, PlacedComponent> = SlotMap::default();
-        let c0 = components.insert(placed_component(GridPos::new(0, 0)));
-        let c1 = components.insert(placed_component(GridPos::new(10, 0)));
-        let tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel> = SlotMap::default();
+        let mut components: HashMap<PlacedCompKey, PlacedComponent> = HashMap::new();
+        let c0 = add_comp(&mut components, placed_component(GridPos::new(0, 0)));
+        let c1 = add_comp(&mut components, placed_component(GridPos::new(10, 0)));
+        let tunnels: HashMap<PlacedTunnelKey, PlacedTunnel> = HashMap::new();
 
         let mut wiring = Wiring::new();
         wiring.add_route(
@@ -319,10 +337,10 @@ mod tests {
 
     #[test]
     fn test_copy_component_and_its_wire_preserves_pin_attach() {
-        let mut components: SlotMap<PlacedCompKey, PlacedComponent> = SlotMap::default();
-        let c0 = components.insert(placed_component(GridPos::new(0, 0)));
-        let c1 = components.insert(placed_component(GridPos::new(10, 0)));
-        let tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel> = SlotMap::default();
+        let mut components: HashMap<PlacedCompKey, PlacedComponent> = HashMap::new();
+        let c0 = add_comp(&mut components, placed_component(GridPos::new(0, 0)));
+        let c1 = add_comp(&mut components, placed_component(GridPos::new(10, 0)));
+        let tunnels: HashMap<PlacedTunnelKey, PlacedTunnel> = HashMap::new();
 
         let mut wiring = Wiring::new();
         wiring.add_route(
@@ -359,9 +377,9 @@ mod tests {
 
     #[test]
     fn test_copy_tunnel() {
-        let components: SlotMap<PlacedCompKey, PlacedComponent> = SlotMap::default();
-        let mut tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel> = SlotMap::default();
-        let key = tunnels.insert(placed_tunnel("A", GridPos::new(1, 1)));
+        let components: HashMap<PlacedCompKey, PlacedComponent> = HashMap::new();
+        let mut tunnels: HashMap<PlacedTunnelKey, PlacedTunnel> = HashMap::new();
+        let key = add_tunnel(&mut tunnels, placed_tunnel("A", GridPos::new(1, 1)));
         let wiring = Wiring::new();
 
         let mut clip = Clipboard::new();
@@ -379,9 +397,9 @@ mod tests {
 
     #[test]
     fn test_plan_paste_applies_offset_and_walks_on_repeated_calls() {
-        let mut components: SlotMap<PlacedCompKey, PlacedComponent> = SlotMap::default();
-        let key = components.insert(placed_component(GridPos::new(0, 0)));
-        let tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel> = SlotMap::default();
+        let mut components: HashMap<PlacedCompKey, PlacedComponent> = HashMap::new();
+        let key = add_comp(&mut components, placed_component(GridPos::new(0, 0)));
+        let tunnels: HashMap<PlacedTunnelKey, PlacedTunnel> = HashMap::new();
         let wiring = Wiring::new();
 
         let mut clip = Clipboard::new();

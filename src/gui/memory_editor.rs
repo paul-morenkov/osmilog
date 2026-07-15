@@ -8,7 +8,7 @@
 //! layout, differing only in which spec variant supplies the dimensions/words -
 //! captured by `MemKind`.
 
-use slotmap::SlotMap;
+use std::collections::HashMap;
 
 use crate::gui::app::PlacedCompKey;
 use crate::gui::placed_component::PlacedComponent;
@@ -83,7 +83,7 @@ impl MemoryEditor {
     pub(crate) fn show(
         &mut self,
         ctx: &egui::Context,
-        components: &SlotMap<PlacedCompKey, PlacedComponent>,
+        components: &HashMap<PlacedCompKey, PlacedComponent>,
         value_locked: bool,
     ) -> Vec<MemEdit> {
         let mut edits = Vec::new();
@@ -111,14 +111,14 @@ fn show_window(
     ctx: &egui::Context,
     pc: PlacedCompKey,
     kind: MemKind,
-    components: &SlotMap<PlacedCompKey, PlacedComponent>,
+    components: &HashMap<PlacedCompKey, PlacedComponent>,
     value_locked: bool,
     edits: &mut Vec<MemEdit>,
 ) -> bool {
     // Close if the component was deleted or undone away (or the key now names
     // something else after a reconfigure to a different type).
-    let dims = match components.get(pc) {
-        Some(c) if c.active => kind.dims(&c.spec),
+    let dims = match components.get(&pc) {
+        Some(c) => kind.dims(&c.spec),
         _ => None,
     };
     let Some((data_width, len)) = dims else {
@@ -167,7 +167,7 @@ fn show_window(
                                     if i >= len {
                                         break;
                                     }
-                                    let mut val = kind.word(&components[pc].spec, i);
+                                    let mut val = kind.word(&components[&pc].spec, i);
                                     let resp = ui.add(
                                         egui::DragValue::new(&mut val)
                                             .range(0..=mask)

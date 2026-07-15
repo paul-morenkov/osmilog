@@ -1,6 +1,7 @@
-use crate::gui::app::{PlacedCompKey, PlacedTunnelKey};
+use crate::gui::app::{PlacedCompKey, PlacedTunnel, PlacedTunnelKey};
 use crate::gui::document::Document;
 use crate::gui::geometry::GridPos;
+use crate::gui::placed_component::PlacedComponent;
 use crate::gui::wiring::{NodeAttach, WireNodeKey, WiringDelta};
 use crate::sim::component::{CompKey, ComponentSpec};
 
@@ -36,15 +37,23 @@ pub enum GuiUndoAction {
         old_pos: GridPos,
     },
 
-    // Component tombstone toggle. `active` is the value to restore.
-    SetComponentActive {
+    // Place/delete of a component record. The record is genuinely
+    // inserted/removed; `InsertComponent` carries the moved-out payload so
+    // undo/redo shuttle it between the map and the history entry.
+    InsertComponent {
         key: PlacedCompKey,
-        active: bool,
+        comp: Box<PlacedComponent>,
     },
-    // Tunnel tombstone toggle. `active` is the value to restore.
-    SetTunnelActive {
+    RemoveComponent {
+        key: PlacedCompKey,
+    },
+    // Place/delete of a tunnel record (see InsertComponent/RemoveComponent).
+    InsertTunnel {
         key: PlacedTunnelKey,
-        active: bool,
+        tunnel: Box<PlacedTunnel>,
+    },
+    RemoveTunnel {
+        key: PlacedTunnelKey,
     },
     // reconfigure_component swaps the whole underlying record (a new CompKey and
     // ComponentSpec, keeping grid_pos/active); this restores the old pair.
@@ -90,51 +99,66 @@ impl Document {
                 }
             }
             GuiUndoAction::MoveComponent { key, old_pos } => {
-                let current = self.components[key].grid_pos;
-                self.components[key].grid_pos = old_pos;
+                let pc = self.components.get_mut(&key).unwrap();
+                let current = pc.grid_pos;
+                pc.grid_pos = old_pos;
                 GuiUndoAction::MoveComponent {
                     key,
                     old_pos: current,
                 }
             }
             GuiUndoAction::MoveTunnel { key, old_pos } => {
-                let current = self.tunnels[key].grid_pos;
-                self.tunnels[key].grid_pos = old_pos;
+                let pt = self.tunnels.get_mut(&key).unwrap();
+                let current = pt.grid_pos;
+                pt.grid_pos = old_pos;
                 GuiUndoAction::MoveTunnel {
                     key,
                     old_pos: current,
                 }
             }
             GuiUndoAction::MoveWireNode { key, old_pos } => {
-                let current = self.wiring.nodes[key].pos;
-                self.wiring.nodes[key].pos = old_pos;
+                let n = self.wiring.nodes.get_mut(&key).unwrap();
+                let current = n.pos;
+                n.pos = old_pos;
                 GuiUndoAction::MoveWireNode {
                     key,
                     old_pos: current,
                 }
             }
-            GuiUndoAction::SetComponentActive { key, active } => {
-                let current = self.components[key].active;
-                self.components[key].active = active;
-                GuiUndoAction::SetComponentActive {
+            GuiUndoAction::RemoveComponent { key } => {
+                let comp = self
+                    .components
+                    .remove(&key)
+                    .expect("undo removes a live component record");
+                GuiUndoAction::InsertComponent {
                     key,
-                    active: current,
+                    comp: Box::new(comp),
                 }
             }
-            GuiUndoAction::SetTunnelActive { key, active } => {
-                let current = self.tunnels[key].active;
-                self.tunnels[key].active = active;
-                GuiUndoAction::SetTunnelActive {
+            GuiUndoAction::InsertComponent { key, comp } => {
+                self.components.insert(key, *comp);
+                GuiUndoAction::RemoveComponent { key }
+            }
+            GuiUndoAction::RemoveTunnel { key } => {
+                let tunnel = self
+                    .tunnels
+                    .remove(&key)
+                    .expect("undo removes a live tunnel record");
+                GuiUndoAction::InsertTunnel {
                     key,
-                    active: current,
+                    tunnel: Box::new(tunnel),
                 }
+            }
+            GuiUndoAction::InsertTunnel { key, tunnel } => {
+                self.tunnels.insert(key, *tunnel);
+                GuiUndoAction::RemoveTunnel { key }
             }
             GuiUndoAction::SwapComponentSpec {
                 key,
                 comp_key,
                 spec,
             } => {
-                let pc = &mut self.components[key];
+                let pc = self.components.get_mut(&key).unwrap();
                 let prev_comp_key = pc.key;
                 let prev_spec = std::mem::replace(&mut pc.spec, spec);
                 pc.key = comp_key;
@@ -145,7 +169,8 @@ impl Document {
                 }
             }
             GuiUndoAction::SetTunnelLabel { key, label } => {
-                let prev = std::mem::replace(&mut self.tunnels[key].label, label);
+                let prev =
+                    std::mem::replace(&mut self.tunnels.get_mut(&key).unwrap().label, label);
                 GuiUndoAction::SetTunnelLabel { key, label: prev }
             }
         }
@@ -158,7 +183,7 @@ impl Document {
         use crate::gui::app::Selected;
         match key {
             Selected::Component(k) => {
-                if let Some(pc) = self.components.get(k) {
+                if let Some(pc) = self.components.get(&k) {
                     if pc.grid_pos != old_pos {
                         self.history
                             .push_gui(GuiUndoAction::MoveComponent { key: k, old_pos });
@@ -166,7 +191,7 @@ impl Document {
                 }
             }
             Selected::Tunnel(k) => {
-                if let Some(pt) = self.tunnels.get(k) {
+                if let Some(pt) = self.tunnels.get(&k) {
                     if pt.grid_pos != old_pos {
                         self.history
                             .push_gui(GuiUndoAction::MoveTunnel { key: k, old_pos });
@@ -181,7 +206,7 @@ impl Document {
     // The wire-node counterpart of commit_move, for the Free elbow nodes
     // interact_component_drag carries along with a bulk selection.
     pub(crate) fn commit_wire_node_move(&mut self, key: WireNodeKey, old_pos: GridPos) {
-        if self.wiring.nodes[key].pos != old_pos {
+        if self.wiring.nodes[&key].pos != old_pos {
             self.history
                 .push_gui(GuiUndoAction::MoveWireNode { key, old_pos });
         }
@@ -211,11 +236,11 @@ mod tests {
     use crate::gui::history::HistoryEntry;
     use crate::gui::wiring::Wiring;
     use crate::sim::component::PinId;
-    use slotmap::SlotMap;
 
+    // These keys are only used as Wiring pin attachments in tests; any distinct
+    // values suffice.
     fn comp_keys(n: usize) -> Vec<PlacedCompKey> {
-        let mut sm: SlotMap<PlacedCompKey, ()> = SlotMap::with_key();
-        (0..n).map(|_| sm.insert(())).collect()
+        (0..n as u64).map(PlacedCompKey).collect()
     }
 
     #[test]

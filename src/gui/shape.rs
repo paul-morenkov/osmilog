@@ -3,7 +3,7 @@ use egui::{pos2, vec2, Pos2, Rect, Vec2};
 pub const BUBBLE_R: f32 = 4.0;
 const BEZIER_STEPS: usize = 16;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ShapeCmd {
     MoveTo(Vec2),
     LineTo(Vec2),
@@ -12,7 +12,7 @@ pub enum ShapeCmd {
 
 /// A pin's location as an integer grid-cell offset from the component's
 /// top-left corner - guarantees every pin lands on a grid intersection.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PinAnchor {
     /// Grid-cell offset from the component's top-left (in cells, not pixels).
     pub cell: Vec2,
@@ -58,6 +58,7 @@ impl PinAnchor {
 // [0,1]^2 box. Only meaningful for Components - Tunnels use
 // `ComponentShape::dynamic_label_pos` instead, since their single label's
 // *text* is user-editable at runtime rather than known at shape() time.
+#[derive(Debug)]
 pub struct ComponentLabel {
     pub text: &'static str,
     pub pos: Vec2,
@@ -74,6 +75,7 @@ impl Default for ComponentLabel {
     }
 }
 
+#[derive(Debug)]
 pub struct ComponentShape {
     pub size: Vec2,
     /// Full outline used for the stroke (may be concave).
