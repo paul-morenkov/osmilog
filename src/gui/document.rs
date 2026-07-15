@@ -231,7 +231,7 @@ impl Document {
     // clear any selection that may now point at a tombstoned record, then
     // rebuild the circuit's nets + settle.
     fn refresh_after_history(&mut self) {
-        let comp_keys: Vec<PlacedCompKey> = self.active_components().map(|(k, _)| k).collect();
+        let comp_keys: Vec<_> = self.components.keys().copied().collect();
         for k in comp_keys {
             self.sync_component_wire_nodes(k);
         }
@@ -351,11 +351,12 @@ impl Document {
     // Live (non-tombstoned) placed components/tunnels, mirroring
     // Wiring::active_nodes/active_segments. Raw indexing on a known-live key
     // is still fine - a tombstone is simply never iterated.
-    pub(crate) fn active_components(
-        &self,
-    ) -> impl Iterator<Item = (PlacedCompKey, &PlacedComponent)> {
-        self.components.iter().map(|(k, pc)| (*k, pc))
-    }
+    // FIXME: Remove this, it's unnecessary
+    // pub(crate) fn active_components(
+    //     &self,
+    // ) -> impl Iterator<Item = (PlacedCompKey, &PlacedComponent)> {
+    //     self.components.iter().map(|(k, pc)| (*k, pc))
+    // }
 
     pub(crate) fn active_tunnels(&self) -> impl Iterator<Item = (PlacedTunnelKey, &PlacedTunnel)> {
         self.tunnels.iter().map(|(k, pt)| (*k, pt))
@@ -479,14 +480,14 @@ impl Document {
         // that net's Value; a dangling group (no endpoints) is Floating.
         let node_value = self.wire_node_values();
 
-        for (seg_key, seg) in self.wiring.active_segments() {
+        for (seg_key, seg) in &self.wiring.segments {
             let a = self.wiring.nodes[&seg.a];
             let b = self.wiring.nodes[&seg.b];
             let p0 = camera.grid_to_screen(a.pos);
             let p1 = camera.grid_to_screen(b.pos);
             let val = node_value.get(&seg.a).copied().unwrap_or(Value::Floating);
             let mut stroke = value_stroke(theme, val);
-            if self.is_highlighted(Selected::Wire(seg_key)) {
+            if self.is_highlighted(Selected::Wire(*seg_key)) {
                 stroke.color = theme.outline_selected;
                 stroke.width += 1.5;
             }
@@ -512,7 +513,7 @@ impl Document {
 
         // Draw components
 
-        for (pc_key, pc) in self.active_components() {
+        for (&pc_key, pc) in &self.components {
             let is_selected = self.is_highlighted(Selected::Component(pc_key));
             draw_component(painter, pc, camera, &self.circuit, is_selected, theme);
         }
@@ -531,8 +532,7 @@ impl Document {
     // node, wire segment, else the snapped cursor cell.
     pub(crate) fn wire_target_at(&self, pos: Pos2, camera: Camera) -> (NodeAttach, GridPos, bool) {
         puffin::profile_function!();
-        if let Some((pck, pin)) = pin_at_pos(self.active_components(), camera, pos, PinKind::Output)
-        {
+        if let Some((pck, pin)) = pin_at_pos(self.components.iter(), camera, pos, PinKind::Output) {
             let gp = pin_grid_pos(
                 &self.components[&pck].shape,
                 self.components[&pck].grid_pos,
@@ -540,8 +540,7 @@ impl Document {
             );
             return (NodeAttach::Pin(pck, pin), gp, true);
         }
-        if let Some((pck, pin)) = pin_at_pos(self.active_components(), camera, pos, PinKind::Input)
-        {
+        if let Some((pck, pin)) = pin_at_pos(self.components.iter(), camera, pos, PinKind::Input) {
             let gp = pin_grid_pos(
                 &self.components[&pck].shape,
                 self.components[&pck].grid_pos,
@@ -549,7 +548,7 @@ impl Document {
             );
             return (NodeAttach::Pin(pck, pin), gp, true);
         }
-        if let Some(ptk) = tunnel_pin_at_pos(self.active_tunnels(), camera, pos) {
+        if let Some(ptk) = tunnel_pin_at_pos(self.tunnels.iter(), camera, pos) {
             return (
                 NodeAttach::Tunnel(ptk),
                 tunnel_pin_grid(&self.tunnels[&ptk]),
@@ -732,7 +731,7 @@ impl Document {
     pub(crate) fn items_in_rect(&self, rect: Rect, camera: Camera) -> Vec<Selected> {
         puffin::profile_function!();
         let mut out = Vec::new();
-        for (key, pc) in self.active_components() {
+        for (&key, pc) in &self.components {
             if rect.contains_rect(component_bounding_rect(pc, camera)) {
                 out.push(Selected::Component(key));
             }
@@ -742,11 +741,11 @@ impl Document {
                 out.push(Selected::Tunnel(key));
             }
         }
-        for (key, seg) in self.wiring.active_segments() {
+        for (key, seg) in &self.wiring.segments {
             let a = camera.grid_to_screen(self.wiring.nodes[&seg.a].pos);
             let b = camera.grid_to_screen(self.wiring.nodes[&seg.b].pos);
             if rect.contains(a) && rect.contains(b) {
-                out.push(Selected::Wire(key));
+                out.push(Selected::Wire(*key));
             }
         }
         out
@@ -824,9 +823,9 @@ impl Document {
         // Hover reticle: hovering over a wire (but not a pin) shows
         // where a branch would tap the wire.
         if let Some(pos) = pointer {
-            if pin_at_pos(self.active_components(), cc.camera, pos, PinKind::Output).is_none()
-                && pin_at_pos(self.active_components(), cc.camera, pos, PinKind::Input).is_none()
-                && tunnel_pin_at_pos(self.active_tunnels(), cc.camera, pos).is_none()
+            if pin_at_pos(self.components.iter(), cc.camera, pos, PinKind::Output).is_none()
+                && pin_at_pos(self.components.iter(), cc.camera, pos, PinKind::Input).is_none()
+                && tunnel_pin_at_pos(self.tunnels.iter(), cc.camera, pos).is_none()
             {
                 if let Some((_, gp)) = self.wiring.segment_at_pos(pos, cc.camera) {
                     draw_reticle(
@@ -932,9 +931,10 @@ impl Document {
                     // Click a component/tunnel body (components take
                     // priority), then a wire segment, else deselect.
                     let maybe_comp = self
-                        .active_components()
-                        .find(|(_k, pc)| component_bounding_rect(pc, cc.camera).contains(pos))
-                        .map(|(k, _)| Selected::Component(k));
+                        .components
+                        .iter()
+                        .find(|(_, pc)| component_bounding_rect(pc, cc.camera).contains(pos))
+                        .map(|(k, _)| Selected::Component(*k));
                     let maybe_tunnel = self
                         .active_tunnels()
                         .find(|(_k, pt)| tunnel_bounding_rect(pt, cc.camera).contains(pos))
@@ -1277,7 +1277,7 @@ mod tests {
             .nodes
             .values()
             .all(|n| !matches!(n.attach, NodeAttach::Pin(k, _) if k == g)));
-        assert_eq!(doc.wiring.active_segments().count(), 0);
+        assert_eq!(doc.wiring.segments.len(), 0);
         assert_eq!(doc.selected, None);
         // Output's input pin is now Floating.
         assert_eq!(doc.circuit.read_output(o_key), Value::Floating);
@@ -1365,7 +1365,7 @@ mod tests {
         assert!(doc.components.contains_key(&far));
         assert_eq!(doc.selected, None);
         // The wire between a and b went with them.
-        assert_eq!(doc.wiring.active_segments().count(), 0);
+        assert_eq!(doc.wiring.segments.len(), 0);
     }
 
     #[test]
@@ -1425,9 +1425,9 @@ mod tests {
         connect_pins(&mut doc, (a, PinId::output(0)), (g, PinId::input(0)));
         doc.rebuild_circuit();
 
-        let seg = doc.wiring.active_segments().next().map(|(k, _)| k).unwrap();
+        let seg = doc.wiring.segments.keys().next().unwrap();
         let stack_before = doc.history.len();
-        doc.delete_wire(seg);
+        doc.delete_wire(*seg);
 
         assert_eq!(doc.history.len(), stack_before + 1);
         assert!(matches!(
@@ -1556,7 +1556,7 @@ mod tests {
             .find(|(_, n)| matches!(n.attach, NodeAttach::Free))
             .map(|(k, _)| *k)
             .unwrap();
-        let seg_keys: Vec<WireSegKey> = doc.wiring.active_segments().map(|(k, _)| k).collect();
+        let seg_keys: Vec<WireSegKey> = doc.wiring.segments.keys().cloned().collect();
         (a, b, elbow_key, seg_keys)
     }
 

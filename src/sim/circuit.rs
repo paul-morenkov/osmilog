@@ -230,7 +230,10 @@ impl Circuit {
             PinId::In(i) => self.nets[net].sinks.push((comp, i)),
             PinId::Out(i) => self.nets[net].sources.push((comp, i)),
         }
-        self.components.get_mut(&comp).unwrap().set_pin_net(pin, net);
+        self.components
+            .get_mut(&comp)
+            .unwrap()
+            .set_pin_net(pin, net);
         // If attaching a sink pin, immediately evaluate the component since no Net's have changed
         // so nothing will call eval_component automatically.
         if let PinId::In(_) = pin {
@@ -275,7 +278,10 @@ impl Circuit {
 
         // Correct backreferences on Net B, then add them into Net A
         for (comp, i) in b_net.sinks {
-            self.components.get_mut(&comp).unwrap().set_pin_net(PinId::In(i), a);
+            self.components
+                .get_mut(&comp)
+                .unwrap()
+                .set_pin_net(PinId::In(i), a);
             self.nets[a].sinks.push((comp, i));
         }
 
@@ -283,7 +289,10 @@ impl Circuit {
         // more than one source and resolve_net will surface it as Invalid
         // (a driver conflict), rather than silently dropping one.
         for (comp, i) in b_net.sources {
-            self.components.get_mut(&comp).unwrap().set_pin_net(PinId::Out(i), a);
+            self.components
+                .get_mut(&comp)
+                .unwrap()
+                .set_pin_net(PinId::Out(i), a);
             self.nets[a].sources.push((comp, i));
         }
 
@@ -1118,9 +1127,24 @@ mod tests {
         let rst = c.add_component(Component::input(0, 1)); // reset deasserted
         let reg = c.add_component(Component::reg(4));
         let out = c.add_component(Component::output());
-        c.link(data, PinId::output(0), reg, PinId::input(RegConf::DATA_PIN as u8));
-        c.link(we, PinId::output(0), reg, PinId::input(RegConf::WRITE_EN_PIN as u8));
-        c.link(rst, PinId::output(0), reg, PinId::input(RegConf::RESET_PIN as u8));
+        c.link(
+            data,
+            PinId::output(0),
+            reg,
+            PinId::input(RegConf::DATA_PIN as u8),
+        );
+        c.link(
+            we,
+            PinId::output(0),
+            reg,
+            PinId::input(RegConf::WRITE_EN_PIN as u8),
+        );
+        c.link(
+            rst,
+            PinId::output(0),
+            reg,
+            PinId::input(RegConf::RESET_PIN as u8),
+        );
         c.link(reg, PinId::output(0), out, PinId::input(0));
 
         // Latch 9 into the register.
@@ -1151,7 +1175,12 @@ mod tests {
         let rst = c.add_component(Component::input(0, 1)); // "0" pin, deasserted
         let ff = c.add_component(Component::t_flip_flop());
         let out = c.add_component(Component::output());
-        c.link(toggle, PinId::output(0), ff, PinId::input(T::TOGGLE_PIN as u8));
+        c.link(
+            toggle,
+            PinId::output(0),
+            ff,
+            PinId::input(T::TOGGLE_PIN as u8),
+        );
         c.link(rst, PinId::output(0), ff, PinId::input(T::RESET_PIN as u8));
         c.link(ff, PinId::output(0), out, PinId::input(0));
         c.settle().unwrap();

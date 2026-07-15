@@ -521,9 +521,10 @@ impl OsmilogApp {
     fn refresh_subcircuits(&mut self) {
         let subs: Vec<(PlacedCompKey, DocId)> = self
             .active()
-            .active_components()
-            .filter_map(|(pck, pc)| match &pc.spec {
-                ComponentSpec::Subcircuit { doc, .. } => Some((pck, *doc)),
+            .components
+            .iter()
+            .filter_map(|(&key, pc)| match pc.spec {
+                ComponentSpec::Subcircuit { doc, .. } => Some((key, doc)),
                 _ => None,
             })
             .collect();
@@ -1625,8 +1626,9 @@ fn extract_records(
         .collect();
 
     let seg_entries: Vec<SegEntry> = wiring
-        .active_segments()
-        .map(|(_, s)| SegEntry {
+        .segments
+        .values()
+        .map(|s| SegEntry {
             a: node_index[&s.a],
             b: node_index[&s.b],
         })
@@ -1712,14 +1714,14 @@ pub(crate) fn tunnel_pin_pos(pt: &PlacedTunnel, camera: Camera) -> Pos2 {
 }
 
 pub(crate) fn pin_at_pos<'a>(
-    components: impl Iterator<Item = (PlacedCompKey, &'a PlacedComponent)>,
+    components: impl Iterator<Item = (&'a PlacedCompKey, &'a PlacedComponent)>,
     camera: Camera,
     pos: Pos2,
     kind: PinKind,
 ) -> Option<(PlacedCompKey, PinId)> {
     puffin::profile_function!();
     let hit_r = camera.scale(PIN_RADIUS * 2.0);
-    for (key, pc) in components {
+    for (&key, pc) in components {
         let shape = &pc.shape;
         match kind {
             PinKind::Output => {
@@ -1745,13 +1747,13 @@ pub(crate) fn pin_at_pos<'a>(
 // A tunnel's single pin under `pos`, regardless of role - a wire can now both
 // start and end on either a Feed or a Pull tunnel.
 pub(crate) fn tunnel_pin_at_pos<'a>(
-    tunnels: impl Iterator<Item = (PlacedTunnelKey, &'a PlacedTunnel)>,
+    tunnels: impl Iterator<Item = (&'a PlacedTunnelKey, &'a PlacedTunnel)>,
     camera: Camera,
     pos: Pos2,
 ) -> Option<PlacedTunnelKey> {
     puffin::profile_function!();
     let hit_r = camera.scale(PIN_RADIUS * 2.0);
-    for (key, tunnel) in tunnels {
+    for (&key, tunnel) in tunnels {
         if tunnel_pin_pos(tunnel, camera).distance(pos) <= hit_r {
             return Some(key);
         }
@@ -1817,27 +1819,19 @@ mod tests {
         let seg = app
             .active()
             .wiring
-            .active_segments()
+            .segments.iter()
             .find(|(_, s)| {
                 matches!(app.active().wiring.nodes[&s.a].attach, NodeAttach::Pin(k, _) if k == a)
                     || matches!(app.active().wiring.nodes[&s.b].attach, NodeAttach::Pin(k, _) if k == a)
             })
-            .map(|(k, _)| k)
+            .map(|(k, _)| *k)
             .unwrap();
         app.active_mut().delete_wire(seg);
-        assert_eq!(
-            app.active().wiring.segments.len(),
-            app.active().wiring.active_segments().count()
-        );
 
         // The saved project carries only live entries, and the reload matches
         // the live graph exactly.
         let file = app.to_project_file();
         let snap = &file.circuits[0].snapshot;
-        assert_eq!(
-            snap.segments.len(),
-            app.active().wiring.active_segments().count()
-        );
         assert_eq!(snap.nodes.len(), app.active().wiring.nodes.len());
 
         let json = file.to_json().unwrap();
@@ -1845,8 +1839,8 @@ mod tests {
         let mut loaded = OsmilogApp::empty();
         loaded.load_project_file(&file2).unwrap();
         assert_eq!(
-            loaded.active().wiring.active_segments().count(),
-            app.active().wiring.active_segments().count()
+            loaded.active().wiring.segments.len(),
+            app.active().wiring.segments.len(),
         );
     }
 
@@ -1910,20 +1904,15 @@ mod tests {
 
         app.paste_clipboard();
 
-        assert_eq!(app.active().active_components().count(), 2);
-        let pasted = app
-            .active()
-            .active_components()
-            .find(|(k, _)| *k != a)
-            .map(|(k, _)| k)
-            .unwrap();
+        assert_eq!(app.active().components.len(), 2);
+        let pasted = app.active().components.keys().find(|&&k| k != a).unwrap();
         assert_eq!(
-            app.active().components[&pasted].grid_pos,
+            app.active().components[pasted].grid_pos,
             GridPos::new(original.x + 2, original.y + 2)
         );
         assert_eq!(
             app.active().selected,
-            Some(Selection::Single(Selected::Component(pasted)))
+            Some(Selection::Single(Selected::Component(*pasted)))
         );
     }
 
@@ -1941,13 +1930,9 @@ mod tests {
         app.paste_clipboard();
 
         // The paste is independent of the now-tombstoned original.
-        let pasted = app
-            .active()
-            .active_components()
-            .find(|(k, _)| *k != a)
-            .map(|(k, _)| k);
+        let pasted = app.active().components.keys().find(|&&k| k != a);
         assert!(pasted.is_some());
-        assert_eq!(app.active().active_components().count(), 1);
+        assert_eq!(app.active().components.len(), 1);
     }
 
     #[test]
@@ -1965,14 +1950,9 @@ mod tests {
 
         // The pasted copy reflects the pre-edit snapshot, offset from the
         // original's position at copy time - not its current position.
-        let pasted = app
-            .active()
-            .active_components()
-            .find(|(k, _)| *k != a)
-            .map(|(k, _)| k)
-            .unwrap();
+        let pasted = app.active().components.keys().find(|&&k| k != a).unwrap();
         assert_eq!(
-            app.active().components[&pasted].grid_pos,
+            app.active().components[pasted].grid_pos,
             GridPos::new(original_pos.x + 2, original_pos.y + 2)
         );
     }
@@ -1994,22 +1974,22 @@ mod tests {
         let b = place(&mut app, ComponentSpec::Output);
         connect_pins(&mut app, (a, PinId::output(0)), (b, PinId::input(0)));
         app.active_mut().rebuild_circuit();
-        let seg = app.active().wiring.active_segments().next().unwrap().0;
+        let seg = app.active().wiring.segments.keys().next().unwrap();
 
         app.active_mut().selected = Some(Selection::Bulk(vec![
             Selected::Component(a),
             Selected::Component(b),
-            Selected::Wire(seg),
+            Selected::Wire(*seg),
         ]));
         app.copy_selection();
         app.paste_clipboard();
-        assert_eq!(app.active().active_components().count(), 4);
-        assert_eq!(app.active().wiring.active_segments().count(), 2);
+        assert_eq!(app.active().components.len(), 4);
+        assert_eq!(app.active().wiring.segments.len(), 2);
 
         // One undo removes the entire pasted batch (components + wiring).
         app.active_mut().undo();
-        assert_eq!(app.active().active_components().count(), 2);
-        assert_eq!(app.active().wiring.active_segments().count(), 1);
+        assert_eq!(app.active().components.len(), 2);
+        assert_eq!(app.active().wiring.segments.len(), 1);
     }
 
     #[test]

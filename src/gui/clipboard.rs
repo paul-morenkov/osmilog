@@ -13,7 +13,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-
 use crate::gui::app::{PlacedCompKey, PlacedTunnel, PlacedTunnelKey, Selected};
 use crate::gui::geometry::GridPos;
 use crate::gui::placed_component::PlacedComponent;
@@ -127,8 +126,8 @@ impl Clipboard {
         // active_nodes() broadly - since wiring scope is strict-selection.
         let mut node_index: HashMap<crate::gui::wiring::WireNodeKey, usize> = HashMap::new();
         let mut node_entries: Vec<NodeEntry> = Vec::new();
-        for (seg_key, seg) in wiring.active_segments() {
-            if !included_wires.contains(&seg_key) {
+        for (seg_key, seg) in &wiring.segments {
+            if !included_wires.contains(seg_key) {
                 continue;
             }
             for nk in [seg.a, seg.b] {
@@ -171,7 +170,8 @@ impl Clipboard {
         }
 
         let seg_entries: Vec<SegEntry> = wiring
-            .active_segments()
+            .segments
+            .iter()
             .filter(|(k, _)| included_wires.contains(k))
             .map(|(_, seg)| SegEntry {
                 a: node_index[&seg.a],
@@ -319,11 +319,11 @@ mod tests {
             NodeAttach::Pin(c0, PinId::output(0)),
             NodeAttach::Pin(c1, PinId::input(0)),
         );
-        let seg = wiring.active_segments().next().unwrap().0;
+        let seg = wiring.segments.keys().next().unwrap();
 
         // Select just the wire segment, not the components it attaches to.
         let mut clip = Clipboard::new();
-        clip.copy(&components, &tunnels, &wiring, &[Selected::Wire(seg)]);
+        clip.copy(&components, &tunnels, &wiring, &[Selected::Wire(*seg)]);
 
         let file = clip.plan_paste().unwrap();
         assert!(file.components.is_empty());
@@ -348,7 +348,7 @@ mod tests {
             NodeAttach::Pin(c0, PinId::output(0)),
             NodeAttach::Pin(c1, PinId::input(0)),
         );
-        let seg = wiring.active_segments().next().unwrap().0;
+        let seg = wiring.segments.keys().next().unwrap();
 
         let mut clip = Clipboard::new();
         clip.copy(
@@ -358,7 +358,7 @@ mod tests {
             &[
                 Selected::Component(c0),
                 Selected::Component(c1),
-                Selected::Wire(seg),
+                Selected::Wire(*seg),
             ],
         );
 

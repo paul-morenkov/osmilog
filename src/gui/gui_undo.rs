@@ -169,8 +169,7 @@ impl Document {
                 }
             }
             GuiUndoAction::SetTunnelLabel { key, label } => {
-                let prev =
-                    std::mem::replace(&mut self.tunnels.get_mut(&key).unwrap().label, label);
+                let prev = std::mem::replace(&mut self.tunnels.get_mut(&key).unwrap().label, label);
                 GuiUndoAction::SetTunnelLabel { key, label: prev }
             }
         }
@@ -284,8 +283,8 @@ mod tests {
                 NodeAttach::Pin(c[0], PinId::output(0)),
                 NodeAttach::Pin(c[1], PinId::input(0)),
             );
-            let seg = w.active_segments().next().unwrap().0;
-            seg
+            let seg = w.segments.keys().next().unwrap();
+            *seg
         };
         // The segment key belongs to a different Wiring; app.wiring is empty, so
         // delete produces an empty delta.

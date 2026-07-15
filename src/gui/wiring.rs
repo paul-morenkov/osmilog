@@ -147,17 +147,6 @@ impl Wiring {
     }
 
     // ── Iteration ───────────────────────────────────────────────────────────
-    // Thin accessors yielding owned keys (like the old slotmap iterators), so
-    // callers stay unchanged. No tombstones exist any more, so these iterate
-    // the whole map.
-    // FIXME: Remove this, it's prob unnecessary
-    // pub fn active_nodes(&self) -> impl Iterator<Item = (WireNodeKey, &WireNode)> {
-    //     self.nodes.iter().map(|(k, n)| (*k, n))
-    // }
-    //
-    pub fn active_segments(&self) -> impl Iterator<Item = (WireSegKey, &WireSegment)> {
-        self.segments.iter().map(|(k, s)| (*k, s))
-    }
 
     fn node_at_grid(&self, pos: GridPos) -> Option<WireNodeKey> {
         self.nodes
@@ -171,8 +160,9 @@ impl Wiring {
     // needing *many* (drawing all junction dots) use `degrees` instead, which
     // computes them all in a single pass rather than one scan per node.
     pub fn degree(&self, node: WireNodeKey) -> usize {
-        self.active_segments()
-            .filter(|(_, s)| s.a == node || s.b == node)
+        self.segments
+            .values()
+            .filter(|s| s.a == node || s.b == node)
             .count()
     }
 
@@ -182,7 +172,7 @@ impl Wiring {
     // `degree` calls in the per-frame drawing path, which were O(nodes x segments).
     pub fn degrees(&self) -> HashMap<WireNodeKey, usize> {
         let mut counts: HashMap<WireNodeKey, usize> = HashMap::new();
-        for (_, s) in self.active_segments() {
+        for s in self.segments.values() {
             *counts.entry(s.a).or_default() += 1;
             *counts.entry(s.b).or_default() += 1;
         }
@@ -193,7 +183,7 @@ impl Wiring {
     // axis-aligned, and between (not on) the endpoints. Splitting here is what
     // turns a mid-wire tap into a real junction.
     fn segment_through(&self, gp: GridPos) -> Option<WireSegKey> {
-        self.active_segments().find_map(|(k, seg)| {
+        self.segments.iter().find_map(|(k, seg)| {
             let a = self.nodes[&seg.a].pos;
             let b = self.nodes[&seg.b].pos;
             let on = if a.x == b.x && gp.x == a.x {
@@ -205,7 +195,7 @@ impl Wiring {
             } else {
                 false
             };
-            on.then_some(k)
+            on.then_some(*k)
         })
     }
 
@@ -244,8 +234,9 @@ impl Wiring {
             return;
         }
         let exists = self
-            .active_segments()
-            .any(|(_, s)| (s.a == a && s.b == b) || (s.a == b && s.b == a));
+            .segments
+            .values()
+            .any(|s| (s.a == a && s.b == b) || (s.a == b && s.b == a));
         if !exists {
             let key = self.next_seg_key();
             let seg = WireSegment { a, b };
@@ -392,9 +383,10 @@ impl Wiring {
     // Remove a node and every segment touching it.
     fn remove_node(&mut self, node: WireNodeKey, ops: &mut Vec<WiringOp>) {
         let touching: Vec<WireSegKey> = self
-            .active_segments()
+            .segments
+            .iter()
             .filter(|(_, s)| s.a == node || s.b == node)
-            .map(|(k, _)| k)
+            .map(|(k, _)| *k)
             .collect();
         for k in touching {
             self.take_segment(k, ops);
@@ -588,7 +580,7 @@ impl Wiring {
         // exist post-cleanup) contributes nothing. Tracking membership here
         // avoids a per-node `degree` scan below, which was O(nodes x segments).
         let mut connected: HashSet<WireNodeKey> = HashSet::new();
-        for (_, s) in self.active_segments() {
+        for s in self.segments.values() {
             connected.insert(s.a);
             connected.insert(s.b);
             let ra = find(&mut parent, s.a);
@@ -636,13 +628,13 @@ impl Wiring {
     pub fn segment_at_pos(&self, pos: Pos2, camera: Camera) -> Option<(WireSegKey, GridPos)> {
         let hit_r = camera.scale(HIT_RADIUS);
         let mut best: Option<(WireSegKey, GridPos, f32)> = None;
-        for (k, s) in self.active_segments() {
+        for (k, s) in &self.segments {
             let a = camera.grid_to_screen(self.nodes[&s.a].pos);
             let b = camera.grid_to_screen(self.nodes[&s.b].pos);
             let (dist, proj) = point_segment(pos, a, b);
             if dist <= hit_r && best.as_ref().is_none_or(|(_, _, d)| dist < *d) {
                 let gp = camera.screen_to_grid(proj);
-                best = Some((k, gp, dist));
+                best = Some((*k, gp, dist));
             }
         }
         best.map(|(k, gp, _)| (k, gp))
@@ -715,7 +707,7 @@ mod tests {
         assert_eq!(groups[0].pins.len(), 3);
         // Two halves of the split + the branch = 3 active segments (the
         // pre-split segment is tombstoned, not counted).
-        assert_eq!(w.active_segments().count(), 3);
+        assert_eq!(w.segments.len(), 3);
     }
 
     #[test]
@@ -734,11 +726,12 @@ mod tests {
         );
         // Delete the vertical branch segment (the one that is not horizontal).
         let branch = w
-            .active_segments()
+            .segments
+            .iter()
             .find(|(_, s)| w.nodes[&s.a].pos.x == w.nodes[&s.b].pos.x)
             .map(|(k, _)| k)
             .unwrap();
-        w.delete_segment(branch);
+        w.delete_segment(*branch);
         // The third pin's node is gone (orphaned), and the main wire still joins
         // the first two pins.
         let groups = w.groups();
@@ -767,11 +760,12 @@ mod tests {
         let before = snapshot(&w);
 
         let branch = w
-            .active_segments()
+            .segments
+            .iter()
             .find(|(_, s)| w.nodes[&s.a].pos.x == w.nodes[&s.b].pos.x)
             .map(|(k, _)| k)
             .unwrap();
-        let delta = w.delete_segment(branch);
+        let delta = w.delete_segment(*branch);
         assert!(!delta.is_empty());
         let after = snapshot(&w);
         assert_ne!(before, after);
@@ -840,7 +834,7 @@ mod tests {
             NodeAttach::Pin(c[0], PinId::output(0)),
             NodeAttach::Pin(c[1], PinId::input(0)),
         );
-        let seg = w.active_segments().next().map(|(k, _)| k).unwrap();
+        let seg = *w.segments.keys().next().unwrap();
         assert!(!w.delete_segment(seg).is_empty());
         // Deleting the same (now tombstoned) segment again changes nothing.
         assert!(w.delete_segment(seg).is_empty());
@@ -860,7 +854,7 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(seg_keys.len(), 1);
         assert_eq!(w.nodes.len(), 2);
-        assert_eq!(w.active_segments().count(), 1);
+        assert_eq!(w.segments.len(), 1);
         let groups = w.groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].pins.len(), 2);
@@ -920,13 +914,13 @@ mod tests {
             NodeAttach::Pin(c[0], PinId::output(0)),
             NodeAttach::Pin(c[1], PinId::input(0)),
         );
-        let seg = w.active_segments().next().map(|(k, _)| k).unwrap();
+        let seg = *w.segments.keys().next().unwrap();
         let delta = w.delete_segment(seg);
         // Deletion genuinely removes the entry (no tombstone left behind).
         assert!(!w.segments.contains_key(&seg));
         // Undo re-inserts it under the same key from the delta's payload.
         w.undo_delta(&delta);
-        assert_eq!(w.active_segments().count(), 1);
+        assert_eq!(w.segments.len(), 1);
         assert!(w.segments.contains_key(&seg));
     }
 }
