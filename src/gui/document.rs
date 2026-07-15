@@ -48,6 +48,27 @@ use crate::sim::value::Value;
 /// where the document registry lives.
 pub use crate::sim::component::DocId;
 
+/// One circuit document: its display name plus its state.
+pub struct CircuitDoc {
+    pub(crate) name: String,
+    pub(crate) state: Document,
+}
+
+impl CircuitDoc {
+    pub(crate) fn blank(name: String) -> Self {
+        Self {
+            name,
+            state: Document::blank(),
+        }
+    }
+}
+
+/// Default name suggested for a new circuit, e.g. "Circuit 2" for the second
+/// document. Only a suggestion (prefilled into the dialog / used when the user
+/// clears the field) - names aren't required to be unique; identity is the `DocId`.
+pub(crate) fn default_new_circuit_name(documents: &SlotMap<DocId, CircuitDoc>) -> String {
+    format!("Circuit {}", documents.len() + 1)
+}
 /// The per-circuit ("document") state. Every document - active or not - holds
 /// exactly one of these directly in its `CircuitDoc::state`; there's no
 /// separate "live" copy the active document promotes into. `OsmilogApp::
@@ -94,31 +115,7 @@ impl Document {
             settle_error: None,
         }
     }
-}
 
-/// One circuit document: its display name plus its state.
-pub struct CircuitDoc {
-    pub(crate) name: String,
-    pub(crate) state: Document,
-}
-
-impl CircuitDoc {
-    pub(crate) fn blank(name: String) -> Self {
-        Self {
-            name,
-            state: Document::blank(),
-        }
-    }
-}
-
-/// Default name suggested for a new circuit, e.g. "Circuit 2" for the second
-/// document. Only a suggestion (prefilled into the dialog / used when the user
-/// clears the field) - names aren't required to be unique; identity is the `DocId`.
-pub(crate) fn default_new_circuit_name(documents: &SlotMap<DocId, CircuitDoc>) -> String {
-    format!("Circuit {}", documents.len() + 1)
-}
-
-impl Document {
     // True while a clock run session is active (Playing or Paused): structural
     // edits (widths, arity, wiring, add/delete) are locked for its whole
     // duration. Only Stop returns to editable. Both lock predicates live here
@@ -755,6 +752,9 @@ impl Document {
     // then components/tunnels (which drop their own wire nodes too). Each
     // removal is existence-checked since deleting a component can take a
     // wire in the same set with it. Rebuilds once at the end.
+    // TODO: `delete_bulk` is slow because each call to `remove_component_nodes` Does many
+    // unnecessary loops. Refactor this so that all nodes to remove are aggregated and removed in
+    // one pass.
     pub(crate) fn delete_bulk(&mut self) {
         let Some(Selection::Bulk(items)) = self.selected.take() else {
             return;
@@ -762,9 +762,6 @@ impl Document {
         self.history.begin_batch();
         for sel in &items {
             if let Selected::Wire(seg) = *sel {
-                // delete_segment self-guards: an already-tombstoned segment
-                // (e.g. dropped by a component deletion earlier in this batch)
-                // yields an empty delta, so edit_wiring records nothing.
                 let delta = self.wiring.delete_segment(seg);
                 self.edit_wiring(delta);
             }
@@ -805,17 +802,15 @@ impl Document {
         self.rebuild_circuit();
         self.history.end_batch();
     }
-}
 
-// ── Canvas mode dispatch ─────────────────────────────────────────────────
-//
-// One method per InteractionMode variant (see OsmilogApp::handle_canvas_
-// interaction, the dispatcher). Every variant except Placing only needs the
-// active document plus the ambient CanvasCtx (egui handles, no app state) -
-// Placing needs OsmilogApp::place_component (instantiate, for subcircuits),
-// so it stays a thin OsmilogApp method; the dispatcher calls into `self` for
-// everything else.
-impl Document {
+    // ── Canvas mode dispatch ─────────────────────────────────────────────────
+    //
+    // One method per InteractionMode variant (see OsmilogApp::handle_canvas_
+    // interaction, the dispatcher). Every variant except Placing only needs the
+    // active document plus the ambient CanvasCtx (egui handles, no app state) -
+    // Placing needs OsmilogApp::place_component (instantiate, for subcircuits),
+    // so it stays a thin OsmilogApp method; the dispatcher calls into `self` for
+    // everything else.
     pub(crate) fn interact_idle(&mut self, cc: &CanvasCtx, pointer: Option<Pos2>) {
         puffin::profile_function!();
         let locked = self.editing_locked();

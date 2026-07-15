@@ -179,19 +179,19 @@ impl Wiring {
         counts
     }
 
-    // The active segment (if any) that gp lies strictly inside: colinear,
+    // The active segment (if any) that `pos` lies strictly inside: colinear,
     // axis-aligned, and between (not on) the endpoints. Splitting here is what
     // turns a mid-wire tap into a real junction.
-    fn segment_through(&self, gp: GridPos) -> Option<WireSegKey> {
+    fn segment_through(&self, pos: GridPos) -> Option<WireSegKey> {
         self.segments.iter().find_map(|(k, seg)| {
             let a = self.nodes[&seg.a].pos;
             let b = self.nodes[&seg.b].pos;
-            let on = if a.x == b.x && gp.x == a.x {
+            let on = if a.x == b.x && pos.x == a.x {
                 let (lo, hi) = (a.y.min(b.y), a.y.max(b.y));
-                gp.y > lo && gp.y < hi
-            } else if a.y == b.y && gp.y == a.y {
+                pos.y > lo && pos.y < hi
+            } else if a.y == b.y && pos.y == a.y {
                 let (lo, hi) = (a.x.min(b.x), a.x.max(b.x));
-                gp.x > lo && gp.x < hi
+                pos.x > lo && pos.x < hi
             } else {
                 false
             };
@@ -347,16 +347,16 @@ impl Wiring {
         segments: &[(usize, usize)],
     ) -> (Vec<WireNodeKey>, Vec<WireSegKey>, WiringDelta) {
         let mut ops = Vec::new();
-        let mut keys = Vec::with_capacity(nodes.len());
+        let mut node_keys = Vec::with_capacity(nodes.len());
         for &(pos, attach) in nodes {
-            keys.push(self.insert_node(WireNode { pos, attach }, &mut ops));
+            node_keys.push(self.insert_node(WireNode { pos, attach }, &mut ops));
         }
         let mut seg_keys = Vec::with_capacity(segments.len());
         for &(a, b) in segments {
             let key = self.next_seg_key();
             let seg = WireSegment {
-                a: keys[a],
-                b: keys[b],
+                a: node_keys[a],
+                b: node_keys[b],
             };
             self.segments.insert(key, seg);
             ops.push(WiringOp::SetSeg {
@@ -366,7 +366,7 @@ impl Wiring {
             });
             seg_keys.push(key);
         }
-        (keys, seg_keys, WiringDelta(ops))
+        (node_keys, seg_keys, WiringDelta(ops))
     }
 
     /// Remove a segment, then any node left with no incident segments.
