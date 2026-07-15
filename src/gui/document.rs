@@ -1274,8 +1274,9 @@ mod tests {
         // cleaned up too, leaving no segments.
         assert!(doc
             .wiring
-            .active_nodes()
-            .all(|(_, n)| !matches!(n.attach, NodeAttach::Pin(k, _) if k == g)));
+            .nodes
+            .values()
+            .all(|n| !matches!(n.attach, NodeAttach::Pin(k, _) if k == g)));
         assert_eq!(doc.wiring.active_segments().count(), 0);
         assert_eq!(doc.selected, None);
         // Output's input pin is now Floating.
@@ -1302,8 +1303,9 @@ mod tests {
         assert!(!doc.circuit.tunnels.contains_key(&t_key));
         assert!(doc
             .wiring
-            .active_nodes()
-            .all(|(_, n)| !matches!(n.attach, NodeAttach::Tunnel(k) if k == t)));
+            .nodes
+            .values()
+            .all(|n| !matches!(n.attach, NodeAttach::Tunnel(k) if k == t)));
         assert_eq!(doc.selected, None);
     }
 
@@ -1549,9 +1551,10 @@ mod tests {
 
         let elbow_key = doc
             .wiring
-            .active_nodes()
+            .nodes
+            .iter()
             .find(|(_, n)| matches!(n.attach, NodeAttach::Free))
-            .map(|(k, _)| k)
+            .map(|(k, _)| *k)
             .unwrap();
         let seg_keys: Vec<WireSegKey> = doc.wiring.active_segments().map(|(k, _)| k).collect();
         (a, b, elbow_key, seg_keys)

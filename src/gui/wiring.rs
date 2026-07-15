@@ -150,19 +150,20 @@ impl Wiring {
     // Thin accessors yielding owned keys (like the old slotmap iterators), so
     // callers stay unchanged. No tombstones exist any more, so these iterate
     // the whole map.
-
-    pub fn active_nodes(&self) -> impl Iterator<Item = (WireNodeKey, &WireNode)> {
-        self.nodes.iter().map(|(k, n)| (*k, n))
-    }
-
+    // FIXME: Remove this, it's prob unnecessary
+    // pub fn active_nodes(&self) -> impl Iterator<Item = (WireNodeKey, &WireNode)> {
+    //     self.nodes.iter().map(|(k, n)| (*k, n))
+    // }
+    //
     pub fn active_segments(&self) -> impl Iterator<Item = (WireSegKey, &WireSegment)> {
         self.segments.iter().map(|(k, s)| (*k, s))
     }
 
-    fn node_at_grid(&self, gp: GridPos) -> Option<WireNodeKey> {
-        self.active_nodes()
-            .find(|(_, n)| n.pos == gp)
-            .map(|(k, _)| k)
+    fn node_at_grid(&self, pos: GridPos) -> Option<WireNodeKey> {
+        self.nodes
+            .iter()
+            .find(|(_, &n)| n.pos == pos)
+            .map(|(k, _)| *k)
     }
 
     // Count of active segments incident on a node (its degree). Scans every
@@ -404,10 +405,11 @@ impl Wiring {
     /// Drop all nodes bound to a removed component (and their segments).
     pub fn remove_component_nodes(&mut self, pck: PlacedCompKey) -> WiringDelta {
         let mut ops = Vec::new();
-        let doomed: Vec<WireNodeKey> = self
-            .active_nodes()
+        let doomed: Vec<_> = self
+            .nodes
+            .iter()
             .filter(|(_, n)| matches!(n.attach, NodeAttach::Pin(k, _) if k == pck))
-            .map(|(k, _)| k)
+            .map(|(k, _)| *k)
             .collect();
         for k in doomed {
             self.remove_node(k, &mut ops);
@@ -420,9 +422,10 @@ impl Wiring {
     pub fn remove_tunnel_nodes(&mut self, ptk: PlacedTunnelKey) -> WiringDelta {
         let mut ops = Vec::new();
         let doomed: Vec<WireNodeKey> = self
-            .active_nodes()
+            .nodes
+            .iter()
             .filter(|(_, n)| matches!(n.attach, NodeAttach::Tunnel(k) if k == ptk))
-            .map(|(k, _)| k)
+            .map(|(k, _)| *k)
             .collect();
         for k in doomed {
             self.remove_node(k, &mut ops);
@@ -441,13 +444,14 @@ impl Wiring {
     ) -> WiringDelta {
         let mut ops = Vec::new();
         let doomed: Vec<WireNodeKey> = self
-            .active_nodes()
+            .nodes
+            .iter()
             .filter(|(_, n)| match n.attach {
                 NodeAttach::Pin(k, PinId::In(i)) => k == pck && (i.0 as usize) >= n_inputs,
                 NodeAttach::Pin(k, PinId::Out(i)) => k == pck && (i.0 as usize) >= n_outputs,
                 _ => false,
             })
-            .map(|(k, _)| k)
+            .map(|(k, _)| *k)
             .collect();
         for k in doomed {
             self.remove_node(k, &mut ops);
@@ -485,10 +489,11 @@ impl Wiring {
 
     // Remove nodes with no incident segments (orphans left by a delete/split).
     fn cleanup(&mut self, ops: &mut Vec<WiringOp>) {
-        let orphans: Vec<WireNodeKey> = self
-            .active_nodes()
-            .map(|(k, _)| k)
-            .filter(|&k| self.degree(k) == 0)
+        let orphans: Vec<_> = self
+            .nodes
+            .keys()
+            .filter(|&&k| self.degree(k) == 0)
+            .cloned()
             .collect();
         for k in orphans {
             self.take_node(k, ops);
@@ -561,7 +566,7 @@ impl Wiring {
         // Union-find over active node keys, unioning the two ends of every
         // active segment.
         let mut parent: HashMap<WireNodeKey, WireNodeKey> =
-            self.active_nodes().map(|(k, _)| (k, k)).collect();
+            self.nodes.keys().map(|&k| (k, k)).collect();
 
         fn find(parent: &mut HashMap<WireNodeKey, WireNodeKey>, x: WireNodeKey) -> WireNodeKey {
             let mut root = x;
@@ -594,7 +599,7 @@ impl Wiring {
         }
 
         let mut by_root: HashMap<WireNodeKey, Group> = HashMap::new();
-        for (k, node) in self.active_nodes() {
+        for (&k, node) in &self.nodes {
             if !connected.contains(&k) {
                 continue;
             }
@@ -620,9 +625,10 @@ impl Wiring {
     /// The active node under `pos`, if any (within the pin hit radius).
     pub fn node_at_pos(&self, pos: Pos2, camera: Camera) -> Option<WireNodeKey> {
         let hit_r = camera.scale(HIT_RADIUS);
-        self.active_nodes()
+        self.nodes
+            .iter()
             .find(|(_, n)| camera.grid_to_screen(n.pos).distance(pos) <= hit_r)
-            .map(|(k, _)| k)
+            .map(|(k, _)| *k)
     }
 
     /// The active segment nearest to `pos` (within the hit radius) and the
@@ -669,11 +675,7 @@ mod tests {
     fn snapshot(w: &Wiring) -> (usize, usize, usize) {
         let groups = w.groups();
         let pins: usize = groups.iter().map(|g| g.pins.len()).sum();
-        (
-            w.active_nodes().count(),
-            w.active_segments().count(),
-            groups.len() * 1000 + pins,
-        )
+        (w.nodes.len(), w.segments.len(), groups.len() * 1000 + pins)
     }
 
     #[test]
@@ -743,7 +745,8 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].pins.len(), 2);
         assert!(w
-            .active_nodes()
+            .nodes
+            .iter()
             .all(|(_, n)| !matches!(n.attach, NodeAttach::Pin(k, _) if k == c[2])));
     }
 
@@ -856,7 +859,7 @@ mod tests {
         );
         assert_eq!(keys.len(), 2);
         assert_eq!(seg_keys.len(), 1);
-        assert_eq!(w.active_nodes().count(), 2);
+        assert_eq!(w.nodes.len(), 2);
         assert_eq!(w.active_segments().count(), 1);
         let groups = w.groups();
         assert_eq!(groups.len(), 1);
@@ -899,13 +902,13 @@ mod tests {
             NodeAttach::Pin(c[0], PinId::output(0)),
             NodeAttach::Pin(c[1], PinId::input(0)),
         );
-        let before_nodes = w.active_nodes().count();
+        let before_nodes = w.nodes.len();
 
         // A subgraph node landing on an already-occupied GridPos must not be
         // deduped/spliced into the existing node there (unlike add_route's
         // resolve_point) - it's an independent copy.
         w.add_subgraph(&[(GridPos::new(0, 0), NodeAttach::Free)], &[]);
-        assert_eq!(w.active_nodes().count(), before_nodes + 1);
+        assert_eq!(w.nodes.len(), before_nodes + 1);
     }
 
     #[test]
