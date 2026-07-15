@@ -28,9 +28,9 @@ WASM adds `wasm-bindgen`/`wasm-bindgen-futures`/`js-sys`/`web-sys`.
     src/sim/circuit.rs                Circuit - the simulation graph, evaluation engine, tunnels
     src/sim/command.rs                Command/CommandOutput/UndoAction - the undo-recordable mutation layer
 
-    src/gui.rs                       pub mod app / canvas_draw / clipboard / clock / document / geometry / gui_undo / history / memory_editor / placed_component / properties / shape / theme / wiring
-    src/gui/app.rs                    OsmilogApp (eframe::App) - state, interaction modes, rendering, menu
-    src/gui/document.rs               DocId/CircuitDoc/Document - the multiple-open-circuits model; per-document state + methods
+    src/gui.rs                       pub mod app / canvas_draw / clipboard / clock / document / geometry / gui_undo / history / memory_editor / placed_component / properties / shape / theme / utils / wiring
+    src/gui/app.rs                    OsmilogApp (eframe::App) - cross-document state; subcircuit instantiation, save/load, clipboard, menu/palette UI
+    src/gui/document.rs               DocId/CircuitDoc/Document - the multiple-open-circuits model; per-document state, simulation, undo/redo, and canvas drawing/interaction methods
     src/gui/properties.rs             show_properties - mutation-free properties panel returning a PropGuiAction
     src/gui/placed_component.rs       PlacedComponent - visual record; GUI-only display methods on ComponentSpec
     src/gui/wiring.rs                 Wiring - GUI's own connectivity graph (grid nodes + segments), + WiringDelta undo
@@ -39,6 +39,7 @@ WASM adds `wasm-bindgen`/`wasm-bindgen-futures`/`js-sys`/`web-sys`.
     src/gui/shape.rs                  ComponentShape, PinAnchor, tessellate_path - visual shape primitives
     src/gui/geometry.rs               per-component-type shape builders + grid/pixel geometry constants
     src/gui/theme.rs                  Theme - canvas/signal colors derived from ambient egui Visuals
+    src/gui/utils.rs                  CanvasCtx - shared canvas-interaction context, used by both app.rs and document.rs
 
     src/io.rs                        ProjectFile/CircuitSnapshot save/load format (JSON), v2->v3 upgrade
 
@@ -59,7 +60,7 @@ non-egui frontend) with zero changes.
 (`gui::wiring::Wiring` - grid nodes and segments) as the *source of truth for what's visually
 wired together*, entirely separate from `sim::circuit::Circuit`, which is the *source of truth
 for signal values*. After any wiring edit, the GUI throws away the circuit's nets and replays
-them from `Wiring` (`OsmilogApp::rebuild_circuit`: `clear_nets()` + `link`/`link_tunnel` per
+them from `Wiring` (`Document::rebuild_circuit`: `clear_nets()` + `link`/`link_tunnel` per
 connected group, then `settle()`). The `Circuit` never learns about pixel/grid geometry; `Wiring`
 never learns about signal values.
 
@@ -153,7 +154,7 @@ applying it reverses the recorded command and returns the inverse to record on t
 
 The `UndoAction`s are deliberately minimal, because **the circuit's net structure is derived
 state**: the GUI rebuilds every net from its authoritative `Wiring`/component/tunnel records after
-any edit (`gui::app::rebuild_circuit`), so undo restores those records and re-derives the nets
+any edit (`Document::rebuild_circuit`), so undo restores those records and re-derives the nets
 rather than reversing net mutations. Hence `ClearNets`/`Link`/`LinkTunnel`/`DetachTunnel` capture
 `NoOp` (no net snapshots, no `NetKey`s), and only the *authoritative* commands capture a real
 inverse. Component and tunnel removal **tombstones** (an `active: bool` on `Component`/`Tunnel`,
@@ -339,6 +340,19 @@ method directly and passes the `WiringDelta` it returns to `doc.edit_wiring(delt
 edits undo-recordable in both domains. `doc` here is `self.active_mut()` from `OsmilogApp`, or
 `&mut self` from a method already defined on `Document`.
 
+**Canvas dispatch.** `OsmilogApp::handle_canvas_interaction` reads the active document's `mode`
+and dispatches to one `interact_*` method per `InteractionMode` variant, each taking a `&CanvasCtx`
+(`gui::utils::CanvasCtx` - the frame's `egui::Response`/`Painter`/`Context` plus `Camera`/`Theme`,
+built fresh each frame in `ui()`, never stored). Every variant except `Placing` needs nothing but
+the active document, so `interact_idle`/`interact_placing_tunnel`/`interact_wire_draw`/
+`interact_component_drag`/`interact_bulk_select` (and `draw`, the canvas painter, and
+`show_memory_editors`/`show_clock_controls`, the two free-floating-window/transport UI blocks) all
+live directly on `Document` - `OsmilogApp` just calls `self.active_mut().interact_idle(cc,
+pointer)` etc. `interact_placing` is the one exception and stays on `OsmilogApp`: placing a
+component has to build the live `Component` via `instantiate`, which (for a `Subcircuit` spec)
+needs the whole `documents` registry a bare `Document` doesn't have - the same
+registry-vs-document split `reconfigure_component` uses (see Properties panel below).
+
 ### Properties panel (`properties.rs`)
 
 The right-hand per-selection editor is a **mutation-free renderer**: `show_properties(doc:
@@ -400,9 +414,11 @@ are:
 
 `OsmilogApp::active()`/`active_mut()` reach the active document's fields by indexing
 `documents[active_id]`; most per-document behavior (simulation stepping, undo/redo, wiring
-queries, placement/deletion, `apply`/`edit_wiring`) is implemented as methods directly on
-`Document` rather than on `OsmilogApp`, which only keeps the cross-document operations (subcircuit
-instantiation, save/load, UI) that need the whole `documents` registry in scope.
+queries, placement/deletion, `apply`/`edit_wiring`, canvas drawing/interaction, the clock-transport
+and memory-editor UI) is implemented as methods directly on `Document` rather than on `OsmilogApp`,
+which only keeps the cross-document operations (subcircuit instantiation, save/load, clipboard
+copy/paste, the menu bar and component palette UI) that need the whole `documents` registry or the
+app-wide `clipboard` in scope.
 
 Switching (`OsmilogApp::switch_circuit`) is just reassigning `active_id` - no `std::mem` moves, no
 serialization, so it never deep-copies a `ComponentSpec` or a ROM's contents. Because every
@@ -462,7 +478,7 @@ instead of removed, so the list's shape doesn't shift as you edit.
 The GUI's own connectivity model: a graph of grid-aligned `WireNode`s (`Free`, `Pin(PlacedCompKey,
 PinId)`, or `Tunnel(PlacedTunnelKey)`) joined by axis-aligned `WireSegment`s. Deliberately knows
 nothing about `Circuit` - connectivity is derived on demand via `Wiring::groups()` (union-find
-over the active segment graph), and `OsmilogApp::rebuild_circuit` is the only place that translates
+over the active segment graph), and `Document::rebuild_circuit` is the only place that translates
 a `Wiring` state into `Circuit` calls (`clear_nets()` then `link`/`link_tunnel` per group). Wire
 selection/deletion is currently per-segment, not per-group (see In-Progress).
 
@@ -581,9 +597,9 @@ app state).
   gaps: **clock ticks are excluded from undo** (`Command::TickClock` is issued untracked, bypassing
   `apply`, since its `RestoreSeqState` replay is unimplemented), and undo/redo re-derives nets via
   `rebuild_circuit` rather than reversing net mutations.
-- **Canvas pan/zoom**: implemented (`OsmilogApp::camera: geometry::Camera`, see OsmilogApp above) -
-  middle-mouse drag pans, Ctrl+scroll zooms toward the cursor. No keyboard/scrollbar pan and no
-  "reset view" affordance yet.
+- **Canvas pan/zoom**: implemented (`Document::camera: geometry::Camera`, see Documents / multiple
+  circuits above) - middle-mouse drag pans, Ctrl+scroll zooms toward the cursor. No
+  keyboard/scrollbar pan and no "reset view" affordance yet.
 - **Whole-wire-run selection**: selecting/deleting a wire is still per-segment. `Wiring::groups()`
   already computes the connected sets a "select the whole net" gesture would need.
 - **Pin-index bounds checking**: `Component::net_of`/`Circuit::net_of`/`link` don't bounds-check

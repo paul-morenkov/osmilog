@@ -11,4 +11,5 @@ pub mod placed_component;
 pub mod properties;
 pub mod shape;
 pub mod theme;
+pub mod utils;
 pub mod wiring;
