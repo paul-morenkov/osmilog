@@ -11,9 +11,11 @@ use crate::gui::clipboard::Clipboard;
 use crate::gui::clock::ClockRun;
 use crate::gui::document::{default_new_circuit_name, CircuitDoc, DocId, Document};
 use crate::gui::geometry::{tunnel_shape, Camera, GridPos, ZOOM_SCROLL_SPEED};
+use crate::gui::gui_undo::GuiUndoAction;
 use crate::gui::history::History;
 use crate::gui::memory_editor::MemKind;
 use crate::gui::placed_component::PlacedComponent;
+use crate::gui::properties::PropGuiAction;
 use crate::gui::shape::ComponentShape;
 use crate::gui::theme::Theme;
 use crate::gui::wiring::{NodeAttach, WireNode, WireNodeKey, WireSegKey, WireSegment, Wiring};
@@ -23,6 +25,7 @@ use crate::io::{
 };
 use crate::platform;
 use crate::sim::circuit::{Circuit, TunnelKey, TunnelRole};
+use crate::sim::command::Command;
 use crate::sim::component::*;
 use crate::sim::value::Value;
 
@@ -253,7 +256,7 @@ impl OsmilogApp {
     // menus, File > Load, and the properties panel are all disabled when this
     // is true. Only Stop (which resets sequential state) returns to editable.
     pub fn editing_locked(&self) -> bool {
-        self.active().clock.run != ClockRun::Stopped
+        self.active().editing_locked()
     }
 
     // True while live *value* edits must be blocked - an Input's bits, a ROM's
@@ -263,7 +266,7 @@ impl OsmilogApp {
     // so this is true only while actively Playing. Structural edits (widths,
     // wiring, add/delete) stay gated on editing_locked().
     pub fn value_editing_locked(&self) -> bool {
-        self.active().clock.run == ClockRun::Playing
+        self.active().value_editing_locked()
     }
 
     // Builds the live sim Component (needs the document registry, so this part
@@ -272,6 +275,61 @@ impl OsmilogApp {
     fn place_component(&mut self, spec: ComponentSpec, grid_pos: GridPos) -> PlacedCompKey {
         let comp = self.instantiate(&spec);
         self.active_mut().place_component(comp, spec, grid_pos)
+    }
+
+    // Applies one intent collected from the properties panel (see
+    // gui::properties::show_properties, which only *describes* edits over a
+    // read-only &Document). This is the single place those descriptions become
+    // mutations - keeping the panel itself decoupled from OsmilogApp.
+    pub(crate) fn apply_prop_gui_action(&mut self, action: PropGuiAction) {
+        match action {
+            PropGuiAction::Reconfigure(key, spec) => self.reconfigure_component(key, spec),
+            PropGuiAction::OpenMemory(key, kind) => self.active_mut().memory_editor.open(key, kind),
+            PropGuiAction::OpenCircuit(doc) => self.switch_circuit(doc),
+            PropGuiAction::SetTunnelLabelLive(key, label) => {
+                // Persist the in-progress edit back to the record (the panel's
+                // text buffer is re-cloned from it next frame). Same-frame with
+                // the render, so the keystroke isn't lost.
+                self.active_mut().tunnels[key].label = label;
+            }
+            PropGuiAction::RenameTunnel(key, label) => {
+                let doc = self.active_mut();
+                let tunnel_key = doc.tunnels[key].key;
+                // Read the old label from the circuit (the record's copy was
+                // already updated live) to capture undo's restore value.
+                let old_label = doc.circuit.tunnels.get(tunnel_key).map(|t| t.label.clone());
+                doc.history.begin_batch();
+                doc.apply(Command::RenameTunnel {
+                    tunnel: tunnel_key,
+                    new_label: label.clone(),
+                });
+                // Record the record-side label change's undo (the Sim
+                // RenameTunnel above only reverses the circuit's copy).
+                if let Some(old) = old_label {
+                    doc.history
+                        .push_gui(GuiUndoAction::SetTunnelLabel { key, label: old });
+                }
+                doc.tunnels[key].label = label;
+                doc.history.end_batch();
+                let result = doc.circuit.settle();
+                doc.record_settle_result(result);
+            }
+            PropGuiAction::Delete(sel) => match sel {
+                Selected::Component(key) => self.active_mut().delete_component(key),
+                Selected::Tunnel(key) => self.active_mut().delete_tunnel(key),
+                Selected::Wire(seg) => self.active_mut().delete_wire(seg),
+            },
+        }
+    }
+
+    // Thin registry-glue wrapper over Document::reconfigure_component: builds
+    // the new component via instantiate (which needs the document registry, so
+    // it can't run inside Document) and hands it to the active document, which
+    // owns all the record/wiring/undo bookkeeping.
+    pub(crate) fn reconfigure_component(&mut self, pc_key: PlacedCompKey, new_spec: ComponentSpec) {
+        let new_comp = self.instantiate(&new_spec);
+        self.active_mut()
+            .reconfigure_component(pc_key, new_spec, new_comp);
     }
 
     // ── Subcircuits ───────────────────────────────────────────────────────────
@@ -494,8 +552,7 @@ impl OsmilogApp {
             if old_in != input_widths.len() || old_out != output_widths.len() {
                 // Boundary changed: full reconfigure (prunes stale wires, new
                 // shape, rebuilt inner circuit). It rebuild_circuits itself.
-                crate::gui::properties::reconfigure_component(
-                    self,
+                self.reconfigure_component(
                     pck,
                     ComponentSpec::Subcircuit {
                         doc,
@@ -1931,7 +1988,11 @@ impl eframe::App for OsmilogApp {
                 egui::ScrollArea::vertical()
                     .id_salt("properties_scroll")
                     .show(ui, |ui| {
-                        crate::gui::properties::show_properties(self, ui);
+                        if let Some(action) =
+                            crate::gui::properties::show_properties(self.active(), ui)
+                        {
+                            self.apply_prop_gui_action(action);
+                        }
                     });
             });
 
@@ -2893,8 +2954,7 @@ mod tests {
         let mut app = OsmilogApp::empty();
         let g = place(&mut app, and2());
         let old_key = app.active().components[g].key;
-        crate::gui::properties::reconfigure_component(
-            &mut app,
+        app.reconfigure_component(
             g,
             ComponentSpec::Gate(Gate {
                 op: GateOp::Not,

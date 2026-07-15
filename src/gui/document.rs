@@ -24,7 +24,7 @@ use crate::gui::app::{
     tunnel_pin_grid, InteractionMode, PinKind, PlacedCompKey, PlacedTunnel, PlacedTunnelKey,
     Selected, Selection,
 };
-use crate::gui::clock::Clock;
+use crate::gui::clock::{Clock, ClockRun};
 use crate::gui::geometry::{Camera, GridPos};
 use crate::gui::gui_undo::GuiUndoAction;
 use crate::gui::history::{History, HistoryEntry};
@@ -107,6 +107,23 @@ pub(crate) fn default_new_circuit_name(documents: &SlotMap<DocId, CircuitDoc>) -
 }
 
 impl Document {
+    // True while a clock run session is active (Playing or Paused): structural
+    // edits (widths, arity, wiring, add/delete) are locked for its whole
+    // duration. Only Stop returns to editable. Both lock predicates live here
+    // (not just on OsmilogApp) so the properties panel can gate its widgets
+    // from a bare `&Document` - see OsmilogApp::editing_locked, which delegates.
+    pub(crate) fn editing_locked(&self) -> bool {
+        self.clock.run != ClockRun::Stopped
+    }
+
+    // True while live *value* edits must be blocked - an Input's bits, a ROM's
+    // or RAM's contents. Carved out of the lock while Paused (a paused run is
+    // frozen structurally but still pokeable), so this is true only while
+    // actively Playing. See OsmilogApp::value_editing_locked, which delegates.
+    pub(crate) fn value_editing_locked(&self) -> bool {
+        self.clock.run == ClockRun::Playing
+    }
+
     pub(crate) fn record_settle_result<T>(
         &mut self,
         result: Result<T, crate::sim::circuit::SettleError>,
@@ -239,6 +256,47 @@ impl Document {
         pc_key
     }
 
+    // Swaps a placed component's parameters. PlacedCompKey stays stable, so
+    // attached wires survive - we only drop wire nodes for pins the new arity
+    // no longer has, re-sync the rest, then rebuild. `new_comp` is built by the
+    // caller (`OsmilogApp::reconfigure_component`) via `instantiate`, the one
+    // step needing the document registry a `Document` doesn't have.
+    pub(crate) fn reconfigure_component(
+        &mut self,
+        pc_key: PlacedCompKey,
+        new_spec: ComponentSpec,
+        new_comp: Component,
+    ) {
+        let old_key = self.components[pc_key].key;
+        let grid_pos = self.components[pc_key].grid_pos;
+        let new_n_in = new_comp.pins.inputs.len();
+        let new_n_out = new_comp.pins.outputs.len();
+
+        self.history.begin_batch();
+        self.apply(Command::RemoveComponent(old_key));
+        let new_key = self.apply(Command::comp(new_comp)).unwrap_comp();
+        // Record the record swap's undo before overwriting: restores the old
+        // CompKey + def (the Sim actions above reactivate the old circuit comp
+        // and deactivate the new one, but the record itself needs restoring).
+        let old_spec = std::mem::replace(
+            &mut self.components[pc_key],
+            PlacedComponent::new(new_key, new_spec, grid_pos),
+        )
+        .spec;
+        self.history.push_gui(GuiUndoAction::SwapComponentSpec {
+            key: pc_key,
+            comp_key: old_key,
+            spec: old_spec,
+        });
+
+        let delta = self.wiring.prune_stale_pins(pc_key, new_n_in, new_n_out);
+        self.edit_wiring(delta);
+        self.sync_component_wire_nodes(pc_key);
+        self.rebuild_circuit();
+        self.history.end_batch();
+        self.selected = Some(Selection::Single(Selected::Component(pc_key)));
+    }
+
     pub(crate) fn place_tunnel(&mut self, role: TunnelRole, grid_pos: GridPos) -> PlacedTunnelKey {
         let label = format!("Tunnel{}", self.tunnels.len());
         self.place_tunnel_labeled(label, role, grid_pos)
@@ -281,7 +339,9 @@ impl Document {
     // Live (non-tombstoned) placed components/tunnels, mirroring
     // Wiring::active_nodes/active_segments. Raw indexing on a known-live key
     // is still fine - a tombstone is simply never iterated.
-    pub(crate) fn active_components(&self) -> impl Iterator<Item = (PlacedCompKey, &PlacedComponent)> {
+    pub(crate) fn active_components(
+        &self,
+    ) -> impl Iterator<Item = (PlacedCompKey, &PlacedComponent)> {
         self.components.iter().filter(|(_, pc)| pc.active)
     }
 

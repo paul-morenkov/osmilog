@@ -28,12 +28,13 @@ WASM adds `wasm-bindgen`/`wasm-bindgen-futures`/`js-sys`/`web-sys`.
     src/sim/circuit.rs                Circuit - the simulation graph, evaluation engine, tunnels
     src/sim/command.rs                Command/CommandOutput/UndoAction - the undo-recordable mutation layer
 
-    src/gui.rs                       pub mod app / document / geometry / gui_undo / history / placed_component / shape / theme / wiring
+    src/gui.rs                       pub mod app / canvas_draw / clipboard / clock / document / geometry / gui_undo / history / memory_editor / placed_component / properties / shape / theme / wiring
     src/gui/app.rs                    OsmilogApp (eframe::App) - state, interaction modes, rendering, menu
-    src/gui/document.rs               DocId/CircuitDoc/DocState - the multiple-open-circuits model
+    src/gui/document.rs               DocId/CircuitDoc/Document - the multiple-open-circuits model; per-document state + methods
+    src/gui/properties.rs             show_properties - mutation-free properties panel returning a PropGuiAction
     src/gui/placed_component.rs       PlacedComponent - visual record; GUI-only display methods on ComponentSpec
     src/gui/wiring.rs                 Wiring - GUI's own connectivity graph (grid nodes + segments), + WiringDelta undo
-    src/gui/gui_undo.rs               GuiUndoAction (Wiring delta / drag-move) + OsmilogApp::edit_wiring/commit_move
+    src/gui/gui_undo.rs               GuiUndoAction (Wiring delta / drag-move) + Document::edit_wiring/commit_move
     src/gui/history.rs                History - accumulates HistoryEntrys (Sim + Gui) from apply()/edit_wiring()
     src/gui/shape.rs                  ComponentShape, PinAnchor, tessellate_path - visual shape primitives
     src/gui/geometry.rs               per-component-type shape builders + grid/pixel geometry constants
@@ -73,15 +74,15 @@ reverse:
   `sim` must never depend on. Rust allows an inherent impl of a crate-local type from any module
   in the crate, so this needs no wrapper/newtype - one enum, one save-file representation, two
   impl blocks in two layers.
-- **`sim::command::Command`** is how the GUI mutates the circuit at all. `OsmilogApp` never calls
-  `Circuit::add_component`/`link`/`remove_component`/etc. directly; every *authoritative* edit goes
-  through `OsmilogApp::apply(Command) -> CommandOutput`, which calls `Circuit::apply` (returning
-  `(CommandOutput, UndoAction)`) and pushes the `UndoAction` onto `gui::history::History`. Edits
-  that only reconstruct *derived* net state (`ClearNets`/`Link`/`LinkTunnel`, all issued from
-  `rebuild_circuit`) bypass that wrapper and call `self.circuit.apply(..).0` untracked - undo
-  re-derives the nets rather than reversing them (see the Command layer section below). This makes
-  every GUI-issued authoritative mutation undo-recordable without the GUI needing to know how to
-  reverse anything itself.
+- **`sim::command::Command`** is how the GUI mutates the circuit at all. Neither `OsmilogApp` nor
+  `Document` ever calls `Circuit::add_component`/`link`/`remove_component`/etc. directly; every
+  *authoritative* edit goes through `Document::apply(Command) -> CommandOutput`, which calls
+  `Circuit::apply` (returning `(CommandOutput, UndoAction)`) and pushes the `UndoAction` onto
+  `gui::history::History`. Edits that only reconstruct *derived* net state (`ClearNets`/`Link`/
+  `LinkTunnel`, all issued from `rebuild_circuit`) bypass that wrapper and call
+  `self.circuit.apply(..).0` untracked - undo re-derives the nets rather than reversing them (see
+  the Command layer section below). This makes every GUI-issued authoritative mutation
+  undo-recordable without the GUI needing to know how to reverse anything itself.
   `gui::gui_undo::GuiUndoAction` is the GUI-only undo counterpart for edits `Command` has no
   notion of (wiring-graph changes, component/tunnel moves) - a wholly separate type since
   `Wiring`/`GridPos`/`PlacedCompKey` must stay out of `sim`, but recorded onto the *same*
@@ -89,8 +90,8 @@ reverse:
   triggers (e.g. drawing a wire also relinks nets via `rebuild_circuit`) collapse into one
   `HistoryEntry::Batch` instead of two disconnected entries. Unlike the sim side there is no
   "GuiCommand" enum: every `Wiring` mutator's inverse is just "replay its delta backwards", so
-  `OsmilogApp` calls the `Wiring` method directly and hands the returned `WiringDelta` to
-  `OsmilogApp::edit_wiring` - no command-as-data indirection.
+  `Document` calls the `Wiring` method directly and hands the returned `WiringDelta` to
+  `Document::edit_wiring` - no command-as-data indirection.
 
 `src/io.rs` (save/load) also depends only on `sim` types (`ComponentSpec`, `TunnelRole`) plus a
 couple of GUI-defined-but-plain-data geometry types - it does not depend on `OsmilogApp` itself.
@@ -209,12 +210,12 @@ it serializes as a plain word array (needs serde's `rc` feature), so the save fo
 `Rc` (not `Arc`) suffices because app state is single-threaded; interior mutability means
 `set_word`/`write_rom` need only `&self`.
 
-The GUI reads/writes contents through the shared handle (`OsmilogApp::write_rom_cell` just calls
-`Circuit::write_rom` + `settle`; the spec updates for free). The properties panel special-cases
-`Rom` *before* its generic per-frame `spec.clone()` so it never deep-copies the buffer just to read
-the widths. The contents editor is a virtualized `egui::Window` (`OsmilogApp::show_rom_editor`,
-hex-dump rows via `ScrollArea::show_rows`) opened from the properties panel, and is the app's first
-free-floating window.
+The GUI reads/writes contents through the shared handle (`Document::write_rom_cell` just calls
+`Circuit::write_rom` + `settle`; the spec updates for free). The properties panel matches the spec
+*by reference* (never a per-frame clone), so it never deep-copies a ROM/RAM buffer just to read the
+widths. The contents editor is a virtualized `egui::Window` (`gui::memory_editor::MemoryEditor`,
+hex-dump rows via `ScrollArea::show_rows`) opened from the panel via `PropGuiAction::OpenMemory`, and
+is the app's first free-floating window.
 
     pub trait SeqLogic {
         fn n_inputs(&self) -> usize;
@@ -310,37 +311,50 @@ made to a child circuit while it was active show up in its parent's placed insta
 
 ### OsmilogApp (`app.rs`)
 
-The `eframe::App` implementation, split into `logic` (pre-frame) and `ui` (painting). Owns:
+The `eframe::App` implementation, split into `logic` (pre-frame) and `ui` (painting). Owns the
+*cross-document* state only - every per-circuit field lives on `Document` instead (see Documents /
+multiple circuits below):
 
-- `circuit: Circuit` - the simulation graph.
-- `history: History` - accumulated undo entries (see History below).
-- `components: SlotMap<PlacedCompKey, PlacedComponent>`, `tunnels: SlotMap<PlacedTunnelKey,
-  PlacedTunnel>` - visual records, keyed by their own generational keys (distinct from the
-  circuit's own `CompKey`/`TunnelKey`) so selection/drag state and `Wiring`'s node bindings stay
-  valid across a `reconfigure_component` (which changes the underlying `CompKey`).
-- `wiring: Wiring` - the GUI's connectivity graph (see Wiring below).
-- `mode: InteractionMode` - what the canvas is currently doing.
-- `selected: Option<Selected>`, `bulk_selection: Vec<Selected>` - single selection (drives the
-  properties panel) and rectangle multi-select, kept separate.
-- `camera: Camera` - the canvas view transform (`geometry::Camera { pan, zoom }`). `pan` (screen-px
-  offset) and `zoom` scale factor funnel through `Camera::grid_to_screen`/`screen_to_grid`/`scale`;
-  every draw/hit function takes a `Camera`, not a bare `pan`. Middle-mouse drag pans, Ctrl+scroll
-  (egui's `zoom_delta`, cursor-anchored, clamped `[ZOOM_MIN, ZOOM_MAX]`) zooms - both applied in
-  `handle_camera_input` before drawing. Not persisted (like the old `pan`).
-- `documents: SlotMap<DocId, CircuitDoc>`, `doc_order: Vec<DocId>`, `active: DocId` - every open
-  circuit document and which one is live (see Documents / multiple circuits below). All of the
-  fields above (`circuit`, `history`, `components`, `tunnels`, `wiring`, `mode`, `camera`, `selected`,
-  `clock`, `rom_editor_open`) are *per-document* state; they hold the active document's state
-  directly, and every other document parks the same fields in a `DocState`.
+- `documents: SlotMap<DocId, CircuitDoc>`, `doc_order: Vec<DocId>`, `active_id: DocId` - every open
+  circuit document, the stable display order for the palette and persisted circuit order (`SlotMap`
+  iteration order is unspecified), and which one is currently active. `active()`/`active_mut()` are
+  the sole accessors onto the active document's state (`&self.documents[self.active_id].state`) -
+  there is no separate set of "live" fields to keep in sync with a parked copy.
+- `clipboard: Clipboard` - snapshot of the last copied selection, decoupled from live `SlotMap`
+  keys so it survives undo/redo and further edits to the copied originals.
+- `io_error: Option<String>` - File > Save/Load I/O errors, distinct from a `Document`'s own
+  `settle_error` (a simulation-side problem); the menu bar shows whichever is set, I/O first.
+- `io: platform::IoState`, `show_profiler: bool`, `new_circuit_dialog: Option<String>` - platform
+  file-I/O orchestration, the Debug-menu puffin viewer toggle, and the new-circuit-name dialog
+  (`Some(buffer)` while open).
 
-`InteractionMode` covers `Idle`, `Placing { spec: ComponentSpec }`, `PlacingTunnel`, `WireDraw`
-(hybrid drag-elbow / click-polyline wire drawing), `ComponentDrag`, and `BulkSelect` (rubber-band
-rectangle select, populating `bulk_selection`).
+`InteractionMode` (one of `Document`'s per-circuit fields) covers `Idle`, `Placing { spec:
+ComponentSpec }`, `PlacingTunnel`, `WireDraw` (hybrid drag-elbow / click-polyline wire drawing),
+`ComponentDrag`, and `BulkSelect` (rubber-band rectangle select, populating a `Selection::Bulk`).
 
-Every circuit mutation goes through `self.apply(command)` (see Command layer above), never a
-direct `Circuit` method call. Every `Wiring`-graph mutation calls the `Wiring` method directly and
-passes the `WiringDelta` it returns to `self.edit_wiring(delta)` (see History / GUI undo below),
-which records it - that's what makes GUI edits undo-recordable in both domains.
+Every circuit mutation goes through `doc.apply(command)` (`Document::apply`, see Command layer
+above), never a direct `Circuit` method call. Every `Wiring`-graph mutation calls the `Wiring`
+method directly and passes the `WiringDelta` it returns to `doc.edit_wiring(delta)`
+(`Document::edit_wiring`, see History / GUI undo below), which records it - that's what makes GUI
+edits undo-recordable in both domains. `doc` here is `self.active_mut()` from `OsmilogApp`, or
+`&mut self` from a method already defined on `Document`.
+
+### Properties panel (`properties.rs`)
+
+The right-hand per-selection editor is a **mutation-free renderer**: `show_properties(doc:
+&Document, ui)` reads only the active document (all its inputs are document-scoped) and *returns*
+the user's intent as an `Option<PropGuiAction>` (`Reconfigure`/`OpenMemory`/`OpenCircuit`/
+`RenameTunnel`/`SetTunnelLabelLive`/`Delete`) instead of mutating anything. The caller in
+`app::ui` applies it via `OsmilogApp::apply_prop_gui_action`, the one place those intents become
+mutations - so the panel stays decoupled from `OsmilogApp`. (The two edit-lock predicates it gates
+widgets on, `editing_locked`/`value_editing_locked`, live on `Document`; the `OsmilogApp` ones
+delegate.)
+
+`reconfigure_component` (the parameter-swap path every component editor commits through:
+`RemoveComponent` + re-add under the same `PlacedCompKey`, prune wires to dropped pins, rebuild)
+lives on `Document`, alongside the record/wiring/undo bookkeeping it does. `OsmilogApp::
+reconfigure_component` is a thin wrapper that pre-builds the new `Component` via `instantiate` (the
+one step needing the whole `documents` registry) and hands it to the document method.
 
 ### PlacedComponent / PlacedTunnel (`placed_component.rs`, `app.rs`)
 
@@ -353,22 +367,51 @@ per-type/pin labels (`ComponentSpec::label()`, `ComponentShape::labels`).
 ### Documents / multiple circuits (`document.rs`, `app.rs`)
 
 `OsmilogApp` can hold several circuit documents in memory at once, so a subcircuit has something
-to reference. Exactly one is *active*: its state lives directly in the live per-circuit fields
-listed under OsmilogApp above; every other document parks the same set of fields in a `DocState`:
+to reference. Every document's per-circuit state - active or not - lives directly in its own
+`Document`, stored in `OsmilogApp::documents: SlotMap<DocId, CircuitDoc>`:
 
-    pub struct DocState { circuit, history, components, tunnels, wiring, mode, camera, selected, clock, rom_editor_open }
-    pub struct CircuitDoc { name: String, state: Option<DocState> }   // state is None iff active
+    pub struct Document { circuit, history, components, tunnels, wiring, mode, camera, selected, clock, memory_editor, settle_error }
+    pub struct CircuitDoc { name: String, state: Document }
 
-Switching (`OsmilogApp::switch_circuit`) is a pair of `std::mem` moves - `take_active_state` empties
-the live fields into a `DocState` parked on the outgoing document, `put_active_state` installs the
-incoming document's parked `DocState` into the live fields - never serialization, so switching
-never deep-copies a `ComponentSpec` or a ROM's contents. Because a parked circuit already holds its
-settled nets, no net rebuild is needed on switch; what *is* needed is `refresh_subcircuits()` (see
-below), since child circuits may have changed while this document was inactive. `doc_order: Vec<
-DocId>` fixes the display order for the palette and the persisted circuit order (`SlotMap`
-iteration order is unspecified); `create_circuit_doc` parks the current document, allocates a new
-blank one via `DocState::blank()`, and appends it to `doc_order`. There is currently no UI to
-rename or delete a circuit document (see In-Progress).
+This is a single source of truth with no "parked vs. live" distinction - an earlier design (still
+visible in old commit history) kept the active document's fields inline on `OsmilogApp` and moved
+them into a `DocState` parked on `CircuitDoc` around every switch; that's gone. `Document`'s fields
+are:
+
+- `circuit: Circuit` - the simulation graph.
+- `history: History` - accumulated undo entries (see History below).
+- `components: SlotMap<PlacedCompKey, PlacedComponent>`, `tunnels: SlotMap<PlacedTunnelKey,
+  PlacedTunnel>` - visual records, keyed by their own generational keys (distinct from the
+  circuit's own `CompKey`/`TunnelKey`) so selection/drag state and `Wiring`'s node bindings stay
+  valid across a `reconfigure_component` (which changes the underlying `CompKey`).
+- `wiring: Wiring` - the GUI's connectivity graph (see Wiring below).
+- `mode: InteractionMode` - what the canvas is currently doing.
+- `selected: Option<Selection>` - `Selection::Single` (drives the properties panel) or
+  `Selection::Bulk` (rectangle multi-select); `None` is the one "nothing selected" representation.
+- `camera: Camera` - the canvas view transform (`geometry::Camera { pan, zoom }`). `pan` (screen-px
+  offset) and `zoom` scale factor funnel through `Camera::grid_to_screen`/`screen_to_grid`/`scale`;
+  every draw/hit function takes a `Camera`, not a bare `pan`. Middle-mouse drag pans, Ctrl+scroll
+  (egui's `zoom_delta`, cursor-anchored, clamped `[ZOOM_MIN, ZOOM_MAX]`) zooms - both applied in
+  `handle_camera_input` before drawing. Not persisted.
+- `clock: Clock`, `memory_editor: MemoryEditor` - the clock-run state machine (see Clock below) and
+  the free-floating ROM/RAM contents editor window's open/closed state.
+- `settle_error: Option<String>` - this document's last `settle()`/`tick_clock()` error surface (an
+  oscillation, a tunnel conflict, ...), distinct from `OsmilogApp::io_error`.
+
+`OsmilogApp::active()`/`active_mut()` reach the active document's fields by indexing
+`documents[active_id]`; most per-document behavior (simulation stepping, undo/redo, wiring
+queries, placement/deletion, `apply`/`edit_wiring`) is implemented as methods directly on
+`Document` rather than on `OsmilogApp`, which only keeps the cross-document operations (subcircuit
+instantiation, save/load, UI) that need the whole `documents` registry in scope.
+
+Switching (`OsmilogApp::switch_circuit`) is just reassigning `active_id` - no `std::mem` moves, no
+serialization, so it never deep-copies a `ComponentSpec` or a ROM's contents. Because every
+document already holds its own settled nets regardless of whether it's active, no net rebuild is
+needed on switch; what *is* needed is `refresh_subcircuits()` (see below), since child circuits may
+have changed while this document was inactive. `doc_order: Vec<DocId>` fixes the display order for
+the palette and the persisted circuit order (`SlotMap` iteration order is unspecified);
+`create_circuit_doc` inserts a new blank `Document`, appends it to `doc_order`, and makes it
+active. There is currently no UI to rename or delete a circuit document (see In-Progress).
 
 ### Subcircuits (`app.rs`)
 
@@ -383,7 +426,7 @@ subcircuit's real inner `Circuit` (see the Simulator's Subcircuits section above
   an accidental reference cycle during the recursive build (real cycles are already refused at
   placement time by `would_cycle`) by yielding an empty placeholder instead of recursing forever.
 - `build_doc_circuit(doc, visited)` builds a fresh standalone `Circuit` from a referenced
-  document's parked records (components/tunnels/wiring), translating them the same way
+  document's records (components/tunnels/wiring), translating them the same way
   `rebuild_circuit` translates the *live* document - but into a new `Circuit`, untracked, and
   recursing through `instantiate_with` for nested subcircuits. It returns the inner boundary
   `Input`/`Output` `CompKey`s ordered top-down (then left-to-right by `grid_pos`), which fixes the
@@ -439,12 +482,12 @@ size); `Wiring::remove_unreferenced_tombstones` reclaims any not referenced by t
     pub fn History::push_gui(&mut self, action: GuiUndoAction)
     pub fn History::begin_batch(&mut self) / fn end_batch(&mut self)
     pub fn History::pop_undo/pop_redo/push_undo/push_redo/can_undo/can_redo
-    fn OsmilogApp::undo(&mut self) / fn redo(&mut self)
+    fn Document::undo(&mut self) / fn redo(&mut self)
 
 `History` holds **two** stacks: `undo_stack` grows as edits are recorded (via `push_sim`/`push_gui`/
 `end_batch`), `redo_stack` holds entries popped by `undo` so `redo` can replay them. Recording
-accumulates one `HistoryEntry` per user gesture from every `OsmilogApp::apply()` (Circuit mutations,
-via `push_sim`) and `OsmilogApp::edit_wiring()` (`Wiring`-graph mutations, via `push_gui`) call.
+accumulates one `HistoryEntry` per user gesture from every `Document::apply()` (Circuit mutations,
+via `push_sim`) and `Document::edit_wiring()` (`Wiring`-graph mutations, via `push_gui`) call.
 `begin_batch`/`end_batch` collapse a multi-step GUI operation (e.g. deleting a component, which
 issues both a tracked `Command::RemoveComponent` and a `Wiring::remove_component_nodes`) into one
 `HistoryEntry` - a `Batch` when it's more than one sub-entry, unwrapped to the bare entry when it's
@@ -459,27 +502,27 @@ list of invertible `WiringOp`s (`NodeActive`/`SegActive` bit flips, `SetAttach` 
 size is proportional to the entries that edit touched, not the whole graph. Because deletes
 tombstone rather than remove, undo/redo are just `Wiring::undo_delta`/`redo_delta` replaying those
 flips (keys never move, so `add_route`'s mid-wire split - which the old whole-graph snapshot existed
-to sidestep - is captured precisely). `OsmilogApp::edit_wiring(delta)` records a non-empty delta as
+to sidestep - is captured precisely). `Document::edit_wiring(delta)` records a non-empty delta as
 `GuiUndoAction::WiringDelta { delta, forward: false }` (the `forward` flag picks `undo_delta` vs
 `redo_delta` so one delta serves both directions across the two stacks); there is no "GuiCommand"
 enum, since unlike `sim::command::Command` every `Wiring` edit's inverse is uniform. Component/tunnel
 drag-moves (`GuiUndoAction::MoveComponent`/`MoveTunnel`) are recorded directly
-(`OsmilogApp::commit_move`), bypassing `edit_wiring`, because `grid_pos` is written every drag frame
+(`Document::commit_move`), bypassing `edit_wiring`, because `grid_pos` is written every drag frame
 for live visual feedback - by the time the drag ends there's no "before" state left in the field to
 read, only the `original_grid_pos` captured once at drag-start. `GuiUndoAction` additionally carries
 the **GUI-authoritative record deltas** the sim-side `Command`/`UndoAction` path has no notion of:
-`SetComponentActive`/`SetTunnelActive` (place/delete tombstone toggle), `SwapComponentDef`
+`SetComponentActive`/`SetTunnelActive` (place/delete tombstone toggle), `SwapComponentSpec`
 (reconfigure's whole-record swap), `SetTunnelLabel` (properties-panel rename) - all swap-style, i.e.
 they store the value to restore and return the value they displaced.
 
-**Consuming the stack.** `OsmilogApp::undo`/`redo` are one symmetric operation in opposite
+**Consuming the stack.** `Document::undo`/`redo` are one symmetric operation in opposite
 directions, built on `apply_entry(entry) -> HistoryEntry`: applying an entry performs the reversal
 *and returns the entry that reverses that* (pushed onto the opposite stack). It dispatches
 `Sim(a) -> Sim(circuit.apply_undo(a))`, `Gui(a) -> Gui(self.apply_gui_undo(a))`, and a `Batch` by
 applying its children last-first and collecting their inverses (so redo of an undone batch replays
-it forward). `Circuit::apply_undo` and `OsmilogApp::apply_gui_undo` only touch authoritative state
+it forward). `Circuit::apply_undo` and `Document::apply_gui_undo` only touch authoritative state
 (active flags, input values, tunnel labels, records) - never nets; afterward
-`OsmilogApp::refresh_after_history` re-syncs every live record's wire-node geometry (needed for a
+`Document::refresh_after_history` re-syncs every live record's wire-node geometry (needed for a
 move-undo, which carries no wiring delta), clears the selection, and `rebuild_circuit`s (re-deriving
 nets + settling). Exposed as an Edit menu (Undo / Redo, the latter `add_enabled`-gated on
 `can_redo`) and `Ctrl/Cmd+Z` (undo) / `Ctrl/Cmd+Y` / `Ctrl/Cmd+Shift+Z` (redo), all guarded by the
@@ -527,7 +570,7 @@ app state).
 ## In-Progress / Not Yet Implemented
 
 - **Undo/redo tombstone GC**: undo/redo itself is **implemented and wired** (see the "History / GUI
-  undo" section under GUI for the full mechanism) - `OsmilogApp::undo`/`redo` consume the two-stack
+  undo" section under GUI for the full mechanism) - `Document::undo`/`redo` consume the two-stack
   `History` via a symmetric `apply_entry`, exposed as an Edit menu (Undo / Redo, the latter
   `add_enabled`-gated on `can_redo`) and `Ctrl/Cmd+Z` / `Ctrl/Cmd+Y` / `Ctrl/Cmd+Shift+Z`. What
   remains here is only the **tombstone garbage collection**: deletes and wiring edits tombstone
@@ -552,6 +595,6 @@ app state).
 - **Circuit document management**: subcircuits (see the Documents / Subcircuits sections under GUI)
   are implemented end-to-end, including project-file persistence - but there's no UI yet to rename
   or delete a circuit document once created (`create_circuit_doc` is the only mutator). Undo/redo
-  is also scoped per-document (`History` lives inside each `DocState`), so it does not span a
+  is also scoped per-document (`History` lives inside each `Document`), so it does not span a
   circuit switch - undoing in a parent after editing and switching back out of a child only undoes
   the parent's own edits, never reaches into the child's history.
