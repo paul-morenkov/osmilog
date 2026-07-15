@@ -1,4 +1,5 @@
-use crate::gui::app::{OsmilogApp, PlacedCompKey, PlacedTunnelKey};
+use crate::gui::app::{PlacedCompKey, PlacedTunnelKey};
+use crate::gui::document::Document;
 use crate::gui::geometry::GridPos;
 use crate::gui::wiring::{NodeAttach, WireNodeKey, WiringDelta};
 use crate::sim::component::{CompKey, ComponentSpec};
@@ -59,9 +60,9 @@ pub enum GuiUndoAction {
     },
 }
 
-impl OsmilogApp {
+impl Document {
     // Records a Wiring edit's delta into history, iff it changed anything.
-    // The GUI counterpart of OsmilogApp::apply() for the Command path.
+    // The GUI counterpart of Document::apply() for the Command path.
     pub(crate) fn edit_wiring(&mut self, delta: WiringDelta) {
         if !delta.is_empty() {
             self.history.push_gui(GuiUndoAction::WiringDelta {
@@ -206,6 +207,7 @@ impl OsmilogApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::app::OsmilogApp;
     use crate::gui::history::HistoryEntry;
     use crate::gui::wiring::Wiring;
     use crate::sim::component::PinId;
@@ -220,15 +222,15 @@ mod tests {
     fn edit_wiring_pushes_one_delta_when_changed() {
         let mut app = OsmilogApp::empty();
         let c = comp_keys(2);
-        let delta = app.wiring.add_route(
+        let delta = app.active_mut().wiring.add_route(
             &[GridPos::new(0, 0), GridPos::new(10, 0)],
             NodeAttach::Pin(c[0], PinId::output(0)),
             NodeAttach::Pin(c[1], PinId::input(0)),
         );
-        app.edit_wiring(delta);
-        assert_eq!(app.history.len(), 1);
+        app.active_mut().edit_wiring(delta);
+        assert_eq!(app.active().history.len(), 1);
         assert!(matches!(
-            app.history.last(),
+            app.active().history.last(),
             Some(HistoryEntry::Gui(GuiUndoAction::WiringDelta { .. }))
         ));
     }
@@ -237,11 +239,13 @@ mod tests {
     fn edit_wiring_pushes_nothing_for_empty_delta() {
         let mut app = OsmilogApp::empty();
         // A sub-two-point route is a no-op, producing an empty delta.
-        let delta = app
-            .wiring
-            .add_route(&[GridPos::new(0, 0)], NodeAttach::Free, NodeAttach::Free);
-        app.edit_wiring(delta);
-        assert_eq!(app.history.len(), 0);
+        let delta = app.active_mut().wiring.add_route(
+            &[GridPos::new(0, 0)],
+            NodeAttach::Free,
+            NodeAttach::Free,
+        );
+        app.active_mut().edit_wiring(delta);
+        assert_eq!(app.active().history.len(), 0);
     }
 
     #[test]
@@ -260,25 +264,25 @@ mod tests {
         };
         // The segment key belongs to a different Wiring; app.wiring is empty, so
         // delete produces an empty delta.
-        let delta = app.wiring.delete_segment(missing);
-        app.edit_wiring(delta);
-        assert_eq!(app.history.len(), 0);
+        let delta = app.active_mut().wiring.delete_segment(missing);
+        app.active_mut().edit_wiring(delta);
+        assert_eq!(app.active().history.len(), 0);
     }
 
     #[test]
     fn remove_component_nodes_on_wired_component_pushes_delta() {
         let mut app = OsmilogApp::empty();
         let c = comp_keys(2);
-        app.wiring.add_route(
+        app.active_mut().wiring.add_route(
             &[GridPos::new(0, 0), GridPos::new(10, 0)],
             NodeAttach::Pin(c[0], PinId::output(0)),
             NodeAttach::Pin(c[1], PinId::input(0)),
         );
-        let delta = app.wiring.remove_component_nodes(c[0]);
-        app.edit_wiring(delta);
-        assert_eq!(app.history.len(), 1);
+        let delta = app.active_mut().wiring.remove_component_nodes(c[0]);
+        app.active_mut().edit_wiring(delta);
+        assert_eq!(app.active().history.len(), 1);
         assert!(matches!(
-            app.history.last(),
+            app.active().history.last(),
             Some(HistoryEntry::Gui(GuiUndoAction::WiringDelta { .. }))
         ));
     }

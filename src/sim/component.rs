@@ -279,7 +279,7 @@ impl Component {
     // Latched output values of a sequential component, reported without
     // recomputing from inputs (what evaluate() dispatches to for Logic::Seq).
     // Only valid on Logic::Seq components - callers must filter with
-    // is_sequential() first.
+    // is_stateful() first.
     pub fn observe(&self) -> Vec<Value> {
         match &self.logic {
             Logic::Comb(_) => unreachable!("observe() called on a combinational component"),
@@ -290,7 +290,7 @@ impl Component {
 
     // Advances one clock tick given pre-collected input values (see read_inputs).
     // Mutates persisted state and returns new out_cache values. Only valid on
-    // Logic::Seq components - callers must filter with is_sequential() first.
+    // Logic::Seq components - callers must filter with is_stateful() first.
     pub fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
         match &mut self.logic {
             Logic::Comb(_) => unreachable!("tick() called on a combinational component"),
@@ -302,7 +302,7 @@ impl Component {
     }
 
     // Restores latched sequential state to its power-on initial value. Only
-    // valid on Logic::Seq components - callers must filter with is_sequential().
+    // valid on Logic::Seq components - callers must filter with is_stateful().
     pub fn reset(&mut self) {
         match &mut self.logic {
             Logic::Comb(_) => unreachable!("reset() called on a combinational component"),
@@ -325,18 +325,10 @@ impl Component {
         };
     }
 
-    pub fn is_sequential(&self) -> bool {
-        matches!(self.logic, Logic::Seq(_))
-    }
-
-    pub fn is_subcircuit(&self) -> bool {
-        matches!(self.logic, Logic::Sub(_))
-    }
-
     // Components whose state advances on a clock tick and whose async effects
     // run inside settle(): sequential components and subcircuits. The engine's
     // whole-component sweeps (eval_component's apply_async, tick_clock,
-    // reset_sequential) key on this rather than is_sequential().
+    // reset_sequential) key on this.
     pub fn is_stateful(&self) -> bool {
         matches!(self.logic, Logic::Seq(_) | Logic::Sub(_))
     }

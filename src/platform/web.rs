@@ -77,10 +77,10 @@ impl IoState {
         match outcome {
             Ok(file) => {
                 if let Err(e) = app.load_project_file(&file) {
-                    app.last_settle_error = Some(format!("load failed: {e}"));
+                    app.io_error = Some(format!("load failed: {e}"));
                 }
             }
-            Err(e) => app.last_settle_error = Some(format!("load failed: {e}")),
+            Err(e) => app.io_error = Some(format!("load failed: {e}")),
         }
     }
 
@@ -119,7 +119,7 @@ impl IoState {
             let filename = save_filename(name);
             match app.to_project_file().to_json() {
                 Ok(json) => trigger_download(&json, &filename),
-                Err(e) => app.last_settle_error = Some(format!("save failed: {e}")),
+                Err(e) => app.io_error = Some(format!("save failed: {e}")),
             }
         }
         if !open || confirmed || cancelled {

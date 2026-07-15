@@ -1,18 +1,22 @@
 use eframe;
-use egui::epaint::{PathShape, PathStroke};
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, StrokeKind};
+use egui::{Color32, Painter, Pos2, Rect, Sense, Stroke, StrokeKind};
 use slotmap::{new_key_type, SecondaryMap, SlotMap};
 use std::collections::HashMap;
 
-use crate::gui::clipboard::Clipboard;
-use crate::gui::document::{default_new_circuit_name, CircuitDoc, DocId, DocState};
-use crate::gui::geometry::{
-    tunnel_shape, Camera, GridPos, LABEL_FONT_SIZE, ZOOM_MAX, ZOOM_MIN, ZOOM_SCROLL_SPEED,
+use crate::gui::canvas_draw::{
+    draw_component, draw_ghost, draw_grid, draw_reticle, draw_tunnel, draw_tunnel_ghost,
+    extend_segment, value_stroke,
 };
+use crate::gui::clipboard::Clipboard;
+use crate::gui::clock::ClockRun;
+use crate::gui::document::{default_new_circuit_name, CircuitDoc, DocId, Document};
+use crate::gui::geometry::{tunnel_shape, Camera, GridPos, ZOOM_SCROLL_SPEED};
 use crate::gui::gui_undo::GuiUndoAction;
-use crate::gui::history::{History, HistoryEntry};
+use crate::gui::history::History;
+use crate::gui::memory_editor::MemKind;
 use crate::gui::placed_component::PlacedComponent;
-use crate::gui::shape::{tessellate_path, ComponentShape, BUBBLE_R};
+use crate::gui::properties::PropGuiAction;
+use crate::gui::shape::ComponentShape;
 use crate::gui::theme::Theme;
 use crate::gui::wiring::{NodeAttach, WireNode, WireNodeKey, WireSegKey, WireSegment, Wiring};
 use crate::io::{
@@ -27,15 +31,12 @@ use crate::sim::value::Value;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const PIN_RADIUS: f32 = 3.0;
-const WIRE_THICKNESS_THIN: f32 = 2.0;
-const WIRE_THICKNESS_THICK: f32 = 4.0;
-const COMP_STROKE: f32 = 1.5;
-
-/// Minimum on-screen spacing (px) kept between drawn grid dots; `draw_grid`
-/// thins to a coarser stride of grid cells rather than let dots crowd closer
-/// than this as the view zooms out.
-const GRID_DOT_MIN_SPACING_PX: f32 = 16.0;
+// Shared canvas pixel sizes. pub(crate) because gui::canvas_draw draws with the
+// same measurements the hit-testing here uses.
+pub(crate) const PIN_RADIUS: f32 = 3.0;
+pub(crate) const WIRE_THICKNESS_THIN: f32 = 2.0;
+pub(crate) const WIRE_THICKNESS_THICK: f32 = 4.0;
+pub(crate) const COMP_STROKE: f32 = 1.5;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_SHA: &str = env!("OSMILOG_GIT_SHA");
@@ -119,87 +120,9 @@ pub enum InteractionMode {
 
 // ── PinKind ───────────────────────────────────────────────────────────────────
 
-enum PinKind {
+pub(crate) enum PinKind {
     Input,
     Output,
-}
-
-// ── ClockControl ──────────────────────────────────────────────────────────────
-
-// The clock transport's run state. Editing is locked whenever this is not
-// `Stopped` (see OsmilogApp::editing_locked) - the whole run session (Play →
-// Pause → …) is read-only, and only Stop returns to an editable circuit.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ClockRun {
-    // Idle and editable; the clock is not advancing (initial state).
-    Stopped,
-    // Auto-advancing at `ticks_per_second`; editing locked.
-    Playing,
-    // Frozen mid-run with sequential state preserved; editing locked.
-    Paused,
-}
-
-// Clock transport state: the run mode plus the auto-advance speed and the
-// egui frame-clock timestamp of the last auto-tick. See OsmilogApp::logic for
-// the auto-advance loop and show_menu_bar for the Play/Pause/Step/Stop UI.
-pub struct ClockControl {
-    run: ClockRun,
-    // Auto-advance rate in ticks per real second (Playing only).
-    ticks_per_second: f32,
-    // ctx.input(|i| i.time) value when the last auto-tick fired. Chosen over
-    // std::time::Instant, which panics on wasm32.
-    last_tick_time: f64,
-}
-
-impl Default for ClockControl {
-    fn default() -> Self {
-        Self {
-            run: ClockRun::Stopped,
-            ticks_per_second: 1.0,
-            last_tick_time: 0.0,
-        }
-    }
-}
-
-impl ClockControl {
-    fn interval(&self) -> f64 {
-        1.0 / self.ticks_per_second.max(0.001) as f64
-    }
-}
-
-// Upper bound on ticks fired in a single frame. egui is reactive and only wakes
-// via request_repaint_after, whose delivered frame gap is >= the requested one
-// and jitters longer (OS timer granularity, vsync, WASM setTimeout clamping and
-// background-tab throttling). A late/coalesced wake therefore covers several
-// intervals at once, and all of them must fire or the sequential state skips
-// values. This cap stops a genuine multi-second stall (a breakpoint, a
-// backgrounded tab) from replaying a huge backlog - a "spiral of death"; past it
-// we resync to `now` and drop the backlog instead.
-const MAX_CATCHUP_TICKS: u32 = 8;
-
-// Fixed-timestep accumulator for one frame of the auto-advance loop: given the
-// current frame time, the reference timestamp of the last fired tick, and the
-// interval, returns how many ticks are due this frame and the new reference.
-// Kept pure (no egui/self) so the cadence is unit-testable.
-//
-// It fires *every* whole interval elapsed since `last`, not just one - a single
-// late frame that spans two intervals owes two ticks, and dropping the extra is
-// exactly the "frame skip" a counter shows as missing numbers. The reference
-// advances by whole intervals (`last + n*interval`), preserving sub-interval
-// phase so the average rate stays `1/interval` regardless of frame jitter;
-// snapping it to `now` would fold each frame's overshoot into the cadence (which
-// is why moving the mouse once sped ticking up). Only a backlog beyond
-// MAX_CATCHUP_TICKS - a real stall, not ordinary jitter - resyncs to `now`.
-fn ticks_due(now: f64, last: f64, interval: f64) -> (u32, f64) {
-    if now - last < interval {
-        return (0, last);
-    }
-    let elapsed = ((now - last) / interval).floor() as u32;
-    if elapsed > MAX_CATCHUP_TICKS {
-        (MAX_CATCHUP_TICKS, now)
-    } else {
-        (elapsed, last + elapsed as f64 * interval)
-    }
 }
 
 // ── OsmilogApp ────────────────────────────────────────────────────────────────
@@ -210,29 +133,14 @@ new_key_type! {
 }
 
 pub struct OsmilogApp {
-    pub circuit: Circuit,
-    // Accumulates UndoActions from every circuit mutation issued via
-    // OsmilogApp::apply(). Track-only for now - nothing consumes it yet.
-    pub history: History,
-    pub components: SlotMap<PlacedCompKey, PlacedComponent>,
-    pub tunnels: SlotMap<PlacedTunnelKey, PlacedTunnel>,
-    // GUI wiring: the source of truth for connectivity. After any edit the
-    // circuit's nets are rebuilt from this graph (see rebuild_circuit).
-    pub wiring: Wiring,
-    pub mode: InteractionMode,
-    pub camera: Camera,
-    // None: nothing selected. Some(Single): properties panel/body-drag target.
-    // Some(Bulk): non-empty means Backspace/Delete removes the whole set.
-    // Cleared by a click in empty space or Escape.
-    pub selected: Option<Selection>,
     // Snapshot of the last copied selection, decoupled from live SlotMap
     // keys so it survives undo/redo and further edits to the copied
     // originals. See gui::clipboard::Clipboard.
     pub clipboard: Clipboard,
-    // Also surfaces File > Save/Load I/O errors, not just settle() errors -
-    // both are transient "something went wrong" status shown in the same
-    // red label in the menu bar (see the "Menu bar" section of `ui`).
-    pub last_settle_error: Option<String>,
+    // File > Save/Load I/O errors. Distinct from a Document's own
+    // settle_error (a simulation-side problem); the menu bar shows whichever
+    // is set, I/O first (see the "Menu bar" section of `ui`).
+    pub io_error: Option<String>,
     // Platform-specific file I/O state and orchestration (native OS dialogs vs.
     // browser async pick / Blob download + in-app Save As modal), behind one
     // interface so the call sites below are cfg-free. See `crate::platform` and
@@ -243,29 +151,16 @@ pub struct OsmilogApp {
     // scopes are recorded regardless; this just controls whether the
     // viewer is drawn.
     show_profiler: bool,
-    // Clock transport: run state (play/pause/stop), speed, and auto-advance
-    // timing. Drives the menu-bar controls and the edit lockout during a run.
-    pub clock: ClockControl,
-    // The placed ROM whose contents editor window is currently open, if any.
-    // Set by the "Edit contents…" button in the properties panel; the window
-    // (show_rom_editor) closes it on ✕ or if the component goes away.
-    rom_editor_open: Option<PlacedCompKey>,
-    // Same as rom_editor_open, for RAM's near-identical contents editor
-    // (show_ram_editor).
-    ram_editor_open: Option<PlacedCompKey>,
     // ── Multiple circuits ──────────────────────────────────────────────────
-    // All circuit documents held in memory. Exactly one is *active*: its
-    // per-circuit state (circuit/history/components/tunnels/wiring/mode/pan/
-    // selected/clock/rom_editor_open/ram_editor_open, above) lives directly in
-    // those live fields, and its `CircuitDoc::state` is None. Every other
-    // document parks its state in `CircuitDoc::state` until switched to. See
-    // DocState.
+    // Every circuit document held in memory, active included - a single
+    // source of truth, with no "parked vs. live" distinction. See
+    // gui::document::Document.
     documents: SlotMap<DocId, CircuitDoc>,
     // Stable palette display order for `documents` (SlotMap iteration order is
     // unspecified). Grows as circuits are created.
     doc_order: Vec<DocId>,
-    // Which document's state is currently live in the fields above.
-    active: DocId,
+    // Which document is currently active. See active()/active_mut().
+    active_id: DocId,
     // New-circuit name dialog: Some(buffer) while open (the String doubles as
     // the live text-field contents), None while closed. Mirrors the web Save As
     // modal pattern (platform/web.rs) but lives on the app so native gets it too.
@@ -287,38 +182,25 @@ struct CanvasCtx<'a> {
 }
 
 impl OsmilogApp {
-    // Split out from `new` so tests (and `load_snapshot`) can construct
+    // Split out from `new` so tests (and `load_project_file`) can construct
     // a fresh app without an eframe::CreationContext, which isn't
     // constructible outside a running eframe host.
     pub fn empty() -> Self {
-        // The single initial "Main" document. It's the active one, so its state
-        // lives in the live per-circuit fields below and its CircuitDoc::state
-        // is None (parked state is only for inactive documents).
+        // The single initial "Main" document, active from the start.
         let mut documents = SlotMap::with_key();
-        let active = documents.insert(CircuitDoc {
+        let active_id = documents.insert(CircuitDoc {
             name: "Main".to_string(),
-            state: None,
+            state: Document::blank(),
         });
         Self {
-            circuit: Circuit::new(),
-            history: History::default(),
-            components: SlotMap::default(),
-            tunnels: SlotMap::default(),
-            wiring: Wiring::new(),
-            mode: InteractionMode::Idle,
-            camera: Camera::default(),
-            selected: None,
             clipboard: Clipboard::new(),
-            last_settle_error: None,
+            io_error: None,
             #[allow(clippy::default_constructed_unit_structs)]
             io: platform::IoState::default(),
             show_profiler: false,
-            clock: ClockControl::default(),
-            rom_editor_open: None,
-            ram_editor_open: None,
             documents,
-            doc_order: vec![active],
-            active,
+            doc_order: vec![active_id],
+            active_id,
             new_circuit_dialog: None,
         }
     }
@@ -335,78 +217,38 @@ impl OsmilogApp {
 
     // ── Multiple circuits ──────────────────────────────────────────────────
 
-    // Move the active document's live per-circuit fields out into a DocState.
-    // The placeholders left behind are throwaway - every caller immediately
-    // overwrites the live fields with an incoming DocState (put_active_state).
-    fn take_active_state(&mut self) -> DocState {
-        DocState {
-            circuit: std::mem::replace(&mut self.circuit, Circuit::new()),
-            history: std::mem::take(&mut self.history),
-            components: std::mem::take(&mut self.components),
-            tunnels: std::mem::take(&mut self.tunnels),
-            wiring: std::mem::replace(&mut self.wiring, Wiring::new()),
-            mode: std::mem::replace(&mut self.mode, InteractionMode::Idle),
-            camera: std::mem::take(&mut self.camera),
-            selected: self.selected.take(),
-            clock: std::mem::take(&mut self.clock),
-            rom_editor_open: self.rom_editor_open.take(),
-            ram_editor_open: self.ram_editor_open.take(),
-        }
+    // The active document's state. All per-document reads/writes go through
+    // these two accessors, indexing straight into the single source of truth
+    // (`documents`) rather than a separate set of "live" fields.
+    pub(crate) fn active(&self) -> &Document {
+        &self.documents[self.active_id].state
     }
 
-    // Install a DocState into the live per-circuit fields (inverse of the move
-    // done by take_active_state).
-    fn put_active_state(&mut self, state: DocState) {
-        self.circuit = state.circuit;
-        self.history = state.history;
-        self.components = state.components;
-        self.tunnels = state.tunnels;
-        self.wiring = state.wiring;
-        self.mode = state.mode;
-        self.camera = state.camera;
-        self.selected = state.selected;
-        self.clock = state.clock;
-        self.rom_editor_open = state.rom_editor_open;
-        self.ram_editor_open = state.ram_editor_open;
+    pub(crate) fn active_mut(&mut self) -> &mut Document {
+        &mut self.documents[self.active_id].state
     }
 
-    // Make `target` the active document: park the current active's live state
-    // into its CircuitDoc, then unpark `target`'s state into the live fields.
-    // No-op if `target` is already active. No net rebuild is needed - a parked
-    // circuit already holds its settled nets, moved back intact.
-    fn switch_circuit(&mut self, target: DocId) {
-        if target == self.active {
+    // Make `target` the active document. No-op if `target` is already active.
+    // No net rebuild is needed - every document already holds its own settled
+    // nets, active or not.
+    pub(crate) fn switch_circuit(&mut self, target: DocId) {
+        if target == self.active_id {
             return;
         }
-        let parked = self.take_active_state();
-        self.documents[self.active].state = Some(parked);
-        let incoming = self.documents[target]
-            .state
-            .take()
-            .expect("inactive document must have parked state");
-        self.put_active_state(incoming);
-        self.active = target;
+        self.active_id = target;
         // Reflect any edits made to child circuits while they were the active
         // document: re-derive every placed subcircuit here against its source.
         self.refresh_subcircuits();
     }
 
-    // Create a new blank circuit document, make it active, and open a blank
-    // canvas on it. The previously-active document is parked unchanged.
+    // Create a new blank circuit document and make it active.
     fn create_circuit_doc(&mut self, name: String) {
-        let parked = self.take_active_state();
-        self.documents[self.active].state = Some(parked);
-        let id = self.documents.insert(CircuitDoc { name, state: None });
+        let id = self.documents.insert(CircuitDoc {
+            name,
+            state: Document::blank(),
+        });
         self.doc_order.push(id);
-        self.put_active_state(DocState::blank());
-        self.active = id;
-    }
-
-    fn record_settle_result<T>(&mut self, result: Result<T, crate::sim::circuit::SettleError>) {
-        match result {
-            Ok(_) => self.last_settle_error = None,
-            Err(e) => self.last_settle_error = Some(e.to_string()),
-        }
+        self.active_id = id;
     }
 
     // True while a clock run session is active (Playing or Paused). The single
@@ -414,7 +256,7 @@ impl OsmilogApp {
     // menus, File > Load, and the properties panel are all disabled when this
     // is true. Only Stop (which resets sequential state) returns to editable.
     pub fn editing_locked(&self) -> bool {
-        self.clock.run != ClockRun::Stopped
+        self.active().editing_locked()
     }
 
     // True while live *value* edits must be blocked - an Input's bits, a ROM's
@@ -424,252 +266,70 @@ impl OsmilogApp {
     // so this is true only while actively Playing. Structural edits (widths,
     // wiring, add/delete) stay gated on editing_locked().
     pub fn value_editing_locked(&self) -> bool {
-        self.clock.run == ClockRun::Playing
+        self.active().value_editing_locked()
     }
 
-    // Advances the clock exactly one tick, untracked (bypassing self.apply) so
-    // it never lands on the undo stack - clock stepping is a simulation step,
-    // not a structural edit. Used by both the Step button and the auto-advance
-    // loop in logic().
-    fn tick_once(&mut self) {
-        let result = self.circuit.apply(Command::TickClock).0.unwrap_settle();
-        self.record_settle_result(result);
-    }
-
-    // Stops the clock: resets all sequential state to its power-on value
-    // (untracked, like a tick) and returns to the editable Stopped state.
-    pub fn stop_clock(&mut self) {
-        let result = self
-            .circuit
-            .apply(Command::ResetSequential)
-            .0
-            .unwrap_settle();
-        self.record_settle_result(result);
-        self.clock.run = ClockRun::Stopped;
-    }
-
-    // Auto-advances the clock while Playing. Uses egui's frame clock
-    // (ctx.input(|i| i.time), wasm-safe) with a fixed-timestep accumulator
-    // (ticks_due) that fires every interval elapsed this frame - not just one -
-    // so a late or coalesced repaint doesn't skip ticks. request_repaint_after
-    // keeps the frame loop alive between ticks (the app is otherwise reactive and
-    // wouldn't repaint on its own); we aim it at the next tick boundary rather
-    // than a full interval out, so the wake targets the deadline instead of
-    // drifting past it. A tick that fails to settle auto-pauses so we don't
-    // hammer a broken circuit every frame.
-    fn advance_clock(&mut self, ctx: &egui::Context) {
-        if self.clock.run != ClockRun::Playing {
-            return;
-        }
-        let now = ctx.input(|i| i.time);
-        let interval = self.clock.interval();
-        let (n_ticks, next) = ticks_due(now, self.clock.last_tick_time, interval);
-        self.clock.last_tick_time = next;
-        for _ in 0..n_ticks {
-            self.tick_once();
-            if self.last_settle_error.is_some() {
-                self.clock.run = ClockRun::Paused;
-                return;
-            }
-        }
-        // Wake right at the next boundary (in (0, interval]), not a full interval
-        // from now, so repaint timing tracks the tick schedule.
-        let wait = (self.clock.last_tick_time + interval - now).max(0.0);
-        ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
-    }
-
-    // Applies a Command and records its UndoAction into history in one place;
-    // callers use it exactly like circuit.apply() (same CommandOutput/unwrap_*
-    // chaining) without touching the undo data themselves.
-    fn apply(&mut self, command: Command) -> crate::sim::command::CommandOutput {
-        let (output, undo) = self.circuit.apply(command);
-        self.history.push_sim(undo);
-        output
-    }
-
-    // ── Undo / redo ───────────────────────────────────────────────────────────
-
-    // Applies one history entry (reversing what it recorded) and returns the
-    // entry that reverses *this* application, for the opposite stack - undo
-    // and redo are the same operation in opposite directions.
-    //
-    // A Batch applies child-last-first; the collected inverses reproduce the
-    // original order, so redo of an undone batch replays it forward.
-    fn apply_entry(&mut self, entry: HistoryEntry) -> HistoryEntry {
-        match entry {
-            HistoryEntry::Sim(action) => HistoryEntry::Sim(self.circuit.apply_undo(action)),
-            HistoryEntry::Gui(action) => HistoryEntry::Gui(self.apply_gui_undo(action)),
-            HistoryEntry::Batch(entries) => {
-                let inverses = entries
-                    .into_iter()
-                    .rev()
-                    .map(|e| self.apply_entry(e))
-                    .collect();
-                HistoryEntry::Batch(inverses)
-            }
-        }
-    }
-
-    // Reverses the most recent edit, moving its inverse onto the redo stack.
-    pub(crate) fn undo(&mut self) {
-        if let Some(entry) = self.history.pop_undo() {
-            let inverse = self.apply_entry(entry);
-            self.history.push_redo(inverse);
-            self.refresh_after_history();
-        }
-    }
-
-    // Re-applies the most recently undone edit, moving its inverse back onto the
-    // undo stack.
-    pub(crate) fn redo(&mut self) {
-        if let Some(entry) = self.history.pop_redo() {
-            let inverse = self.apply_entry(entry);
-            self.history.push_undo(inverse);
-            self.refresh_after_history();
-        }
-    }
-
-    // Restores derived state after an undo/redo: re-sync wire-node geometry
-    // (needed for a move-undo, whose MoveComponent carries no wiring delta),
-    // clear any selection that may now point at a tombstoned record, then
-    // rebuild the circuit's nets + settle.
-    fn refresh_after_history(&mut self) {
-        let comp_keys: Vec<PlacedCompKey> = self.active_components().map(|(k, _)| k).collect();
-        for k in comp_keys {
-            self.sync_component_wire_nodes(k);
-        }
-        let tunnel_keys: Vec<PlacedTunnelKey> = self.active_tunnels().map(|(k, _)| k).collect();
-        for k in tunnel_keys {
-            self.sync_tunnel_wire_nodes(k);
-        }
-        self.selected = None;
-        self.rebuild_circuit();
-    }
-
+    // Builds the live sim Component (needs the document registry, so this part
+    // can't live on Document - see instantiate below) then hands it to
+    // Document::place_component for the per-document record/undo bookkeeping.
     fn place_component(&mut self, spec: ComponentSpec, grid_pos: GridPos) -> PlacedCompKey {
-        self.history.begin_batch();
         let comp = self.instantiate(&spec);
-        let key = self.apply(Command::comp(comp)).unwrap_comp();
-        let pc = PlacedComponent::new(key, spec, grid_pos);
-        let pc_key = self.components.insert(pc);
-        // Record the placement's undo: tombstone this record. Paired with the
-        // Sim DeactivateComponent already recorded by apply() above, so undo
-        // both drops the circuit component and hides the visual record.
-        self.history.push_gui(GuiUndoAction::SetComponentActive {
-            key: pc_key,
-            active: false,
-        });
-        self.history.end_batch();
-        pc_key
+        self.active_mut().place_component(comp, spec, grid_pos)
     }
 
-    fn place_tunnel(&mut self, role: TunnelRole, grid_pos: GridPos) -> PlacedTunnelKey {
-        let label = format!("Tunnel{}", self.tunnels.len());
-        self.place_tunnel_labeled(label, role, grid_pos)
-    }
-
-    // Shared by place_tunnel (auto-generated label) and install_circuit_records
-    // (label restored from a saved file - tunnels connect to each other by
-    // matching label, so a loaded tunnel must keep its exact saved label).
-    fn place_tunnel_labeled(
-        &mut self,
-        label: String,
-        role: TunnelRole,
-        grid_pos: GridPos,
-    ) -> PlacedTunnelKey {
-        self.history.begin_batch();
-        let key = self
-            .apply(Command::AddTunnel {
-                label: label.clone(),
-                role,
-            })
-            .unwrap_tunnel();
-        let pt = PlacedTunnel {
-            key,
-            label,
-            role,
-            grid_pos,
-            active: true,
-        };
-        let pt_key = self.tunnels.insert(pt);
-        // Record the placement's undo: tombstone this record (paired with the
-        // Sim DeactivateTunnel from apply() above).
-        self.history.push_gui(GuiUndoAction::SetTunnelActive {
-            key: pt_key,
-            active: false,
-        });
-        self.history.end_batch();
-        pt_key
-    }
-
-    // Live (non-tombstoned) placed components/tunnels, mirroring
-    // Wiring::active_nodes/active_segments. Raw indexing on a known-live key
-    // is still fine - a tombstone is simply never iterated.
-    fn active_components(&self) -> impl Iterator<Item = (PlacedCompKey, &PlacedComponent)> {
-        self.components.iter().filter(|(_, pc)| pc.active)
-    }
-
-    fn active_tunnels(&self) -> impl Iterator<Item = (PlacedTunnelKey, &PlacedTunnel)> {
-        self.tunnels.iter().filter(|(_, pt)| pt.active)
-    }
-
-    // Rebuilds every circuit net from the GUI wiring graph: clear_nets() drops
-    // all nets, then each connected wire group is replayed as circuit links
-    // (fan-out/driver-conflict handling lives in Circuit::link). A group with
-    // no component pin is skipped. Called after any wiring edit.
-    pub(crate) fn rebuild_circuit(&mut self) {
-        puffin::profile_function!();
-        // Reconcile each circuit tunnel's label from its GUI record
-        let renames: Vec<(TunnelKey, String)> = self
-            .tunnels
-            .values()
-            .filter(|pt| self.circuit.tunnel_label(pt.key) != Some(pt.label.as_str()))
-            .map(|pt| (pt.key, pt.label.clone()))
-            .collect();
-        for (key, label) in renames {
-            self.circuit.apply(Command::RenameTunnel {
-                tunnel: key,
-                new_label: label,
-            });
-        }
-
-        self.circuit.apply(Command::ClearNets);
-        for group in self.wiring.groups() {
-            // Map GUI PlacedCompKeys to live circuit CompKeys; a stale key
-            // (component already gone) is dropped.
-            let pins: Vec<(CompKey, PinId)> = group
-                .pins
-                .iter()
-                .filter_map(|&(pck, pin)| {
-                    self.components
-                        .get(pck)
-                        .filter(|pc| pc.active)
-                        .map(|pc| (pc.key, pin))
-                })
-                .collect();
-            let Some(&(anchor_comp, anchor_pin)) = pins.first() else {
-                continue; // no component pin: nothing to drive a net
-            };
-            for &(comp, pin) in &pins[1..] {
-                self.circuit.apply(Command::Link {
-                    a: anchor_comp,
-                    a_pin: anchor_pin,
-                    b: comp,
-                    b_pin: pin,
+    // Applies one intent collected from the properties panel (see
+    // gui::properties::show_properties, which only *describes* edits over a
+    // read-only &Document). This is the single place those descriptions become
+    // mutations - keeping the panel itself decoupled from OsmilogApp.
+    pub(crate) fn apply_prop_gui_action(&mut self, action: PropGuiAction) {
+        match action {
+            PropGuiAction::Reconfigure(key, spec) => self.reconfigure_component(key, spec),
+            PropGuiAction::OpenMemory(key, kind) => self.active_mut().memory_editor.open(key, kind),
+            PropGuiAction::OpenCircuit(doc) => self.switch_circuit(doc),
+            PropGuiAction::SetTunnelLabelLive(key, label) => {
+                // Persist the in-progress edit back to the record (the panel's
+                // text buffer is re-cloned from it next frame). Same-frame with
+                // the render, so the keystroke isn't lost.
+                self.active_mut().tunnels[key].label = label;
+            }
+            PropGuiAction::RenameTunnel(key, label) => {
+                let doc = self.active_mut();
+                let tunnel_key = doc.tunnels[key].key;
+                // Read the old label from the circuit (the record's copy was
+                // already updated live) to capture undo's restore value.
+                let old_label = doc.circuit.tunnels.get(tunnel_key).map(|t| t.label.clone());
+                doc.history.begin_batch();
+                doc.apply(Command::RenameTunnel {
+                    tunnel: tunnel_key,
+                    new_label: label.clone(),
                 });
-            }
-            for &ptk in &group.tunnels {
-                if let Some(pt) = self.tunnels.get(ptk).filter(|pt| pt.active) {
-                    self.circuit.apply(Command::LinkTunnel {
-                        tunnel: pt.key,
-                        comp: anchor_comp,
-                        pin: anchor_pin,
-                    });
+                // Record the record-side label change's undo (the Sim
+                // RenameTunnel above only reverses the circuit's copy).
+                if let Some(old) = old_label {
+                    doc.history
+                        .push_gui(GuiUndoAction::SetTunnelLabel { key, label: old });
                 }
+                doc.tunnels[key].label = label;
+                doc.history.end_batch();
+                let result = doc.circuit.settle();
+                doc.record_settle_result(result);
             }
+            PropGuiAction::Delete(sel) => match sel {
+                Selected::Component(key) => self.active_mut().delete_component(key),
+                Selected::Tunnel(key) => self.active_mut().delete_tunnel(key),
+                Selected::Wire(seg) => self.active_mut().delete_wire(seg),
+            },
         }
-        let result = self.circuit.settle();
-        self.record_settle_result(result);
+    }
+
+    // Thin registry-glue wrapper over Document::reconfigure_component: builds
+    // the new component via instantiate (which needs the document registry, so
+    // it can't run inside Document) and hands it to the active document, which
+    // owns all the record/wiring/undo bookkeeping.
+    pub(crate) fn reconfigure_component(&mut self, pc_key: PlacedCompKey, new_spec: ComponentSpec) {
+        let new_comp = self.instantiate(&new_spec);
+        self.active_mut()
+            .reconfigure_component(pc_key, new_spec, new_comp);
     }
 
     // ── Subcircuits ───────────────────────────────────────────────────────────
@@ -680,7 +340,7 @@ impl OsmilogApp {
     // to_component can't do - it has no document registry). This is the one
     // spec->component build path the GUI uses (place_component /
     // reconfigure_component), so subcircuits always get a real inner circuit.
-    fn instantiate(&self, spec: &ComponentSpec) -> Component {
+    pub(crate) fn instantiate(&self, spec: &ComponentSpec) -> Component {
         let mut visited = Vec::new();
         self.instantiate_with(spec, &mut visited)
     }
@@ -723,9 +383,10 @@ impl OsmilogApp {
     }
 
     // Builds a fresh standalone Circuit from a referenced document's records
-    // (its parked DocState), translating placed components/tunnels + the wiring
-    // graph the same way rebuild_circuit translates the live doc - but into a
-    // new Circuit rather than self.circuit, untracked, and recursing through
+    // (its Document in the documents slotmap), translating placed
+    // components/tunnels + the wiring graph the same way Document::
+    // rebuild_circuit translates its own live doc - but into a new Circuit
+    // rather than the active document's, untracked, and recursing through
     // instantiate_with for nested subcircuits. Returns the inner Input/Output
     // component keys ordered top-down (then left-to-right), which is the pin
     // order the subcircuit component exposes and its shape lays out.
@@ -734,11 +395,12 @@ impl OsmilogApp {
         doc: DocId,
         visited: &mut Vec<DocId>,
     ) -> (Circuit, Vec<CompKey>, Vec<CompKey>) {
-        // A subcircuit only ever targets a parked (non-active) document, so its
-        // records live in the CircuitDoc's state.
-        let Some(state) = self.documents.get(doc).and_then(|d| d.state.as_ref()) else {
+        // Every document's records live directly in its CircuitDoc::state,
+        // active or not.
+        let Some(cdoc) = self.documents.get(doc) else {
             return (Circuit::new(), Vec::new(), Vec::new());
         };
+        let state = &cdoc.state;
 
         let mut circuit = Circuit::new();
         let mut comp_map: SecondaryMap<PlacedCompKey, CompKey> = SecondaryMap::new();
@@ -842,13 +504,13 @@ impl OsmilogApp {
     // CompKey, same outer pins), so inner edits that didn't change the boundary
     // are reflected. Used by refresh_subcircuits for the common case.
     fn rebuild_subcircuit_inner(&mut self, pck: PlacedCompKey) {
-        let ComponentSpec::Subcircuit { doc, .. } = self.components[pck].spec else {
+        let ComponentSpec::Subcircuit { doc, .. } = self.active().components[pck].spec else {
             return;
         };
-        let comp_key = self.components[pck].key;
+        let comp_key = self.active().components[pck].key;
         let mut visited = Vec::new();
         let (inner, inputs, outputs) = self.build_doc_circuit(doc, &mut visited);
-        if let Some(comp) = self.circuit.components.get_mut(comp_key) {
+        if let Some(comp) = self.active_mut().circuit.components.get_mut(comp_key) {
             if let Logic::Sub(sub) = &mut comp.logic {
                 sub.inner = inner;
                 sub.inputs = inputs;
@@ -866,6 +528,7 @@ impl OsmilogApp {
     // rebuild_circuit so the re-derived inner outputs settle outward.
     fn refresh_subcircuits(&mut self) {
         let subs: Vec<(PlacedCompKey, DocId)> = self
+            .active()
             .active_components()
             .filter_map(|(pck, pc)| match &pc.spec {
                 ComponentSpec::Subcircuit { doc, .. } => Some((pck, *doc)),
@@ -876,7 +539,7 @@ impl OsmilogApp {
         let mut rebuilt_any = false;
         for (pck, doc) in subs {
             let (name, input_widths, output_widths) = self.derive_subcircuit_interface(doc);
-            let (old_in, old_out, old_name) = match &self.components[pck].spec {
+            let (old_in, old_out, old_name) = match &self.active().components[pck].spec {
                 ComponentSpec::Subcircuit {
                     input_widths,
                     output_widths,
@@ -903,7 +566,7 @@ impl OsmilogApp {
                 // shape is unchanged since pin counts match) and rebuild the
                 // inner circuit in place.
                 if old_name != name {
-                    self.components[pck].spec = ComponentSpec::Subcircuit {
+                    self.active_mut().components[pck].spec = ComponentSpec::Subcircuit {
                         doc,
                         name,
                         input_widths,
@@ -916,25 +579,19 @@ impl OsmilogApp {
         }
 
         if rebuilt_any {
-            self.rebuild_circuit();
+            self.active_mut().rebuild_circuit();
         }
     }
 
     // The documents referenced (as subcircuits) directly by `doc`'s placed
-    // components. Reads the live fields for the active doc, the parked state
-    // otherwise.
+    // components. Every document's records live directly in its
+    // CircuitDoc::state, active or not, so no active-doc special case is
+    // needed here.
     fn doc_references(&self, doc: DocId) -> Vec<DocId> {
-        let comps = if doc == self.active {
-            Some(&self.components)
-        } else {
-            self.documents
-                .get(doc)
-                .and_then(|d| d.state.as_ref())
-                .map(|s| &s.components)
-        };
-        comps
+        self.documents
+            .get(doc)
             .into_iter()
-            .flat_map(|c| c.values())
+            .flat_map(|d| d.state.components.values())
             .filter(|pc| pc.active)
             .filter_map(|pc| match &pc.spec {
                 ComponentSpec::Subcircuit { doc, .. } => Some(*doc),
@@ -947,13 +604,13 @@ impl OsmilogApp {
     // create a cycle: true if target is the active doc itself, or target
     // already (transitively) references the active doc.
     fn would_cycle(&self, target: DocId) -> bool {
-        if target == self.active {
+        if target == self.active_id {
             return true;
         }
         let mut stack = vec![target];
         let mut seen: Vec<DocId> = Vec::new();
         while let Some(d) = stack.pop() {
-            if d == self.active {
+            if d == self.active_id {
                 return true;
             }
             if seen.contains(&d) {
@@ -967,108 +624,7 @@ impl OsmilogApp {
 
     // Repositions the component's wire-anchor nodes to its current pin grid
     // positions (after a move or reconfigure). Segments to them stretch.
-    fn sync_component_wire_nodes(&mut self, pck: PlacedCompKey) {
-        let Some(pc) = self.components.get(pck) else {
-            return;
-        };
-        let shape = &pc.shape;
-        let grid_pos = pc.grid_pos;
-        self.wiring
-            .sync_component_nodes(pck, |pin| pin_grid_pos(shape, grid_pos, pin));
-    }
-
-    fn sync_tunnel_wire_nodes(&mut self, ptk: PlacedTunnelKey) {
-        let Some(pt) = self.tunnels.get(ptk) else {
-            return;
-        };
-        self.wiring.sync_tunnel_nodes(ptk, tunnel_pin_grid(pt));
-    }
-
-    // The resolved circuit Value at each wire node, for colouring segments. All
-    // nodes in a connected group share one net, so we resolve the group's value
-    // from any pin/tunnel endpoint on it (Floating if it has none).
-    fn wire_node_values(&self) -> HashMap<WireNodeKey, Value> {
-        puffin::profile_function!();
-        let mut out = HashMap::new();
-        for group in self.wiring.groups() {
-            let mut val = Value::Floating;
-            for &(pck, pin) in &group.pins {
-                if let Some(pc) = self.components.get(pck).filter(|pc| pc.active) {
-                    if let Some(nk) = self.circuit.components[pc.key].net_of(pin) {
-                        val = self.circuit.nets[nk].value;
-                        break;
-                    }
-                }
-            }
-            if val == Value::Floating {
-                for &ptk in &group.tunnels {
-                    if let Some(pt) = self.tunnels.get(ptk).filter(|pt| pt.active) {
-                        if let Some(nk) = self.circuit.tunnels.get(pt.key).and_then(|t| t.net) {
-                            val = self.circuit.nets[nk].value;
-                            break;
-                        }
-                    }
-                }
-            }
-            for nk in group.nodes {
-                out.insert(nk, val);
-            }
-        }
-        out
-    }
-
-    // Resolves what lies under a screen position for wiring: the attachment
-    // to bind, the on-grid point to route to, and whether it's a real
-    // terminal vs. empty space. Priority: pin (out, then in), tunnel, wire
-    // node, wire segment, else the snapped cursor cell.
-    fn wire_target_at(&self, pos: Pos2, camera: Camera) -> (NodeAttach, GridPos, bool) {
-        puffin::profile_function!();
-        if let Some((pck, pin)) = pin_at_pos(self.active_components(), camera, pos, PinKind::Output)
-        {
-            let gp = pin_grid_pos(
-                &self.components[pck].shape,
-                self.components[pck].grid_pos,
-                pin,
-            );
-            return (NodeAttach::Pin(pck, pin), gp, true);
-        }
-        if let Some((pck, pin)) = pin_at_pos(self.active_components(), camera, pos, PinKind::Input)
-        {
-            let gp = pin_grid_pos(
-                &self.components[pck].shape,
-                self.components[pck].grid_pos,
-                pin,
-            );
-            return (NodeAttach::Pin(pck, pin), gp, true);
-        }
-        if let Some(ptk) = tunnel_pin_at_pos(self.active_tunnels(), camera, pos) {
-            return (
-                NodeAttach::Tunnel(ptk),
-                tunnel_pin_grid(&self.tunnels[ptk]),
-                true,
-            );
-        }
-        if let Some(nk) = self.wiring.node_at_pos(pos, camera) {
-            return (NodeAttach::Free, self.wiring.nodes[nk].pos, true);
-        }
-        if let Some((_, gp)) = self.wiring.segment_at_pos(pos, camera) {
-            return (NodeAttach::Free, gp, true);
-        }
-        (NodeAttach::Free, camera.screen_to_grid(pos), false)
-    }
-
-    // A wire may only start on a real terminal (pin, tunnel, or existing wire),
-    // not in empty space.
-    fn wire_start_at(&self, pos: Pos2, camera: Camera) -> Option<(NodeAttach, GridPos)> {
-        let (attach, gp, terminal) = self.wire_target_at(pos, camera);
-        terminal.then_some((attach, gp))
-    }
-
     // ── Save / load ──────────────────────────────────────────────────────
-
-    pub fn to_snapshot(&self) -> CircuitSnapshot {
-        extract_records(&self.components, &self.tunnels, &self.wiring).0
-    }
 
     // Serializes the whole workspace - every circuit document, not just the
     // active one - into a ProjectFile, with each placed subcircuit's
@@ -1082,7 +638,7 @@ impl OsmilogApp {
             .enumerate()
             .map(|(i, &d)| (d, i))
             .collect();
-        let active = doc_index[&self.active];
+        let active = doc_index[&self.active_id];
         let circuits = self
             .doc_order
             .iter()
@@ -1091,21 +647,15 @@ impl OsmilogApp {
         ProjectFile::new(active, circuits)
     }
 
-    // Builds one document's CircuitEntry. Reads the live per-circuit fields for
-    // the active document, the parked DocState otherwise. Subcircuit references
+    // Builds one document's CircuitEntry. Every document's records live
+    // directly in its CircuitDoc::state, active or not. Subcircuit references
     // map each placed Subcircuit component (by its emitted index) to the index
     // of the document it references, via `doc_index`.
     fn circuit_entry_of(&self, doc: DocId, doc_index: &HashMap<DocId, usize>) -> CircuitEntry {
         let name = self.documents[doc].name.clone();
-        let (components_map, tunnels_map, wiring) = if doc == self.active {
-            (&self.components, &self.tunnels, &self.wiring)
-        } else {
-            let st = self.documents[doc]
-                .state
-                .as_ref()
-                .expect("inactive document must have parked state");
-            (&st.components, &st.tunnels, &st.wiring)
-        };
+        let state = &self.documents[doc].state;
+        let (components_map, tunnels_map, wiring) =
+            (&state.components, &state.tunnels, &state.wiring);
         let (snapshot, comp_index) = extract_records(components_map, tunnels_map, wiring);
         let subcircuits = components_map
             .iter()
@@ -1127,28 +677,6 @@ impl OsmilogApp {
         }
     }
 
-    // Replaces the active document's circuit with the one described by
-    // `snapshot`. Validates first so a malformed snapshot is rejected before any
-    // existing state is touched. Single-document path (no subcircuit references);
-    // the whole-workspace load is `load_project_file`.
-    pub fn load_snapshot(&mut self, snapshot: &CircuitSnapshot) -> Result<(), LoadError> {
-        snapshot.validate()?;
-
-        self.circuit = Circuit::new();
-        self.components = SlotMap::default();
-        self.tunnels = SlotMap::default();
-        self.wiring = Wiring::new();
-        self.selected = None;
-        self.mode = InteractionMode::Idle;
-        self.last_settle_error = None;
-
-        self.install_circuit_records(snapshot, &[], &[]);
-        self.rebuild_circuit();
-        // Clear undo stack that results from `rebuild_circuit()`
-        self.history = History::default();
-        Ok(())
-    }
-
     // Replaces the whole workspace with the circuits described by `file`,
     // restoring its active document. Validates first so a malformed file is
     // rejected before any existing state is touched.
@@ -1156,12 +684,12 @@ impl OsmilogApp {
     // Every document is allocated (blank) up front, so a stable DocId exists for
     // each circuit before any records are placed - subcircuit references then
     // resolve by index regardless of the order documents are populated in.
-    // Circuits are loaded one at a time into the live fields (parking the
-    // previous), which reuses the ordinary placement machinery. A placed
-    // subcircuit's inner Circuit is left as a placeholder here and rebuilt
-    // against its (now fully-populated) referenced document by the final
-    // `refresh_subcircuits`; parked documents' subcircuits are likewise rebuilt
-    // when they're later switched to.
+    // Circuits are loaded one at a time by making each one active in turn
+    // (make_live_for_load) and installing its records, which reuses the
+    // ordinary placement machinery. A placed subcircuit's inner Circuit is left
+    // as a placeholder here and rebuilt against its (now fully-populated)
+    // referenced document by the final `refresh_subcircuits`; other documents'
+    // subcircuits are likewise rebuilt when they're later switched to.
     pub fn load_project_file(&mut self, file: &ProjectFile) -> Result<(), LoadError> {
         file.validate()?;
 
@@ -1174,11 +702,8 @@ impl OsmilogApp {
 
         self.documents = documents;
         self.doc_order = doc_ids.clone();
-        self.last_settle_error = None;
-        // Start with circuit 0 live: move its blank state into the live fields.
-        self.active = doc_ids[0];
-        self.documents[self.active].state = None;
-        self.put_active_state(DocState::blank());
+        self.io_error = None;
+        self.active_id = doc_ids[0];
 
         for (i, entry) in file.circuits.iter().enumerate() {
             self.make_live_for_load(doc_ids[i]);
@@ -1188,45 +713,35 @@ impl OsmilogApp {
         // Restore the saved active document and reconcile its placed subcircuits
         // against the now fully-populated referenced documents.
         self.make_live_for_load(doc_ids[file.active]);
-        self.selected = None;
-        self.mode = InteractionMode::Idle;
+        self.active_mut().selected = None;
+        self.active_mut().mode = InteractionMode::Idle;
         self.refresh_subcircuits();
-        self.rebuild_circuit();
+        self.active_mut().rebuild_circuit();
         Ok(())
     }
 
-    // Parks the current active document and makes `target` live, without the
-    // `refresh_subcircuits` a normal `switch_circuit` runs - during a load the
-    // referenced documents aren't all populated yet, so subcircuit rebuilding is
-    // deferred to the end of `load_project_file`. No-op if already active.
+    // Makes `target` the active document, without the `refresh_subcircuits` a
+    // normal `switch_circuit` runs - during a load the referenced documents
+    // aren't all populated yet, so subcircuit rebuilding is deferred to the end
+    // of `load_project_file`. Just an active_id reassignment: every document
+    // already has its own (blank, freshly allocated) Document in the slotmap.
     fn make_live_for_load(&mut self, target: DocId) {
-        if target == self.active {
-            return;
-        }
-        let parked = self.take_active_state();
-        self.documents[self.active].state = Some(parked);
-        let incoming = self.documents[target]
-            .state
-            .take()
-            .expect("document being loaded must have parked state");
-        self.put_active_state(incoming);
-        self.active = target;
+        self.active_id = target;
     }
 
-    // Loads one circuit's records into the (blank) live fields, then rebuilds
-    // its nets. Assumes the live fields are the fresh blank state for this
-    // document (as arranged by `load_project_file`).
+    // Loads one circuit's records into the (blank) active document, then
+    // rebuilds its nets. Assumes the active document is the fresh blank state
+    // for this circuit (as arranged by `load_project_file`).
     fn load_circuit_entry(&mut self, entry: &CircuitEntry, doc_ids: &[DocId]) {
         self.install_circuit_records(&entry.snapshot, &entry.subcircuits, doc_ids);
-        self.rebuild_circuit();
-        // See load_snapshot: placement records undo entries that loading a
-        // fresh document should not carry.
-        self.history = History::default();
+        self.active_mut().rebuild_circuit();
+        // Placement records undo entries that loading a fresh document should
+        // not carry.
+        self.active_mut().history = History::default();
     }
 
     // Places one circuit's records (components, tunnels, wire nodes/segments)
-    // into the live fields and re-binds subcircuit references. Shared by the
-    // single-document `load_snapshot` (which passes no subcircuit refs) and the
+    // into the active document and re-binds subcircuit references, for the
     // per-circuit `load_circuit_entry`. Does not rebuild nets - the caller does,
     // once its records are in.
     fn install_circuit_records(
@@ -1249,7 +764,9 @@ impl OsmilogApp {
             if let (Some(&pck), Some(&doc)) =
                 (comp_keys.get(sub.component), doc_ids.get(sub.circuit))
             {
-                if let ComponentSpec::Subcircuit { doc: d, .. } = &mut self.components[pck].spec {
+                if let ComponentSpec::Subcircuit { doc: d, .. } =
+                    &mut self.active_mut().components[pck].spec
+                {
                     *d = doc;
                 }
             }
@@ -1258,7 +775,13 @@ impl OsmilogApp {
         let tunnel_keys: Vec<PlacedTunnelKey> = snapshot
             .tunnels
             .iter()
-            .map(|entry| self.place_tunnel_labeled(entry.label.clone(), entry.role, entry.grid_pos))
+            .map(|entry| {
+                self.active_mut().place_tunnel_labeled(
+                    entry.label.clone(),
+                    entry.role,
+                    entry.grid_pos,
+                )
+            })
             .collect();
 
         let node_keys: Vec<_> = snapshot
@@ -1281,7 +804,7 @@ impl OsmilogApp {
                     }
                     NodeAttachEntry::Tunnel { tunnel } => NodeAttach::Tunnel(tunnel_keys[tunnel]),
                 };
-                self.wiring.nodes.insert(WireNode {
+                self.active_mut().wiring.nodes.insert(WireNode {
                     pos: entry.pos,
                     attach,
                     active: true,
@@ -1290,7 +813,7 @@ impl OsmilogApp {
             .collect();
 
         for s in &snapshot.segments {
-            self.wiring.segments.insert(WireSegment {
+            self.active_mut().wiring.segments.insert(WireSegment {
                 a: node_keys[s.a],
                 b: node_keys[s.b],
                 active: true,
@@ -1298,981 +821,18 @@ impl OsmilogApp {
         }
     }
 
-    /// Shows the properties panel for the selected item. Edits call
-    /// `self.reconfigure_component()` with an updated `ComponentSpec`.
-    fn show_properties(&mut self, ui: &mut egui::Ui) {
-        let sel = match &self.selected {
-            None => {
-                ui.label("Click a component or tunnel to select it.");
-                return;
+    // Draws any open ROM/RAM contents editor windows (see gui::memory_editor)
+    // and applies the word edits they collected. Applying stays here because the
+    // write paths need &mut Circuit + settle (ROM) that MemoryEditor doesn't own.
+    fn show_memory_editors(&mut self, ctx: &egui::Context) {
+        let value_locked = self.value_editing_locked();
+        let doc = self.active_mut();
+        let edits = doc.memory_editor.show(ctx, &doc.components, value_locked);
+        for edit in edits {
+            match edit.kind {
+                MemKind::Rom => doc.write_rom_cell(edit.pc, edit.index, edit.value),
+                MemKind::Ram => doc.write_ram_cell(edit.pc, edit.index, edit.value),
             }
-            Some(Selection::Bulk(items)) => {
-                ui.heading("SELECTION");
-                ui.separator();
-                ui.label(format!("{} items selected.", items.len()));
-                ui.label("Press Backspace or Delete to remove them.");
-                return;
-            }
-            Some(Selection::Single(sel)) => *sel,
-        };
-        // A run session makes structural edits read-only, but value edits
-        // (an Input's bits, ROM/RAM contents) stay live while Paused. Rather
-        // than blanket-disabling the panel, each per-component editor gates its
-        // own widgets - structural ones on editing_locked(), value ones on
-        // value_editing_locked() - so the carve-out lands on exactly those.
-        match sel {
-            Selected::Component(key) => self.show_component_properties(key, ui),
-            Selected::Tunnel(key) => self.show_tunnel_properties(key, ui),
-            Selected::Wire(_) => {
-                ui.heading("WIRE");
-                ui.label("A wire segment. Press Backspace or Delete to remove it.");
-            }
-        }
-
-        ui.separator();
-        // Delete is structural: disabled for the whole run session.
-        ui.add_enabled_ui(!self.editing_locked(), |ui| {
-            if ui.button("Delete").clicked() {
-                match sel {
-                    Selected::Component(key) => self.delete_component(key),
-                    Selected::Tunnel(key) => self.delete_tunnel(key),
-                    Selected::Wire(seg) => self.delete_wire(seg),
-                }
-            }
-        });
-    }
-
-    fn show_tunnel_properties(&mut self, key: PlacedTunnelKey, ui: &mut egui::Ui) {
-        let role = self.tunnels[key].role;
-        let tunnel_key = self.tunnels[key].key;
-
-        ui.heading(match role {
-            TunnelRole::Feed => "TUNNEL (FEED)",
-            TunnelRole::Pull => "TUNNEL (PULL)",
-        });
-        ui.separator();
-        // A tunnel's label is structural (it rewires nets): read-only for the
-        // whole run session.
-        ui.add_enabled_ui(!self.editing_locked(), |ui| {
-            ui.label("Label:");
-            let mut label = self.tunnels[key].label.clone();
-            let response = ui.text_edit_singleline(&mut label);
-            if response.changed() {
-                self.tunnels[key].label = label.clone();
-            }
-
-            // Commit on any focus loss (Enter/Tab/click-away), not just Enter:
-            // the record label is already updated live above (on `changed()`),
-            // but the circuit's hasn't committed yet, so read the old label
-            // from the circuit to both detect a real change and capture undo's
-            // restore value. (rebuild_circuit also reconciles as a backstop.)
-            if response.lost_focus() {
-                let old_label = self
-                    .circuit
-                    .tunnels
-                    .get(tunnel_key)
-                    .map(|t| t.label.clone());
-                if old_label.as_deref() != Some(label.as_str()) {
-                    self.history.begin_batch();
-                    self.apply(Command::RenameTunnel {
-                        tunnel: tunnel_key,
-                        new_label: label.clone(),
-                    });
-                    // Record the record-side label change's undo (the Sim
-                    // RenameTunnel above only reverses the circuit's copy).
-                    if let Some(old) = old_label {
-                        self.history
-                            .push_gui(GuiUndoAction::SetTunnelLabel { key, label: old });
-                    }
-                    self.tunnels[key].label = label;
-                    self.history.end_batch();
-                    let result = self.circuit.settle();
-                    self.record_settle_result(result);
-                }
-            }
-        });
-    }
-
-    fn show_component_properties(&mut self, key: PlacedCompKey, ui: &mut egui::Ui) {
-        let comp_key = self.components[key].key;
-
-        ui.heading(self.components[key].spec.label());
-        ui.separator();
-
-        // A run session locks *structural* edits (widths, arity, wiring) for its
-        // whole duration, but carves out live *value* edits - an Input's bits and
-        // ROM/RAM contents - which stay pokeable while Paused (blocked only while
-        // actively Playing). Every editable widget below is gated on whichever
-        // predicate applies; read-only value displays stay ungated so a running
-        // circuit's state remains observable.
-        let structural_ok = !self.editing_locked();
-        let value_ok = !self.value_editing_locked();
-
-        // The spec is matched *by reference*: a ROM/RAM spec carries its whole
-        // contents buffer (up to tens of MiB), so cloning it every frame just to
-        // own the match scrutinee is out. Borrowing it means the arms can't call
-        // the &mut self mutators (reconfigure/switch/open-editor) while the match
-        // is live, so each records a deferred PropEdit that we apply once the
-        // borrow ends, just past the match.
-        enum PropEdit {
-            Reconfigure(ComponentSpec),
-            OpenRom,
-            OpenRam,
-            OpenCircuit(DocId),
-        }
-        let mut edit: Option<PropEdit> = None;
-
-        let fmt_val = |v: Value| match v {
-            Value::Fixed { bits, width } => format!("0x{:X} ({}b)", bits, width),
-            Value::Floating => "Floating".to_string(),
-            Value::Invalid => "Invalid (width mismatch)".to_string(),
-        };
-
-        match &self.components[key].spec {
-            ComponentSpec::Input(Input {
-                mut bits,
-                mut width,
-            }) => {
-                let mut changed = false;
-                ui.label(format!("Value: 0x{:X}", bits));
-                // `bits` is the live value: editable while Paused.
-                ui.add_enabled_ui(value_ok, |ui| {
-                    // `bits` controlled by checkbox or textfield depending on `width`
-                    if width == 1 {
-                        let mut high = bits != 0;
-                        if ui.checkbox(&mut high, "Toggle").clicked() {
-                            bits = high as u32;
-                            changed = true;
-                        }
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.label("Bits:");
-                            changed |= ui
-                                .add(egui::DragValue::new(&mut bits).range(0..=Value::mask(width)))
-                                .changed();
-                        });
-                    }
-                });
-                // `width` is structural: locked for the whole run session.
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut width).range(1..=32))
-                            .changed();
-                    });
-                });
-                if changed {
-                    bits &= Value::mask(width); // In case width was changed below max `bits` value
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Input(Input {
-                        bits,
-                        width,
-                    })));
-                }
-            }
-            ComponentSpec::Constant(Constant {
-                mut bits,
-                mut width,
-            }) => {
-                let mut changed = false;
-                ui.label(format!("Value: 0x{:X}", bits));
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    // `bits` controlled by checkbox or textfield depending on `width`
-                    if width == 1 {
-                        let mut high = bits != 0;
-                        if ui.checkbox(&mut high, "Toggle").clicked() {
-                            bits = high as u32;
-                            changed = true;
-                        }
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.label("Bits:");
-                            changed |= ui
-                                .add(egui::DragValue::new(&mut bits).range(0..=Value::mask(width)))
-                                .changed();
-                        });
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("Width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut width).range(1..=32))
-                            .changed();
-                    });
-                });
-                if changed {
-                    bits &= Value::mask(width); // In case width was changed below max `bits` value
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Constant(Constant {
-                        bits,
-                        width,
-                    })));
-                }
-            }
-            ComponentSpec::Output => {
-                let val = self.circuit.read_output(comp_key);
-                ui.label(format!("Value: {}", fmt_val(val)));
-            }
-            ComponentSpec::Gate(Gate {
-                op,
-                mut n_inputs,
-                mut width,
-            }) => {
-                let op = *op;
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    if op != GateOp::Not {
-                        ui.horizontal(|ui| {
-                            ui.label("Inputs:");
-                            changed |= ui
-                                .add(egui::DragValue::new(&mut n_inputs).range(2..=8))
-                                .changed();
-                        });
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("Width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut width).range(1..=32))
-                            .changed();
-                    });
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Gate(Gate {
-                        op,
-                        n_inputs,
-                        width,
-                    })));
-                }
-            }
-            ComponentSpec::Mux(Mux {
-                mut data_width,
-                mut sel_width,
-            }) => {
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Sel width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut sel_width).range(1..=4))
-                            .changed();
-                    });
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Mux(Mux {
-                        data_width,
-                        sel_width,
-                    })));
-                }
-            }
-            ComponentSpec::Demux(Demux {
-                mut data_width,
-                mut sel_width,
-            }) => {
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Sel width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut sel_width).range(1..=4))
-                            .changed();
-                    });
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Demux(Demux {
-                        data_width,
-                        sel_width,
-                    })));
-                }
-            }
-            ComponentSpec::Reg(RegConf { mut data_width }) => {
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                            .changed();
-                    });
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Reg(RegConf {
-                        data_width,
-                    })));
-                }
-
-                let cur = self.circuit.components[comp_key].pins.out_cache[0];
-                ui.label(format!("Value: {}", fmt_val(cur)));
-            }
-            ComponentSpec::ShiftReg(ShiftRegConf {
-                mut data_width,
-                mut num_stages,
-                mut parallel_load,
-            }) => {
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Stages:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut num_stages).range(1..=16))
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        changed |= ui.checkbox(&mut parallel_load, "Parallel load").changed();
-                    });
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::ShiftReg(
-                        ShiftRegConf {
-                            data_width,
-                            num_stages,
-                            parallel_load,
-                        },
-                    )));
-                }
-
-                for (i, v) in self.circuit.components[comp_key]
-                    .pins
-                    .out_cache
-                    .iter()
-                    .enumerate()
-                {
-                    ui.label(format!("Stage {i}: {}", fmt_val(*v)));
-                }
-            }
-            ComponentSpec::Counter(CounterConf {
-                mut data_width,
-                mut max_value,
-                mut overflow_action,
-            }) => {
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Max value:");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut max_value)
-                                    .range(0..=Value::mask(data_width)),
-                            )
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Overflow action:");
-                        egui::ComboBox::from_id_salt(key)
-                            .selected_text(format!("{overflow_action:?}"))
-                            .show_ui(ui, |ui| {
-                                for action in [
-                                    OverflowAction::Wrap,
-                                    OverflowAction::StayMax,
-                                    OverflowAction::PassMax,
-                                    OverflowAction::LoadNext,
-                                ] {
-                                    changed |= ui
-                                        .selectable_value(
-                                            &mut overflow_action,
-                                            action,
-                                            format!("{action:?}"),
-                                        )
-                                        .changed();
-                                }
-                            });
-                    });
-                });
-                if changed {
-                    max_value = max_value.min(Value::mask(data_width)); // Re-cap in case data_width shrank below max_value
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Counter(CounterConf {
-                        data_width,
-                        max_value,
-                        overflow_action,
-                    })));
-                }
-
-                let q = self.circuit.components[comp_key].pins.out_cache[0];
-                let carry = self.circuit.components[comp_key].pins.out_cache[1];
-                ui.label(format!("Q: {}", fmt_val(q)));
-                ui.label(format!("Carry: {}", fmt_val(carry)));
-            }
-            ComponentSpec::DFlipFlop(_)
-            | ComponentSpec::TFlipFlop(_)
-            | ComponentSpec::JKFlipFlop(_)
-            | ComponentSpec::SRFlipFlop(_) => {
-                let cur = self.circuit.components[comp_key].pins.out_cache[0];
-                ui.label(format!("Value: {}", fmt_val(cur)));
-            }
-            ComponentSpec::Encoder(Encoder { mut sel_width }) => {
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Sel width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut sel_width).range(0..=4))
-                            .changed();
-                    });
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Encoder(Encoder {
-                        sel_width,
-                    })));
-                }
-            }
-            ComponentSpec::Adder(Adder { mut data_width }) => {
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                            .changed();
-                    });
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Adder(Adder {
-                        data_width,
-                    })));
-                }
-            }
-            ComponentSpec::Subtractor(Subtractor { mut data_width }) => {
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                            .changed();
-                    });
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Subtractor(
-                        Subtractor { data_width },
-                    )));
-                }
-            }
-            ComponentSpec::Multiplier(Multiplier { mut data_width }) => {
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                            .changed();
-                    });
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Multiplier(
-                        Multiplier { data_width },
-                    )));
-                }
-            }
-            ComponentSpec::Divider(Divider { mut data_width }) => {
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                            .changed();
-                    });
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Divider(Divider {
-                        data_width,
-                    })));
-                }
-            }
-            ComponentSpec::Comparator(Comparator { mut data_width }) => {
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                            .changed();
-                    });
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Comparator(
-                        Comparator { data_width },
-                    )));
-                }
-            }
-            // A ROM's contents buffer is huge, so its spec is matched by
-            // reference here (never cloned per-frame) - the whole reason the spec
-            // match above borrows rather than owns. Widths are structural;
-            // rom.resized() preserve-and-fits the contents into a fresh owned
-            // buffer, and editing the contents is a value edit (live while Paused).
-            ComponentSpec::Rom(
-                rom @ Rom {
-                    mut data_width,
-                    mut address_width,
-                    ..
-                },
-            ) => {
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Address width:");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut address_width)
-                                    .range(1..=MAX_ADDRESS_WIDTH),
-                            )
-                            .changed();
-                    });
-                    ui.label(format!("{} words", 1usize << address_width));
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Rom(
-                        rom.resized(data_width, address_width),
-                    )));
-                }
-                ui.add_enabled_ui(value_ok, |ui| {
-                    if ui.button("Edit contents…").clicked() {
-                        edit = Some(PropEdit::OpenRom);
-                    }
-                });
-            }
-            // Same reasoning as Rom, above (huge contents buffer, matched by
-            // reference); read behavior joins the widths as structural.
-            ComponentSpec::Ram(
-                ram @ Ram {
-                    mut data_width,
-                    mut address_width,
-                    mut read_behavior,
-                    ..
-                },
-            ) => {
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut data_width).range(1..=32))
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Address width:");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut address_width)
-                                    .range(1..=MAX_ADDRESS_WIDTH),
-                            )
-                            .changed();
-                    });
-                    ui.label(format!("{} words", 1usize << address_width));
-                    ui.horizontal(|ui| {
-                        ui.label("Read behavior:");
-                        egui::ComboBox::from_id_salt(key)
-                            .selected_text(format!("{read_behavior:?}"))
-                            .show_ui(ui, |ui| {
-                                for rb in
-                                    [ReadBehavior::ReadAfterWrite, ReadBehavior::WriteAfterRead]
-                                {
-                                    changed |= ui
-                                        .selectable_value(&mut read_behavior, rb, format!("{rb:?}"))
-                                        .changed();
-                                }
-                            });
-                    });
-                });
-                if changed {
-                    let mut resized = ram.resized(data_width, address_width);
-                    resized.read_behavior = read_behavior;
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Ram(resized)));
-                }
-                ui.add_enabled_ui(value_ok, |ui| {
-                    if ui.button("Edit contents…").clicked() {
-                        edit = Some(PropEdit::OpenRam);
-                    }
-                });
-
-                let cur = self.circuit.components[comp_key].pins.out_cache[0];
-                ui.label(format!("DO: {}", fmt_val(cur)));
-            }
-            ComponentSpec::Splitter {
-                mut width,
-                arm_bits,
-                mut direction,
-            } => {
-                // let mut width = *width;
-                let mut arm_bits = arm_bits.clone();
-                let mut changed = false;
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    let before_dir = direction;
-                    ui.horizontal(|ui| {
-                        ui.label("Fan Direction:");
-                        ui.selectable_value(&mut direction, FanDirection::Right, "Split");
-                        ui.selectable_value(&mut direction, FanDirection::Left, "Combine");
-                    });
-                    changed |= direction != before_dir;
-
-                    ui.horizontal(|ui| {
-                        ui.label("Data width:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut width).range(1..=32))
-                            .changed();
-                    });
-                    let mut arms = arm_bits.len() as u8;
-                    ui.horizontal(|ui| {
-                        ui.label("Arms:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut arms).range(1..=16))
-                            .changed();
-                    });
-
-                    // Apply width/arms bookkeeping before rendering bit rows below,
-                    // so a shrink is reflected the same frame; truncating drops
-                    // any bits assigned to a removed arm.
-                    arm_bits.resize_with(arms as usize, Vec::new);
-                    for list in &mut arm_bits {
-                        list.retain(|&b| b < width);
-                    }
-
-                    for bit in 0..width {
-                        let mut current_arm = arm_bits
-                            .iter()
-                            .position(|list| list.contains(&bit))
-                            .map(|i| i as u8);
-                        let before = current_arm;
-                        ui.horizontal(|ui| {
-                            ui.label(format!("Bit {bit}:"));
-                            egui::ComboBox::from_id_salt((key, bit))
-                                .selected_text(match current_arm {
-                                    Some(a) => format!("Arm {a}"),
-                                    None => "None".to_string(),
-                                })
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut current_arm, None, "None");
-                                    for a in 0..arms {
-                                        ui.selectable_value(
-                                            &mut current_arm,
-                                            Some(a),
-                                            format!("Arm {a}"),
-                                        );
-                                    }
-                                });
-                        });
-                        if current_arm != before {
-                            for list in &mut arm_bits {
-                                list.retain(|&b| b != bit);
-                            }
-                            if let Some(a) = current_arm {
-                                arm_bits[a as usize].push(bit);
-                            }
-                            changed = true;
-                        }
-                    }
-                });
-                if changed {
-                    edit = Some(PropEdit::Reconfigure(ComponentSpec::Splitter {
-                        width,
-                        arm_bits,
-                        direction,
-                    }));
-                }
-            }
-            // Read-only: a subcircuit's interface is derived from the referenced
-            // document, not edited here. Offer a jump to edit that document
-            // (mirrors ROM's "Edit contents…" affordance); interface changes
-            // are picked up on switch-back (refresh_subcircuits).
-            ComponentSpec::Subcircuit {
-                doc,
-                name,
-                input_widths,
-                output_widths,
-            } => {
-                let doc = *doc;
-                ui.label(format!("Circuit: {name}"));
-                ui.label(format!(
-                    "{} input(s), {} output(s)",
-                    input_widths.len(),
-                    output_widths.len()
-                ));
-                // Navigating into the child circuit is a structural action
-                // (it switches the active document): locked during a run.
-                ui.add_enabled_ui(structural_ok, |ui| {
-                    if ui.button("Open circuit").clicked() {
-                        edit = Some(PropEdit::OpenCircuit(doc));
-                    }
-                });
-            }
-        }
-
-        match edit {
-            Some(PropEdit::Reconfigure(spec)) => self.reconfigure_component(key, spec),
-            Some(PropEdit::OpenRom) => self.rom_editor_open = Some(key),
-            Some(PropEdit::OpenRam) => self.ram_editor_open = Some(key),
-            Some(PropEdit::OpenCircuit(doc)) => self.switch_circuit(doc),
-            None => {}
-        }
-    }
-
-    // Swaps a placed component's parameters. PlacedCompKey stays stable, so
-    // attached wires survive - we only drop wire nodes for pins the new
-    // arity no longer has, re-sync the rest, then rebuild.
-    fn reconfigure_component(&mut self, pc_key: PlacedCompKey, new_spec: ComponentSpec) {
-        self.history.begin_batch();
-        let old_key = self.components[pc_key].key;
-        let grid_pos = self.components[pc_key].grid_pos;
-
-        let new_comp = self.instantiate(&new_spec);
-        let new_n_in = new_comp.pins.inputs.len();
-        let new_n_out = new_comp.pins.outputs.len();
-
-        self.apply(Command::RemoveComponent(old_key));
-        let new_key = self.apply(Command::comp(new_comp)).unwrap_comp();
-        // Record the record swap's undo before overwriting: restores the old
-        // CompKey + def (the Sim actions above reactivate the old circuit comp
-        // and deactivate the new one, but the record itself needs restoring).
-        let old_spec = std::mem::replace(
-            &mut self.components[pc_key],
-            PlacedComponent::new(new_key, new_spec, grid_pos),
-        )
-        .spec;
-        self.history.push_gui(GuiUndoAction::SwapComponentSpec {
-            key: pc_key,
-            comp_key: old_key,
-            spec: old_spec,
-        });
-
-        let delta = self.wiring.prune_stale_pins(pc_key, new_n_in, new_n_out);
-        self.edit_wiring(delta);
-        self.sync_component_wire_nodes(pc_key);
-        self.rebuild_circuit();
-        self.history.end_batch();
-        self.selected = Some(Selection::Single(Selected::Component(pc_key)));
-    }
-
-    // Writes one word into a placed ROM's contents, then settles so a downstream
-    // read updates. The placed spec and the live component share one buffer (see
-    // Rom::shared), so write_rom mutates what the spec sees too - no separate
-    // mirror write. Deliberately not routed through Command/History: ROM contents
-    // are mutated in place and are not undoable (like clock ticks).
-    fn write_rom_cell(&mut self, pc: PlacedCompKey, index: usize, value: u32) {
-        let comp_key = self.components[pc].key;
-        self.circuit.write_rom(comp_key, index, value);
-        let result = self.circuit.settle();
-        self.record_settle_result(result);
-    }
-
-    // Draws the ROM contents editor window while `rom_editor_open` names a live
-    // ROM. Hex-dump layout: one row per WORDS_PER_ROW words, a base-address label,
-    // then a hex DragValue per word. The row list is virtualized (show_rows) so a
-    // 2^24-word ROM only builds the handful of rows actually on screen. Edits are
-    // collected during the (self-immutable) draw pass and applied afterward.
-    fn show_rom_editor(&mut self, ctx: &egui::Context, pc: PlacedCompKey) {
-        const WORDS_PER_ROW: usize = 8;
-
-        // Close if the ROM was deleted or undone away (or the key now names
-        // something else after a reconfigure to a different type).
-        let (data_width, len) = match self.components.get(pc) {
-            Some(c) if c.active => match &c.spec {
-                ComponentSpec::Rom(rom) => (rom.data_width, rom.len()),
-                _ => {
-                    self.rom_editor_open = None;
-                    return;
-                }
-            },
-            _ => {
-                self.rom_editor_open = None;
-                return;
-            }
-        };
-
-        let word_nibbles = data_width.div_ceil(4) as usize;
-        let addr_nibbles = (usize::BITS - (len.max(1) - 1).leading_zeros())
-            .div_ceil(4)
-            .max(1) as usize;
-        let mask = if data_width >= 32 {
-            u32::MAX
-        } else {
-            (1u32 << data_width) - 1
-        };
-        let total_rows = len.div_ceil(WORDS_PER_ROW);
-
-        // Contents are a value edit: pokeable while Paused, frozen while
-        // Playing. The window can only be *opened* while value edits are
-        // allowed, but one left open from Stopped/Paused survives into Play,
-        // so gate the fields (they stay visible for observation, just dimmed).
-        let values_enabled = !self.value_editing_locked();
-        let mut open = true;
-        let mut edits: Vec<(usize, u32)> = Vec::new();
-        egui::Window::new("ROM contents")
-            .open(&mut open)
-            .default_size([440.0, 480.0])
-            .resizable(true)
-            .show(ctx, |ui| {
-                // DragValue renders with `drag_value_text_style` (defaults to
-                // the proportional Button style), so its digit widths vary
-                // and columns drift out of alignment across rows. Force it
-                // monospace to keep the hex grid aligned; scoped to this Ui
-                // so it doesn't affect DragValues elsewhere in the app.
-                ui.style_mut().drag_value_text_style = egui::TextStyle::Monospace;
-                let row_height = ui.spacing().interact_size.y;
-                ui.add_enabled_ui(values_enabled, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show_rows(ui, row_height, total_rows, |ui, range| {
-                            for row in range {
-                                let base = row * WORDS_PER_ROW;
-                                ui.horizontal(|ui| {
-                                    ui.monospace(format!("0x{base:0addr_nibbles$X}:"));
-                                    for col in 0..WORDS_PER_ROW {
-                                        let i = base + col;
-                                        if i >= len {
-                                            break;
-                                        }
-                                        let mut val = match &self.components[pc].spec {
-                                            ComponentSpec::Rom(rom) => rom.word(i),
-                                            _ => 0,
-                                        };
-                                        let resp = ui.add(
-                                            egui::DragValue::new(&mut val)
-                                                .range(0..=mask)
-                                                .hexadecimal(word_nibbles, false, true),
-                                        );
-                                        if resp.changed() {
-                                            edits.push((i, val));
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                });
-            });
-
-        for (i, v) in edits {
-            self.write_rom_cell(pc, i, v);
-        }
-        if !open {
-            self.rom_editor_open = None;
-        }
-    }
-
-    // Writes one word directly into a placed RAM's contents. Unlike
-    // write_rom_cell this never needs a settle(): RAM's data_out is a
-    // registered output only updated by tick_clock (see RamCell), so a
-    // direct memory edit here has nothing downstream to propagate until the
-    // next tick. The placed spec and the live component share one buffer
-    // (see Ram::shared), so this mutates what the spec sees too. Not routed
-    // through Command/History: RAM contents are mutated in place and are not
-    // undoable, like a ROM's.
-    fn write_ram_cell(&mut self, pc: PlacedCompKey, index: usize, value: u32) {
-        let comp_key = self.components[pc].key;
-        self.circuit.write_ram(comp_key, index, value);
-    }
-
-    // Draws the RAM contents editor window while `ram_editor_open` names a
-    // live RAM - near-identical to show_rom_editor (same hex-dump/virtualized
-    // layout), differing only in which field supplies the widths/word access
-    // and that edits don't need a settle() afterward.
-    fn show_ram_editor(&mut self, ctx: &egui::Context, pc: PlacedCompKey) {
-        const WORDS_PER_ROW: usize = 8;
-
-        // Close if the RAM was deleted or undone away (or the key now names
-        // something else after a reconfigure to a different type).
-        let (data_width, len) = match self.components.get(pc) {
-            Some(c) if c.active => match &c.spec {
-                ComponentSpec::Ram(ram) => (ram.data_width, ram.len()),
-                _ => {
-                    self.ram_editor_open = None;
-                    return;
-                }
-            },
-            _ => {
-                self.ram_editor_open = None;
-                return;
-            }
-        };
-
-        let word_nibbles = data_width.div_ceil(4) as usize;
-        let addr_nibbles = (usize::BITS - (len.max(1) - 1).leading_zeros())
-            .div_ceil(4)
-            .max(1) as usize;
-        let mask = if data_width >= 32 {
-            u32::MAX
-        } else {
-            (1u32 << data_width) - 1
-        };
-        let total_rows = len.div_ceil(WORDS_PER_ROW);
-
-        // Contents are a value edit: pokeable while Paused, frozen while
-        // Playing (same gating as the ROM editor above).
-        let values_enabled = !self.value_editing_locked();
-        let mut open = true;
-        let mut edits: Vec<(usize, u32)> = Vec::new();
-        egui::Window::new("RAM contents")
-            .open(&mut open)
-            .default_size([440.0, 480.0])
-            .resizable(true)
-            .show(ctx, |ui| {
-                // See show_rom_editor: force monospace so DragValue columns
-                // stay aligned across rows.
-                ui.style_mut().drag_value_text_style = egui::TextStyle::Monospace;
-                let row_height = ui.spacing().interact_size.y;
-                ui.add_enabled_ui(values_enabled, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show_rows(ui, row_height, total_rows, |ui, range| {
-                            for row in range {
-                                let base = row * WORDS_PER_ROW;
-                                ui.horizontal(|ui| {
-                                    ui.monospace(format!("0x{base:0addr_nibbles$X}:"));
-                                    for col in 0..WORDS_PER_ROW {
-                                        let i = base + col;
-                                        if i >= len {
-                                            break;
-                                        }
-                                        let mut val = match &self.components[pc].spec {
-                                            ComponentSpec::Ram(ram) => ram.word(i),
-                                            _ => 0,
-                                        };
-                                        let resp = ui.add(
-                                            egui::DragValue::new(&mut val)
-                                                .range(0..=mask)
-                                                .hexadecimal(word_nibbles, false, true),
-                                        );
-                                        if resp.changed() {
-                                            edits.push((i, val));
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                });
-            });
-
-        for (i, v) in edits {
-            self.write_ram_cell(pc, i, v);
-        }
-        if !open {
-            self.ram_editor_open = None;
         }
     }
 
@@ -2325,203 +885,21 @@ impl OsmilogApp {
         }
     }
 
-    // Removes a placed component: drop it from the circuit and its wire nodes
-    // from the wiring graph, then rebuild the circuit's nets from what remains.
-    fn delete_component(&mut self, key: PlacedCompKey) {
-        self.history.begin_batch();
-        let comp_key = self.components[key].key;
-        self.apply(Command::RemoveComponent(comp_key));
-        let delta = self.wiring.remove_component_nodes(key);
-        self.edit_wiring(delta);
-        // Tombstone rather than remove: keeps the PlacedCompKey valid so undo can
-        // reactivate this record (see PlacedComponent::active).
-        self.components[key].active = false;
-        self.history
-            .push_gui(GuiUndoAction::SetComponentActive { key, active: true });
-        if self.selected == Some(Selection::Single(Selected::Component(key))) {
-            self.selected = None;
-        }
-        self.rebuild_circuit();
-        self.history.end_batch();
-    }
-
-    // Removes a placed tunnel: drop it from the circuit and its wire nodes from
-    // the wiring graph, then rebuild.
-    fn delete_tunnel(&mut self, key: PlacedTunnelKey) {
-        self.history.begin_batch();
-        let tunnel_key = self.tunnels[key].key;
-        self.apply(Command::RemoveTunnel(tunnel_key));
-        let delta = self.wiring.remove_tunnel_nodes(key);
-        self.edit_wiring(delta);
-        // Tombstone rather than remove (see delete_component).
-        self.tunnels[key].active = false;
-        self.history
-            .push_gui(GuiUndoAction::SetTunnelActive { key, active: true });
-        if self.selected == Some(Selection::Single(Selected::Tunnel(key))) {
-            self.selected = None;
-        }
-        self.rebuild_circuit();
-        self.history.end_batch();
-    }
-
-    // Removes a single wire segment; the wiring graph handles orphan cleanup and
-    // any net split, then the circuit is rebuilt.
-    fn delete_wire(&mut self, seg: WireSegKey) {
-        self.history.begin_batch();
-        let delta = self.wiring.delete_segment(seg);
-        self.edit_wiring(delta);
-        if self.selected == Some(Selection::Single(Selected::Wire(seg))) {
-            self.selected = None;
-        }
-        self.rebuild_circuit();
-        self.history.end_batch();
-    }
-
-    // True if `sel` is either the single selection or part of the bulk
-    // selection, i.e. it should be drawn highlighted.
-    fn is_highlighted(&self, sel: Selected) -> bool {
-        match &self.selected {
-            Some(Selection::Single(s)) => *s == sel,
-            Some(Selection::Bulk(items)) => items.contains(&sel),
-            None => false,
-        }
-    }
-
-    // A selected item's screen-space bounding rect and current grid_pos, for
-    // deciding whether a drag-start point hits it and what "original
-    // position" a ComponentDrag should restore on cancel/undo. `None` for a
-    // Selected::Wire (no draggable body) or a stale key.
-    fn drag_grid_pos(&self, sel: Selected, camera: Camera) -> Option<(Rect, GridPos)> {
-        match sel {
-            Selected::Component(key) => self
-                .components
-                .get(key)
-                .filter(|pc| pc.active)
-                .map(|pc| (component_bounding_rect(pc, camera), pc.grid_pos)),
-            Selected::Tunnel(key) => self
-                .tunnels
-                .get(key)
-                .filter(|pt| pt.active)
-                .map(|pt| (tunnel_bounding_rect(pt, camera), pt.grid_pos)),
-            Selected::Wire(_) => None,
-        }
-    }
-
-    // The Free-attached WireNodes belonging to any Selected::Wire in `sels`
-    // (deduped - a route's interior node can be shared by two selected
-    // segments), each paired with its current grid_pos. Pin/Tunnel-attached
-    // nodes are excluded: those follow their owning component/tunnel via
-    // sync_component_wire_nodes/sync_tunnel_wire_nodes instead, and must
-    // stay put if that owner isn't itself part of the drag.
-    fn free_wire_nodes(&self, sels: &[Selected]) -> Vec<(WireNodeKey, GridPos)> {
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for sel in sels {
-            let Selected::Wire(seg) = sel else { continue };
-            let Some(segment) = self.wiring.segments.get(*seg) else {
-                continue;
-            };
-            for node_key in [segment.a, segment.b] {
-                if !seen.insert(node_key) {
-                    continue;
-                }
-                if let Some(node) = self.wiring.nodes.get(node_key) {
-                    if matches!(node.attach, NodeAttach::Free) {
-                        out.push((node_key, node.pos));
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    // Every component, tunnel, and wire segment fully contained in `rect`
-    // (screen space): a component/tunnel counts when its bounding rect is
-    // inside, a wire when both endpoints are.
-    fn items_in_rect(&self, rect: Rect, camera: Camera) -> Vec<Selected> {
-        puffin::profile_function!();
-        let mut out = Vec::new();
-        for (key, pc) in self.active_components() {
-            if rect.contains_rect(component_bounding_rect(pc, camera)) {
-                out.push(Selected::Component(key));
-            }
-        }
-        for (key, pt) in self.active_tunnels() {
-            if rect.contains_rect(tunnel_bounding_rect(pt, camera)) {
-                out.push(Selected::Tunnel(key));
-            }
-        }
-        for (key, seg) in self.wiring.active_segments() {
-            let a = camera.grid_to_screen(self.wiring.nodes[seg.a].pos);
-            let b = camera.grid_to_screen(self.wiring.nodes[seg.b].pos);
-            if rect.contains(a) && rect.contains(b) {
-                out.push(Selected::Wire(key));
-            }
-        }
-        out
-    }
-
-    // Removes everything in the current bulk selection: wire segments first,
-    // then components/tunnels (which drop their own wire nodes too). Each
-    // removal is existence-checked since deleting a component can take a
-    // wire in the same set with it. Rebuilds once at the end.
-    fn delete_bulk(&mut self) {
-        let Some(Selection::Bulk(items)) = self.selected.take() else {
-            return;
-        };
-        self.history.begin_batch();
-        for sel in &items {
-            if let Selected::Wire(seg) = *sel {
-                // delete_segment self-guards: an already-tombstoned segment
-                // (e.g. dropped by a component deletion earlier in this batch)
-                // yields an empty delta, so edit_wiring records nothing.
-                let delta = self.wiring.delete_segment(seg);
-                self.edit_wiring(delta);
-            }
-        }
-        for sel in &items {
-            match *sel {
-                Selected::Component(key) => {
-                    // Guard on active, not just presence: a tombstoned record
-                    // (deleted earlier in this same batch) must not be redeleted.
-                    if let Some(pc) = self.components.get(key).filter(|pc| pc.active) {
-                        let comp_key = pc.key;
-                        self.apply(Command::RemoveComponent(comp_key));
-                        let delta = self.wiring.remove_component_nodes(key);
-                        self.edit_wiring(delta);
-                        self.components[key].active = false;
-                        self.history
-                            .push_gui(GuiUndoAction::SetComponentActive { key, active: true });
-                    }
-                }
-                Selected::Tunnel(key) => {
-                    if let Some(pt) = self.tunnels.get(key).filter(|pt| pt.active) {
-                        let tunnel_key = pt.key;
-                        self.apply(Command::RemoveTunnel(tunnel_key));
-                        let delta = self.wiring.remove_tunnel_nodes(key);
-                        self.edit_wiring(delta);
-                        self.tunnels[key].active = false;
-                        self.history
-                            .push_gui(GuiUndoAction::SetTunnelActive { key, active: true });
-                    }
-                }
-                Selected::Wire(_) => {}
-            }
-        }
-        self.rebuild_circuit();
-        self.history.end_batch();
-    }
-
     // Snapshots the current selection onto the clipboard. No-op if nothing
     // is selected. Read-only: never touches history.
     fn copy_selection(&mut self) {
-        let items: Vec<Selected> = match &self.selected {
+        // Indexed directly (not via active()) so this borrows only
+        // self.documents, leaving self.clipboard free for the &mut borrow
+        // .copy() below needs - active() is an opaque method call the borrow
+        // checker can't see through as a disjoint field borrow.
+        let doc = &self.documents[self.active_id].state;
+        let items: Vec<Selected> = match &doc.selected {
             None => return,
             Some(Selection::Single(s)) => vec![*s],
             Some(Selection::Bulk(v)) => v.clone(),
         };
         self.clipboard
-            .copy(&self.components, &self.tunnels, &self.wiring, &items);
+            .copy(&doc.components, &doc.tunnels, &doc.wiring, &items);
     }
 
     // Materializes the clipboard's (offset) snapshot as new components,
@@ -2531,7 +909,7 @@ impl OsmilogApp {
         let Some(file) = self.clipboard.plan_paste() else {
             return;
         };
-        self.history.begin_batch();
+        self.active_mut().history.begin_batch();
 
         // Snapshot indices -> the freshly placed GUI keys, mirroring
         // install_circuit_records (wiring nodes reference components/tunnels by
@@ -2545,7 +923,13 @@ impl OsmilogApp {
         let tunnel_keys: Vec<PlacedTunnelKey> = file
             .tunnels
             .iter()
-            .map(|entry| self.place_tunnel_labeled(entry.label.clone(), entry.role, entry.grid_pos))
+            .map(|entry| {
+                self.active_mut().place_tunnel_labeled(
+                    entry.label.clone(),
+                    entry.role,
+                    entry.grid_pos,
+                )
+            })
             .collect();
 
         let nodes: Vec<(GridPos, NodeAttach)> = file
@@ -2573,21 +957,22 @@ impl OsmilogApp {
             .collect();
         let segments: Vec<(usize, usize)> = file.segments.iter().map(|s| (s.a, s.b)).collect();
 
-        let (_, seg_keys, delta) = self.wiring.add_subgraph(&nodes, &segments);
-        self.edit_wiring(delta);
-        self.rebuild_circuit();
+        let doc = self.active_mut();
+        let (_, seg_keys, delta) = doc.wiring.add_subgraph(&nodes, &segments);
+        doc.edit_wiring(delta);
+        doc.rebuild_circuit();
 
         let mut new_selection: Vec<Selected> = Vec::new();
         new_selection.extend(comp_keys.into_iter().map(Selected::Component));
         new_selection.extend(tunnel_keys.into_iter().map(Selected::Tunnel));
         new_selection.extend(seg_keys.into_iter().map(Selected::Wire));
-        self.selected = match new_selection.len() {
+        doc.selected = match new_selection.len() {
             0 => None,
             1 => Some(Selection::Single(new_selection[0])),
             _ => Some(Selection::Bulk(new_selection)),
         };
 
-        self.history.end_batch();
+        doc.history.end_batch();
     }
 
     // Runs `f` with the platform `IoState` temporarily moved out of `self`, so
@@ -2630,22 +1015,31 @@ impl OsmilogApp {
                 ui.add_enabled_ui(!locked, |ui| {
                     ui.menu_button("Edit", |ui| {
                         if ui
-                            .add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
+                            .add_enabled(
+                                self.active().history.can_undo(),
+                                egui::Button::new("Undo"),
+                            )
                             .clicked()
                         {
-                            self.undo();
+                            self.active_mut().undo();
                             ui.close();
                         }
                         if ui
-                            .add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
+                            .add_enabled(
+                                self.active().history.can_redo(),
+                                egui::Button::new("Redo"),
+                            )
                             .clicked()
                         {
-                            self.redo();
+                            self.active_mut().redo();
                             ui.close();
                         }
                         ui.separator();
                         if ui
-                            .add_enabled(self.selected.is_some(), egui::Button::new("Copy"))
+                            .add_enabled(
+                                self.active().selected.is_some(),
+                                egui::Button::new("Copy"),
+                            )
                             .clicked()
                         {
                             self.copy_selection();
@@ -2665,7 +1059,13 @@ impl OsmilogApp {
                 });
                 ui.separator();
                 self.show_clock_controls(ui);
-                if let Some(err) = &self.last_settle_error {
+                // I/O errors take priority (they're rarer and more actionable);
+                // otherwise show the active document's own settle() error.
+                if let Some(err) = self
+                    .io_error
+                    .as_ref()
+                    .or(self.active().settle_error.as_ref())
+                {
                     ui.colored_label(theme.error_text, err);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2712,7 +1112,7 @@ impl OsmilogApp {
                 for &doc_id in &self.doc_order {
                     let cyclic = self.would_cycle(doc_id);
                     let resp =
-                        ui.selectable_label(doc_id == self.active, &self.documents[doc_id].name);
+                        ui.selectable_label(doc_id == self.active_id, &self.documents[doc_id].name);
                     let resp = resp.on_hover_text(if cyclic {
                         "Can't nest: would create a cycle"
                     } else {
@@ -2727,26 +1127,26 @@ impl OsmilogApp {
                 if let Some(target) = switch_target {
                     // Cancel any placing started by this double click's first
                     // click, so the parent doc isn't parked mid-placement.
-                    self.mode = InteractionMode::Idle;
+                    self.active_mut().mode = InteractionMode::Idle;
                     self.switch_circuit(target);
                 } else if let Some(doc) = place_target {
                     let spec = self.subcircuit_spec(doc);
-                    self.mode = InteractionMode::Placing { spec };
+                    self.active_mut().mode = InteractionMode::Placing { spec };
                 }
             });
 
             if ui.button("Input").clicked() {
-                self.mode = InteractionMode::Placing {
+                self.active_mut().mode = InteractionMode::Placing {
                     spec: ComponentSpec::Input(Input { bits: 0, width: 1 }),
                 };
             }
             if ui.button("Constant").clicked() {
-                self.mode = InteractionMode::Placing {
+                self.active_mut().mode = InteractionMode::Placing {
                     spec: ComponentSpec::Constant(Constant { bits: 0, width: 1 }),
                 };
             }
             if ui.button("Output").clicked() {
-                self.mode = InteractionMode::Placing {
+                self.active_mut().mode = InteractionMode::Placing {
                     spec: ComponentSpec::Output,
                 };
             }
@@ -2761,7 +1161,7 @@ impl OsmilogApp {
                 ];
                 for (name, op, n) in gates {
                     if ui.button(name).clicked() {
-                        self.mode = InteractionMode::Placing {
+                        self.active_mut().mode = InteractionMode::Placing {
                             spec: ComponentSpec::Gate(Gate {
                                 op,
                                 n_inputs: n,
@@ -2773,7 +1173,7 @@ impl OsmilogApp {
             });
             egui::CollapsingHeader::new("Plexers").show(ui, |ui| {
                 if ui.button("Mux").clicked() {
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::Mux(Mux {
                             data_width: 1,
                             sel_width: 1,
@@ -2781,7 +1181,7 @@ impl OsmilogApp {
                     };
                 }
                 if ui.button("Demux").clicked() {
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::Demux(Demux {
                             data_width: 1,
                             sel_width: 1,
@@ -2789,7 +1189,7 @@ impl OsmilogApp {
                     };
                 }
                 if ui.button("Splitter").clicked() {
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::Splitter {
                             width: 2,
                             arm_bits: vec![vec![0], vec![1]],
@@ -2798,46 +1198,46 @@ impl OsmilogApp {
                     };
                 }
                 if ui.button("Encoder").clicked() {
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::Encoder(Encoder { sel_width: 1 }),
                     };
                 }
             });
             egui::CollapsingHeader::new("Arithmetic").show(ui, |ui| {
                 if ui.button("Adder").clicked() {
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::Adder(Adder { data_width: 1 }),
                     };
                 }
                 if ui.button("Subtractor").clicked() {
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::Subtractor(Subtractor { data_width: 1 }),
                     };
                 }
                 if ui.button("Multiplier").clicked() {
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::Multiplier(Multiplier { data_width: 1 }),
                     };
                 }
                 if ui.button("Divider").clicked() {
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::Divider(Divider { data_width: 1 }),
                     };
                 }
                 if ui.button("Comparator").clicked() {
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::Comparator(Comparator { data_width: 1 }),
                     };
                 }
             });
             egui::CollapsingHeader::new("Memory").show(ui, |ui| {
                 if ui.button("Register").clicked() {
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::Reg(RegConf { data_width: 1 }),
                     };
                 }
                 if ui.button("Shift Register").clicked() {
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::ShiftReg(ShiftRegConf {
                             data_width: 1,
                             num_stages: 4,
@@ -2847,7 +1247,7 @@ impl OsmilogApp {
                 }
                 if ui.button("Counter").clicked() {
                     let data_width = 1;
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::Counter(CounterConf {
                             data_width,
                             max_value: Value::mask(data_width),
@@ -2857,45 +1257,45 @@ impl OsmilogApp {
                 }
                 egui::CollapsingHeader::new("Flip-Flop").show(ui, |ui| {
                     if ui.button("D Flip-Flop").clicked() {
-                        self.mode = InteractionMode::Placing {
+                        self.active_mut().mode = InteractionMode::Placing {
                             spec: ComponentSpec::DFlipFlop(DFlipFlopConf),
                         };
                     }
                     if ui.button("T Flip-Flop").clicked() {
-                        self.mode = InteractionMode::Placing {
+                        self.active_mut().mode = InteractionMode::Placing {
                             spec: ComponentSpec::TFlipFlop(TFlipFlopConf),
                         };
                     }
                     if ui.button("JK Flip-Flop").clicked() {
-                        self.mode = InteractionMode::Placing {
+                        self.active_mut().mode = InteractionMode::Placing {
                             spec: ComponentSpec::JKFlipFlop(JKFlipFlopConf),
                         };
                     }
                     if ui.button("SR Flip-Flop").clicked() {
-                        self.mode = InteractionMode::Placing {
+                        self.active_mut().mode = InteractionMode::Placing {
                             spec: ComponentSpec::SRFlipFlop(SRFlipFlopConf),
                         };
                     }
                 });
                 if ui.button("ROM").clicked() {
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::Rom(Rom::new(8, 8)),
                     };
                 }
                 if ui.button("RAM").clicked() {
-                    self.mode = InteractionMode::Placing {
+                    self.active_mut().mode = InteractionMode::Placing {
                         spec: ComponentSpec::Ram(Ram::new(8, 8, ReadBehavior::default())),
                     };
                 }
             });
             egui::CollapsingHeader::new("Tunnel").show(ui, |ui| {
                 if ui.button("Feed").clicked() {
-                    self.mode = InteractionMode::PlacingTunnel {
+                    self.active_mut().mode = InteractionMode::PlacingTunnel {
                         role: TunnelRole::Feed,
                     };
                 }
                 if ui.button("Pull").clicked() {
-                    self.mode = InteractionMode::PlacingTunnel {
+                    self.active_mut().mode = InteractionMode::PlacingTunnel {
                         role: TunnelRole::Pull,
                     };
                 }
@@ -2909,12 +1309,12 @@ impl OsmilogApp {
     // resets sequential state. All ticks are issued untracked (see tick_once).
     fn show_clock_controls(&mut self, ui: &mut egui::Ui) {
         const MAX_CLOCK_TPS: f32 = 100.0;
-        let run = self.clock.run;
+        let run = self.active().clock.run;
 
         // Speed is only adjustable while stopped - locked during a run session.
         ui.add_enabled(
             run == ClockRun::Stopped,
-            egui::DragValue::new(&mut self.clock.ticks_per_second)
+            egui::DragValue::new(&mut self.active_mut().clock.ticks_per_second)
                 .speed(0.1)
                 .range(1.0..=MAX_CLOCK_TPS)
                 .suffix(" tick/s"),
@@ -2927,9 +1327,10 @@ impl OsmilogApp {
             .add_enabled(run != ClockRun::Playing, egui::Button::new("Play"))
             .clicked()
         {
-            self.clock.run = ClockRun::Playing;
-            self.clock.last_tick_time = ui.ctx().input(|i| i.time);
-            self.mode = InteractionMode::Idle;
+            let now = ui.ctx().input(|i| i.time);
+            let doc = self.active_mut();
+            doc.clock.play(now);
+            doc.mode = InteractionMode::Idle;
         }
 
         // Pause: freeze mid-run, preserving sequential state (stays locked).
@@ -2937,7 +1338,7 @@ impl OsmilogApp {
             .add_enabled(run == ClockRun::Playing, egui::Button::new("Pause"))
             .clicked()
         {
-            self.clock.run = ClockRun::Paused;
+            self.active_mut().clock.pause();
         }
 
         // Step: advance exactly one tick. Available when not playing - from
@@ -2947,7 +1348,7 @@ impl OsmilogApp {
             .add_enabled(run != ClockRun::Playing, egui::Button::new("Step"))
             .clicked()
         {
-            self.tick_once();
+            self.active_mut().tick_once();
         }
 
         // Stop: halt, reset all sequential state to power-on, return to editable.
@@ -2955,7 +1356,7 @@ impl OsmilogApp {
             .add_enabled(run != ClockRun::Stopped, egui::Button::new("Stop"))
             .clicked()
         {
-            self.stop_clock();
+            self.active_mut().stop_clock();
         }
     }
 
@@ -2965,19 +1366,21 @@ impl OsmilogApp {
         painter.rect_filled(clip_rect, 0.0, theme.canvas_bg);
         draw_grid(painter, clip_rect, camera, theme);
 
+        let doc = self.active();
+
         // Draw wire segments. Colour comes from each connected group's net
         // value: any component pin / tunnel on the group resolves (live) to
         // that net's Value; a dangling group (no endpoints) is Floating.
-        let node_value = self.wire_node_values();
+        let node_value = doc.wire_node_values();
 
-        for (seg_key, seg) in self.wiring.active_segments() {
-            let a = self.wiring.nodes[seg.a];
-            let b = self.wiring.nodes[seg.b];
+        for (seg_key, seg) in doc.wiring.active_segments() {
+            let a = doc.wiring.nodes[seg.a];
+            let b = doc.wiring.nodes[seg.b];
             let p0 = camera.grid_to_screen(a.pos);
             let p1 = camera.grid_to_screen(b.pos);
             let val = node_value.get(&seg.a).copied().unwrap_or(Value::Floating);
             let mut stroke = value_stroke(theme, val);
-            if self.is_highlighted(Selected::Wire(seg_key)) {
+            if doc.is_highlighted(Selected::Wire(seg_key)) {
                 stroke.color = theme.outline_selected;
                 stroke.width += 1.5;
             }
@@ -2989,8 +1392,8 @@ impl OsmilogApp {
         // Junction dots where three or more segments meet, so a real branch
         // reads differently from a mere crossing. All degrees in one pass, not
         // a per-node scan of every segment.
-        let degrees = self.wiring.degrees();
-        for (nk, node) in self.wiring.active_nodes() {
+        let degrees = doc.wiring.degrees();
+        for (nk, node) in doc.wiring.active_nodes() {
             if degrees.get(&nk).copied().unwrap_or(0) >= 3 {
                 let val = node_value.get(&nk).copied().unwrap_or(Value::Floating);
                 painter.circle_filled(
@@ -3003,16 +1406,16 @@ impl OsmilogApp {
 
         // Draw components
 
-        for (pc_key, pc) in self.active_components() {
-            let is_selected = self.is_highlighted(Selected::Component(pc_key));
-            draw_component(painter, pc, camera, &self.circuit, is_selected, theme);
+        for (pc_key, pc) in doc.active_components() {
+            let is_selected = doc.is_highlighted(Selected::Component(pc_key));
+            draw_component(painter, pc, camera, &doc.circuit, is_selected, theme);
         }
 
         // Draw tunnels
 
-        for (pt_key, pt) in self.active_tunnels() {
-            let is_selected = self.is_highlighted(Selected::Tunnel(pt_key));
-            draw_tunnel(painter, pt, camera, &self.circuit, is_selected, theme);
+        for (pt_key, pt) in doc.active_tunnels() {
+            let is_selected = doc.is_highlighted(Selected::Tunnel(pt_key));
+            draw_tunnel(painter, pt, camera, &doc.circuit, is_selected, theme);
         }
     }
 
@@ -3021,38 +1424,6 @@ impl OsmilogApp {
     // gestures are independent of the primary-button gestures the interaction
     // modes handle (`drag_started`/`clicked`/`drag_delta` are primary-only), so
     // this runs as a standalone pre-step in `ui()`.
-    fn handle_camera_input(&mut self, response: &egui::Response, ctx: &egui::Context) {
-        puffin::profile_function!();
-        // Pan: middle-button drag. Use the raw pointer delta - `drag_delta`
-        // tracks only the primary button.
-        if response.dragged_by(egui::PointerButton::Middle) {
-            self.camera.pan += ctx.input(|i| i.pointer.delta());
-        }
-
-        // Zoom: Ctrl(+Cmd)+scroll, only while hovering the canvas. egui folds a
-        // ctrl-scroll (its default `zoom_modifier`) - and any trackpad pinch -
-        // into `zoom_delta()`, a multiplicative factor (1.0 = no change). egui's
-        // own scroll-zoom sensitivity is set directly at startup (see
-        // ZOOM_SCROLL_SPEED, set in `OsmilogApp::new`) rather than rescaled here
-        // - `zoom_delta()` is already exactly the factor we want to apply.
-        if response.hovered() {
-            let zoom_delta = ctx.input(|i| i.zoom_delta());
-            if zoom_delta != 1.0 {
-                if let Some(cursor) = ctx.pointer_hover_pos() {
-                    let old = self.camera.zoom;
-                    let new = (old * zoom_delta).clamp(ZOOM_MIN, ZOOM_MAX);
-                    if new != old {
-                        // Keep the grid point under the cursor fixed:
-                        // pan' = cursor - (cursor - pan) * (new / old).
-                        let c = cursor.to_vec2();
-                        self.camera.pan = c - (c - self.camera.pan) * (new / old);
-                        self.camera.zoom = new;
-                    }
-                }
-            }
-        }
-    }
-
     // ── Global canvas keyboard shortcuts ─────────────────────────────────
     // Escape (cancel drag/wire-draw, clear selection), Delete/Backspace, and
     // Undo/Redo. Must run before `handle_canvas_interaction` reads `self.mode`
@@ -3060,21 +1431,22 @@ impl OsmilogApp {
     fn handle_canvas_shortcuts(&mut self, ctx: &egui::Context) {
         puffin::profile_function!();
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            match &self.mode {
+            let doc = self.active_mut();
+            match &doc.mode {
                 InteractionMode::SelectionDrag {
                     items, free_nodes, ..
                 } => {
                     for (key, original_grid_pos) in items {
                         match key {
                             Selected::Component(k) => {
-                                self.components[*k].grid_pos = *original_grid_pos
+                                doc.components[*k].grid_pos = *original_grid_pos
                             }
-                            Selected::Tunnel(k) => self.tunnels[*k].grid_pos = *original_grid_pos,
+                            Selected::Tunnel(k) => doc.tunnels[*k].grid_pos = *original_grid_pos,
                             Selected::Wire(_) => {}
                         }
                     }
                     for (key, original_pos) in free_nodes {
-                        self.wiring.nodes[*key].pos = *original_pos;
+                        doc.wiring.nodes[*key].pos = *original_pos;
                     }
                 }
                 // Esc while drawing commits the polyline drawn so far as a
@@ -3086,17 +1458,17 @@ impl OsmilogApp {
                     ..
                 } if points.len() >= 2 => {
                     let (points, start_attach) = (points.clone(), *start_attach);
-                    self.commit_wire_route(points, start_attach, NodeAttach::Free);
+                    doc.commit_wire_route(points, start_attach, NodeAttach::Free);
                 }
                 // BulkSelect: Esc cancels the in-progress rubber-band (the
                 // trailing reset to Idle handles it) alongside clearing any
                 // existing bulk selection below.
                 _ => {}
             }
-            if matches!(self.selected, Some(Selection::Bulk(_))) {
-                self.selected = None;
+            if matches!(doc.selected, Some(Selection::Bulk(_))) {
+                doc.selected = None;
             }
-            self.mode = InteractionMode::Idle;
+            doc.mode = InteractionMode::Idle;
         }
 
         // Backspace/Delete removes the current selection (bulk selection
@@ -3108,12 +1480,13 @@ impl OsmilogApp {
         let delete_pressed =
             ctx.input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete));
         if delete_pressed && !edits_blocked {
-            match &self.selected {
-                Some(Selection::Bulk(_)) => self.delete_bulk(),
+            let doc = self.active_mut();
+            match &doc.selected {
+                Some(Selection::Bulk(_)) => doc.delete_bulk(),
                 Some(Selection::Single(sel)) => match *sel {
-                    Selected::Component(k) => self.delete_component(k),
-                    Selected::Tunnel(k) => self.delete_tunnel(k),
-                    Selected::Wire(seg) => self.delete_wire(seg),
+                    Selected::Component(k) => doc.delete_component(k),
+                    Selected::Tunnel(k) => doc.delete_tunnel(k),
+                    Selected::Wire(seg) => doc.delete_wire(seg),
                 },
                 None => {}
             }
@@ -3132,9 +1505,9 @@ impl OsmilogApp {
                 (undo, redo)
             });
             if undo {
-                self.undo();
+                self.active_mut().undo();
             } else if redo {
-                self.redo();
+                self.active_mut().redo();
             }
         }
 
@@ -3164,7 +1537,7 @@ impl OsmilogApp {
             .response
             .interact_pointer_pos()
             .or_else(|| cc.ctx.pointer_hover_pos());
-        let mode = self.mode.clone();
+        let mode = self.active().mode.clone();
         match mode {
             InteractionMode::Idle => self.interact_idle(cc, pointer),
             InteractionMode::Placing { spec } => self.interact_placing(cc, pointer, spec),
@@ -3190,14 +1563,20 @@ impl OsmilogApp {
 
     fn interact_idle(&mut self, cc: &CanvasCtx, pointer: Option<Pos2>) {
         puffin::profile_function!();
+        // Computed before taking active_mut(), which borrows self.documents
+        // mutably for the rest of this function - see the borrow rule in the
+        // document module docs.
+        let locked = self.editing_locked();
+        let doc = self.active_mut();
+
         // Hover reticle: hovering over a wire (but not a pin) shows
         // where a branch would tap the wire.
         if let Some(pos) = pointer {
-            if pin_at_pos(self.active_components(), cc.camera, pos, PinKind::Output).is_none()
-                && pin_at_pos(self.active_components(), cc.camera, pos, PinKind::Input).is_none()
-                && tunnel_pin_at_pos(self.active_tunnels(), cc.camera, pos).is_none()
+            if pin_at_pos(doc.active_components(), cc.camera, pos, PinKind::Output).is_none()
+                && pin_at_pos(doc.active_components(), cc.camera, pos, PinKind::Input).is_none()
+                && tunnel_pin_at_pos(doc.active_tunnels(), cc.camera, pos).is_none()
             {
-                if let Some((_, gp)) = self.wiring.segment_at_pos(pos, cc.camera) {
+                if let Some((_, gp)) = doc.wiring.segment_at_pos(pos, cc.camera) {
                     draw_reticle(
                         cc.painter,
                         cc.camera.grid_to_screen(gp),
@@ -3214,29 +1593,29 @@ impl OsmilogApp {
         // egui's `drag_started`/`dragged` flags are button-agnostic, so exclude
         // a middle-button drag here - that gesture pans the camera
         // (`handle_camera_input`) and must not also start an edit gesture.
-        if !self.editing_locked()
+        if !locked
             && cc.response.drag_started()
             && !cc.response.dragged_by(egui::PointerButton::Middle)
         {
             let origin = cc.ctx.input(|i| i.pointer.press_origin());
             if let Some(pos) = origin {
-                if let Some((attach, gp)) = self.wire_start_at(pos, cc.camera) {
+                if let Some((attach, gp)) = doc.wire_start_at(pos, cc.camera) {
                     // Drag from a pin / tunnel / existing wire → draw
                     // a wire (quick elbow, committed on release).
-                    self.mode = InteractionMode::WireDraw {
+                    doc.mode = InteractionMode::WireDraw {
                         points: vec![gp],
                         start_attach: attach,
                         cursor: pos,
                         dragging: true,
                     };
-                } else if let Some((items, free_nodes)) = match &self.selected {
+                } else if let Some((items, free_nodes)) = match &doc.selected {
                     Some(Selection::Single(sel)) => {
                         // Selected component/tunnel body drag → move it,
                         // but only when the drag actually began inside its
                         // bounding rect. A lone selected wire has no body to
                         // drag (drag_grid_pos returns None for it).
                         let sel = *sel;
-                        self.drag_grid_pos(sel, cc.camera)
+                        doc.drag_grid_pos(sel, cc.camera)
                             .filter(|(rect, _)| rect.contains(pos))
                             .map(|(_, grid_pos)| (vec![(sel, grid_pos)], Vec::new()))
                     }
@@ -3246,24 +1625,23 @@ impl OsmilogApp {
                         // selection also covers, as long as the drag began
                         // inside *any one* component/tunnel's bounding rect.
                         let started_inside = sels.iter().any(|sel| {
-                            self.drag_grid_pos(*sel, cc.camera)
+                            doc.drag_grid_pos(*sel, cc.camera)
                                 .is_some_and(|(rect, _)| rect.contains(pos))
                         });
                         started_inside.then(|| {
                             let items: Vec<(Selected, GridPos)> = sels
                                 .iter()
                                 .filter_map(|sel| {
-                                    self.drag_grid_pos(*sel, cc.camera)
-                                        .map(|(_, gp)| (*sel, gp))
+                                    doc.drag_grid_pos(*sel, cc.camera).map(|(_, gp)| (*sel, gp))
                                 })
                                 .collect();
-                            let free_nodes = self.free_wire_nodes(sels);
+                            let free_nodes = doc.free_wire_nodes(sels);
                             (items, free_nodes)
                         })
                     }
                     None => None,
                 } {
-                    self.mode = InteractionMode::SelectionDrag {
+                    doc.mode = InteractionMode::SelectionDrag {
                         items,
                         free_nodes,
                         drag_origin: pos,
@@ -3271,8 +1649,8 @@ impl OsmilogApp {
                 } else {
                     // Drag from empty space → rubber-band bulk select.
                     let gp = cc.camera.screen_to_grid(pos);
-                    self.selected = None;
-                    self.mode = InteractionMode::BulkSelect {
+                    doc.selected = None;
+                    doc.mode = InteractionMode::BulkSelect {
                         start: gp,
                         current: gp,
                     };
@@ -3286,12 +1664,12 @@ impl OsmilogApp {
                 // clicking a bare wire selects it instead (branching
                 // off a wire is a drag gesture, handled above). Suppressed
                 // during a run session so only selection remains.
-                let pin_start = self
+                let pin_start = doc
                     .wire_start_at(pos, cc.camera)
                     .filter(|(a, _)| matches!(a, NodeAttach::Pin(..) | NodeAttach::Tunnel(_)))
-                    .filter(|_| !self.editing_locked());
+                    .filter(|_| !locked);
                 if let Some((attach, gp)) = pin_start {
-                    self.mode = InteractionMode::WireDraw {
+                    doc.mode = InteractionMode::WireDraw {
                         points: vec![gp],
                         start_attach: attach,
                         cursor: pos,
@@ -3300,19 +1678,19 @@ impl OsmilogApp {
                 } else {
                     // Click a component/tunnel body (components take
                     // priority), then a wire segment, else deselect.
-                    let maybe_comp = self
+                    let maybe_comp = doc
                         .active_components()
                         .find(|(_k, pc)| component_bounding_rect(pc, cc.camera).contains(pos))
                         .map(|(k, _)| Selected::Component(k));
-                    let maybe_tunnel = self
+                    let maybe_tunnel = doc
                         .active_tunnels()
                         .find(|(_k, pt)| tunnel_bounding_rect(pt, cc.camera).contains(pos))
                         .map(|(k, _)| Selected::Tunnel(k));
-                    let maybe_wire = self
+                    let maybe_wire = doc
                         .wiring
                         .segment_at_pos(pos, cc.camera)
                         .map(|(seg, _)| Selected::Wire(seg));
-                    self.selected = maybe_comp
+                    doc.selected = maybe_comp
                         .or(maybe_tunnel)
                         .or(maybe_wire)
                         .map(Selection::Single);
@@ -3330,7 +1708,7 @@ impl OsmilogApp {
             if let Some(pos) = pointer {
                 let gp = cc.camera.screen_to_grid(pos);
                 self.place_component(spec, gp);
-                self.mode = InteractionMode::Idle;
+                self.active_mut().mode = InteractionMode::Idle;
             }
         }
     }
@@ -3343,8 +1721,8 @@ impl OsmilogApp {
         if cc.response.clicked() {
             if let Some(pos) = pointer {
                 let gp = cc.camera.screen_to_grid(pos);
-                self.place_tunnel(role, gp);
-                self.mode = InteractionMode::Idle;
+                self.active_mut().place_tunnel(role, gp);
+                self.active_mut().mode = InteractionMode::Idle;
             }
         }
     }
@@ -3360,7 +1738,8 @@ impl OsmilogApp {
     ) {
         puffin::profile_function!();
         let end = pointer.unwrap_or(cursor);
-        let (drop_attach, drop_gp, terminal) = self.wire_target_at(end, cc.camera);
+        let doc = self.active_mut();
+        let (drop_attach, drop_gp, terminal) = doc.wire_target_at(end, cc.camera);
 
         // Preview: committed segments, then the pending elbow from the
         // last committed corner to the (snapped) drop point.
@@ -3388,7 +1767,7 @@ impl OsmilogApp {
         }
 
         if dragging {
-            self.mode = InteractionMode::WireDraw {
+            doc.mode = InteractionMode::WireDraw {
                 points: points.clone(),
                 start_attach,
                 cursor: end,
@@ -3397,8 +1776,8 @@ impl OsmilogApp {
             if cc.response.drag_stopped() {
                 let mut route = points.clone();
                 route.extend(pending);
-                self.commit_wire_route(route, start_attach, drop_attach);
-                self.mode = InteractionMode::Idle;
+                doc.commit_wire_route(route, start_attach, drop_attach);
+                doc.mode = InteractionMode::Idle;
             }
         } else {
             // Click-polyline: a click on a terminal (or a double-click)
@@ -3407,29 +1786,29 @@ impl OsmilogApp {
             let mut finished = false;
             if cc.response.double_clicked() {
                 next_points.extend(pending.clone());
-                self.history.begin_batch();
-                let delta = self
+                doc.history.begin_batch();
+                let delta = doc
                     .wiring
                     .add_route(&next_points, start_attach, NodeAttach::Free);
-                self.edit_wiring(delta);
+                doc.edit_wiring(delta);
                 finished = true;
             } else if cc.response.clicked() {
                 next_points.extend(pending.clone());
                 if terminal {
-                    self.history.begin_batch();
-                    let delta = self
+                    doc.history.begin_batch();
+                    let delta = doc
                         .wiring
                         .add_route(&next_points, start_attach, drop_attach);
-                    self.edit_wiring(delta);
+                    doc.edit_wiring(delta);
                     finished = true;
                 }
             }
             if finished {
-                self.rebuild_circuit();
-                self.history.end_batch();
-                self.mode = InteractionMode::Idle;
+                doc.rebuild_circuit();
+                doc.history.end_batch();
+                doc.mode = InteractionMode::Idle;
             } else {
-                self.mode = InteractionMode::WireDraw {
+                doc.mode = InteractionMode::WireDraw {
                     points: next_points,
                     start_attach,
                     cursor: end,
@@ -3448,6 +1827,7 @@ impl OsmilogApp {
         drag_origin: Pos2,
     ) {
         puffin::profile_function!();
+        let doc = self.active_mut();
         if let Some(pos) = pointer {
             let step = cc.camera.grid_scale();
             let delta_x = ((pos.x - drag_origin.x) / step).round() as i32;
@@ -3463,12 +1843,12 @@ impl OsmilogApp {
                 // Topology is unchanged, so no circuit rebuild is needed.
                 match key {
                     Selected::Component(k) => {
-                        self.components[k].grid_pos = new_grid_pos;
-                        self.sync_component_wire_nodes(k);
+                        doc.components[k].grid_pos = new_grid_pos;
+                        doc.sync_component_wire_nodes(k);
                     }
                     Selected::Tunnel(k) => {
-                        self.tunnels[k].grid_pos = new_grid_pos;
-                        self.sync_tunnel_wire_nodes(k);
+                        doc.tunnels[k].grid_pos = new_grid_pos;
+                        doc.sync_tunnel_wire_nodes(k);
                     }
                     Selected::Wire(_) => {}
                 }
@@ -3478,7 +1858,7 @@ impl OsmilogApp {
             // directly by the same delta - otherwise a selected wire run
             // with an interior corner would stay pinned while its ends move.
             for &(key, original_pos) in &free_nodes {
-                self.wiring.nodes[key].pos =
+                doc.wiring.nodes[key].pos =
                     GridPos::new(original_pos.x + delta_x, original_pos.y + delta_y);
             }
         }
@@ -3486,15 +1866,15 @@ impl OsmilogApp {
             // One undo batch restores every moved item's/node's original
             // position at once, even when only some of them actually moved
             // (e.g. the pointer didn't clear a whole grid cell).
-            self.history.begin_batch();
+            doc.history.begin_batch();
             for (key, original_grid_pos) in items {
-                self.commit_move(key, original_grid_pos);
+                doc.commit_move(key, original_grid_pos);
             }
             for (key, original_pos) in free_nodes {
-                self.commit_wire_node_move(key, original_pos);
+                doc.commit_wire_node_move(key, original_pos);
             }
-            self.history.end_batch();
-            self.mode = InteractionMode::Idle;
+            doc.history.end_batch();
+            doc.mode = InteractionMode::Idle;
         }
     }
 
@@ -3523,17 +1903,18 @@ impl OsmilogApp {
         // Finish on release. The `!dragged` guard also recovers from a
         // flick released the same frame it started (drag_stopped never
         // fires in the BulkSelect arm then), so the mode can't stick.
+        let doc = self.active_mut();
         if cc.response.drag_stopped() || !cc.response.dragged() {
-            let selected_items = self.items_in_rect(rect, cc.camera);
+            let selected_items = doc.items_in_rect(rect, cc.camera);
             // If only one item in bounds, directly select it
-            self.selected = match selected_items.len() {
+            doc.selected = match selected_items.len() {
                 0 => None,
                 1 => Some(Selection::Single(selected_items[0])),
                 _ => Some(Selection::Bulk(selected_items)),
             };
-            self.mode = InteractionMode::Idle;
+            doc.mode = InteractionMode::Idle;
         } else {
-            self.mode = InteractionMode::BulkSelect { start, current };
+            doc.mode = InteractionMode::BulkSelect { start, current };
         }
     }
 }
@@ -3549,7 +1930,7 @@ impl eframe::App for OsmilogApp {
         // one; no-op on native (and every quiet frame on web).
         self.with_io(|io, app| io.poll_pending_load(app));
 
-        self.advance_clock(ctx);
+        self.active_mut().advance_clock(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) {
             // Exits the process on native; no-op on web (the canvas just stops).
@@ -3568,15 +1949,8 @@ impl eframe::App for OsmilogApp {
 
         self.show_menu_bar(ui, theme);
 
-        // ROM contents editor window, drawn while a ROM's editor is open.
-        if let Some(pc) = self.rom_editor_open {
-            self.show_rom_editor(&ctx, pc);
-        }
-
-        // RAM contents editor window, drawn while a RAM's editor is open.
-        if let Some(pc) = self.ram_editor_open {
-            self.show_ram_editor(&ctx, pc);
-        }
+        // ROM/RAM contents editor windows, drawn while open.
+        self.show_memory_editors(&ctx);
 
         // "New Circuit" name dialog, drawn while it's open.
         self.create_new_circuit_dialog(&ctx);
@@ -3614,7 +1988,11 @@ impl eframe::App for OsmilogApp {
                 egui::ScrollArea::vertical()
                     .id_salt("properties_scroll")
                     .show(ui, |ui| {
-                        self.show_properties(ui);
+                        if let Some(action) =
+                            crate::gui::properties::show_properties(self.active(), ui)
+                        {
+                            self.apply_prop_gui_action(action);
+                        }
                     });
             });
 
@@ -3623,8 +2001,8 @@ impl eframe::App for OsmilogApp {
 
         // Update the camera (middle-drag pan, Ctrl+scroll zoom) before drawing so
         // the change applies this same frame.
-        self.handle_camera_input(&response, &ctx);
-        let camera = self.camera;
+        self.active_mut().camera.handle_input(&response, &ctx);
+        let camera = self.active().camera;
 
         self.handle_canvas_shortcuts(&ctx);
         self.draw_canvas(&painter, clip_rect, camera, theme);
@@ -3647,8 +2025,8 @@ impl eframe::App for OsmilogApp {
 // WireNodeKey become positions in the emitted Vecs, so cross-references are
 // plain indices rather than ephemeral slotmap keys. Tombstones (kept for undo)
 // never reach a file. Also returns the PlacedCompKey -> component-index map, so
-// a caller can emit per-component references (subcircuit links) by index.
-// Shared by `to_snapshot` and `circuit_entry_of`.
+// `circuit_entry_of` can emit per-component references (subcircuit links) by
+// index.
 fn extract_records(
     components: &SlotMap<PlacedCompKey, PlacedComponent>,
     tunnels: &SlotMap<PlacedTunnelKey, PlacedTunnel>,
@@ -3735,7 +2113,7 @@ fn extract_records(
     )
 }
 
-fn component_bounding_rect(pc: &PlacedComponent, camera: Camera) -> Rect {
+pub(crate) fn component_bounding_rect(pc: &PlacedComponent, camera: Camera) -> Rect {
     Rect::from_min_size(
         camera.grid_to_screen(pc.grid_pos),
         pc.shape.size * camera.zoom,
@@ -3744,7 +2122,7 @@ fn component_bounding_rect(pc: &PlacedComponent, camera: Camera) -> Rect {
 
 // Grid coordinate of a pin: the component's grid_pos plus the anchor's whole-cell
 // offset. This is the wiring counterpart of comp_pin_pos (which returns pixels).
-fn pin_grid_pos(shape: &ComponentShape, grid_pos: GridPos, pin: PinId) -> GridPos {
+pub(crate) fn pin_grid_pos(shape: &ComponentShape, grid_pos: GridPos, pin: PinId) -> GridPos {
     let anchor = match pin {
         PinId::In(InIdx(i)) => &shape.input_anchors[i as usize],
         PinId::Out(OutIdx(i)) => &shape.output_anchors[i as usize],
@@ -3756,7 +2134,7 @@ fn pin_grid_pos(shape: &ComponentShape, grid_pos: GridPos, pin: PinId) -> GridPo
 }
 
 // Grid coordinate of a tunnel's single pin.
-fn tunnel_pin_grid(pt: &PlacedTunnel) -> GridPos {
+pub(crate) fn tunnel_pin_grid(pt: &PlacedTunnel) -> GridPos {
     let shape = tunnel_shape(pt.role);
     let anchor = match pt.role {
         TunnelRole::Feed => &shape.output_anchors[0],
@@ -3789,7 +2167,12 @@ fn route_elbow(from: GridPos, to: GridPos) -> Vec<GridPos> {
 
 // Takes an already-computed ComponentShape (not &PlacedComponent) so callers
 // needing multiple pins from one component compute shape() once and reuse it.
-fn comp_pin_pos(shape: &ComponentShape, grid_pos: GridPos, camera: Camera, pin: PinId) -> Pos2 {
+pub(crate) fn comp_pin_pos(
+    shape: &ComponentShape,
+    grid_pos: GridPos,
+    camera: Camera,
+    pin: PinId,
+) -> Pos2 {
     let tl = camera.grid_to_screen(grid_pos);
     let anchor = match pin {
         PinId::In(InIdx(i)) => &shape.input_anchors[i as usize],
@@ -3800,12 +2183,12 @@ fn comp_pin_pos(shape: &ComponentShape, grid_pos: GridPos, camera: Camera, pin: 
     tl + anchor.cell * camera.grid_scale()
 }
 
-fn tunnel_bounding_rect(pt: &PlacedTunnel, camera: Camera) -> Rect {
+pub(crate) fn tunnel_bounding_rect(pt: &PlacedTunnel, camera: Camera) -> Rect {
     let size = tunnel_shape(pt.role).size;
     Rect::from_min_size(camera.grid_to_screen(pt.grid_pos), size * camera.zoom)
 }
 
-fn tunnel_pin_pos(pt: &PlacedTunnel, camera: Camera) -> Pos2 {
+pub(crate) fn tunnel_pin_pos(pt: &PlacedTunnel, camera: Camera) -> Pos2 {
     let shape = tunnel_shape(pt.role);
     let tl = camera.grid_to_screen(pt.grid_pos);
     let anchor = match pt.role {
@@ -3815,7 +2198,7 @@ fn tunnel_pin_pos(pt: &PlacedTunnel, camera: Camera) -> Pos2 {
     tl + anchor.cell * camera.grid_scale()
 }
 
-fn pin_at_pos<'a>(
+pub(crate) fn pin_at_pos<'a>(
     components: impl Iterator<Item = (PlacedCompKey, &'a PlacedComponent)>,
     camera: Camera,
     pos: Pos2,
@@ -3848,7 +2231,7 @@ fn pin_at_pos<'a>(
 }
 // A tunnel's single pin under `pos`, regardless of role - a wire can now both
 // start and end on either a Feed or a Pull tunnel.
-fn tunnel_pin_at_pos<'a>(
+pub(crate) fn tunnel_pin_at_pos<'a>(
     tunnels: impl Iterator<Item = (PlacedTunnelKey, &'a PlacedTunnel)>,
     camera: Camera,
     pos: Pos2,
@@ -3863,408 +2246,14 @@ fn tunnel_pin_at_pos<'a>(
     None
 }
 
-// ── Color ─────────────────────────────────────────────────────────────────────
-
-fn value_stroke(theme: Theme, val: Value) -> Stroke {
-    let (color, weight) = match val {
-        Value::Floating => (theme.value_floating, WIRE_THICKNESS_THIN),
-        Value::Invalid => (theme.value_invalid, WIRE_THICKNESS_THICK),
-        Value::Fixed { bits, width } => (
-            if bits == 0 {
-                theme.value_low
-            } else {
-                theme.value_high
-            },
-            if width == 1 {
-                WIRE_THICKNESS_THIN
-            } else {
-                WIRE_THICKNESS_THICK
-            },
-        ),
-    };
-    Stroke::new(weight, color)
-}
-
-// ── Drawing ───────────────────────────────────────────────────────────────────
-
-// egui's line segments use butt caps with no joins, so two segments meeting
-// at a grid-node corner leave a visible notch (the stroke doesn't reach past
-// the shared center point in the perpendicular direction). Extending each
-// end by half the stroke width fills that gap, at the cost of slightly
-// overshooting unjoined endpoints (wire tips, pins) by the same amount.
-fn extend_segment(p0: Pos2, p1: Pos2, extend: f32) -> (Pos2, Pos2) {
-    let delta = p1 - p0;
-    let len = delta.length();
-    if len < f32::EPSILON {
-        return (p0, p1);
-    }
-    let dir = delta / len;
-    (p0 - dir * extend, p1 + dir * extend)
-}
-
-fn draw_grid(painter: &Painter, clip_rect: Rect, camera: Camera, theme: Theme) {
-    let step = camera.grid_scale();
-    // As the view zooms out, thin the drawn dots to every `stride`-th grid
-    // cell so on-screen spacing never crowds below GRID_DOT_MIN_SPACING_PX -
-    // otherwise a wide-out view would paint thousands of near-touching dots.
-    let stride = grid_dot_stride(step);
-    let cell_x1 = ((clip_rect.right() - camera.pan.x) / step).ceil() as i32;
-    let cell_y1 = ((clip_rect.bottom() - camera.pan.y) / step).ceil() as i32;
-    let x0 = (((clip_rect.left() - camera.pan.x) / step).floor() as i32).div_euclid(stride) * stride;
-    let y0 = (((clip_rect.top() - camera.pan.y) / step).floor() as i32).div_euclid(stride) * stride;
-
-    let mut gx = x0;
-    while gx <= cell_x1 {
-        let mut gy = y0;
-        while gy <= cell_y1 {
-            painter.circle_filled(
-                camera.grid_to_screen(GridPos::new(gx, gy)),
-                1.0,
-                theme.grid_dot,
-            );
-            gy += stride;
-        }
-        gx += stride;
-    }
-}
-
-/// Smallest stride (in grid cells, one of 1/2/5 times a power of ten) that
-/// keeps on-screen dot spacing at least `GRID_DOT_MIN_SPACING_PX` given
-/// `cell_px` pixels per grid cell - the standard "nice numbers" tick-spacing
-/// pick, applied to grid dots instead of axis labels.
-fn grid_dot_stride(cell_px: f32) -> i32 {
-    if cell_px >= GRID_DOT_MIN_SPACING_PX {
-        return 1;
-    }
-    let target = GRID_DOT_MIN_SPACING_PX / cell_px;
-    let mut magnitude = 1i32;
-    loop {
-        for base in [1, 2, 5] {
-            let candidate = base * magnitude;
-            if candidate as f32 >= target {
-                return candidate;
-            }
-        }
-        magnitude *= 10;
-    }
-}
-
-// A small crosshair marking where a branch would tap an existing wire.
-fn draw_reticle(painter: &Painter, pos: Pos2, camera: Camera, theme: Theme) {
-    let r = camera.scale(PIN_RADIUS + 1.0);
-    let stroke = Stroke::new(camera.scale(1.0), theme.wire_drag_preview);
-    painter.line_segment([pos - egui::vec2(r, 0.0), pos + egui::vec2(r, 0.0)], stroke);
-    painter.line_segment([pos - egui::vec2(0.0, r), pos + egui::vec2(0.0, r)], stroke);
-}
-
-fn draw_component(
-    painter: &Painter,
-    pc: &PlacedComponent,
-    camera: Camera,
-    circuit: &Circuit,
-    is_selected: bool,
-    theme: Theme,
-) {
-    puffin::profile_function!();
-    let shape = &pc.shape;
-    let rect = component_bounding_rect(pc, camera);
-    let fill = theme.component_fill;
-    let (stroke_w, stroke_col) = if is_selected {
-        (camera.scale(COMP_STROKE + 1.0), theme.outline_selected)
-    } else {
-        (camera.scale(COMP_STROKE), theme.outline_default)
-    };
-    let outline_stroke = Stroke::new(stroke_w, stroke_col);
-
-    // Fill: use the convex fill_outline if provided (avoids epaint's concave polygon artifact),
-    // otherwise fall back to the regular outline.
-    let fill_pts = tessellate_path(
-        shape.fill_outline.as_deref().unwrap_or(&shape.outline),
-        rect,
-    );
-    painter.add(egui::Shape::Path(PathShape {
-        points: fill_pts,
-        closed: true,
-        fill,
-        stroke: Stroke::NONE.into(),
-    }));
-
-    // Stroke: always use the full outline (may include concave curves).
-    let stroke_pts = tessellate_path(&shape.outline, rect);
-    painter.add(egui::Shape::Path(PathShape {
-        points: stroke_pts,
-        closed: true,
-        fill: Color32::TRANSPARENT,
-        stroke: PathStroke::new(stroke_w, stroke_col),
-    }));
-
-    for stroke_cmds in &shape.extra_strokes {
-        let stroke_pts = tessellate_path(stroke_cmds, rect);
-        painter.add(egui::Shape::line(stroke_pts, outline_stroke));
-    }
-
-    let bubble_r = camera.scale(BUBBLE_R);
-    for (i, &has_bubble) in shape.output_bubbles.iter().enumerate() {
-        if has_bubble {
-            let anchor = &shape.output_anchors[i];
-            // The pin sits one cell beyond the body edge; the bubble is drawn in
-            // the gap, just outside the edge (one cell back from the pin).
-            let pin = comp_pin_pos(shape, pc.grid_pos, camera, PinId::output(i as u8));
-            let edge = pin - anchor.wire_dir * camera.grid_scale();
-            let center = edge + anchor.wire_dir * bubble_r;
-            painter.circle_filled(center, bubble_r, fill);
-            painter.circle_stroke(center, bubble_r, outline_stroke);
-        }
-    }
-
-    for label in &shape.labels {
-        let label_pos = egui::pos2(
-            rect.left() + label.pos.x * rect.width(),
-            rect.top() + label.pos.y * rect.height(),
-        );
-        painter.text(
-            label_pos,
-            Align2::CENTER_CENTER,
-            label.text,
-            FontId::monospace(camera.scale(label.font_size)),
-            theme.label_text,
-        );
-    }
-
-    // A subcircuit's on-canvas label is the referenced document's name, drawn
-    // dynamically (like a tunnel label) since it isn't a &'static str.
-    if let ComponentSpec::Subcircuit { name, .. } = &pc.spec {
-        let label_pos = egui::pos2(
-            rect.left() + shape.dynamic_label_pos.x * rect.width(),
-            rect.top() + shape.dynamic_label_pos.y * rect.height(),
-        );
-        painter.text(
-            label_pos,
-            Align2::CENTER_CENTER,
-            name,
-            FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
-            theme.label_text,
-        );
-    }
-
-    // A Constant's on-canvas label is its current value, drawn dynamically
-    // for the same reason a Subcircuit's name is - distinguishing it visually
-    // from an Input at a glance, without a boundary pin to inspect.
-    if let ComponentSpec::Constant(Constant { bits, .. }) = &pc.spec {
-        let label_pos = egui::pos2(
-            rect.left() + shape.dynamic_label_pos.x * rect.width(),
-            rect.top() + shape.dynamic_label_pos.y * rect.height(),
-        );
-        painter.text(
-            label_pos,
-            Align2::CENTER_CENTER,
-            format!("0x{:X}", bits),
-            FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
-            theme.label_text,
-        );
-    }
-
-    let pin_r = camera.scale(PIN_RADIUS);
-    for i in 0..pc.spec.n_inputs() {
-        let pos = comp_pin_pos(shape, pc.grid_pos, camera, PinId::input(i as u8));
-        let val = circuit.components[pc.key].pins.inputs[i]
-            .map(|nk| circuit.nets[nk].value)
-            .unwrap_or(Value::Floating);
-        painter.circle_filled(pos, pin_r, value_stroke(theme, val).color);
-    }
-    for i in 0..pc.spec.n_outputs() {
-        let pos = comp_pin_pos(shape, pc.grid_pos, camera, PinId::output(i as u8));
-        let val = circuit.components[pc.key].pins.out_cache[i];
-        painter.circle_filled(pos, pin_r, value_stroke(theme, val).color);
-    }
-}
-
-fn draw_tunnel(
-    painter: &Painter,
-    pt: &PlacedTunnel,
-    camera: Camera,
-    circuit: &Circuit,
-    is_selected: bool,
-    theme: Theme,
-) {
-    puffin::profile_function!();
-    let shape = tunnel_shape(pt.role);
-    let rect = tunnel_bounding_rect(pt, camera);
-    // Distinct fill from components (theme's "open" widget tone), to visually
-    // distinguish tunnels.
-    let fill = theme.tunnel_fill;
-    let (stroke_w, stroke_col) = if is_selected {
-        (camera.scale(COMP_STROKE + 1.0), theme.outline_selected)
-    } else {
-        (camera.scale(COMP_STROKE), theme.outline_default)
-    };
-
-    let fill_pts = tessellate_path(&shape.outline, rect);
-    painter.add(egui::Shape::Path(PathShape {
-        points: fill_pts,
-        closed: true,
-        fill,
-        stroke: Stroke::NONE.into(),
-    }));
-
-    let stroke_pts = tessellate_path(&shape.outline, rect);
-    painter.add(egui::Shape::Path(PathShape {
-        points: stroke_pts,
-        closed: true,
-        fill: Color32::TRANSPARENT,
-        stroke: PathStroke::new(stroke_w, stroke_col),
-    }));
-
-    let label_pos = egui::pos2(
-        rect.left() + shape.dynamic_label_pos.x * rect.width(),
-        rect.top() + shape.dynamic_label_pos.y * rect.height(),
-    );
-    painter.text(
-        label_pos,
-        Align2::CENTER_CENTER,
-        &pt.label,
-        FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
-        theme.label_text,
-    );
-
-    let val = circuit
-        .tunnels
-        .get(pt.key)
-        .and_then(|t| t.net)
-        .map(|nk| circuit.nets[nk].value)
-        .unwrap_or(Value::Floating);
-    painter.circle_filled(
-        tunnel_pin_pos(pt, camera),
-        camera.scale(PIN_RADIUS),
-        value_stroke(theme, val).color,
-    );
-}
-
-fn draw_ghost(
-    painter: &Painter,
-    spec: &ComponentSpec,
-    grid_pos: GridPos,
-    camera: Camera,
-    theme: Theme,
-) {
-    let shape = spec.shape();
-    let rect = Rect::from_min_size(camera.grid_to_screen(grid_pos), shape.size * camera.zoom);
-    let ghost_col = theme.ghost_preview;
-    let stroke_w = camera.scale(COMP_STROKE);
-
-    let pts = tessellate_path(&shape.outline, rect);
-    painter.add(egui::Shape::Path(PathShape {
-        points: pts,
-        closed: true,
-        fill: Color32::TRANSPARENT,
-        stroke: PathStroke::new(stroke_w, ghost_col),
-    }));
-
-    for stroke_cmds in &shape.extra_strokes {
-        let stroke_pts = tessellate_path(stroke_cmds, rect);
-        painter.add(egui::Shape::line(
-            stroke_pts,
-            Stroke::new(stroke_w, ghost_col),
-        ));
-    }
-
-    for label in &shape.labels {
-        let label_pos = egui::pos2(
-            rect.left() + label.pos.x * rect.width(),
-            rect.top() + label.pos.y * rect.height(),
-        );
-        painter.text(
-            label_pos,
-            Align2::CENTER_CENTER,
-            label.text,
-            FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
-            ghost_col,
-        );
-    }
-
-    if let ComponentSpec::Subcircuit { name, .. } = spec {
-        let label_pos = egui::pos2(
-            rect.left() + shape.dynamic_label_pos.x * rect.width(),
-            rect.top() + shape.dynamic_label_pos.y * rect.height(),
-        );
-        painter.text(
-            label_pos,
-            Align2::CENTER_CENTER,
-            name,
-            FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
-            ghost_col,
-        );
-    }
-}
-
-fn draw_tunnel_ghost(
-    painter: &Painter,
-    role: TunnelRole,
-    grid_pos: GridPos,
-    camera: Camera,
-    theme: Theme,
-) {
-    let shape = tunnel_shape(role);
-    let rect = Rect::from_min_size(camera.grid_to_screen(grid_pos), shape.size * camera.zoom);
-    let ghost_col = theme.ghost_preview;
-
-    let pts = tessellate_path(&shape.outline, rect);
-    painter.add(egui::Shape::Path(PathShape {
-        points: pts,
-        closed: true,
-        fill: Color32::TRANSPARENT,
-        stroke: PathStroke::new(camera.scale(COMP_STROKE), ghost_col),
-    }));
-
-    let label_pos = egui::pos2(
-        rect.left() + shape.dynamic_label_pos.x * rect.width(),
-        rect.top() + shape.dynamic_label_pos.y * rect.height(),
-    );
-    let label = match role {
-        TunnelRole::Feed => "TUN(F)",
-        TunnelRole::Pull => "TUN(P)",
-    };
-    painter.text(
-        label_pos,
-        Align2::CENTER_CENTER,
-        label,
-        FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
-        ghost_col,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::gui_undo::GuiUndoAction;
+    use crate::gui::history::HistoryEntry;
     use crate::gui::wiring::NodeAttach;
+    use crate::sim::command::Command;
     use crate::sim::component::GateOp;
-
-    #[test]
-    fn grid_dot_stride_is_1_above_min_spacing() {
-        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX), 1);
-        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX * 2.0), 1);
-    }
-
-    #[test]
-    fn grid_dot_stride_picks_smallest_nice_stride_that_fits() {
-        // At half the min spacing, a stride of 2 already gets there.
-        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX / 2.0), 2);
-        // At a fifth, stride 5 is the smallest nice number that clears it.
-        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX / 4.5), 5);
-        // At a tenth, stride 10.
-        assert_eq!(grid_dot_stride(GRID_DOT_MIN_SPACING_PX / 10.0), 10);
-    }
-
-    #[test]
-    fn grid_dot_stride_result_always_clears_the_minimum_spacing() {
-        for cell_px in [0.5, 1.0, 2.0, 2.5, 3.0, 7.0, 15.9, 16.0, 50.0] {
-            let stride = grid_dot_stride(cell_px);
-            assert!(
-                cell_px * stride as f32 >= GRID_DOT_MIN_SPACING_PX,
-                "cell_px={cell_px} stride={stride} leaves dots too close"
-            );
-        }
-    }
 
     fn place(app: &mut OsmilogApp, spec: ComponentSpec) -> PlacedCompKey {
         app.place_component(spec, GridPos::new(0, 0))
@@ -4274,26 +2263,26 @@ mod tests {
     // pin's grid cell, and return the two node keys.
     fn connect_pins(app: &mut OsmilogApp, a: (PlacedCompKey, PinId), b: (PlacedCompKey, PinId)) {
         let pa = pin_grid_pos(
-            &app.components[a.0].shape,
-            app.components[a.0].grid_pos,
+            &app.active().components[a.0].shape,
+            app.active().components[a.0].grid_pos,
             a.1,
         );
         let pb = pin_grid_pos(
-            &app.components[b.0].shape,
-            app.components[b.0].grid_pos,
+            &app.active().components[b.0].shape,
+            app.active().components[b.0].grid_pos,
             b.1,
         );
-        let na = app.wiring.nodes.insert(WireNode {
+        let na = app.active_mut().wiring.nodes.insert(WireNode {
             pos: pa,
             attach: NodeAttach::Pin(a.0, a.1),
             active: true,
         });
-        let nb = app.wiring.nodes.insert(WireNode {
+        let nb = app.active_mut().wiring.nodes.insert(WireNode {
             pos: pb,
             attach: NodeAttach::Pin(b.0, b.1),
             active: true,
         });
-        app.wiring.segments.insert(WireSegment {
+        app.active_mut().wiring.segments.insert(WireSegment {
             a: na,
             b: nb,
             active: true,
@@ -4303,70 +2292,26 @@ mod tests {
     // Insert a wire (one segment) between a component pin and a tunnel.
     fn connect_pin_tunnel(app: &mut OsmilogApp, c: (PlacedCompKey, PinId), ptk: PlacedTunnelKey) {
         let pc = pin_grid_pos(
-            &app.components[c.0].shape,
-            app.components[c.0].grid_pos,
+            &app.active().components[c.0].shape,
+            app.active().components[c.0].grid_pos,
             c.1,
         );
-        let pt = tunnel_pin_grid(&app.tunnels[ptk]);
-        let nc = app.wiring.nodes.insert(WireNode {
+        let pt = tunnel_pin_grid(&app.active().tunnels[ptk]);
+        let nc = app.active_mut().wiring.nodes.insert(WireNode {
             pos: pc,
             attach: NodeAttach::Pin(c.0, c.1),
             active: true,
         });
-        let nt = app.wiring.nodes.insert(WireNode {
+        let nt = app.active_mut().wiring.nodes.insert(WireNode {
             pos: pt,
             attach: NodeAttach::Tunnel(ptk),
             active: true,
         });
-        app.wiring.segments.insert(WireSegment {
+        app.active_mut().wiring.segments.insert(WireSegment {
             a: nc,
             b: nt,
             active: true,
         });
-    }
-
-    #[test]
-    fn test_circuit_file_round_trip_basic() {
-        let mut app = OsmilogApp::empty();
-        let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
-        let b = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
-        let g = place(
-            &mut app,
-            ComponentSpec::Gate(Gate {
-                op: GateOp::And,
-                n_inputs: 2,
-                width: 1,
-            }),
-        );
-        let o = place(&mut app, ComponentSpec::Output);
-
-        connect_pins(&mut app, (a, PinId::output(0)), (g, PinId::input(0)));
-        connect_pins(&mut app, (b, PinId::output(0)), (g, PinId::input(1)));
-        connect_pins(&mut app, (g, PinId::output(0)), (o, PinId::input(0)));
-        app.rebuild_circuit();
-
-        let o_key = app.components[o].key;
-        assert_eq!(app.circuit.read_output(o_key), Value::ONE);
-
-        // Save -> JSON -> parse -> load into a fresh app, and confirm the
-        // loaded circuit behaves identically.
-        let snap = app.to_snapshot();
-        let json = serde_json::to_string(&snap).unwrap();
-        let snap2: CircuitSnapshot = serde_json::from_str(&json).unwrap();
-
-        let mut loaded = OsmilogApp::empty();
-        loaded.load_snapshot(&snap2).unwrap();
-
-        assert_eq!(loaded.components.len(), 4);
-        assert_eq!(loaded.wiring.segments.len(), 3);
-        assert_eq!(loaded.wiring.nodes.len(), 6);
-        let loaded_out_key = loaded
-            .components
-            .values()
-            .find(|pc| matches!(pc.spec, ComponentSpec::Output))
-            .unwrap()
-            .key;
-        assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::ONE);
     }
 
     #[test]
@@ -4386,104 +2331,50 @@ mod tests {
         let o = place(&mut app, ComponentSpec::Output);
         connect_pins(&mut app, (a, PinId::output(0)), (g, PinId::input(0)));
         connect_pins(&mut app, (g, PinId::output(0)), (o, PinId::input(0)));
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
         // Delete the a->g wire; its nodes/segment become tombstones still held
         // in the SlotMaps.
         let seg = app
+            .active()
             .wiring
             .active_segments()
             .find(|(_, s)| {
-                matches!(app.wiring.nodes[s.a].attach, NodeAttach::Pin(k, _) if k == a)
-                    || matches!(app.wiring.nodes[s.b].attach, NodeAttach::Pin(k, _) if k == a)
+                matches!(app.active().wiring.nodes[s.a].attach, NodeAttach::Pin(k, _) if k == a)
+                    || matches!(app.active().wiring.nodes[s.b].attach, NodeAttach::Pin(k, _) if k == a)
             })
             .map(|(k, _)| k)
             .unwrap();
-        app.delete_wire(seg);
-        assert!(app.wiring.segments.len() > app.wiring.active_segments().count());
+        app.active_mut().delete_wire(seg);
+        assert!(app.active().wiring.segments.len() > app.active().wiring.active_segments().count());
 
-        // The snapshot carries only live entries, and the reload matches the
-        // live graph exactly.
-        let snap = app.to_snapshot();
-        assert_eq!(snap.segments.len(), app.wiring.active_segments().count());
-        assert_eq!(snap.nodes.len(), app.wiring.active_nodes().count());
-
-        let json = serde_json::to_string(&snap).unwrap();
-        let snap2: CircuitSnapshot = serde_json::from_str(&json).unwrap();
-        let mut loaded = OsmilogApp::empty();
-        loaded.load_snapshot(&snap2).unwrap();
+        // The saved project carries only live entries, and the reload matches
+        // the live graph exactly.
+        let file = app.to_project_file();
+        let snap = &file.circuits[0].snapshot;
         assert_eq!(
-            loaded.wiring.active_segments().count(),
-            app.wiring.active_segments().count()
+            snap.segments.len(),
+            app.active().wiring.active_segments().count()
+        );
+        assert_eq!(snap.nodes.len(), app.active().wiring.active_nodes().count());
+
+        let json = file.to_json().unwrap();
+        let file2 = ProjectFile::from_json(&json).unwrap();
+        let mut loaded = OsmilogApp::empty();
+        loaded.load_project_file(&file2).unwrap();
+        assert_eq!(
+            loaded.active().wiring.active_segments().count(),
+            app.active().wiring.active_segments().count()
         );
         // A fresh load has no tombstones: every stored entry is live.
         assert_eq!(
-            loaded.wiring.segments.len(),
-            loaded.wiring.active_segments().count()
+            loaded.active().wiring.segments.len(),
+            loaded.active().wiring.active_segments().count()
         );
         assert_eq!(
-            loaded.wiring.nodes.len(),
-            loaded.wiring.active_nodes().count()
+            loaded.active().wiring.nodes.len(),
+            loaded.active().wiring.active_nodes().count()
         );
-    }
-
-    #[test]
-    fn test_circuit_file_round_trip_with_tunnel() {
-        let mut app = OsmilogApp::empty();
-        let inp = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
-        let out = place(&mut app, ComponentSpec::Output);
-        let feed = app.place_tunnel(TunnelRole::Feed, GridPos::new(0, 0));
-        let pull = app.place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
-
-        // Tunnels connect to each other by matching label, not by wire -
-        // give `pull` the same label as `feed` so they form one virtual net.
-        let shared_label = app.tunnels[feed].label.clone();
-        app.circuit
-            .rename_tunnel(app.tunnels[pull].key, shared_label.clone());
-        app.tunnels[pull].label = shared_label;
-
-        // Pull reads FROM inp's output; Feed drives out's input.
-        connect_pin_tunnel(&mut app, (inp, PinId::output(0)), pull);
-        connect_pin_tunnel(&mut app, (out, PinId::input(0)), feed);
-        app.rebuild_circuit();
-
-        let out_key = app.components[out].key;
-        assert_eq!(app.circuit.read_output(out_key), Value::ONE);
-
-        let snap = app.to_snapshot();
-        let json = serde_json::to_string(&snap).unwrap();
-        let snap2: CircuitSnapshot = serde_json::from_str(&json).unwrap();
-
-        let mut loaded = OsmilogApp::empty();
-        loaded.load_snapshot(&snap2).unwrap();
-
-        assert_eq!(loaded.tunnels.len(), 2);
-        let loaded_out_key = loaded
-            .components
-            .values()
-            .find(|pc| matches!(pc.spec, ComponentSpec::Output))
-            .unwrap()
-            .key;
-        assert_eq!(loaded.circuit.read_output(loaded_out_key), Value::ONE);
-    }
-
-    #[test]
-    fn test_load_snapshot_clears_undo_history() {
-        // Loading a snapshot places components/tunnels through the ordinary
-        // undo-recordable path; a fresh load must not leave those placements
-        // sitting on the undo stack, or undo would delete the just-loaded
-        // circuit one piece at a time instead of being a no-op.
-        let mut app = OsmilogApp::empty();
-        place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
-        place(&mut app, ComponentSpec::Output);
-        app.place_tunnel(TunnelRole::Pull, GridPos::new(0, 0));
-        let snap = app.to_snapshot();
-
-        let mut loaded = OsmilogApp::empty();
-        loaded.load_snapshot(&snap).unwrap();
-
-        assert!(!loaded.history.can_undo());
-        assert!(!loaded.history.can_redo());
     }
 
     #[test]
@@ -4496,38 +2387,43 @@ mod tests {
         let mut loaded = OsmilogApp::empty();
         loaded.load_project_file(&file).unwrap();
 
-        assert!(!loaded.history.can_undo());
-        assert!(!loaded.history.can_redo());
+        assert!(!loaded.active().history.can_undo());
+        assert!(!loaded.active().history.can_redo());
     }
 
     #[test]
-    fn test_load_snapshot_rejects_bad_component_index() {
-        let snap = CircuitSnapshot {
-            components: vec![ComponentEntry {
-                spec: ComponentSpec::Output,
-                grid_pos: GridPos::ZERO,
-            }],
-            tunnels: vec![],
-            nodes: vec![NodeEntry {
-                pos: GridPos::ZERO,
-                attach: NodeAttachEntry::Pin {
-                    comp: 5,
-                    is_input: true,
-                    pin_index: 0,
-                },
-            }],
-            segments: vec![],
+    fn test_load_project_file_rejects_bad_component_index() {
+        let entry = CircuitEntry {
+            name: "Main".to_string(),
+            snapshot: CircuitSnapshot {
+                components: vec![ComponentEntry {
+                    spec: ComponentSpec::Output,
+                    grid_pos: GridPos::ZERO,
+                }],
+                tunnels: vec![],
+                nodes: vec![NodeEntry {
+                    pos: GridPos::ZERO,
+                    attach: NodeAttachEntry::Pin {
+                        comp: 5,
+                        is_input: true,
+                        pin_index: 0,
+                    },
+                }],
+                segments: vec![],
+            },
+            subcircuits: vec![],
         };
+        let file = ProjectFile::new(0, vec![entry]);
 
         let mut app = OsmilogApp::empty();
-        let before = app.components.len();
-        assert!(app.load_snapshot(&snap).is_err());
-        // A rejected snapshot must not leave the app half-overwritten.
-        assert_eq!(app.components.len(), before);
+        let before = app.active().components.len();
+        assert!(app.load_project_file(&file).is_err());
+        // A rejected file must not leave the app half-overwritten.
+        assert_eq!(app.active().components.len(), before);
     }
 
-    // (Unsupported-version rejection is a project-file concern now that a
-    // snapshot carries no version - see test_project_file_validate_rejects_bad_files.)
+    // (Unsupported-version rejection is a project-file concern - see
+    // test_project_file_validate_rejects_bad_files.)
 
     #[test]
     fn test_delete_component_drops_wire_nodes_and_refreshes_downstream() {
@@ -4548,32 +2444,38 @@ mod tests {
         let o = place(&mut app, ComponentSpec::Output);
         connect_pins(&mut app, (a, PinId::output(0)), (g, PinId::input(0)));
         connect_pins(&mut app, (g, PinId::output(0)), (o, PinId::input(0)));
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
-        let g_key = app.components[g].key;
-        let o_key = app.components[o].key;
-        assert_eq!(app.circuit.read_output(o_key), Value::ZERO); // NOT(1) = 0
-        app.selected = Some(Selection::Single(Selected::Component(g)));
+        let g_key = app.active().components[g].key;
+        let o_key = app.active().components[o].key;
+        assert_eq!(app.active().circuit.read_output(o_key), Value::ZERO); // NOT(1) = 0
+        app.active_mut().selected = Some(Selection::Single(Selected::Component(g)));
 
-        app.delete_component(g);
+        app.active_mut().delete_component(g);
 
         // The placed record is tombstoned (kept for undo), so its key stays
         // valid but the record is inactive rather than gone.
-        assert!(app.components.contains_key(g));
-        assert!(!app.components[g].active);
+        assert!(app.active().components.contains_key(g));
+        assert!(!app.active().components[g].active);
         // Circuit-side removal tombstones (keeps the CompKey for undo), so the
         // component is inactive rather than gone.
-        assert!(app.circuit.components.get(g_key).is_some_and(|c| !c.active));
+        assert!(app
+            .active()
+            .circuit
+            .components
+            .get(g_key)
+            .is_some_and(|c| !c.active));
         // No wire node references the deleted component; orphan neighbours were
         // cleaned up too, leaving no segments.
         assert!(app
+            .active()
             .wiring
             .active_nodes()
             .all(|(_, n)| !matches!(n.attach, NodeAttach::Pin(k, _) if k == g)));
-        assert_eq!(app.wiring.active_segments().count(), 0);
-        assert_eq!(app.selected, None);
+        assert_eq!(app.active().wiring.active_segments().count(), 0);
+        assert_eq!(app.active().selected, None);
         // Output's input pin is now Floating.
-        assert_eq!(app.circuit.read_output(o_key), Value::Floating);
+        assert_eq!(app.active().circuit.read_output(o_key), Value::Floating);
     }
 
     #[test]
@@ -4582,24 +2484,32 @@ mod tests {
         // nodes and clears the selection.
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
-        let t = app.place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
-        let t_key = app.tunnels[t].key;
+        let t = app
+            .active_mut()
+            .place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
+        let t_key = app.active().tunnels[t].key;
         connect_pin_tunnel(&mut app, (a, PinId::output(0)), t);
-        app.rebuild_circuit();
-        app.selected = Some(Selection::Single(Selected::Tunnel(t)));
+        app.active_mut().rebuild_circuit();
+        app.active_mut().selected = Some(Selection::Single(Selected::Tunnel(t)));
 
-        app.delete_tunnel(t);
+        app.active_mut().delete_tunnel(t);
 
         // Placed record tombstoned (kept for undo): key valid, record inactive.
-        assert!(app.tunnels.contains_key(t));
-        assert!(!app.tunnels[t].active);
+        assert!(app.active().tunnels.contains_key(t));
+        assert!(!app.active().tunnels[t].active);
         // Tombstoned circuit-side (TunnelKey kept for undo): inactive, not gone.
-        assert!(app.circuit.tunnels.get(t_key).is_some_and(|t| !t.active));
         assert!(app
+            .active()
+            .circuit
+            .tunnels
+            .get(t_key)
+            .is_some_and(|t| !t.active));
+        assert!(app
+            .active()
             .wiring
             .active_nodes()
             .all(|(_, n)| !matches!(n.attach, NodeAttach::Tunnel(k) if k == t)));
-        assert_eq!(app.selected, None);
+        assert_eq!(app.active().selected, None);
     }
 
     #[test]
@@ -4612,22 +2522,26 @@ mod tests {
         let mut app = OsmilogApp::empty();
         let inp = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let out = place(&mut app, ComponentSpec::Output);
-        let pull = app.place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
-        let feed = app.place_tunnel(TunnelRole::Feed, GridPos::new(2, 2));
+        let pull = app
+            .active_mut()
+            .place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
+        let feed = app
+            .active_mut()
+            .place_tunnel(TunnelRole::Feed, GridPos::new(2, 2));
 
         connect_pin_tunnel(&mut app, (inp, PinId::output(0)), pull);
         connect_pin_tunnel(&mut app, (out, PinId::input(0)), feed);
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
-        let out_key = app.components[out].key;
-        assert_eq!(app.circuit.read_output(out_key), Value::Floating);
+        let out_key = app.active().components[out].key;
+        assert_eq!(app.active().circuit.read_output(out_key), Value::Floating);
 
         // GUI label changed only; circuit.rename_tunnel deliberately NOT called.
-        let shared = app.tunnels[pull].label.clone();
-        app.tunnels[feed].label = shared;
-        app.rebuild_circuit();
+        let shared = app.active().tunnels[pull].label.clone();
+        app.active_mut().tunnels[feed].label = shared;
+        app.active_mut().rebuild_circuit();
 
-        assert_eq!(app.circuit.read_output(out_key), Value::ONE);
+        assert_eq!(app.active().circuit.read_output(out_key), Value::ONE);
     }
 
     #[test]
@@ -4640,25 +2554,25 @@ mod tests {
         let b = app.place_component(ComponentSpec::Output, GridPos::new(2, 2));
         let far = app.place_component(ComponentSpec::Output, GridPos::new(50, 50));
         connect_pins(&mut app, (a, PinId::output(0)), (b, PinId::input(0)));
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
         let camera = Camera::default();
         let rect = selection_screen_rect(GridPos::new(-2, -2), GridPos::new(12, 12), camera);
-        let items = app.items_in_rect(rect, camera);
+        let items = app.active().items_in_rect(rect, camera);
         assert!(items.contains(&Selected::Component(a)));
         assert!(items.contains(&Selected::Component(b)));
         assert!(!items.contains(&Selected::Component(far)));
 
-        app.selected = Some(Selection::Bulk(items));
-        app.delete_bulk();
+        app.active_mut().selected = Some(Selection::Bulk(items));
+        app.active_mut().delete_bulk();
 
         // Deleted records are tombstoned (inactive), the untouched one stays active.
-        assert!(!app.components[a].active);
-        assert!(!app.components[b].active);
-        assert!(app.components[far].active);
-        assert_eq!(app.selected, None);
+        assert!(!app.active().components[a].active);
+        assert!(!app.active().components[b].active);
+        assert!(app.active().components[far].active);
+        assert_eq!(app.active().selected, None);
         // The wire between a and b went with them.
-        assert_eq!(app.wiring.active_segments().count(), 0);
+        assert_eq!(app.active().wiring.active_segments().count(), 0);
     }
 
     #[test]
@@ -4678,25 +2592,26 @@ mod tests {
         let o = place(&mut app, ComponentSpec::Output);
         connect_pins(&mut app, (a, PinId::output(0)), (g, PinId::input(0)));
         connect_pins(&mut app, (g, PinId::output(0)), (o, PinId::input(0)));
-        app.rebuild_circuit();
-        let o_key = app.components[o].key;
-        assert_eq!(app.circuit.read_output(o_key), Value::ZERO);
+        app.active_mut().rebuild_circuit();
+        let o_key = app.active().components[o].key;
+        assert_eq!(app.active().circuit.read_output(o_key), Value::ZERO);
 
         // Delete the a->g segment (the one touching a's output pin node).
         let seg = app
+            .active()
             .wiring
             .segments
             .iter()
             .find(|(_, s)| {
-                matches!(app.wiring.nodes[s.a].attach, NodeAttach::Pin(k, _) if k == a)
-                    || matches!(app.wiring.nodes[s.b].attach, NodeAttach::Pin(k, _) if k == a)
+                matches!(app.active().wiring.nodes[s.a].attach, NodeAttach::Pin(k, _) if k == a)
+                    || matches!(app.active().wiring.nodes[s.b].attach, NodeAttach::Pin(k, _) if k == a)
             })
             .map(|(k, _)| k)
             .unwrap();
-        app.delete_wire(seg);
+        app.active_mut().delete_wire(seg);
 
         // g's input is now Floating -> NOT(Floating) = Floating at the output.
-        assert_eq!(app.circuit.read_output(o_key), Value::Floating);
+        assert_eq!(app.active().circuit.read_output(o_key), Value::Floating);
     }
 
     #[test]
@@ -4716,15 +2631,21 @@ mod tests {
             }),
         );
         connect_pins(&mut app, (a, PinId::output(0)), (g, PinId::input(0)));
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
-        let seg = app.wiring.active_segments().next().map(|(k, _)| k).unwrap();
-        let stack_before = app.history.len();
-        app.delete_wire(seg);
+        let seg = app
+            .active()
+            .wiring
+            .active_segments()
+            .next()
+            .map(|(k, _)| k)
+            .unwrap();
+        let stack_before = app.active().history.len();
+        app.active_mut().delete_wire(seg);
 
-        assert_eq!(app.history.len(), stack_before + 1);
+        assert_eq!(app.active().history.len(), stack_before + 1);
         assert!(matches!(
-            app.history.last(),
+            app.active().history.last(),
             Some(HistoryEntry::Gui(GuiUndoAction::WiringDelta { .. }))
         ));
     }
@@ -4733,18 +2654,20 @@ mod tests {
     fn test_commit_move_pushes_undo_only_when_position_changed() {
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
-        let original = app.components[a].grid_pos;
-        let stack_before = app.history.len();
+        let original = app.active().components[a].grid_pos;
+        let stack_before = app.active().history.len();
 
         // No movement: nothing pushed.
-        app.commit_move(Selected::Component(a), original);
-        assert_eq!(app.history.len(), stack_before);
+        app.active_mut()
+            .commit_move(Selected::Component(a), original);
+        assert_eq!(app.active().history.len(), stack_before);
 
         // Moved: pushes one MoveComponent entry with the correct old_pos.
-        app.components[a].grid_pos = GridPos::new(original.x + 3, original.y + 1);
-        app.commit_move(Selected::Component(a), original);
-        assert_eq!(app.history.len(), stack_before + 1);
-        match app.history.last() {
+        app.active_mut().components[a].grid_pos = GridPos::new(original.x + 3, original.y + 1);
+        app.active_mut()
+            .commit_move(Selected::Component(a), original);
+        assert_eq!(app.active().history.len(), stack_before + 1);
+        match app.active().history.last() {
             Some(HistoryEntry::Gui(GuiUndoAction::MoveComponent { key, old_pos })) => {
                 assert_eq!(*key, a);
                 assert_eq!(*old_pos, original);
@@ -4758,40 +2681,43 @@ mod tests {
         let mut app = OsmilogApp::empty();
         let a = app.place_component(ComponentSpec::Output, GridPos::new(0, 0));
         let b = app.place_component(ComponentSpec::Output, GridPos::new(10, 0));
-        let orig_a = app.components[a].grid_pos;
-        let orig_b = app.components[b].grid_pos;
-        let stack_before = app.history.len();
+        let orig_a = app.active().components[a].grid_pos;
+        let orig_b = app.active().components[b].grid_pos;
+        let stack_before = app.active().history.len();
 
         // Mirrors what interact_component_drag's drag_stopped branch does for
         // a Selection::Bulk: every dragged item already moved (one frame at
         // a time, by the same pointer delta - simulated here directly since
         // driving the gesture needs a live egui::Response), then the whole
         // set is committed inside one begin_batch/end_batch.
-        app.components[a].grid_pos = GridPos::new(orig_a.x + 3, orig_a.y + 2);
-        app.components[b].grid_pos = GridPos::new(orig_b.x + 3, orig_b.y + 2);
+        app.active_mut().components[a].grid_pos = GridPos::new(orig_a.x + 3, orig_a.y + 2);
+        app.active_mut().components[b].grid_pos = GridPos::new(orig_b.x + 3, orig_b.y + 2);
 
-        app.history.begin_batch();
-        app.commit_move(Selected::Component(a), orig_a);
-        app.commit_move(Selected::Component(b), orig_b);
-        app.history.end_batch();
+        app.active_mut().history.begin_batch();
+        app.active_mut().commit_move(Selected::Component(a), orig_a);
+        app.active_mut().commit_move(Selected::Component(b), orig_b);
+        app.active_mut().history.end_batch();
 
         // One batch entry for the whole gesture, not one per item.
-        assert_eq!(app.history.len(), stack_before + 1);
-        assert!(matches!(app.history.last(), Some(HistoryEntry::Batch(_))));
+        assert_eq!(app.active().history.len(), stack_before + 1);
+        assert!(matches!(
+            app.active().history.last(),
+            Some(HistoryEntry::Batch(_))
+        ));
 
         // One undo restores every item's original position at once.
-        app.undo();
-        assert_eq!(app.components[a].grid_pos, orig_a);
-        assert_eq!(app.components[b].grid_pos, orig_b);
+        app.active_mut().undo();
+        assert_eq!(app.active().components[a].grid_pos, orig_a);
+        assert_eq!(app.active().components[b].grid_pos, orig_b);
 
         // One redo replays the whole move again.
-        app.redo();
+        app.active_mut().redo();
         assert_eq!(
-            app.components[a].grid_pos,
+            app.active().components[a].grid_pos,
             GridPos::new(orig_a.x + 3, orig_a.y + 2)
         );
         assert_eq!(
-            app.components[b].grid_pos,
+            app.active().components[b].grid_pos,
             GridPos::new(orig_b.x + 3, orig_b.y + 2)
         );
     }
@@ -4801,9 +2727,11 @@ mod tests {
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Output);
         assert!(app
+            .active()
             .drag_grid_pos(Selected::Wire(Default::default()), Camera::default())
             .is_none());
         assert!(app
+            .active()
             .drag_grid_pos(Selected::Component(a), Camera::default())
             .is_some());
     }
@@ -4820,31 +2748,37 @@ mod tests {
         );
         let b = app.place_component(ComponentSpec::Output, GridPos::new(10, 0));
         let pa = pin_grid_pos(
-            &app.components[a].shape,
-            app.components[a].grid_pos,
+            &app.active().components[a].shape,
+            app.active().components[a].grid_pos,
             PinId::output(0),
         );
         let pb = pin_grid_pos(
-            &app.components[b].shape,
-            app.components[b].grid_pos,
+            &app.active().components[b].shape,
+            app.active().components[b].grid_pos,
             PinId::input(0),
         );
         let elbow = GridPos::new(pa.x + 2, pb.y + 4);
-        let delta = app.wiring.add_route(
+        let delta = app.active_mut().wiring.add_route(
             &[pa, elbow, pb],
             NodeAttach::Pin(a, PinId::output(0)),
             NodeAttach::Pin(b, PinId::input(0)),
         );
-        app.edit_wiring(delta);
-        app.rebuild_circuit();
+        app.active_mut().edit_wiring(delta);
+        app.active_mut().rebuild_circuit();
 
         let elbow_key = app
+            .active()
             .wiring
             .active_nodes()
             .find(|(_, n)| matches!(n.attach, NodeAttach::Free))
             .map(|(k, _)| k)
             .unwrap();
-        let seg_keys: Vec<WireSegKey> = app.wiring.active_segments().map(|(k, _)| k).collect();
+        let seg_keys: Vec<WireSegKey> = app
+            .active()
+            .wiring
+            .active_segments()
+            .map(|(k, _)| k)
+            .collect();
         (a, b, elbow_key, seg_keys)
     }
 
@@ -4855,22 +2789,22 @@ mod tests {
         assert_eq!(segs.len(), 2, "pin -> elbow -> pin is two segments");
 
         let sels: Vec<Selected> = segs.iter().map(|&s| Selected::Wire(s)).collect();
-        let free_nodes = app.free_wire_nodes(&sels);
+        let free_nodes = app.active().free_wire_nodes(&sels);
 
         // Both segments share the elbow node; it must appear exactly once,
         // and the two Pin-attached endpoints must not appear at all.
         assert_eq!(free_nodes.len(), 1);
         assert_eq!(free_nodes[0].0, elbow);
-        assert_eq!(free_nodes[0].1, app.wiring.nodes[elbow].pos);
+        assert_eq!(free_nodes[0].1, app.active().wiring.nodes[elbow].pos);
     }
 
     #[test]
     fn test_bulk_drag_batch_restores_free_wire_node_alongside_components() {
         let mut app = OsmilogApp::empty();
         let (a, b, elbow, _segs) = place_route_with_elbow(&mut app);
-        let orig_a = app.components[a].grid_pos;
-        let orig_b = app.components[b].grid_pos;
-        let orig_elbow = app.wiring.nodes[elbow].pos;
+        let orig_a = app.active().components[a].grid_pos;
+        let orig_b = app.active().components[b].grid_pos;
+        let orig_elbow = app.active().wiring.nodes[elbow].pos;
 
         // What interact_component_drag does for one drag frame of a bulk
         // selection covering both components and the whole wire run: move
@@ -4879,36 +2813,39 @@ mod tests {
         let new_a = GridPos::new(orig_a.x + 3, orig_a.y + 2);
         let new_b = GridPos::new(orig_b.x + 3, orig_b.y + 2);
         let new_elbow = GridPos::new(orig_elbow.x + 3, orig_elbow.y + 2);
-        app.components[a].grid_pos = new_a;
-        app.sync_component_wire_nodes(a);
-        app.components[b].grid_pos = new_b;
-        app.sync_component_wire_nodes(b);
-        app.wiring.nodes[elbow].pos = new_elbow;
+        app.active_mut().components[a].grid_pos = new_a;
+        app.active_mut().sync_component_wire_nodes(a);
+        app.active_mut().components[b].grid_pos = new_b;
+        app.active_mut().sync_component_wire_nodes(b);
+        app.active_mut().wiring.nodes[elbow].pos = new_elbow;
 
         // Wire geometry moved as a whole - the elbow isn't left behind.
-        assert_eq!(app.wiring.nodes[elbow].pos, new_elbow);
+        assert_eq!(app.active().wiring.nodes[elbow].pos, new_elbow);
 
         // drag_stopped: commit every moved item and node as one undo batch.
-        let stack_before = app.history.len();
-        app.history.begin_batch();
-        app.commit_move(Selected::Component(a), orig_a);
-        app.commit_move(Selected::Component(b), orig_b);
-        app.commit_wire_node_move(elbow, orig_elbow);
-        app.history.end_batch();
-        assert_eq!(app.history.len(), stack_before + 1);
-        assert!(matches!(app.history.last(), Some(HistoryEntry::Batch(_))));
+        let stack_before = app.active().history.len();
+        app.active_mut().history.begin_batch();
+        app.active_mut().commit_move(Selected::Component(a), orig_a);
+        app.active_mut().commit_move(Selected::Component(b), orig_b);
+        app.active_mut().commit_wire_node_move(elbow, orig_elbow);
+        app.active_mut().history.end_batch();
+        assert_eq!(app.active().history.len(), stack_before + 1);
+        assert!(matches!(
+            app.active().history.last(),
+            Some(HistoryEntry::Batch(_))
+        ));
 
         // One undo restores the components AND the elbow together.
-        app.undo();
-        assert_eq!(app.components[a].grid_pos, orig_a);
-        assert_eq!(app.components[b].grid_pos, orig_b);
-        assert_eq!(app.wiring.nodes[elbow].pos, orig_elbow);
+        app.active_mut().undo();
+        assert_eq!(app.active().components[a].grid_pos, orig_a);
+        assert_eq!(app.active().components[b].grid_pos, orig_b);
+        assert_eq!(app.active().wiring.nodes[elbow].pos, orig_elbow);
 
         // One redo replays the whole move again.
-        app.redo();
-        assert_eq!(app.components[a].grid_pos, new_a);
-        assert_eq!(app.components[b].grid_pos, new_b);
-        assert_eq!(app.wiring.nodes[elbow].pos, new_elbow);
+        app.active_mut().redo();
+        assert_eq!(app.active().components[a].grid_pos, new_a);
+        assert_eq!(app.active().components[b].grid_pos, new_b);
+        assert_eq!(app.active().wiring.nodes[elbow].pos, new_elbow);
     }
 
     // ── undo / redo ────────────────────────────────────────────────────────
@@ -4925,26 +2862,29 @@ mod tests {
     fn undo_redo_place_component_toggles_both_records() {
         let mut app = OsmilogApp::empty();
         let g = place(&mut app, and2());
-        let comp_key = app.components[g].key;
-        assert!(app.history.can_undo());
-        assert!(!app.history.can_redo());
-        assert!(app.components[g].active);
-        assert!(app.circuit.components[comp_key].active);
+        let comp_key = app.active().components[g].key;
+        assert!(app.active().history.can_undo());
+        assert!(!app.active().history.can_redo());
+        assert!(app.active().components[g].active);
+        assert!(app.active().circuit.components[comp_key].active);
 
-        app.undo();
-        assert!(!app.components[g].active, "record tombstoned by undo");
+        app.active_mut().undo();
         assert!(
-            !app.circuit.components[comp_key].active,
+            !app.active().components[g].active,
+            "record tombstoned by undo"
+        );
+        assert!(
+            !app.active().circuit.components[comp_key].active,
             "circuit component deactivated by undo"
         );
-        assert!(app.history.can_redo());
-        assert!(!app.history.can_undo());
+        assert!(app.active().history.can_redo());
+        assert!(!app.active().history.can_undo());
 
-        app.redo();
-        assert!(app.components[g].active);
-        assert!(app.circuit.components[comp_key].active);
-        assert!(app.history.can_undo());
-        assert!(!app.history.can_redo());
+        app.active_mut().redo();
+        assert!(app.active().components[g].active);
+        assert!(app.active().circuit.components[comp_key].active);
+        assert!(app.active().history.can_undo());
+        assert!(!app.active().history.can_redo());
     }
 
     #[test]
@@ -4952,25 +2892,29 @@ mod tests {
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let o = place(&mut app, ComponentSpec::Output);
-        app.commit_wire_route(
+        app.active_mut().commit_wire_route(
             vec![GridPos::new(0, 0), GridPos::new(10, 0)],
             NodeAttach::Pin(a, PinId::output(0)),
             NodeAttach::Pin(o, PinId::input(0)),
         );
-        let o_key = app.components[o].key;
-        assert_eq!(app.circuit.read_output(o_key), Value::ONE);
-        assert_eq!(app.wiring.groups().len(), 1);
+        let o_key = app.active().components[o].key;
+        assert_eq!(app.active().circuit.read_output(o_key), Value::ONE);
+        assert_eq!(app.active().wiring.groups().len(), 1);
 
-        app.undo();
+        app.active_mut().undo();
         assert!(
-            app.wiring.groups().iter().all(|grp| grp.pins.len() < 2),
+            app.active()
+                .wiring
+                .groups()
+                .iter()
+                .all(|grp| grp.pins.len() < 2),
             "wire removed: no group ties both pins together"
         );
-        assert_eq!(app.circuit.read_output(o_key), Value::Floating);
+        assert_eq!(app.active().circuit.read_output(o_key), Value::Floating);
 
-        app.redo();
-        assert_eq!(app.wiring.groups().len(), 1);
-        assert_eq!(app.circuit.read_output(o_key), Value::ONE);
+        app.active_mut().redo();
+        assert_eq!(app.active().wiring.groups().len(), 1);
+        assert_eq!(app.active().circuit.read_output(o_key), Value::ONE);
     }
 
     #[test]
@@ -4978,38 +2922,38 @@ mod tests {
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let o = place(&mut app, ComponentSpec::Output);
-        app.commit_wire_route(
+        app.active_mut().commit_wire_route(
             vec![GridPos::new(0, 0), GridPos::new(10, 0)],
             NodeAttach::Pin(a, PinId::output(0)),
             NodeAttach::Pin(o, PinId::input(0)),
         );
-        let o_key = app.components[o].key;
-        assert_eq!(app.circuit.read_output(o_key), Value::ONE);
+        let o_key = app.active().components[o].key;
+        assert_eq!(app.active().circuit.read_output(o_key), Value::ONE);
 
-        app.delete_component(a);
-        assert!(!app.components[a].active);
-        assert_eq!(app.circuit.read_output(o_key), Value::Floating);
+        app.active_mut().delete_component(a);
+        assert!(!app.active().components[a].active);
+        assert_eq!(app.active().circuit.read_output(o_key), Value::Floating);
 
-        app.undo();
-        assert!(app.components[a].active);
-        let a_key = app.components[a].key;
-        assert!(app.circuit.components[a_key].active);
+        app.active_mut().undo();
+        assert!(app.active().components[a].active);
+        let a_key = app.active().components[a].key;
+        assert!(app.active().circuit.components[a_key].active);
         assert_eq!(
-            app.circuit.read_output(o_key),
+            app.active().circuit.read_output(o_key),
             Value::ONE,
             "wire nodes and driving input restored"
         );
 
-        app.redo();
-        assert!(!app.components[a].active);
-        assert_eq!(app.circuit.read_output(o_key), Value::Floating);
+        app.active_mut().redo();
+        assert!(!app.active().components[a].active);
+        assert_eq!(app.active().circuit.read_output(o_key), Value::Floating);
     }
 
     #[test]
     fn undo_redo_reconfigure_restores_def_and_key() {
         let mut app = OsmilogApp::empty();
         let g = place(&mut app, and2());
-        let old_key = app.components[g].key;
+        let old_key = app.active().components[g].key;
         app.reconfigure_component(
             g,
             ComponentSpec::Gate(Gate {
@@ -5019,27 +2963,31 @@ mod tests {
             }),
         );
         assert!(matches!(
-            app.components[g].spec,
+            app.active().components[g].spec,
             ComponentSpec::Gate(Gate {
                 op: GateOp::Not,
                 ..
             })
         ));
 
-        app.undo();
+        app.active_mut().undo();
         assert!(matches!(
-            app.components[g].spec,
+            app.active().components[g].spec,
             ComponentSpec::Gate(Gate {
                 op: GateOp::And,
                 n_inputs: 2,
                 ..
             })
         ));
-        assert_eq!(app.components[g].key, old_key, "old CompKey restored");
+        assert_eq!(
+            app.active().components[g].key,
+            old_key,
+            "old CompKey restored"
+        );
 
-        app.redo();
+        app.active_mut().redo();
         assert!(matches!(
-            app.components[g].spec,
+            app.active().components[g].spec,
             ComponentSpec::Gate(Gate {
                 op: GateOp::Not,
                 ..
@@ -5051,83 +2999,89 @@ mod tests {
     fn undo_redo_move_restores_grid_pos() {
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, and2());
-        let original = app.components[a].grid_pos;
+        let original = app.active().components[a].grid_pos;
         let moved = GridPos::new(original.x + 4, original.y + 2);
-        app.components[a].grid_pos = moved;
-        app.commit_move(Selected::Component(a), original);
+        app.active_mut().components[a].grid_pos = moved;
+        app.active_mut()
+            .commit_move(Selected::Component(a), original);
 
-        app.undo();
-        assert_eq!(app.components[a].grid_pos, original);
+        app.active_mut().undo();
+        assert_eq!(app.active().components[a].grid_pos, original);
 
-        app.redo();
-        assert_eq!(app.components[a].grid_pos, moved);
+        app.active_mut().redo();
+        assert_eq!(app.active().components[a].grid_pos, moved);
     }
 
     #[test]
     fn new_edit_after_undo_clears_redo() {
         let mut app = OsmilogApp::empty();
         place(&mut app, and2());
-        app.undo();
-        assert!(app.history.can_redo());
+        app.active_mut().undo();
+        assert!(app.active().history.can_redo());
         // A fresh edit invalidates the redo branch.
         place(&mut app, ComponentSpec::Output);
-        assert!(!app.history.can_redo());
+        assert!(!app.active().history.can_redo());
     }
 
     #[test]
     fn undo_redo_tunnel_rename_restores_label() {
         let mut app = OsmilogApp::empty();
-        let t = app.place_tunnel(TunnelRole::Feed, GridPos::new(0, 0));
-        let tunnel_key = app.tunnels[t].key;
-        let original = app.tunnels[t].label.clone();
+        let t = app
+            .active_mut()
+            .place_tunnel(TunnelRole::Feed, GridPos::new(0, 0));
+        let tunnel_key = app.active().tunnels[t].key;
+        let original = app.active().tunnels[t].label.clone();
 
         // Simulate a rename commit: record label change live, then the batched
         // Sim rename + record-label undo (mirrors show_tunnel_properties).
-        app.tunnels[t].label = "RENAMED".to_string();
-        app.history.begin_batch();
-        app.apply(Command::RenameTunnel {
+        app.active_mut().tunnels[t].label = "RENAMED".to_string();
+        app.active_mut().history.begin_batch();
+        app.active_mut().apply(Command::RenameTunnel {
             tunnel: tunnel_key,
             new_label: "RENAMED".to_string(),
         });
-        app.history.push_gui(GuiUndoAction::SetTunnelLabel {
-            key: t,
-            label: original.clone(),
-        });
-        app.history.end_batch();
+        app.active_mut()
+            .history
+            .push_gui(GuiUndoAction::SetTunnelLabel {
+                key: t,
+                label: original.clone(),
+            });
+        app.active_mut().history.end_batch();
 
-        app.undo();
-        assert_eq!(app.tunnels[t].label, original);
-        assert_eq!(app.circuit.tunnels[tunnel_key].label, original);
+        app.active_mut().undo();
+        assert_eq!(app.active().tunnels[t].label, original);
+        assert_eq!(app.active().circuit.tunnels[tunnel_key].label, original);
 
-        app.redo();
-        assert_eq!(app.tunnels[t].label, "RENAMED");
-        assert_eq!(app.circuit.tunnels[tunnel_key].label, "RENAMED");
+        app.active_mut().redo();
+        assert_eq!(app.active().tunnels[t].label, "RENAMED");
+        assert_eq!(app.active().circuit.tunnels[tunnel_key].label, "RENAMED");
     }
 
     #[test]
     fn test_copy_single_component_then_paste_creates_offset_copy() {
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Output);
-        let original = app.components[a].grid_pos;
+        let original = app.active().components[a].grid_pos;
 
-        app.selected = Some(Selection::Single(Selected::Component(a)));
+        app.active_mut().selected = Some(Selection::Single(Selected::Component(a)));
         app.copy_selection();
         assert!(!app.clipboard.is_empty());
 
         app.paste_clipboard();
 
-        assert_eq!(app.active_components().count(), 2);
+        assert_eq!(app.active().active_components().count(), 2);
         let pasted = app
+            .active()
             .active_components()
             .find(|(k, _)| *k != a)
             .map(|(k, _)| k)
             .unwrap();
         assert_eq!(
-            app.components[pasted].grid_pos,
+            app.active().components[pasted].grid_pos,
             GridPos::new(original.x + 2, original.y + 2)
         );
         assert_eq!(
-            app.selected,
+            app.active().selected,
             Some(Selection::Single(Selected::Component(pasted)))
         );
     }
@@ -5136,46 +3090,48 @@ mod tests {
     fn test_paste_after_undo_of_original_still_works() {
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Output);
-        app.selected = Some(Selection::Single(Selected::Component(a)));
+        app.active_mut().selected = Some(Selection::Single(Selected::Component(a)));
         app.copy_selection();
 
         // Undo the original placement: it's now tombstoned.
-        app.undo();
-        assert!(!app.components[a].active);
+        app.active_mut().undo();
+        assert!(!app.active().components[a].active);
 
         app.paste_clipboard();
 
         // The paste is independent of the now-tombstoned original.
         let pasted = app
+            .active()
             .active_components()
             .find(|(k, _)| *k != a)
             .map(|(k, _)| k);
         assert!(pasted.is_some());
-        assert_eq!(app.active_components().count(), 1);
+        assert_eq!(app.active().active_components().count(), 1);
     }
 
     #[test]
     fn test_paste_after_editing_original_is_unaffected() {
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Output);
-        let original_pos = app.components[a].grid_pos;
-        app.selected = Some(Selection::Single(Selected::Component(a)));
+        let original_pos = app.active().components[a].grid_pos;
+        app.active_mut().selected = Some(Selection::Single(Selected::Component(a)));
         app.copy_selection();
 
         // Move the original after copying.
-        app.components[a].grid_pos = GridPos::new(100, 100);
+        app.active_mut().components[a].grid_pos = GridPos::new(100, 100);
 
         app.paste_clipboard();
 
         // The pasted copy reflects the pre-edit snapshot, offset from the
         // original's position at copy time - not its current position.
         let pasted = app
+            .active()
             .active_components()
             .find(|(k, _)| *k != a)
             .map(|(k, _)| k)
             .unwrap();
         assert_eq!(
-            app.components[pasted].grid_pos,
+            app.active().components[pasted].grid_pos,
             GridPos::new(original_pos.x + 2, original_pos.y + 2)
         );
     }
@@ -5184,10 +3140,10 @@ mod tests {
     fn test_paste_normalizes_selection_to_single_for_one_item() {
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Output);
-        app.selected = Some(Selection::Single(Selected::Component(a)));
+        app.active_mut().selected = Some(Selection::Single(Selected::Component(a)));
         app.copy_selection();
         app.paste_clipboard();
-        assert!(matches!(app.selected, Some(Selection::Single(_))));
+        assert!(matches!(app.active().selected, Some(Selection::Single(_))));
     }
 
     #[test]
@@ -5196,23 +3152,23 @@ mod tests {
         let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let b = place(&mut app, ComponentSpec::Output);
         connect_pins(&mut app, (a, PinId::output(0)), (b, PinId::input(0)));
-        app.rebuild_circuit();
-        let seg = app.wiring.active_segments().next().unwrap().0;
+        app.active_mut().rebuild_circuit();
+        let seg = app.active().wiring.active_segments().next().unwrap().0;
 
-        app.selected = Some(Selection::Bulk(vec![
+        app.active_mut().selected = Some(Selection::Bulk(vec![
             Selected::Component(a),
             Selected::Component(b),
             Selected::Wire(seg),
         ]));
         app.copy_selection();
         app.paste_clipboard();
-        assert_eq!(app.active_components().count(), 4);
-        assert_eq!(app.wiring.active_segments().count(), 2);
+        assert_eq!(app.active().active_components().count(), 4);
+        assert_eq!(app.active().wiring.active_segments().count(), 2);
 
         // One undo removes the entire pasted batch (components + wiring).
-        app.undo();
-        assert_eq!(app.active_components().count(), 2);
-        assert_eq!(app.wiring.active_segments().count(), 1);
+        app.active_mut().undo();
+        assert_eq!(app.active().active_components().count(), 2);
+        assert_eq!(app.active().wiring.active_segments().count(), 1);
     }
 
     #[test]
@@ -5221,44 +3177,10 @@ mod tests {
         place(&mut app, ComponentSpec::Output);
         assert!(app.clipboard.is_empty());
 
-        let before = app.components.len();
+        let before = app.active().components.len();
         app.paste_clipboard();
-        assert_eq!(app.components.len(), before);
-        assert_eq!(app.selected, None);
-    }
-
-    #[test]
-    fn test_ticks_due_is_frame_rate_independent() {
-        let interval = 0.2;
-
-        // (n_ticks exact; reference compared with a float tolerance.)
-        let check = |(n, next): (u32, f64), en: u32, enext: f64| {
-            assert_eq!(n, en);
-            assert!((next - enext).abs() < 1e-9, "ref {next} != {enext}");
-        };
-
-        // Interval not elapsed yet: no tick, reference unchanged.
-        check(ticks_due(0.1, 0.0, interval), 0, 0.0);
-
-        // Dense frames (mouse moving): a frame lands just past the boundary.
-        // One tick; the reference advances by exactly one interval, NOT to `now`,
-        // so the small overshoot doesn't accumulate into the cadence.
-        check(ticks_due(0.21, 0.0, interval), 1, 0.2);
-        check(ticks_due(0.216, 0.0, interval), 1, 0.2);
-
-        // A late/coalesced frame spanning two intervals owes TWO ticks (the core
-        // fix: no dropped ticks). Reference advances by two whole intervals,
-        // keeping phase - the leftover 0.01 carries into the next frame.
-        check(ticks_due(0.41, 0.0, interval), 2, 0.4);
-
-        // Three intervals in one frame -> three ticks.
-        check(ticks_due(0.61, 0.0, interval), 3, 0.6);
-
-        // A genuine stall beyond the catch-up cap: fire the cap, then resync to
-        // `now` and drop the backlog rather than replaying a burst.
-        let (n, next) = ticks_due(100.0, 0.0, interval);
-        assert_eq!(n, MAX_CATCHUP_TICKS);
-        assert_eq!(next, 100.0);
+        assert_eq!(app.active().components.len(), before);
+        assert_eq!(app.active().selected, None);
     }
 
     #[test]
@@ -5268,14 +3190,14 @@ mod tests {
         assert!(!app.editing_locked());
 
         // Both Playing and Paused lock the whole run session.
-        app.clock.run = ClockRun::Playing;
+        app.active_mut().clock.run = ClockRun::Playing;
         assert!(app.editing_locked());
-        app.clock.run = ClockRun::Paused;
+        app.active_mut().clock.run = ClockRun::Paused;
         assert!(app.editing_locked());
 
         // Stop returns to editable.
-        app.stop_clock();
-        assert_eq!(app.clock.run, ClockRun::Stopped);
+        app.active_mut().stop_clock();
+        assert_eq!(app.active().clock.run, ClockRun::Stopped);
         assert!(!app.editing_locked());
     }
 
@@ -5287,15 +3209,15 @@ mod tests {
 
         // Paused carves value edits (Input bits, ROM/RAM contents) out of the
         // structural lock: still not value-locked, even though editing_locked().
-        app.clock.run = ClockRun::Paused;
+        app.active_mut().clock.run = ClockRun::Paused;
         assert!(app.editing_locked());
         assert!(!app.value_editing_locked());
 
         // Playing blocks everything, values included.
-        app.clock.run = ClockRun::Playing;
+        app.active_mut().clock.run = ClockRun::Playing;
         assert!(app.value_editing_locked());
 
-        app.stop_clock();
+        app.active_mut().stop_clock();
         assert!(!app.value_editing_locked());
     }
 
@@ -5310,21 +3232,21 @@ mod tests {
         connect_pins(&mut app, (data, PinId::output(0)), (reg, PinId::input(0)));
         connect_pins(&mut app, (we, PinId::output(0)), (reg, PinId::input(1)));
         connect_pins(&mut app, (reg, PinId::output(0)), (out, PinId::input(0)));
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
-        let out_key = app.components[out].key;
+        let out_key = app.active().components[out].key;
         // Register powers on at 0.
-        assert_eq!(app.circuit.read_output(out_key), Value::ZERO);
+        assert_eq!(app.active().circuit.read_output(out_key), Value::ZERO);
 
         // A tick with write-enable high latches the data (1).
-        app.tick_once();
-        assert_eq!(app.circuit.read_output(out_key), Value::ONE);
+        app.active_mut().tick_once();
+        assert_eq!(app.active().circuit.read_output(out_key), Value::ONE);
 
         // Stop resets the register to 0 and returns to the editable state.
-        app.clock.run = ClockRun::Playing;
-        app.stop_clock();
-        assert_eq!(app.clock.run, ClockRun::Stopped);
-        assert_eq!(app.circuit.read_output(out_key), Value::ZERO);
+        app.active_mut().clock.run = ClockRun::Playing;
+        app.active_mut().stop_clock();
+        assert_eq!(app.active().clock.run, ClockRun::Stopped);
+        assert_eq!(app.active().circuit.read_output(out_key), Value::ZERO);
     }
 
     // ── Multiple circuits ──────────────────────────────────────────────────
@@ -5334,36 +3256,33 @@ mod tests {
         let app = OsmilogApp::empty();
         assert_eq!(app.documents.len(), 1);
         assert_eq!(app.doc_order.len(), 1);
-        assert_eq!(app.doc_order[0], app.active);
-        assert_eq!(app.documents[app.active].name, "Main");
-        // The active document's state is live, not parked.
-        assert!(app.documents[app.active].state.is_none());
+        assert_eq!(app.doc_order[0], app.active_id);
+        assert_eq!(app.documents[app.active_id].name, "Main");
     }
 
     #[test]
     fn create_circuit_doc_adds_active_blank_document() {
         let mut app = OsmilogApp::empty();
-        let main = app.active;
+        let main = app.active_id;
         place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
-        assert_eq!(app.components.len(), 1);
+        assert_eq!(app.active().components.len(), 1);
 
         app.create_circuit_doc("C2".to_string());
 
         // A second document exists and is now active, with a blank canvas.
         assert_eq!(app.documents.len(), 2);
         assert_eq!(app.doc_order.len(), 2);
-        assert_ne!(app.active, main);
-        assert_eq!(app.documents[app.active].name, "C2");
-        assert!(app.components.is_empty());
-        // The previous document is parked (its state moved off the live fields).
-        assert!(app.documents[main].state.is_some());
-        assert!(app.documents[app.active].state.is_none());
+        assert_ne!(app.active_id, main);
+        assert_eq!(app.documents[app.active_id].name, "C2");
+        assert!(app.active().components.is_empty());
+        // The previous document's records are untouched, still reachable by key.
+        assert_eq!(app.documents[main].state.components.len(), 1);
     }
 
     #[test]
     fn switching_circuits_parks_and_restores_state() {
         let mut app = OsmilogApp::empty();
-        let main = app.active;
+        let main = app.active_id;
 
         // Build a settled AND-of-two-highs -> Output on "Main".
         let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
@@ -5380,42 +3299,40 @@ mod tests {
         connect_pins(&mut app, (a, PinId::output(0)), (g, PinId::input(0)));
         connect_pins(&mut app, (b, PinId::output(0)), (g, PinId::input(1)));
         connect_pins(&mut app, (g, PinId::output(0)), (o, PinId::input(0)));
-        app.rebuild_circuit();
-        let o_key = app.components[o].key;
-        assert_eq!(app.circuit.read_output(o_key), Value::ONE);
+        app.active_mut().rebuild_circuit();
+        let o_key = app.active().components[o].key;
+        assert_eq!(app.active().circuit.read_output(o_key), Value::ONE);
 
         // Create + switch to a blank second circuit: Main's contents vanish
         // from the live fields.
         app.create_circuit_doc("C2".to_string());
-        assert!(app.components.is_empty());
+        assert!(app.active().components.is_empty());
 
         // Switch back: Main's components and settled net values return intact,
         // without a rebuild (the parked circuit kept its nets).
         app.switch_circuit(main);
-        assert_eq!(app.active, main);
-        assert_eq!(app.components.len(), 4);
-        assert_eq!(app.circuit.read_output(o_key), Value::ONE);
+        assert_eq!(app.active_id, main);
+        assert_eq!(app.active().components.len(), 4);
+        assert_eq!(app.active().circuit.read_output(o_key), Value::ONE);
     }
 
     #[test]
     fn switch_to_active_is_a_noop() {
         let mut app = OsmilogApp::empty();
-        let main = app.active;
+        let main = app.active_id;
         place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
 
         app.switch_circuit(main);
 
-        assert_eq!(app.active, main);
+        assert_eq!(app.active_id, main);
         assert_eq!(app.documents.len(), 1);
-        assert_eq!(app.components.len(), 1);
-        // Active document's state stays live (never parked into itself).
-        assert!(app.documents[main].state.is_none());
+        assert_eq!(app.active().components.len(), 1);
     }
 
     #[test]
     fn subcircuit_placement_derives_interface_and_simulates() {
         let mut app = OsmilogApp::empty();
-        let main = app.active;
+        let main = app.active_id;
 
         // Main: a 1-bit passthrough Input -> Output (one boundary pin each).
         let in_main = place(&mut app, ComponentSpec::Input(Input { bits: 0, width: 1 }));
@@ -5425,7 +3342,7 @@ mod tests {
             (in_main, PinId::output(0)),
             (out_main, PinId::input(0)),
         );
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
         // New circuit C2 (now active, Main parked); place Main as a subcircuit.
         app.create_circuit_doc("C2".to_string());
@@ -5433,8 +3350,8 @@ mod tests {
         let sub = app.place_component(spec, GridPos::new(5, 5));
 
         // Interface derived from Main's one Input and one Output.
-        assert_eq!(app.components[sub].spec.n_inputs(), 1);
-        assert_eq!(app.components[sub].spec.n_outputs(), 1);
+        assert_eq!(app.active().components[sub].spec.n_inputs(), 1);
+        assert_eq!(app.active().components[sub].spec.n_outputs(), 1);
 
         // Drive it end-to-end: C2 Input(=1) -> sub -> C2 Output. The passthrough
         // subcircuit settles a 1 out through the boundary.
@@ -5442,15 +3359,15 @@ mod tests {
         let y = place(&mut app, ComponentSpec::Output);
         connect_pins(&mut app, (x, PinId::output(0)), (sub, PinId::input(0)));
         connect_pins(&mut app, (sub, PinId::output(0)), (y, PinId::input(0)));
-        app.rebuild_circuit();
-        let y_key = app.components[y].key;
-        assert_eq!(app.circuit.read_output(y_key), Value::ONE);
+        app.active_mut().rebuild_circuit();
+        let y_key = app.active().components[y].key;
+        assert_eq!(app.active().circuit.read_output(y_key), Value::ONE);
     }
 
     #[test]
     fn subcircuit_placement_prevents_cycles() {
         let mut app = OsmilogApp::empty();
-        let main = app.active;
+        let main = app.active_id;
 
         // Main is a passthrough so it has a usable boundary.
         let in_main = place(&mut app, ComponentSpec::Input(Input { bits: 0, width: 1 }));
@@ -5460,11 +3377,11 @@ mod tests {
             (in_main, PinId::output(0)),
             (out_main, PinId::input(0)),
         );
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
         // C2 contains a subcircuit of Main.
         app.create_circuit_doc("C2".to_string());
-        let c2 = app.active;
+        let c2 = app.active_id;
         let spec = app.subcircuit_spec(main);
         app.place_component(spec, GridPos::new(5, 5));
 
@@ -5478,7 +3395,7 @@ mod tests {
 
         // A fresh, unrelated circuit is fine to nest.
         app.create_circuit_doc("C3".to_string());
-        let c3 = app.active;
+        let c3 = app.active_id;
         app.switch_circuit(main);
         assert!(!app.would_cycle(c3));
     }
@@ -5502,14 +3419,14 @@ mod tests {
         let o = place(&mut app, ComponentSpec::Output);
         connect_pins(&mut app, (a, PinId::output(0)), (n, PinId::input(0)));
         connect_pins(&mut app, (n, PinId::output(0)), (o, PinId::input(0)));
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
         // C2 (now active): Input(1) -> Output, a passthrough settling a 1.
         app.create_circuit_doc("C2".to_string());
         let x = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let y = place(&mut app, ComponentSpec::Output);
         connect_pins(&mut app, (x, PinId::output(0)), (y, PinId::input(0)));
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
         // Save the whole workspace (C2 is the active document) and reload it.
         let file = app.to_project_file();
@@ -5528,27 +3445,29 @@ mod tests {
             .map(|&d| loaded.documents[d].name.clone())
             .collect();
         assert_eq!(names, vec!["Main".to_string(), "C2".to_string()]);
-        assert_eq!(loaded.active, loaded.doc_order[1]);
+        assert_eq!(loaded.active_id, loaded.doc_order[1]);
 
         // The active document (C2) simulates: its Output reads 1.
         let c2_out = loaded
+            .active()
             .components
             .values()
             .find(|pc| matches!(pc.spec, ComponentSpec::Output))
             .unwrap()
             .key;
-        assert_eq!(loaded.circuit.read_output(c2_out), Value::ONE);
+        assert_eq!(loaded.active().circuit.read_output(c2_out), Value::ONE);
 
         // Switching to Main brings its (independent) state back: Output reads 0.
         let main = loaded.doc_order[0];
         loaded.switch_circuit(main);
         let main_out = loaded
+            .active()
             .components
             .values()
             .find(|pc| matches!(pc.spec, ComponentSpec::Output))
             .unwrap()
             .key;
-        assert_eq!(loaded.circuit.read_output(main_out), Value::ZERO);
+        assert_eq!(loaded.active().circuit.read_output(main_out), Value::ZERO);
     }
 
     #[test]
@@ -5599,18 +3518,19 @@ mod tests {
         loaded.load_project_file(&project).unwrap();
         assert_eq!(loaded.documents.len(), 1);
         let out = loaded
+            .active()
             .components
             .values()
             .find(|pc| matches!(pc.spec, ComponentSpec::Output))
             .unwrap()
             .key;
-        assert_eq!(loaded.circuit.read_output(out), Value::ONE);
+        assert_eq!(loaded.active().circuit.read_output(out), Value::ONE);
     }
 
     #[test]
     fn test_project_file_subcircuit_round_trip() {
         let mut app = OsmilogApp::empty();
-        let main = app.active;
+        let main = app.active_id;
 
         // Main: Input(1) -> Output, a passthrough.
         let in_main = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
@@ -5620,7 +3540,7 @@ mod tests {
             (in_main, PinId::output(0)),
             (out_main, PinId::input(0)),
         );
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
         // C2: Input(1) -> [Main as subcircuit] -> Output.
         app.create_circuit_doc("C2".to_string());
@@ -5630,7 +3550,7 @@ mod tests {
         let y = place(&mut app, ComponentSpec::Output);
         connect_pins(&mut app, (x, PinId::output(0)), (sub, PinId::input(0)));
         connect_pins(&mut app, (sub, PinId::output(0)), (y, PinId::input(0)));
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
         // The subcircuit reference is emitted as an index into `circuits`.
         let file = app.to_project_file();
@@ -5646,6 +3566,7 @@ mod tests {
         let mut loaded = OsmilogApp::empty();
         loaded.load_project_file(&file2).unwrap();
         let sub_reloaded = loaded
+            .active()
             .components
             .values()
             .find(|pc| matches!(pc.spec, ComponentSpec::Subcircuit { .. }))
@@ -5653,12 +3574,13 @@ mod tests {
         assert_eq!(sub_reloaded.spec.n_inputs(), 1);
         assert_eq!(sub_reloaded.spec.n_outputs(), 1);
         let y_key = loaded
+            .active()
             .components
             .values()
             .find(|pc| matches!(pc.spec, ComponentSpec::Output))
             .unwrap()
             .key;
-        assert_eq!(loaded.circuit.read_output(y_key), Value::ONE);
+        assert_eq!(loaded.active().circuit.read_output(y_key), Value::ONE);
     }
 
     #[test]
@@ -5668,11 +3590,11 @@ mod tests {
         // blank. The placed subcircuit must still get its cached pin arity (not
         // a 0-pin placeholder) or wiring to it panics.
         let mut app = OsmilogApp::empty();
-        let main = app.active;
+        let main = app.active_id;
 
         // C2: Input(1) -> Output passthrough.
         app.create_circuit_doc("C2".to_string());
-        let c2 = app.active;
+        let c2 = app.active_id;
         let c2_in = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let c2_out = place(&mut app, ComponentSpec::Output);
         connect_pins(
@@ -5680,7 +3602,7 @@ mod tests {
             (c2_in, PinId::output(0)),
             (c2_out, PinId::input(0)),
         );
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
         // Back on Main: Input(1) -> [C2 as subcircuit] -> Output.
         app.switch_circuit(main);
@@ -5690,7 +3612,7 @@ mod tests {
         let y = place(&mut app, ComponentSpec::Output);
         connect_pins(&mut app, (x, PinId::output(0)), (sub, PinId::input(0)));
         connect_pins(&mut app, (sub, PinId::output(0)), (y, PinId::input(0)));
-        app.rebuild_circuit();
+        app.active_mut().rebuild_circuit();
 
         let file = app.to_project_file();
         assert_eq!(file.active, 0); // Main active.
@@ -5702,11 +3624,12 @@ mod tests {
         let mut loaded = OsmilogApp::empty();
         loaded.load_project_file(&file2).unwrap();
         let y_key = loaded
+            .active()
             .components
             .values()
             .find(|pc| matches!(pc.spec, ComponentSpec::Output))
             .unwrap()
             .key;
-        assert_eq!(loaded.circuit.read_output(y_key), Value::ONE);
+        assert_eq!(loaded.active().circuit.read_output(y_key), Value::ONE);
     }
 }

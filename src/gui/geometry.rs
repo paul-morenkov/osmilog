@@ -161,6 +161,41 @@ impl Camera {
     pub fn scale(&self, px: f32) -> f32 {
         px * self.zoom
     }
+
+    /// Applies one frame of camera input over the canvas `response`: middle-drag
+    /// pan and Ctrl(+Cmd)/pinch cursor-anchored zoom. Called before drawing so
+    /// the view transform is current for the frame.
+    pub fn handle_input(&mut self, response: &egui::Response, ctx: &egui::Context) {
+        puffin::profile_function!();
+        // Pan: middle-button drag. Use the raw pointer delta - `drag_delta`
+        // tracks only the primary button.
+        if response.dragged_by(egui::PointerButton::Middle) {
+            self.pan += ctx.input(|i| i.pointer.delta());
+        }
+
+        // Zoom: Ctrl(+Cmd)+scroll, only while hovering the canvas. egui folds a
+        // ctrl-scroll (its default `zoom_modifier`) - and any trackpad pinch -
+        // into `zoom_delta()`, a multiplicative factor (1.0 = no change). egui's
+        // own scroll-zoom sensitivity is set directly at startup (see
+        // ZOOM_SCROLL_SPEED, set in `OsmilogApp::new`) rather than rescaled here
+        // - `zoom_delta()` is already exactly the factor we want to apply.
+        if response.hovered() {
+            let zoom_delta = ctx.input(|i| i.zoom_delta());
+            if zoom_delta != 1.0 {
+                if let Some(cursor) = ctx.pointer_hover_pos() {
+                    let old = self.zoom;
+                    let new = (old * zoom_delta).clamp(ZOOM_MIN, ZOOM_MAX);
+                    if new != old {
+                        // Keep the grid point under the cursor fixed:
+                        // pan' = cursor - (cursor - pan) * (new / old).
+                        let c = cursor.to_vec2();
+                        self.pan = c - (c - self.pan) * (new / old);
+                        self.zoom = new;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── Stack geometry (in cells) ─────────────────────────────────────────────────
