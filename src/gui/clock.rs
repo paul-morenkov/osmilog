@@ -6,6 +6,8 @@
 //! `advance_clock`) bridge the returned settle result into the app-global error
 //! label - see there.
 
+use crate::gui::app::InteractionMode;
+use crate::gui::document::Document;
 use crate::sim::circuit::{Circuit, SettleError};
 use crate::sim::command::Command;
 
@@ -115,6 +117,64 @@ impl Clock {
         let wait = (self.last_tick_time + interval - now).max(0.0);
         request_repaint(wait);
         last
+    }
+}
+
+impl Document {
+    // The clock transport: a speed setting plus Play / Pause / Step / Stop.
+    // Buttons are enable-gated on the current run state (see the state table in
+    // ClockRun); entering Play locks editing for the whole session and Stop
+    // resets sequential state. All ticks are issued untracked (see tick_once).
+    pub(crate) fn show_clock_controls(&mut self, ui: &mut egui::Ui) {
+        const MAX_CLOCK_TPS: f32 = 100.0;
+        let run = self.clock.run;
+
+        // Speed is only adjustable while stopped - locked during a run session.
+        ui.add_enabled(
+            run == ClockRun::Stopped,
+            egui::DragValue::new(&mut self.clock.ticks_per_second)
+                .speed(0.1)
+                .range(1.0..=MAX_CLOCK_TPS)
+                .suffix(" tick/s"),
+        );
+
+        // Play: start (from Stopped) or resume (from Paused) auto-advancing.
+        // Resets the auto-advance clock and abandons any in-progress placement
+        // so nothing can edit mid-run.
+        if ui
+            .add_enabled(run != ClockRun::Playing, egui::Button::new("Play"))
+            .clicked()
+        {
+            let now = ui.ctx().input(|i| i.time);
+            self.clock.play(now);
+            self.mode = InteractionMode::Idle;
+        }
+
+        // Pause: freeze mid-run, preserving sequential state (stays locked).
+        if ui
+            .add_enabled(run == ClockRun::Playing, egui::Button::new("Pause"))
+            .clicked()
+        {
+            self.clock.pause();
+        }
+
+        // Step: advance exactly one tick. Available when not playing - from
+        // Stopped it's a single manual tick (stays editable); from Paused it
+        // nudges the frozen run forward one step.
+        if ui
+            .add_enabled(run != ClockRun::Playing, egui::Button::new("Step"))
+            .clicked()
+        {
+            self.tick_once();
+        }
+
+        // Stop: halt, reset all sequential state to power-on, return to editable.
+        if ui
+            .add_enabled(run != ClockRun::Stopped, egui::Button::new("Stop"))
+            .clicked()
+        {
+            self.stop_clock();
+        }
     }
 }
 
