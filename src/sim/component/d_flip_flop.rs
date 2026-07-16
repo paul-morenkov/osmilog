@@ -176,7 +176,10 @@ mod tests {
         let mut ff = new_d_flip_flop();
         ff.tick(&[Value::ONE, Value::ONE, NO_RST]); // latch 1
                                                     // reset=1 dominates write_enable=1/data=1: latches 0.
-        assert_eq!(ff.tick(&[Value::ONE, Value::ONE, Value::ONE]), vec![Value::ZERO]);
+        assert_eq!(
+            ff.tick(&[Value::ONE, Value::ONE, Value::ONE]),
+            vec![Value::ZERO]
+        );
     }
 
     #[test_case(Value::ZERO; "reset exactly zero")]

@@ -4,7 +4,7 @@ use slotmap::SlotMap;
 use std::collections::HashMap;
 
 use crate::gui::canvas_draw::draw_ghost;
-use crate::gui::clipboard::Clipboard;
+use crate::gui::clipboard::{build_selection_snapshot, Clipboard};
 use crate::gui::document::{default_new_circuit_name, CircuitDoc, DocId, Document};
 use crate::gui::geometry::{tunnel_shape, Camera, GridPos, ZOOM_SCROLL_SPEED};
 use crate::gui::gui_undo::GuiUndoAction;
@@ -163,10 +163,16 @@ pub struct OsmilogApp {
     doc_order: Vec<DocId>,
     // Which document is currently active. See active()/active_mut().
     active_id: DocId,
-    // New-circuit name dialog: Some(buffer) while open (the String doubles as
-    // the live text-field contents), None while closed. Mirrors the web Save As
-    // modal pattern (platform/web.rs) but lives on the app so native gets it too.
-    new_circuit_dialog: Option<String>,
+    // New-circuit name dialog: Some((buffer, snapshot)) while open (the String
+    // doubles as the live text-field contents), None while closed. Mirrors the
+    // web Save As modal pattern (platform/web.rs) but lives on the app so
+    // native gets it too. The snapshot is installed into the freshly created
+    // document on Create - empty for a plain blank circuit (the palette
+    // header's "+"), or captured from a bulk selection (mirrors Clipboard::
+    // copy) when extracting a selection into its own circuit via the
+    // properties panel's "Add to New Circuit" button, so it can't be
+    // invalidated by edits made to the originals before Create is pressed.
+    new_circuit_dialog: Option<(String, CircuitSnapshot)>,
 }
 
 impl OsmilogApp {
@@ -206,8 +212,7 @@ impl OsmilogApp {
     // ── Multiple circuits ──────────────────────────────────────────────────
 
     // The active document's state. All per-document reads/writes go through
-    // these two accessors, indexing straight into the single source of truth
-    // (`documents`) rather than a separate set of "live" fields.
+    // these two accessors rather than a separate set of "live" fields.
     pub(crate) fn active(&self) -> &Document {
         &self.documents[self.active_id].state
     }
@@ -216,10 +221,8 @@ impl OsmilogApp {
         &mut self.documents[self.active_id].state
     }
 
-    // Make `target` the active document. No-op if `target` is already active.
-    // No net rebuild is needed - every document already holds its own settled
-    // nets, active or not.
-    pub(crate) fn switch_circuit(&mut self, target: DocId) {
+    // Make `target` the active document.
+    pub(crate) fn switch_document(&mut self, target: DocId) {
         if target == self.active_id {
             return;
         }
@@ -230,7 +233,7 @@ impl OsmilogApp {
     }
 
     // Create a new blank circuit document and make it active.
-    fn create_circuit_doc(&mut self, name: String) {
+    fn create_document(&mut self, name: String) {
         let id = self.documents.insert(CircuitDoc {
             name,
             state: Document::blank(),
@@ -273,7 +276,8 @@ impl OsmilogApp {
         match action {
             PropGuiAction::Reconfigure(key, spec) => self.reconfigure_component(key, spec),
             PropGuiAction::OpenMemory(key, kind) => self.active_mut().memory_editor.open(key, kind),
-            PropGuiAction::OpenCircuit(doc) => self.switch_circuit(doc),
+            PropGuiAction::OpenCircuit(doc) => self.switch_document(doc),
+            PropGuiAction::CreateCircuit => self.open_extract_circuit_dialog(),
             PropGuiAction::SetTunnelLabelLive(key, label) => {
                 // Persist the in-progress edit back to the record (the panel's
                 // text buffer is re-cloned from it next frame). Same-frame with
@@ -810,14 +814,35 @@ impl OsmilogApp {
         }
     }
 
+    // Opens the "New Circuit" dialog for a plain blank circuit - just
+    // create_extract_circuit_dialog's dialog with an empty snapshot, so
+    // Create installs nothing extra into the new document.
+    fn open_new_circuit_dialog(&mut self) {
+        let name = default_new_circuit_name(&self.documents);
+        self.new_circuit_dialog = Some((name, CircuitSnapshot::default()));
+    }
+
+    // Captures the active document's current bulk selection into a
+    // CircuitSnapshot and opens the same "New Circuit" dialog
+    // (create_extract_circuit_dialog) pre-populated with it, so Create
+    // installs a copy of the selection into the new document. No-op if the
+    // selection isn't a Bulk
+    fn open_extract_circuit_dialog(&mut self) {
+        let doc = &self.documents[self.active_id].state;
+        let Some(Selection::Bulk(items)) = &doc.selected else {
+            return;
+        };
+        let snapshot = build_selection_snapshot(&doc.components, &doc.tunnels, &doc.wiring, items);
+        let name = default_new_circuit_name(&self.documents);
+        self.new_circuit_dialog = Some((name, snapshot));
+    }
+
     // Draws the "New Circuit" name dialog while `new_circuit_dialog` is Some.
-    // The Option doubles as open-state and the live text buffer, mirroring the
-    // web Save As modal (platform/web.rs); living here (not in the web backend)
-    // means native gets the dialog too. On Create it makes a new active blank
-    // circuit; Cancel / ✕ / an empty-after-trim name that's still confirmed all
-    // fall back sensibly. Driven once per frame from `ui()`.
-    fn create_new_circuit_dialog(&mut self, ctx: &egui::Context) {
-        let Some(name) = &mut self.new_circuit_dialog else {
+    // The buffer/snapshot pair doubles as open-state. On Create it makes a new
+    // active document and installs the paired snapshot (from an optional bulk
+    // selection), untracked.
+    fn create_extract_circuit_dialog(&mut self, ctx: &egui::Context) {
+        let Some((name, _)) = &mut self.new_circuit_dialog else {
             return;
         };
         let mut open = true;
@@ -846,13 +871,19 @@ impl OsmilogApp {
             });
 
         if confirmed {
+            let (name, snapshot) = self.new_circuit_dialog.take().unwrap();
             let trimmed = name.trim();
             let final_name = if trimmed.is_empty() {
                 default_new_circuit_name(&self.documents)
             } else {
                 trimmed.to_string()
             };
-            self.create_circuit_doc(final_name);
+            self.create_document(final_name);
+            self.install_circuit_records(&snapshot, &[], &[]);
+            self.active_mut().rebuild_circuit();
+            // Placement records undo entries that a freshly created document
+            // should not carry (mirrors load_circuit_entry).
+            self.active_mut().history = History::default();
         }
         if !open || confirmed || cancelled {
             self.new_circuit_dialog = None;
@@ -862,12 +893,8 @@ impl OsmilogApp {
     // Snapshots the current selection onto the clipboard. No-op if nothing
     // is selected. Read-only: never touches history.
     fn copy_selection(&mut self) {
-        // Indexed directly (not via active()) so this borrows only
-        // self.documents, leaving self.clipboard free for the &mut borrow
-        // .copy() below needs - active() is an opaque method call the borrow
-        // checker can't see through as a disjoint field borrow.
         let doc = &self.documents[self.active_id].state;
-        let items: Vec<Selected> = match &doc.selected {
+        let items = match &doc.selected {
             None => return,
             Some(Selection::Single(s)) => vec![*s],
             Some(Selection::Bulk(v)) => v.clone(),
@@ -1068,7 +1095,7 @@ impl OsmilogApp {
             .show_header(ui, |ui| {
                 ui.label("User Created");
                 if ui.small_button("+").clicked() {
-                    self.new_circuit_dialog = Some(default_new_circuit_name(&self.documents));
+                    self.open_new_circuit_dialog();
                 }
             })
             .body(|ui| {
@@ -1102,7 +1129,7 @@ impl OsmilogApp {
                     // Cancel any placing started by this double click's first
                     // click, so the parent doc isn't parked mid-placement.
                     self.active_mut().mode = InteractionMode::Idle;
-                    self.switch_circuit(target);
+                    self.switch_document(target);
                 } else if let Some(doc) = place_target {
                     let spec = self.subcircuit_spec(doc);
                     self.active_mut().mode = InteractionMode::Placing { spec };
@@ -1483,8 +1510,9 @@ impl eframe::App for OsmilogApp {
         // ROM/RAM contents editor windows, drawn while open.
         self.active_mut().show_memory_editors(&ctx);
 
-        // "New Circuit" name dialog, drawn while it's open.
-        self.create_new_circuit_dialog(&ctx);
+        // "New Circuit" name dialog, drawn while it's open (covers both a
+        // plain blank circuit and extracting a bulk selection into one).
+        self.create_extract_circuit_dialog(&ctx);
 
         // Draws the web "Save As" filename modal while it's open (and completes
         // the download on confirm); no-op on native.
@@ -2022,7 +2050,7 @@ mod tests {
         place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         assert_eq!(app.active().components.len(), 1);
 
-        app.create_circuit_doc("C2".to_string());
+        app.create_document("C2".to_string());
 
         // A second document exists and is now active, with a blank canvas.
         assert_eq!(app.documents.len(), 2);
@@ -2060,12 +2088,12 @@ mod tests {
 
         // Create + switch to a blank second circuit: Main's contents vanish
         // from the live fields.
-        app.create_circuit_doc("C2".to_string());
+        app.create_document("C2".to_string());
         assert!(app.active().components.is_empty());
 
         // Switch back: Main's components and settled net values return intact,
         // without a rebuild (the parked circuit kept its nets).
-        app.switch_circuit(main);
+        app.switch_document(main);
         assert_eq!(app.active_id, main);
         assert_eq!(app.active().components.len(), 4);
         assert_eq!(app.active().circuit.read_output(o_key), Value::ONE);
@@ -2077,7 +2105,7 @@ mod tests {
         let main = app.active_id;
         place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
 
-        app.switch_circuit(main);
+        app.switch_document(main);
 
         assert_eq!(app.active_id, main);
         assert_eq!(app.documents.len(), 1);
@@ -2100,7 +2128,7 @@ mod tests {
         app.active_mut().rebuild_circuit();
 
         // New circuit C2 (now active, Main parked); place Main as a subcircuit.
-        app.create_circuit_doc("C2".to_string());
+        app.create_document("C2".to_string());
         let spec = app.subcircuit_spec(main);
         let sub = app.place_component(spec, GridPos::new(5, 5));
 
@@ -2135,13 +2163,13 @@ mod tests {
         app.active_mut().rebuild_circuit();
 
         // C2 contains a subcircuit of Main.
-        app.create_circuit_doc("C2".to_string());
+        app.create_document("C2".to_string());
         let c2 = app.active_id;
         let spec = app.subcircuit_spec(main);
         app.place_component(spec, GridPos::new(5, 5));
 
         // Back on Main: placing C2 here would form Main -> C2 -> Main. Rejected.
-        app.switch_circuit(main);
+        app.switch_document(main);
         assert!(
             app.would_cycle(c2),
             "C2 references Main, so nesting it cycles"
@@ -2149,9 +2177,9 @@ mod tests {
         assert!(app.would_cycle(main), "a circuit can't contain itself");
 
         // A fresh, unrelated circuit is fine to nest.
-        app.create_circuit_doc("C3".to_string());
+        app.create_document("C3".to_string());
         let c3 = app.active_id;
-        app.switch_circuit(main);
+        app.switch_document(main);
         assert!(!app.would_cycle(c3));
     }
 
@@ -2177,7 +2205,7 @@ mod tests {
         app.active_mut().rebuild_circuit();
 
         // C2 (now active): Input(1) -> Output, a passthrough settling a 1.
-        app.create_circuit_doc("C2".to_string());
+        app.create_document("C2".to_string());
         let x = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let y = place(&mut app, ComponentSpec::Output);
         connect_pins(&mut app, (x, PinId::output(0)), (y, PinId::input(0)));
@@ -2214,7 +2242,7 @@ mod tests {
 
         // Switching to Main brings its (independent) state back: Output reads 0.
         let main = loaded.doc_order[0];
-        loaded.switch_circuit(main);
+        loaded.switch_document(main);
         let main_out = loaded
             .active()
             .components
@@ -2298,7 +2326,7 @@ mod tests {
         app.active_mut().rebuild_circuit();
 
         // C2: Input(1) -> [Main as subcircuit] -> Output.
-        app.create_circuit_doc("C2".to_string());
+        app.create_document("C2".to_string());
         let spec = app.subcircuit_spec(main);
         let sub = app.place_component(spec, GridPos::new(5, 5));
         let x = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
@@ -2348,7 +2376,7 @@ mod tests {
         let main = app.active_id;
 
         // C2: Input(1) -> Output passthrough.
-        app.create_circuit_doc("C2".to_string());
+        app.create_document("C2".to_string());
         let c2 = app.active_id;
         let c2_in = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let c2_out = place(&mut app, ComponentSpec::Output);
@@ -2360,7 +2388,7 @@ mod tests {
         app.active_mut().rebuild_circuit();
 
         // Back on Main: Input(1) -> [C2 as subcircuit] -> Output.
-        app.switch_circuit(main);
+        app.switch_document(main);
         let spec = app.subcircuit_spec(c2);
         let sub = app.place_component(spec, GridPos::new(5, 5));
         let x = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));

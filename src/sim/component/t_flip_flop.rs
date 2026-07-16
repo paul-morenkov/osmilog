@@ -188,7 +188,10 @@ mod tests {
         let mut ff = new_t_flip_flop();
         ff.tick(&[Value::ONE, Value::ONE, NO_RST]); // toggle to 1
                                                     // reset=1 dominates toggle=1/we=1: forces 0.
-        assert_eq!(ff.tick(&[Value::ONE, Value::ONE, Value::ONE]), vec![Value::ZERO]);
+        assert_eq!(
+            ff.tick(&[Value::ONE, Value::ONE, Value::ONE]),
+            vec![Value::ZERO]
+        );
     }
 
     #[test]

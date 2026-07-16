@@ -61,10 +61,8 @@ impl Clipboard {
     }
 
     /// Snapshots `selected` out of the given live GUI state. No-op if
-    /// `selected` is empty. Wiring scope is strict: a node/segment is only
-    /// captured if its owning wire segment is itself in `selected` (not
-    /// merely reachable from a selected component) - see module docs.
-    /// Resets the walking paste offset back to the base step.
+    /// `selected` is empty. Resets the walking paste offset back to the base
+    /// step.
     pub fn copy(
         &mut self,
         components: &HashMap<PlacedCompKey, PlacedComponent>,
@@ -75,116 +73,9 @@ impl Clipboard {
         if selected.is_empty() {
             return;
         }
-
-        let mut included_components: HashSet<PlacedCompKey> = HashSet::new();
-        let mut included_tunnels: HashSet<PlacedTunnelKey> = HashSet::new();
-        let mut included_wires: HashSet<WireSegKey> = HashSet::new();
-        for sel in selected {
-            match *sel {
-                Selected::Component(k) => {
-                    included_components.insert(k);
-                }
-                Selected::Tunnel(k) => {
-                    included_tunnels.insert(k);
-                }
-                Selected::Wire(k) => {
-                    included_wires.insert(k);
-                }
-            }
-        }
-
-        let mut comp_index: HashMap<PlacedCompKey, usize> = HashMap::new();
-        let comp_entries: Vec<ComponentEntry> = components
-            .iter()
-            .filter(|(k, _)| included_components.contains(k))
-            .enumerate()
-            .map(|(i, (k, pc))| {
-                comp_index.insert(*k, i);
-                ComponentEntry {
-                    spec: pc.spec.clone(),
-                    grid_pos: pc.grid_pos,
-                }
-            })
-            .collect();
-
-        let mut tunnel_index: HashMap<PlacedTunnelKey, usize> = HashMap::new();
-        let tunnel_entries: Vec<TunnelEntry> = tunnels
-            .iter()
-            .filter(|(k, _)| included_tunnels.contains(k))
-            .enumerate()
-            .map(|(i, (k, pt))| {
-                tunnel_index.insert(*k, i);
-                TunnelEntry {
-                    label: pt.label.clone(),
-                    role: pt.role,
-                    grid_pos: pt.grid_pos,
-                }
-            })
-            .collect();
-
-        // Node set is exactly the endpoints of included wire segments - not
-        // active_nodes() broadly - since wiring scope is strict-selection.
-        let mut node_index: HashMap<crate::gui::wiring::WireNodeKey, usize> = HashMap::new();
-        let mut node_entries: Vec<NodeEntry> = Vec::new();
-        for (seg_key, seg) in &wiring.segments {
-            if !included_wires.contains(seg_key) {
-                continue;
-            }
-            for nk in [seg.a, seg.b] {
-                if node_index.contains_key(&nk) {
-                    continue;
-                }
-                let node = &wiring.nodes[&nk];
-                // A node's Pin/Tunnel attach only survives into the copy if
-                // its owning component/tunnel is *also* included; otherwise
-                // it would reference an index that doesn't exist in this
-                // clipboard, so it's downgraded to a Free (unattached) stub
-                // rather than a dangling reference.
-                let attach = match node.attach {
-                    NodeAttach::Free => NodeAttachEntry::Free,
-                    NodeAttach::Pin(pck, pin) => match comp_index.get(&pck) {
-                        Some(&comp) => {
-                            let (is_input, pin_index) = match pin {
-                                PinId::In(InIdx(p)) => (true, p),
-                                PinId::Out(OutIdx(p)) => (false, p),
-                            };
-                            NodeAttachEntry::Pin {
-                                comp,
-                                is_input,
-                                pin_index,
-                            }
-                        }
-                        None => NodeAttachEntry::Free,
-                    },
-                    NodeAttach::Tunnel(ptk) => match tunnel_index.get(&ptk) {
-                        Some(&tunnel) => NodeAttachEntry::Tunnel { tunnel },
-                        None => NodeAttachEntry::Free,
-                    },
-                };
-                node_index.insert(nk, node_entries.len());
-                node_entries.push(NodeEntry {
-                    pos: node.pos,
-                    attach,
-                });
-            }
-        }
-
-        let seg_entries: Vec<SegEntry> = wiring
-            .segments
-            .iter()
-            .filter(|(k, _)| included_wires.contains(k))
-            .map(|(_, seg)| SegEntry {
-                a: node_index[&seg.a],
-                b: node_index[&seg.b],
-            })
-            .collect();
-
-        self.snapshot = Some(CircuitSnapshot {
-            components: comp_entries,
-            tunnels: tunnel_entries,
-            nodes: node_entries,
-            segments: seg_entries,
-        });
+        self.snapshot = Some(build_selection_snapshot(
+            components, tunnels, wiring, selected,
+        ));
         self.next_offset = base_offset();
     }
 
@@ -233,6 +124,130 @@ impl Clipboard {
 impl Default for Clipboard {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Builds a `CircuitSnapshot` of exactly `selected` out of the given live GUI
+/// state - the same strict-selection scoping `Clipboard::copy` uses (a
+/// node/segment is only captured if its owning wire segment is itself in
+/// `selected`, not merely reachable from a selected component). Factored out
+/// of `Clipboard::copy` so other callers (e.g. extracting a bulk selection
+/// into a new circuit document) can capture the same shape of snapshot
+/// without going through the clipboard's copy/paste-offset machinery.
+pub(crate) fn build_selection_snapshot(
+    components: &HashMap<PlacedCompKey, PlacedComponent>,
+    tunnels: &HashMap<PlacedTunnelKey, PlacedTunnel>,
+    wiring: &Wiring,
+    selected: &[Selected],
+) -> CircuitSnapshot {
+    let mut included_components: HashSet<PlacedCompKey> = HashSet::new();
+    let mut included_tunnels: HashSet<PlacedTunnelKey> = HashSet::new();
+    let mut included_wires: HashSet<WireSegKey> = HashSet::new();
+    for sel in selected {
+        match *sel {
+            Selected::Component(k) => {
+                included_components.insert(k);
+            }
+            Selected::Tunnel(k) => {
+                included_tunnels.insert(k);
+            }
+            Selected::Wire(k) => {
+                included_wires.insert(k);
+            }
+        }
+    }
+
+    let mut comp_index: HashMap<PlacedCompKey, usize> = HashMap::new();
+    let comp_entries: Vec<ComponentEntry> = components
+        .iter()
+        .filter(|(k, _)| included_components.contains(k))
+        .enumerate()
+        .map(|(i, (k, pc))| {
+            comp_index.insert(*k, i);
+            ComponentEntry {
+                spec: pc.spec.clone(),
+                grid_pos: pc.grid_pos,
+            }
+        })
+        .collect();
+
+    let mut tunnel_index: HashMap<PlacedTunnelKey, usize> = HashMap::new();
+    let tunnel_entries: Vec<TunnelEntry> = tunnels
+        .iter()
+        .filter(|(k, _)| included_tunnels.contains(k))
+        .enumerate()
+        .map(|(i, (k, pt))| {
+            tunnel_index.insert(*k, i);
+            TunnelEntry {
+                label: pt.label.clone(),
+                role: pt.role,
+                grid_pos: pt.grid_pos,
+            }
+        })
+        .collect();
+
+    // Node set is exactly the endpoints of included wire segments - not
+    // active_nodes() broadly - since wiring scope is strict-selection.
+    let mut node_index: HashMap<crate::gui::wiring::WireNodeKey, usize> = HashMap::new();
+    let mut node_entries: Vec<NodeEntry> = Vec::new();
+    for (seg_key, seg) in &wiring.segments {
+        if !included_wires.contains(seg_key) {
+            continue;
+        }
+        for nk in [seg.a, seg.b] {
+            if node_index.contains_key(&nk) {
+                continue;
+            }
+            let node = &wiring.nodes[&nk];
+            // A node's Pin/Tunnel attach only survives into the copy if
+            // its owning component/tunnel is *also* included; otherwise
+            // it would reference an index that doesn't exist in this
+            // clipboard, so it's downgraded to a Free (unattached) stub
+            // rather than a dangling reference.
+            let attach = match node.attach {
+                NodeAttach::Free => NodeAttachEntry::Free,
+                NodeAttach::Pin(pck, pin) => match comp_index.get(&pck) {
+                    Some(&comp) => {
+                        let (is_input, pin_index) = match pin {
+                            PinId::In(InIdx(p)) => (true, p),
+                            PinId::Out(OutIdx(p)) => (false, p),
+                        };
+                        NodeAttachEntry::Pin {
+                            comp,
+                            is_input,
+                            pin_index,
+                        }
+                    }
+                    None => NodeAttachEntry::Free,
+                },
+                NodeAttach::Tunnel(ptk) => match tunnel_index.get(&ptk) {
+                    Some(&tunnel) => NodeAttachEntry::Tunnel { tunnel },
+                    None => NodeAttachEntry::Free,
+                },
+            };
+            node_index.insert(nk, node_entries.len());
+            node_entries.push(NodeEntry {
+                pos: node.pos,
+                attach,
+            });
+        }
+    }
+
+    let seg_entries: Vec<SegEntry> = wiring
+        .segments
+        .iter()
+        .filter(|(k, _)| included_wires.contains(k))
+        .map(|(_, seg)| SegEntry {
+            a: node_index[&seg.a],
+            b: node_index[&seg.b],
+        })
+        .collect();
+
+    CircuitSnapshot {
+        components: comp_entries,
+        tunnels: tunnel_entries,
+        nodes: node_entries,
+        segments: seg_entries,
     }
 }
 

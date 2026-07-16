@@ -168,11 +168,12 @@ fn show_window(
                                         break;
                                     }
                                     let mut val = kind.word(&components[&pc].spec, i);
-                                    let resp = ui.add(
-                                        egui::DragValue::new(&mut val)
-                                            .range(0..=mask)
-                                            .hexadecimal(word_nibbles, false, true),
-                                    );
+                                    let resp =
+                                        ui.add(
+                                            egui::DragValue::new(&mut val)
+                                                .range(0..=mask)
+                                                .hexadecimal(word_nibbles, false, true),
+                                        );
                                     if resp.changed() {
                                         edits.push(MemEdit {
                                             pc,

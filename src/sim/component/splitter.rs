@@ -78,8 +78,11 @@ impl Splitter {
     // its round-trip test and this module's own.
     #[allow(dead_code)]
     pub(crate) fn arm_bits(&self) -> Vec<Vec<u8>> {
-        let mut arm_bits: Vec<Vec<u8>> =
-            self.arm_width.iter().map(|&w| vec![0u8; w as usize]).collect();
+        let mut arm_bits: Vec<Vec<u8>> = self
+            .arm_width
+            .iter()
+            .map(|&w| vec![0u8; w as usize])
+            .collect();
         for (bit, routed) in self.routing.iter().enumerate() {
             if let Some((arm, slot)) = routed {
                 arm_bits[*arm as usize][*slot as usize] = bit as u8;

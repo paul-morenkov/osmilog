@@ -35,7 +35,7 @@ pub const CIRCUIT_FILE_EXT: &str = "osm";
 // clipboard snapshot (`gui::clipboard`), each project `CircuitEntry` (flattened
 // in), and the legacy v2 file body (`LegacyV2File`). The App<->records
 // conversion lives in `gui::app`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CircuitSnapshot {
     pub components: Vec<ComponentEntry>,
     pub tunnels: Vec<TunnelEntry>,

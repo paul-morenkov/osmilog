@@ -25,6 +25,8 @@ pub(crate) enum PropGuiAction {
     OpenMemory(PlacedCompKey, MemKind),
     /// Switch the active document to a placed subcircuit's referenced circuit.
     OpenCircuit(DocId),
+    /// Create new document from bulk selection
+    CreateCircuit,
     /// Commit a tunnel label rename (on focus loss) - relinks nets, undoable.
     RenameTunnel(PlacedTunnelKey, String),
     /// Persist an in-progress tunnel label edit (on each keystroke). Must be
@@ -50,7 +52,12 @@ pub(crate) fn show_properties(doc: &Document, ui: &mut egui::Ui) -> Option<PropG
             ui.separator();
             ui.label(format!("{} items selected.", items.len()));
             ui.label("Press Backspace or Delete to remove them.");
-            return None;
+
+            if ui.button("Add to New Circuit").clicked() {
+                return Some(PropGuiAction::CreateCircuit);
+            } else {
+                return None;
+            }
         }
         Some(Selection::Single(sel)) => *sel,
     };

@@ -39,9 +39,11 @@ impl CombLogic for Subtractor {
             inputs[Self::SUBTRAHEND_PIN],
             borrow_in,
         ) {
-            (Value::Fixed { bits: a, width: aw }, Value::Fixed { bits: b, width: bw }, Some(bin))
-                if aw == width && bw == width =>
-            {
+            (
+                Value::Fixed { bits: a, width: aw },
+                Value::Fixed { bits: b, width: bw },
+                Some(bin),
+            ) if aw == width && bw == width => {
                 // Wraps mod 2^32 then masks to `width` bits, which equals mod
                 // 2^width since 2^width divides 2^32 - no signed/widened
                 // intermediate needed, unlike the borrow-out check below.

@@ -145,7 +145,8 @@ impl CombLogic for Rom {
             // data.len() == 2^address_width, so the index is always in range - the
             // get() guard is just belt-and-braces.
             Value::Fixed { bits, width } if width == self.address_width => {
-                let word = self.data.borrow().get(bits as usize).copied().unwrap_or(0) & self.mask();
+                let word =
+                    self.data.borrow().get(bits as usize).copied().unwrap_or(0) & self.mask();
                 vec![Value::new(word, self.data_width)]
             }
             // Floating/Invalid address, or a width mismatch (mirrors how Mux
