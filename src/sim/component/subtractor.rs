@@ -16,12 +16,10 @@ impl Subtractor {
 
 impl CombLogic for Subtractor {
     fn n_inputs(&self) -> usize {
-        // Minuend, subtrahend, and a borrow-in
         3
     }
 
     fn n_outputs(&self) -> usize {
-        // Difference and borrow-out
         2
     }
 

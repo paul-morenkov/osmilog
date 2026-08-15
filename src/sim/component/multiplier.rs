@@ -16,7 +16,6 @@ impl Multiplier {
 
 impl CombLogic for Multiplier {
     fn n_inputs(&self) -> usize {
-        // Multiplicand, multiplier, and a carry-in
         3
     }
 

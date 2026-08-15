@@ -11,22 +11,18 @@ pub enum FanDirection {
 pub struct Splitter {
     arms: u8,
     direction: FanDirection,
-    // routing[i] = Some((arm, slot)) => data bit i is arm `arm`'s `slot`-th
-    // bit; None => unrouted (dropped in Right mode, always 0 in the merged
-    // Left-mode trunk).
+    // routing[i] = Some((arm, slot)): data bit i is arm `arm`'s `slot`-th bit.
+    // None: unrouted (dropped in Right mode, always 0 in the Left-mode trunk).
     routing: Vec<Option<(u8, u8)>>,
-    // arm_width[j] = number of data bits owned by arm j. In Right mode this
-    // is the width evaluate() gives that arm's output; in Left mode it's
-    // the width evaluate() requires on that arm's input.
+    // arm_width[j] = bits owned by arm j: an output width in Right mode, a
+    // required input width in Left mode.
     arm_width: Vec<u8>,
 }
 
 impl Splitter {
-    // arm_bits[j] lists the data-bit indices routed to arm j, e.g.
-    // [[0, 2], [1, 3]] sends bits 0,2 to arm0 and bits 1,3 to arm1. A bit
-    // listed in more than one arm goes to the later arm. `direction` picks
-    // which side is the input: Right is the classic splitter (1 bus -> arms
-    // outputs); Left inverts it into a combiner (arms inputs -> 1 bus).
+    // arm_bits[j] lists the data-bit indices routed to arm j. A bit listed
+    // under more than one arm goes to the later arm. Right is the classic
+    // splitter (1 bus -> arm outputs); Left inverts it into a combiner.
     pub fn new(arm_bits: Vec<Vec<u8>>, direction: FanDirection) -> Self {
         let arms = arm_bits.len() as u8;
         let width = arm_bits
@@ -41,8 +37,6 @@ impl Splitter {
                 owner[bit as usize] = Some(arm as u8);
             }
         }
-        // Precomputed once here (not recounted per evaluate() call) since it
-        // depends only on arm_bits' structure; slot 0 = LSB of that arm.
         let mut arm_width = vec![0u8; arms as usize];
         let routing: Vec<Option<(u8, u8)>> = owner
             .into_iter()
@@ -70,12 +64,9 @@ impl Splitter {
         self.direction
     }
 
-    // Reconstructs an arm-major arm_bits from routing/arm_width, inverting
-    // new(). Round-trips through Splitter::new() to an identical
-    // routing/arm_width, though not necessarily the exact input Vec<Vec<u8>>
-    // (a bit claimed by two arms only appears under the winning arm here).
-    // Only caller is Component::spec (unused outside tests); retained for
-    // its round-trip test and this module's own.
+    // Inverts new(). Round-trips to an identical routing/arm_width, though not
+    // necessarily the same input (a bit claimed by two arms only shows here
+    // under the winning arm).
     #[allow(dead_code)]
     pub(crate) fn arm_bits(&self) -> Vec<Vec<u8>> {
         let mut arm_bits: Vec<Vec<u8>> = self
@@ -125,9 +116,7 @@ impl CombLogic for Splitter {
             },
             FanDirection::Left => {
                 let arm_vals: Vec<Value> = (0..self.arms as usize).map(|i| inputs[i]).collect();
-                // Every arm owning >=1 bit must be driven at exactly that
-                // width; Floating or a mismatch poisons the whole merged
-                // output rather than truncating/zero-extending.
+                // Floating or a wrong-width arm poisons the whole merged output.
                 let widths_ok = (0..self.arms as usize).all(|arm| {
                     self.arm_width[arm] == 0
                         || matches!(arm_vals[arm], Value::Fixed { width, .. } if width == self.arm_width[arm])
@@ -178,7 +167,7 @@ mod tests {
 
     #[test]
     fn test_contiguous_halves() {
-        // 4-bit bus split into two 2-bit arms: bits [0,1] -> arm0, bits [2,3] -> arm1.
+        // bits [0,1] -> arm0, bits [2,3] -> arm1.
         let s = Splitter::new(vec![vec![0, 1], vec![2, 3]], FanDirection::Right);
         assert_eq!(
             s.evaluate(&[Value::new(0, 4)]),
@@ -200,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_interleaved() {
-        // 4-bit bus, even bits (0,2) -> arm0, odd bits (1,3) -> arm1.
+        // even bits (0,2) -> arm0, odd bits (1,3) -> arm1.
         let s = Splitter::new(vec![vec![0, 2], vec![1, 3]], FanDirection::Right);
         assert_eq!(
             s.evaluate(&[Value::new(0, 4)]),
@@ -226,7 +215,6 @@ mod tests {
 
     #[test]
     fn test_full_spread() {
-        // Each of the 4 bits fans out to its own dedicated 1-bit arm.
         let s = Splitter::new(
             vec![vec![0], vec![1], vec![2], vec![3]],
             FanDirection::Right,
@@ -260,7 +248,6 @@ mod tests {
 
     #[test]
     fn test_arm_with_no_mapped_bits_is_zero_width() {
-        // arm 2 is listed with no bits, so it should receive nothing.
         let s = Splitter::new(vec![vec![0], vec![1], vec![]], FanDirection::Right);
         let out = s.evaluate(&[Value::new(0b11, 2)]);
         assert_eq!(out[2], Value::new(0, 0));
@@ -268,8 +255,7 @@ mod tests {
 
     #[test]
     fn test_unrouted_high_bits_of_wider_input_are_ignored() {
-        // arm_bits only covers the low 2 bits of a 4-bit input value; the
-        // upper bits (2,3) are unrouted and should have no effect on any arm.
+        // Bits 2,3 are unrouted; only bits 0,1 affect output.
         let s = Splitter::new(vec![vec![0], vec![1]], FanDirection::Right);
         assert_eq!(
             s.evaluate(&[Value::new(0b1101, 4)]),
@@ -279,8 +265,6 @@ mod tests {
 
     #[test]
     fn test_bit_claimed_by_multiple_arms_last_arm_wins() {
-        // bit1 is listed under both arm0 and arm1; arm_bits is processed in
-        // order, so the later arm (arm1) should end up owning it, not arm0.
         let s = Splitter::new(vec![vec![0, 1], vec![1]], FanDirection::Right);
         assert_eq!(
             s.evaluate(&[Value::new(0b01, 2)]), // bit0 set, bit1 clear
@@ -304,8 +288,7 @@ mod tests {
 
     #[test]
     fn test_combine_contiguous_halves() {
-        // Inverse of test_contiguous_halves: two 2-bit arms merge into
-        // a single 4-bit output, bits [0,1] from arm0, bits [2,3] from arm1.
+        // Inverse of test_contiguous_halves.
         let s = Splitter::new(vec![vec![0, 1], vec![2, 3]], FanDirection::Left);
         assert_eq!(
             s.evaluate(&[Value::new(0, 2), Value::new(0, 2)]),
@@ -323,8 +306,6 @@ mod tests {
 
     #[test]
     fn test_combine_floating_arm_propagates() {
-        // One owning arm left unconnected (Floating) poisons the whole merged
-        // output, regardless of the other arm's value.
         let s = Splitter::new(vec![vec![0], vec![1]], FanDirection::Left);
         assert_eq!(
             s.evaluate(&[Value::new(0b1, 1), Value::Floating]),
@@ -334,7 +315,6 @@ mod tests {
 
     #[test]
     fn test_combine_width_mismatch_yields_floating() {
-        // arm0 owns 2 bits but is driven by a 3-bit source -> Floating.
         let s = Splitter::new(vec![vec![0, 1], vec![2]], FanDirection::Left);
         assert_eq!(
             s.evaluate(&[Value::new(0, 3), Value::ZERO]),
@@ -344,8 +324,7 @@ mod tests {
 
     #[test]
     fn test_combine_unrouted_bit_defaults_zero() {
-        // arm_bits only covers bits 0 and 2 of a 3-bit merged output; bit 1 has
-        // no owning arm and should always read as 0, regardless of other arms.
+        // Bit 1 has no owning arm; it always reads 0.
         let s = Splitter::new(vec![vec![0], vec![2]], FanDirection::Left);
         assert_eq!(
             s.evaluate(&[Value::new(0b1, 1), Value::new(0b1, 1)]),
@@ -355,9 +334,8 @@ mod tests {
 
     #[test]
     fn test_combine_zero_arms_produces_single_zero_output() {
-        // Deliberately asymmetric with test_zero_arms_produces_empty_output:
-        // Left mode always has exactly one trunk output pin, even with zero arms,
-        // whereas Right mode with zero arms has zero output pins.
+        // Left mode always has one trunk output pin, even with zero arms
+        // (unlike Right mode, which then has zero output pins).
         let s = Splitter::new(vec![], FanDirection::Left);
         assert_eq!(s.n_inputs(), 0);
         assert_eq!(s.evaluate(&[]), vec![Value::new(0, 0)]);
@@ -365,8 +343,6 @@ mod tests {
 
     #[test]
     fn test_arm_bits_round_trips_through_new() {
-        // Interleaved mapping (not a trivial contiguous split) exercises
-        // reconstruction across non-adjacent bit indices per arm.
         let s1 = Splitter::new(vec![vec![0, 2], vec![1, 3]], FanDirection::Right);
         let reconstructed = s1.arm_bits();
         let s2 = Splitter::new(reconstructed, FanDirection::Right);
@@ -379,9 +355,8 @@ mod tests {
 
     #[test]
     fn test_arm_bits_round_trips_after_collision_resolution() {
-        // Bit 0 is claimed by both arms; the later arm (arm1) wins per
-        // Splitter::new's documented precedence. arm_bits() must reflect the
-        // already-resolved winner, not the original ambiguous input.
+        // Bit 0 is claimed by both arms; arm_bits() must reflect the
+        // already-resolved winner (arm1), not the original ambiguous input.
         let s1 = Splitter::new(vec![vec![0, 1], vec![0]], FanDirection::Right);
         let reconstructed = s1.arm_bits();
         let s2 = Splitter::new(reconstructed, FanDirection::Right);

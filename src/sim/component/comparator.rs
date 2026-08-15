@@ -17,12 +17,10 @@ impl Comparator {
 
 impl CombLogic for Comparator {
     fn n_inputs(&self) -> usize {
-        // The two operands being compared
         2
     }
 
     fn n_outputs(&self) -> usize {
-        // Greater-than, equal, less-than
         3
     }
 

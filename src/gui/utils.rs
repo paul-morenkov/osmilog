@@ -6,11 +6,8 @@ use egui::Painter;
 use crate::gui::geometry::Camera;
 use crate::gui::theme::Theme;
 
-// Ambient egui/render handles used by the canvas-interaction dispatch and its
-// per-mode methods (`OsmilogApp::handle_canvas_interaction` and its
-// `interact_*` methods, some on `OsmilogApp`, some on `Document`). Built fresh
-// each frame in `OsmilogApp::ui`, never stored - just a bundle of the 5 values
-// that would otherwise be repeated as individual parameters everywhere.
+// Built fresh each frame in `OsmilogApp::ui`, never stored - bundles values that
+// would otherwise be repeated as individual parameters across interact_* methods.
 pub(crate) struct CanvasCtx<'a> {
     pub(crate) response: &'a egui::Response,
     pub(crate) painter: &'a Painter,

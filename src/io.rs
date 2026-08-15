@@ -1,12 +1,6 @@
-// Save/load format for whole circuits, shared as a plain JSON file. Mirrors
-// the GUI's visual state (PlacedComponent/PlacedTunnel + the wiring graph),
-// not sim `Circuit`'s SlotMaps directly - slotmap keys are ephemeral, so
-// every cross-reference here is a plain `usize` index into
-// `components`/`tunnels`/`nodes` instead.
-//
-// Deliberately gui-light: depends only on plain-data types (ComponentSpec,
-// GateOp, FanDirection, TunnelRole), not OsmilogApp itself - the
-// App<->records conversion lives in app.rs, which owns the SlotMaps.
+// Save/load format for whole circuits, as plain JSON. Mirrors the GUI's visual state, not
+// sim `Circuit`'s SlotMaps: every cross-reference here is a plain `usize` index instead,
+// since slotmap keys are ephemeral. The App<->records conversion lives in app.rs.
 
 use serde::{Deserialize, Serialize};
 
@@ -14,27 +8,17 @@ use crate::gui::geometry::GridPos;
 use crate::sim::circuit::TunnelRole;
 use crate::sim::component::ComponentSpec;
 
-// Bumped whenever the on-disk shape changes in a way that breaks compatibility
-// with previously saved files. Checked by `validate()`.
-// v2: wires became a grid segment graph (`nodes` + `segments`), replacing the
-// v1 pin-to-pin `wires`/`tunnel_wires` lists. v1 files are rejected.
-// v3: the top-level file became a `ProjectFile` holding *several* named
-// circuits (so subcircuits round-trip), rather than a single circuit. v2 files
-// are still accepted and loaded as a one-circuit project (see
-// `ProjectFile::from_json` / `LegacyV2File`).
+// Bumped on breaking on-disk changes; checked by `validate()`. v2: wires became a grid
+// segment graph, replacing v1's pin-to-pin lists (v1 rejected). v3: the top-level file
+// became a `ProjectFile` of several named circuits, so subcircuits round-trip; v2 files
+// still load, upgraded to a one-circuit project.
 pub const CURRENT_VERSION: u32 = 3;
-// The single-circuit file version (`LegacyV2File`) that v3 still upgrades on
-// load. Predates subcircuits, so such a file never carries cross-circuit refs.
+// Predates subcircuits, so a v2 file never carries cross-circuit refs.
 pub const LEGACY_SINGLE_CIRCUIT_VERSION: u32 = 2;
 pub const CIRCUIT_FILE_EXT: &str = "osm";
 
-// One circuit's visual state as index-based records: placed components/tunnels
-// plus the wiring graph (nodes + segments), every cross-reference a plain
-// `usize` index into these vectors (slotmap keys are ephemeral and not worth
-// persisting). NOT a file itself - it's the reusable payload shared by the
-// clipboard snapshot (`gui::clipboard`), each project `CircuitEntry` (flattened
-// in), and the legacy v2 file body (`LegacyV2File`). The App<->records
-// conversion lives in `gui::app`.
+// NOT a file itself: the reusable payload shared by the clipboard snapshot, each project
+// `CircuitEntry` (flattened in), and the legacy v2 file body.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CircuitSnapshot {
     pub components: Vec<ComponentEntry>,
@@ -56,10 +40,8 @@ pub struct TunnelEntry {
     pub grid_pos: GridPos,
 }
 
-// A wire graph node at a grid position, optionally bound to a component pin or
-// a tunnel. `comp`/`tunnel` are indices into the snapshot's components/tunnels;
-// `is_input` + `pin_index` spell out a PinId without depending on
-// sim::component::PinId.
+// `comp`/`tunnel` index the snapshot's components/tunnels. `is_input` + `pin_index`
+// spell out a PinId without depending on sim::component::PinId.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct NodeEntry {
     pub pos: GridPos,
@@ -331,7 +313,6 @@ mod tests {
 
     #[test]
     fn test_from_json_upgrades_legacy_v2_to_single_circuit_project() {
-        // A hand-built v2 single-circuit file: Input(1) -> Output.
         let v2 = LegacyV2File {
             version: LEGACY_SINGLE_CIRCUIT_VERSION,
             snapshot: CircuitSnapshot {
@@ -369,8 +350,6 @@ mod tests {
         };
         let json = serde_json::to_string(&v2).unwrap();
 
-        // Parsing upgrades it to a one-circuit project named "Main", carrying
-        // the original snapshot through unchanged.
         let project = ProjectFile::from_json(&json).unwrap();
         assert_eq!(project.version, CURRENT_VERSION);
         assert_eq!(project.circuits.len(), 1);
@@ -396,7 +375,6 @@ mod tests {
             subcircuits: vec![],
         };
 
-        // Unsupported version.
         let f = ProjectFile {
             version: CURRENT_VERSION + 1,
             active: 0,
@@ -410,18 +388,15 @@ mod tests {
             })
         );
 
-        // No circuits at all.
         let f = ProjectFile::new(0, vec![]);
         assert_eq!(f.validate(), Err(LoadError::EmptyProject));
 
-        // `active` out of range.
         let f = ProjectFile::new(3, vec![good_circuit()]);
         assert_eq!(
             f.validate(),
             Err(LoadError::CircuitIndexOutOfRange { index: 3, len: 1 })
         );
 
-        // A subcircuit reference pointing at a non-existent circuit.
         let mut c = good_circuit();
         c.snapshot.components.push(ComponentEntry {
             spec: ComponentSpec::Output,

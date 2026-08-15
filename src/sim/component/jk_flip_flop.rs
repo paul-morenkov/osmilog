@@ -207,8 +207,8 @@ mod tests {
     #[test]
     fn test_apply_async_reset_clears_state_destructively() {
         let mut ff = new_jk_flip_flop();
-        ff.tick(&[Value::ONE, Value::ZERO, Value::ONE, NO_RST]); // set to 1
-                                                                 // Reset held: apply_async clears Q, no tick.
+        ff.tick(&[Value::ONE, Value::ZERO, Value::ONE, NO_RST]);
+        // Reset held: apply_async clears Q, no tick.
         ff.apply_async(&[
             Value::Floating,
             Value::Floating,
@@ -224,8 +224,8 @@ mod tests {
     #[test]
     fn test_async_reset_dominates_on_tick() {
         let mut ff = new_jk_flip_flop();
-        ff.tick(&[Value::ONE, Value::ZERO, Value::ONE, NO_RST]); // set to 1
-                                                                 // reset=1 dominates J=1/K=0/we=1.
+        ff.tick(&[Value::ONE, Value::ZERO, Value::ONE, NO_RST]);
+        // reset=1 dominates J=1/K=0/we=1.
         assert_eq!(
             ff.tick(&[Value::ONE, Value::ZERO, Value::ONE, Value::ONE]),
             vec![Value::ZERO]

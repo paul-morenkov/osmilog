@@ -16,12 +16,10 @@ impl Adder {
 
 impl CombLogic for Adder {
     fn n_inputs(&self) -> usize {
-        // Two addends and a carry-in
         3
     }
 
     fn n_outputs(&self) -> usize {
-        // Sum and carry-out
         2
     }
 

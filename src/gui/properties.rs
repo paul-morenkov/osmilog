@@ -11,36 +11,23 @@ use crate::sim::circuit::TunnelRole;
 use crate::sim::component::*;
 use crate::sim::value::Value;
 
-/// One user intent collected from the (mutation-free) properties panel, applied
-/// afterward by `OsmilogApp::apply_prop_gui_action` once the panel's `&Document`
-/// borrow ends. The panel only *describes* what to do; it never mutates app
-/// state itself, which is what keeps `show_properties` a pure render function
-/// over a bare `&Document`. Named for its origin: these are GUI-panel actions,
-/// distinct from the sim-layer `Command`/`GuiUndoAction` machinery each one may
-/// ultimately drive.
+/// A user intent from the properties panel. The panel only describes what to do; the caller
+/// applies it via `OsmilogApp::apply_prop_gui_action`.
 pub(crate) enum PropGuiAction {
-    /// Swap a component's construction params (widths, arity, ...).
     Reconfigure(PlacedCompKey, ComponentSpec),
-    /// Open the virtualized contents editor for a ROM or RAM.
     OpenMemory(PlacedCompKey, MemKind),
-    /// Switch the active document to a placed subcircuit's referenced circuit.
     OpenCircuit(DocId),
-    /// Create new document from bulk selection
     CreateCircuit,
-    /// Commit a tunnel label rename (on focus loss) - relinks nets, undoable.
+    /// Relinks nets. Undoable.
     RenameTunnel(PlacedTunnelKey, String),
-    /// Persist an in-progress tunnel label edit (on each keystroke). Must be
-    /// applied the same frame: the text buffer is re-cloned from the record
-    /// every frame, so a dropped write loses the edit. Not a committed rename.
+    /// Must be applied the same frame: the text buffer is re-cloned from the record every
+    /// frame, so a dropped write loses the edit.
     SetTunnelLabelLive(PlacedTunnelKey, String),
-    /// Delete the selected component / tunnel / wire.
     Delete(Selected),
 }
 
-/// Renders the properties panel for the current selection and returns the edit
-/// the user requested this frame, if any. Deliberately takes a read-only
-/// `&Document` (not `&mut OsmilogApp`): every value it needs to draw is
-/// document-scoped, so all it can do is collect intent - the caller applies it.
+/// Takes a read-only `&Document`, not `&mut OsmilogApp`: it only collects intent, the caller
+/// applies it.
 pub(crate) fn show_properties(doc: &Document, ui: &mut egui::Ui) -> Option<PropGuiAction> {
     let sel = match &doc.selected {
         None => {
@@ -61,11 +48,6 @@ pub(crate) fn show_properties(doc: &Document, ui: &mut egui::Ui) -> Option<PropG
         }
         Some(Selection::Single(sel)) => *sel,
     };
-    // A run session makes structural edits read-only, but value edits
-    // (an Input's bits, ROM/RAM contents) stay live while Paused. Rather
-    // than blanket-disabling the panel, each per-component editor gates its
-    // own widgets - structural ones on editing_locked(), value ones on
-    // value_editing_locked() - so the carve-out lands on exactly those.
     let mut action = match sel {
         Selected::Component(key) => show_component_properties(doc, key, ui),
         Selected::Tunnel(key) => show_tunnel_properties(doc, key, ui),
@@ -107,16 +89,11 @@ pub(crate) fn show_tunnel_properties(
         let mut label = doc.tunnels[&key].label.clone();
         let response = ui.text_edit_singleline(&mut label);
         if response.changed() {
-            // Persist the in-progress edit back to the record this frame (the
-            // buffer is re-cloned from it next frame). Applied by the caller,
-            // but still same-frame - see SetTunnelLabelLive.
             action = Some(PropGuiAction::SetTunnelLabelLive(key, label.clone()));
         }
 
-        // Commit on any focus loss (Enter/Tab/click-away), not just Enter. The
-        // record label is updated live above, but the circuit's isn't; the
-        // caller reads the old label from the circuit to detect a real change
-        // and capture undo's restore value. (rebuild_circuit also reconciles.)
+        // Commits on any focus loss, not just Enter. Compares against the circuit's
+        // (not yet updated) label to detect a real change and capture undo's restore value.
         if response.lost_focus()
             && doc
                 .circuit
@@ -131,10 +108,7 @@ pub(crate) fn show_tunnel_properties(
     action
 }
 
-// Draws "<label> [DragValue]" in a horizontal row and returns whether the
-// value changed - the recurring widget idiom nearly every ComponentSpec
-// arm below uses for one numeric parameter. Generic over the DragValue's
-// numeric type since fields vary between u8/u32/usize.
+// Shared "<label> [DragValue]" widget for one numeric parameter; returns whether it changed.
 fn labeled_drag<Num: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     label: &str,
@@ -149,11 +123,7 @@ fn labeled_drag<Num: egui::emath::Numeric>(
     changed
 }
 
-// Draws the "bits" widget shared by Input and Constant: a checkbox when
-// width == 1 (a single bit reads as on/off), else a labeled DragValue
-// clamped to the value's width. Returns whether it changed. Callers
-// choose which enable-gate wraps this (Input gates it on value_ok,
-// Constant on structural_ok - see each arm).
+// Shared "bits" widget: a checkbox when width == 1, else a DragValue clamped to the width.
 fn bits_widget(ui: &mut egui::Ui, bits: &mut u32, width: u8) -> bool {
     if width == 1 {
         let mut high = *bits != 0;
@@ -177,20 +147,13 @@ pub(crate) fn show_component_properties(
     ui.heading(doc.components[&key].spec.label());
     ui.separator();
 
-    // A run session locks *structural* edits (widths, arity, wiring) for its
-    // whole duration, but carves out live *value* edits - an Input's bits and
-    // ROM/RAM contents - which stay pokeable while Paused (blocked only while
-    // actively Playing). Every editable widget below is gated on whichever
-    // predicate applies; read-only value displays stay ungated so a running
-    // circuit's state remains observable.
+    // Structural edits (widths, arity, wiring) lock for the whole run session; value
+    // edits (Input bits, ROM/RAM contents) stay live while Paused, blocked only while Playing.
     let structural_ok = !doc.editing_locked();
     let value_ok = !doc.value_editing_locked();
 
-    // The spec is matched *by reference*: a ROM/RAM spec carries its whole
-    // contents buffer (up to tens of MiB), so cloning it every frame just to
-    // own the match scrutinee is out. Borrowing it (and taking only `&Document`)
-    // means the arms can't mutate anything, so each records a deferred
-    // PropGuiAction the caller applies once this borrow ends.
+    // Matched by reference, not cloned: a ROM/RAM spec's contents buffer can be tens of
+    // MiB. So the arms can't mutate; each records a deferred edit for the caller to apply.
     let mut edit: Option<PropGuiAction> = None;
 
     let fmt_val = |v: Value| match v {
@@ -486,11 +449,7 @@ pub(crate) fn show_component_properties(
                 ));
             }
         }
-        // A ROM's contents buffer is huge, so its spec is matched by
-        // reference here (never cloned per-frame) - the whole reason the spec
-        // match above borrows rather than owns. Widths are structural;
-        // rom.resized() preserve-and-fits the contents into a fresh owned
-        // buffer, and editing the contents is a value edit (live while Paused).
+        // rom.resized() preserves and fits the contents into a fresh owned buffer.
         ComponentSpec::Rom(
             rom @ Rom {
                 mut data_width,
@@ -521,8 +480,7 @@ pub(crate) fn show_component_properties(
                 }
             });
         }
-        // Same reasoning as Rom, above (huge contents buffer, matched by
-        // reference); read behavior joins the widths as structural.
+        // Read behavior joins the widths as structural.
         ComponentSpec::Ram(
             ram @ Ram {
                 mut data_width,
@@ -573,7 +531,6 @@ pub(crate) fn show_component_properties(
             arm_bits,
             mut direction,
         } => {
-            // let mut width = *width;
             let mut arm_bits = arm_bits.clone();
             let mut changed = false;
             ui.add_enabled_ui(structural_ok, |ui| {
@@ -589,9 +546,7 @@ pub(crate) fn show_component_properties(
                 let mut arms = arm_bits.len() as u8;
                 changed |= labeled_drag(ui, "Arms:", &mut arms, 1..=16);
 
-                // Apply width/arms bookkeeping before rendering bit rows below,
-                // so a shrink is reflected the same frame; truncating drops
-                // any bits assigned to a removed arm.
+                // Truncating drops any bits assigned to a removed arm.
                 arm_bits.resize_with(arms as usize, Vec::new);
                 for list in &mut arm_bits {
                     list.retain(|&b| b < width);
@@ -643,10 +598,7 @@ pub(crate) fn show_component_properties(
                 ));
             }
         }
-        // Read-only: a subcircuit's interface is derived from the referenced
-        // document, not edited here. Offer a jump to edit that document
-        // (mirrors ROM's "Edit contents…" affordance); interface changes
-        // are picked up on switch-back (refresh_subcircuits).
+        // Read-only: the interface comes from the referenced document, edited by jumping there.
         ComponentSpec::Subcircuit {
             doc,
             name,
@@ -660,8 +612,7 @@ pub(crate) fn show_component_properties(
                 input_widths.len(),
                 output_widths.len()
             ));
-            // Navigating into the child circuit is a structural action
-            // (it switches the active document): locked during a run.
+            // Switches the active document, so this is structural: locked during a run.
             ui.add_enabled_ui(structural_ok, |ui| {
                 if ui.button("Open circuit").clicked() {
                     edit = Some(PropGuiAction::OpenCircuit(doc));

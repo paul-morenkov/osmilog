@@ -16,8 +16,6 @@ use crate::sim::component::ComponentSpec;
 
 const WORDS_PER_ROW: usize = 8;
 
-/// Which kind of memory a window is editing. Selects the spec variant to read
-/// (and, for the app applying edits, which write path to use).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MemKind {
     Rom,
@@ -32,8 +30,8 @@ impl MemKind {
         }
     }
 
-    /// `(data_width, len)` for this memory kind, or `None` if `spec` isn't that
-    /// kind (component deleted / reconfigured to another type -> close window).
+    /// `None` if `spec` isn't this kind: the component was deleted or reconfigured, so the
+    /// window should close.
     fn dims(self, spec: &ComponentSpec) -> Option<(u8, usize)> {
         match (self, spec) {
             (MemKind::Rom, ComponentSpec::Rom(r)) => Some((r.data_width, r.len())),
@@ -51,7 +49,6 @@ impl MemKind {
     }
 }
 
-/// One word edit made in an editor window, for the app to apply.
 pub struct MemEdit {
     pub pc: PlacedCompKey,
     pub kind: MemKind,
@@ -59,8 +56,6 @@ pub struct MemEdit {
     pub value: u32,
 }
 
-/// Open-state of the memory contents editor windows. A ROM and a RAM window can
-/// each be open independently.
 #[derive(Default)]
 pub struct MemoryEditor {
     pub(crate) rom_open: Option<PlacedCompKey>,
@@ -68,7 +63,6 @@ pub struct MemoryEditor {
 }
 
 impl MemoryEditor {
-    /// Opens the editor for `pc` of the given kind (from the properties panel).
     pub(crate) fn open(&mut self, pc: PlacedCompKey, kind: MemKind) {
         match kind {
             MemKind::Rom => self.rom_open = Some(pc),
@@ -76,10 +70,8 @@ impl MemoryEditor {
         }
     }
 
-    /// Draws whichever windows are open and returns the word edits the user
-    /// made. Closes a window whose component is gone or is no longer the right
-    /// memory kind. `value_locked` dims (but keeps visible) the fields while a
-    /// clock run is actively Playing.
+    /// Closes a window whose component is gone or no longer the right memory kind.
+    /// `value_locked` dims the fields (but keeps them visible) while a clock run plays.
     pub(crate) fn show(
         &mut self,
         ctx: &egui::Context,
@@ -101,12 +93,8 @@ impl MemoryEditor {
     }
 }
 
-// Draws one memory contents editor window (hex-dump layout: one row per
-// WORDS_PER_ROW words, a base-address label, then a hex DragValue per word). The
-// row list is virtualized (show_rows) so a 2^24-word memory only builds the
-// handful of rows actually on screen. Collected edits are pushed onto `edits`.
-// Returns whether the window should stay open (false = close: the ✕ was hit or
-// the component went away / changed type).
+// Row list is virtualized (show_rows) so a 2^24-word memory only builds visible rows.
+// Returns whether the window should stay open.
 fn show_window(
     ctx: &egui::Context,
     pc: PlacedCompKey,
@@ -115,8 +103,6 @@ fn show_window(
     value_locked: bool,
     edits: &mut Vec<MemEdit>,
 ) -> bool {
-    // Close if the component was deleted or undone away (or the key now names
-    // something else after a reconfigure to a different type).
     let dims = match components.get(&pc) {
         Some(c) => kind.dims(&c.spec),
         _ => None,
@@ -136,10 +122,7 @@ fn show_window(
     };
     let total_rows = len.div_ceil(WORDS_PER_ROW);
 
-    // Contents are a value edit: pokeable while Paused, frozen while Playing.
-    // The window can only be *opened* while value edits are allowed, but one
-    // left open from Stopped/Paused survives into Play, so gate the fields (they
-    // stay visible for observation, just dimmed).
+    // A window opened during Stopped/Paused can survive into Play, so gate (not hide) the fields.
     let values_enabled = !value_locked;
     let mut open = true;
     egui::Window::new(kind.title())
@@ -147,11 +130,7 @@ fn show_window(
         .default_size([440.0, 480.0])
         .resizable(true)
         .show(ctx, |ui| {
-            // DragValue renders with `drag_value_text_style` (defaults to the
-            // proportional Button style), so its digit widths vary and columns
-            // drift out of alignment across rows. Force it monospace to keep the
-            // hex grid aligned; scoped to this Ui so it doesn't affect
-            // DragValues elsewhere in the app.
+            // Forces monospace so digit widths don't drift columns out of alignment across rows.
             ui.style_mut().drag_value_text_style = egui::TextStyle::Monospace;
             let row_height = ui.spacing().interact_size.y;
             ui.add_enabled_ui(values_enabled, |ui| {

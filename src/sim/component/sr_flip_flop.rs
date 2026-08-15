@@ -1,8 +1,7 @@
 use super::{SeqLogic, SeqState};
 use crate::sim::value::Value;
 
-/// An S-R flip-flop: S=R=0 holds, S=1/R=0 sets, S=0/R=1 resets, S=R=1 is the
-/// forbidden state and floats the output.
+/// An S-R flip-flop: S=R=0 holds, S=1/R=0 sets, S=0/R=1 resets, S=R=1 is forbidden (floats).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SRFlipFlopConf;
 
@@ -206,8 +205,8 @@ mod tests {
     #[test]
     fn test_apply_async_reset_clears_state_destructively() {
         let mut ff = new_sr_flip_flop();
-        ff.tick(&[Value::ONE, Value::ZERO, Value::ONE, NO_RST]); // set to 1
-                                                                 // Reset held: apply_async clears Q, no tick.
+        ff.tick(&[Value::ONE, Value::ZERO, Value::ONE, NO_RST]);
+        // Reset held: apply_async clears Q, no tick.
         ff.apply_async(&[
             Value::Floating,
             Value::Floating,
@@ -223,8 +222,8 @@ mod tests {
     #[test]
     fn test_async_reset_dominates_on_tick() {
         let mut ff = new_sr_flip_flop();
-        ff.tick(&[Value::ONE, Value::ZERO, Value::ONE, NO_RST]); // set to 1
-                                                                 // reset=1 dominates S=1/R=0/we=1.
+        ff.tick(&[Value::ONE, Value::ZERO, Value::ONE, NO_RST]);
+        // reset=1 dominates S=1/R=0/we=1.
         assert_eq!(
             ff.tick(&[Value::ONE, Value::ZERO, Value::ONE, Value::ONE]),
             vec![Value::ZERO]

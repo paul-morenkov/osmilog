@@ -47,22 +47,13 @@ pub use sr_flip_flop::{SRFlipFlop, SRFlipFlopConf};
 pub use subtractor::Subtractor;
 pub use t_flip_flop::{TFlipFlop, TFlipFlopConf};
 
-/// Stable, app-assigned identifier for a `Component` within a `Circuit`'s
-/// `components` map. Unlike a slotmap key, it survives a remove + re-insert:
-/// deleting a component genuinely removes it (moving the owned `Component` into
-/// the undo entry), and undo re-inserts it under this same key, so every
-/// history/wiring reference stays valid. Ids are allocated from a monotonic
-/// counter and never reused.
+/// Stable, app-assigned id for a `Component`; survives remove + re-insert (ids never reused).
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct CompKey(pub(crate) u64);
 
 new_key_type! {
-    /// Opaque reference to another circuit document, embedded in
-    /// `ComponentSpec::Subcircuit`. The simulator never dereferences it: the GUI
-    /// owns the document registry (`SlotMap<DocId, CircuitDoc>`) and builds a
-    /// subcircuit's inner `Circuit` from the referenced document. Defined here
-    /// (not in the GUI) so `ComponentSpec` can carry it without `sim` depending
-    /// on `gui`; re-exported from `gui::document`.
+    /// Opaque reference to another circuit document. The simulator never
+    /// dereferences it; the GUI owns the document registry.
     pub struct DocId;
 }
 
@@ -161,10 +152,7 @@ impl Component {
         Self::from_comb(LogicComb::Splitter(Splitter::new(arm_bits, direction)))
     }
 
-    // Builds a subcircuit component wrapping a whole inner Circuit. `inputs` /
-    // `outputs` are the inner Input / Output component keys in the pin order
-    // this component exposes (the GUI derives that top-down); pin arity comes
-    // straight from their lengths. See Logic::Sub / SubCircuit.
+    // `inputs`/`outputs` are the inner Input/Output keys in this component's pin order (GUI-derived).
     pub fn subcircuit(inner: Circuit, inputs: Vec<CompKey>, outputs: Vec<CompKey>) -> Self {
         let pins = Pins::new(inputs.len(), outputs.len());
         Self {
@@ -177,10 +165,8 @@ impl Component {
         }
     }
 
-    // A subcircuit component with the given pin arity but an empty inner
-    // circuit (no boundary keys), so it settles to all-Floating outputs. Only a
-    // safe fallback for ComponentSpec::to_component() on a Subcircuit spec; the
-    // GUI builds real subcircuits via gui::app::instantiate.
+    // A safe, all-Floating fallback for ComponentSpec::to_component() on a Subcircuit spec;
+    // the GUI builds real subcircuits via gui::app::instantiate.
     pub fn subcircuit_placeholder(n_inputs: usize, n_outputs: usize) -> Self {
         Self {
             pins: Pins::new(n_inputs, n_outputs),
@@ -216,21 +202,15 @@ impl Component {
         Self::from_comb(LogicComb::Comparator(Comparator { data_width }))
     }
 
-    // Builds a ROM from a full Rom record (widths + contents). Takes the record
-    // by value so to_component() can hand over a clone of the placed spec's data.
     pub fn rom(rom: Rom) -> Self {
         Self::from_comb(LogicComb::Rom(rom))
     }
 
-    // Builds a RAM from a full Ram record (widths + read_behavior + shared
-    // contents handle). Takes the record by value, same as rom() - see Ram's
-    // docs for why the buffer aliases the placed spec instead of copying it.
+    // Same buffer-aliasing as rom() - see Ram's docs.
     pub fn ram(ram: Ram) -> Self {
         Self::from_seq(LogicSeq::Ram(RamCell::new(ram)))
     }
 
-    // Reads the current Value of every input pin from net state, without mutating
-    // anything. Used by evaluate() and by Circuit::tick_clock()'s input-collection stage.
     pub fn read_inputs(&self, nets: &SlotMap<NetKey, Net>) -> Vec<Value> {
         self.pins
             .inputs
@@ -246,37 +226,25 @@ impl Component {
         let inputs = self.read_inputs(nets);
         match &self.logic {
             Logic::Comb(comb) => comb.evaluate(&inputs),
-            // Sequential components report their latched value here; any async
-            // input effect (e.g. a reset) was already folded into that state by
-            // apply_async(), and clocked changes only happen in tick().
+            // Reports the latched value; any async effect was already folded in by apply_async().
             Logic::Seq(seq) => seq.observe(),
-            // A subcircuit's inner Circuit was already driven+settled by
-            // apply_async() (settle-time) or tick() (clock-time), so this is a
-            // pure read of its boundary Output components.
+            // The inner Circuit was already driven+settled by apply_async() or tick(); this just reads its outputs.
             Logic::Sub(sub) => sub.observe(),
         }
     }
 
-    // Applies a sequential component's asynchronous, level-sensitive logic
-    // (e.g. an async reset) to its latched state, given current inputs. No-op
-    // for combinational components. Called by Circuit::settle() so an async
-    // input can take effect without a clock tick; must be idempotent (see
-    // SeqLogic::apply_async).
+    // Applies a sequential component's async, level-sensitive logic (e.g. an async reset) to its
+    // latched state. No-op for combinational components. Must be idempotent (see SeqLogic::apply_async).
     pub fn apply_async(&mut self, inputs: &[Value]) {
         match &mut self.logic {
             Logic::Seq(seq) => seq.apply_async(inputs),
-            // Drive the boundary Input components with the current inputs and
-            // settle the inner circuit. Idempotent: driving the same values
-            // marks nothing dirty and settle() becomes a no-op.
+            // Drives the boundary Inputs and settles the inner circuit; idempotent.
             Logic::Sub(sub) => sub.drive_and_settle(inputs),
             Logic::Comb(_) => {}
         }
     }
 
-    // Latched output values of a sequential component, reported without
-    // recomputing from inputs (what evaluate() dispatches to for Logic::Seq).
-    // Only valid on Logic::Seq components - callers must filter with
-    // is_stateful() first.
+    // Reports latched output without recomputing. Only valid on Logic::Seq - callers filter with is_stateful() first.
     pub fn observe(&self) -> Vec<Value> {
         match &self.logic {
             Logic::Comb(_) => unreachable!("observe() called on a combinational component"),
@@ -285,21 +253,16 @@ impl Component {
         }
     }
 
-    // Advances one clock tick given pre-collected input values (see read_inputs).
-    // Mutates persisted state and returns new out_cache values. Only valid on
-    // Logic::Seq components - callers must filter with is_stateful() first.
+    // Mutates persisted state and returns new out_cache values. Only valid on Logic::Seq - callers filter with is_stateful() first.
     pub fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
         match &mut self.logic {
             Logic::Comb(_) => unreachable!("tick() called on a combinational component"),
             Logic::Seq(seq) => seq.tick(inputs),
-            // Forward the clock edge into the inner circuit, then read its
-            // boundary Output components as the new latched values.
             Logic::Sub(sub) => sub.tick(inputs),
         }
     }
 
-    // Restores latched sequential state to its power-on initial value. Only
-    // valid on Logic::Seq components - callers must filter with is_stateful().
+    // Restores latched sequential state to its power-on initial value. Only valid on Logic::Seq.
     pub fn reset(&mut self) {
         match &mut self.logic {
             Logic::Comb(_) => unreachable!("reset() called on a combinational component"),
@@ -322,10 +285,7 @@ impl Component {
         };
     }
 
-    // Components whose state advances on a clock tick and whose async effects
-    // run inside settle(): sequential components and subcircuits. The engine's
-    // whole-component sweeps (eval_component's apply_async, tick_clock,
-    // reset_sequential) key on this.
+    // Sequential components and subcircuits: state advances on a tick, async effects run inside settle().
     pub fn is_stateful(&self) -> bool {
         matches!(self.logic, Logic::Seq(_) | Logic::Sub(_))
     }
@@ -356,11 +316,8 @@ impl Component {
     }
 }
 
-// The canonical "construction params" record for a component - one variant
-// per type, holding just enough to rebuild an equivalent `Component` via
-// `to_component()` (inverse: `Component::spec`). Reused unmodified as the
-// GUI's placed-component record: gui::placed_component adds a second
-// inherent impl with GUI-only display methods, no wrapper/newtype needed.
+// A component's construction params, enough to rebuild it via to_component(). Reused unmodified
+// as the GUI's placed-component record; gui::placed_component adds GUI-only display methods.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ComponentSpec {
     Input(Input),
@@ -385,10 +342,7 @@ pub enum ComponentSpec {
     SRFlipFlop(SRFlipFlopConf),
     Counter(CounterConf),
     Splitter {
-        // The trunk width being edited in the GUI properties panel,
-        // independent of how many bits `arm_bits` actually assigns.
-        // to_component() never reads this back - Splitter::new derives the
-        // real data_width from arm_bits alone.
+        // The trunk width edited in the properties panel; to_component() never reads it back.
         width: u8,
         arm_bits: Vec<Vec<u8>>,
         direction: FanDirection,

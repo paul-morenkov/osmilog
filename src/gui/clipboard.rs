@@ -1,15 +1,7 @@
-// Copy/paste: `Clipboard` holds a `CircuitSnapshot` of a copied selection (the
-// same index-based records Save/Load uses), not live SlotMap keys,
-// so it survives further edits/undo-redo to the originals. Wiring scope on
-// copy is strict-selection-only: exactly the components/tunnels/wire
-// segments in the selection passed to `copy`, mirroring `delete_bulk`'s
-// traversal - no connectivity-inference/auto-follow-wiring.
-//
-// Deliberately OsmilogApp-agnostic, mirroring `Wiring`'s own independence:
-// `copy`/`plan_paste` take exactly the borrowed data they need and know
-// nothing about `History`/`Command`/undo. `OsmilogApp::copy_selection`/
-// `paste_clipboard` (in app.rs) call into this and handle materializing the
-// result into live state plus undo batching themselves.
+// Copy/paste. `Clipboard` holds a `CircuitSnapshot` (Save/Load's index-based records,
+// not live SlotMap keys), so it survives further edits and undo/redo to the originals.
+// Copy scope is strict-selection-only, no connectivity-inference/auto-follow-wiring.
+// OsmilogApp-agnostic: `OsmilogApp::copy_selection`/`paste_clipboard` handle undo batching.
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,10 +14,8 @@ use crate::io::{
 };
 use crate::sim::component::{InIdx, OutIdx, PinId};
 
-// Grid cells added to a pasted item's position relative to its copied
-// original, on both axes. Matches the width of the narrowest placed
-// components (EDGE_BODY_W/IO_W = 2 in geometry.rs), so a paste reads as a
-// clearly offset duplicate without jumping far from the originals.
+// Matches the narrowest placed component's width (geometry.rs), so a paste reads
+// as a clearly offset duplicate without jumping far from the originals.
 pub(crate) const PASTE_OFFSET_STEP: i32 = 2;
 
 fn offset_grid_pos(gp: GridPos, off: GridPos) -> GridPos {
@@ -36,13 +26,8 @@ fn base_offset() -> GridPos {
     GridPos::new(PASTE_OFFSET_STEP, PASTE_OFFSET_STEP)
 }
 
-/// Holds a snapshot of a copied selection, independent of any live
-/// PlacedCompKey/PlacedTunnelKey/WireNodeKey/WireSegKey - a `CircuitSnapshot`,
-/// the same index-based records io.rs uses for save/load, scoped to just the
-/// copied subset. Surviving edits/undo-redo to the originals is the entire
-/// point: paste only ever reads this snapshot, so it can't be invalidated by
-/// anything that happens to the copied items afterward. Also owns the walking
-/// paste offset (see `plan_paste`).
+/// A snapshot of a copied selection. It holds no live keys, so later edits or undo/redo
+/// cannot invalidate it.
 pub struct Clipboard {
     snapshot: Option<CircuitSnapshot>,
     next_offset: GridPos,
@@ -60,9 +45,7 @@ impl Clipboard {
         self.snapshot.is_none()
     }
 
-    /// Snapshots `selected` out of the given live GUI state. No-op if
-    /// `selected` is empty. Resets the walking paste offset back to the base
-    /// step.
+    /// No-op if `selected` is empty. Resets the paste offset to the base step.
     pub fn copy(
         &mut self,
         components: &HashMap<PlacedCompKey, PlacedComponent>,
@@ -79,12 +62,9 @@ impl Clipboard {
         self.next_offset = base_offset();
     }
 
-    /// Returns an offset-adjusted copy of the snapshot, ready for a caller
-    /// to materialize into live state (positions already shifted - the
-    /// caller does no further position math). Advances the internal walking
-    /// offset for the *next* call, so repeated calls without an intervening
-    /// `copy` step further each time (a diagonal "staircase"). `None` if
-    /// nothing has been copied yet.
+    /// Returns the snapshot with positions already shifted. Each call without an
+    /// intervening `copy` shifts one step further, so repeated pastes step diagonally.
+    /// `None` if nothing has been copied yet.
     pub fn plan_paste(&mut self) -> Option<CircuitSnapshot> {
         let file = self.snapshot.as_ref()?;
         let offset = self.next_offset;
@@ -127,13 +107,8 @@ impl Default for Clipboard {
     }
 }
 
-/// Builds a `CircuitSnapshot` of exactly `selected` out of the given live GUI
-/// state - the same strict-selection scoping `Clipboard::copy` uses (a
-/// node/segment is only captured if its owning wire segment is itself in
-/// `selected`, not merely reachable from a selected component). Factored out
-/// of `Clipboard::copy` so other callers (e.g. extracting a bulk selection
-/// into a new circuit document) can capture the same shape of snapshot
-/// without going through the clipboard's copy/paste-offset machinery.
+/// Captures only what is directly in `selected`: a wire node/segment counts only if its
+/// own segment is selected, not merely reachable from a selected component.
 pub(crate) fn build_selection_snapshot(
     components: &HashMap<PlacedCompKey, PlacedComponent>,
     tunnels: &HashMap<PlacedTunnelKey, PlacedTunnel>,
@@ -186,8 +161,7 @@ pub(crate) fn build_selection_snapshot(
         })
         .collect();
 
-    // Node set is exactly the endpoints of included wire segments - not
-    // active_nodes() broadly - since wiring scope is strict-selection.
+    // Node set is exactly the endpoints of included wire segments, per strict-selection scope.
     let mut node_index: HashMap<crate::gui::wiring::WireNodeKey, usize> = HashMap::new();
     let mut node_entries: Vec<NodeEntry> = Vec::new();
     for (seg_key, seg) in &wiring.segments {
@@ -199,11 +173,8 @@ pub(crate) fn build_selection_snapshot(
                 continue;
             }
             let node = &wiring.nodes[&nk];
-            // A node's Pin/Tunnel attach only survives into the copy if
-            // its owning component/tunnel is *also* included; otherwise
-            // it would reference an index that doesn't exist in this
-            // clipboard, so it's downgraded to a Free (unattached) stub
-            // rather than a dangling reference.
+            // A Pin/Tunnel attach survives only if its owner is also included; otherwise
+            // it downgrades to Free rather than reference an index absent from this copy.
             let attach = match node.attach {
                 NodeAttach::Free => NodeAttachEntry::Free,
                 NodeAttach::Pin(pck, pin) => match comp_index.get(&pck) {
@@ -272,8 +243,7 @@ mod tests {
         }
     }
 
-    // Append a record under a fresh stable key (tests build maps by hand;
-    // append-only, so map length is a fine monotonic id source).
+    // Map length is a fine monotonic id source since these maps are append-only in tests.
     fn add_comp(
         map: &mut HashMap<PlacedCompKey, PlacedComponent>,
         pc: PlacedComponent,

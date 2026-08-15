@@ -1,7 +1,7 @@
 use super::{SeqLogic, SeqState};
 use crate::sim::value::Value;
 
-/// A D flip-flop is essentially a single-bit register.
+/// A T flip-flop toggles its stored bit each time the toggle input is high on write.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TFlipFlopConf;
 
@@ -25,9 +25,9 @@ impl TFlipFlopConf {
 
     pub fn input_width(&self, i: usize) -> Option<u8> {
         match i {
-            TFlipFlopConf::TOGGLE_PIN => Some(1),   // toggle
-            TFlipFlopConf::WRITE_EN_PIN => Some(1), // write_enable
-            TFlipFlopConf::RESET_PIN => Some(1),    // async reset
+            TFlipFlopConf::TOGGLE_PIN => Some(1),
+            TFlipFlopConf::WRITE_EN_PIN => Some(1),
+            TFlipFlopConf::RESET_PIN => Some(1),
             _ => None,
         }
     }
@@ -175,7 +175,7 @@ mod tests {
         // Mirrors the intended GUI flow: toggle up to 1, then pulse the async
         // reset pin - state clears at once, no tick, and stays cleared.
         let mut ff = new_t_flip_flop();
-        ff.tick(&[Value::ONE, Value::ONE, NO_RST]); // toggle to 1
+        ff.tick(&[Value::ONE, Value::ONE, NO_RST]);
         ff.apply_async(&[Value::Floating, Value::Floating, Value::ONE]);
         assert_eq!(ff.observe(), vec![Value::ZERO]);
         // Reset released: stays 0 (destroyed, not restored).
@@ -186,8 +186,8 @@ mod tests {
     #[test]
     fn test_async_reset_dominates_on_tick() {
         let mut ff = new_t_flip_flop();
-        ff.tick(&[Value::ONE, Value::ONE, NO_RST]); // toggle to 1
-                                                    // reset=1 dominates toggle=1/we=1: forces 0.
+        ff.tick(&[Value::ONE, Value::ONE, NO_RST]);
+        // reset=1 dominates toggle=1/we=1: forces 0.
         assert_eq!(
             ff.tick(&[Value::ONE, Value::ONE, Value::ONE]),
             vec![Value::ZERO]

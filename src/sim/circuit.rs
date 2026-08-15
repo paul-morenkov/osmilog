@@ -5,18 +5,12 @@ use crate::sim::value::Value;
 use slotmap::{SecondaryMap, SlotMap};
 use std::collections::{HashMap, VecDeque};
 
-/// Stable, app-assigned identifier for a `Tunnel`. Like [`CompKey`], it survives
-/// a remove + re-insert so undo can restore a deleted tunnel under its original
-/// key; ids come from a monotonic counter and are never reused.
-///
-/// [`CompKey`]: crate::sim::component::CompKey
+/// Stable, app-assigned id for a `Tunnel`; survives remove + re-insert (ids never reused).
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct TunnelKey(pub(crate) u64);
 
-// Ties all Tunnels sharing a Label into one virtual net without a drawn wire
-// (a schematic "net label" / off-page connector). Feed tunnels drive their
-// net FROM the group's resolved value; Pull tunnels contribute their net's
-// value TO the group. See Circuit::settle()/resolve_net().
+// Ties tunnels sharing a label into one virtual net, with no drawn wire.
+// Feed drives FROM the group's value; Pull contributes TO it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TunnelRole {
     Feed,
@@ -63,22 +57,15 @@ pub struct Circuit {
     queued: SecondaryMap<NetKey, bool>,
     pub(crate) tunnels: HashMap<TunnelKey, Tunnel>,
     tunnel_labels: HashMap<String, Vec<TunnelKey>>,
-    // Monotonic id allocators for the two stable-key maps above. Never reused,
-    // so a removed key is never handed to a different entity (no ABA); undo
-    // re-inserts a deleted entity under its original key with a plain
-    // `HashMap::insert`.
+    // Monotonic, never reused - avoids ABA when undo re-inserts a deleted entity under its original key.
     next_comp: u64,
     next_tunnel: u64,
 }
 
 impl Circuit {
-    // How many times a single net may change value within one settle() call
-    // before it's a combinational oscillation - bounded by reconvergent
-    // fan-in depth, not circuit size.
+    // Max value changes for one net per settle() before it flags oscillation.
     const REVISIT_THRESHOLD: usize = 16;
-    // Defensive backstop on total net-pops, in case many nets oscillate at
-    // once. Scaled to circuit size to avoid false positives; should rarely
-    // trigger if the per-net check above is doing its job.
+    // Backstop on total net-pops if many nets oscillate at once; scaled to circuit size.
     const ITERATION_BUDGET_PER_NET: usize = 64;
 
     pub fn new() -> Self {
@@ -93,10 +80,8 @@ impl Circuit {
         key
     }
 
-    /// Re-inserts a previously-removed component under its original key - the
-    /// undo of `remove_component`. Re-evaluates it so its `out_cache` refreshes;
-    /// the caller re-establishes nets (via rebuild) and settles. A moved-in
-    /// `Reg`'s latched state comes back exactly as it was at removal.
+    /// Undo of `remove_component`. The caller rebuilds nets afterward. A
+    /// `Reg`'s latched state returns intact.
     pub(crate) fn insert_component(&mut self, key: CompKey, comp: Component) {
         self.components.insert(key, comp);
         self.eval_component(key);
@@ -113,29 +98,20 @@ impl Circuit {
         }
     }
 
-    /// Injects a Value directly onto a component's output pin 0, as if the
-    /// component had produced it, and dirties that output net. Used to feed a
-    /// subcircuit's boundary Input components from the enclosing circuit: unlike
-    /// set_input it can deliver any Value (including Floating), and because an
-    /// Input has no input nets, settle() never re-runs its evaluate() to
-    /// overwrite the injected value. Marks the net dirty only when the value
-    /// changes, so re-driving identical inputs is a no-op (keeps settle
-    /// convergent). No-op if `comp` is stale.
+    /// Injects `value` directly onto `comp`'s output pin 0, bypassing
+    /// `evaluate()`. Unlike `set_input`, this accepts `Value::Floating`. Used
+    /// to drive a subcircuit's boundary `Input` components. No-op if `comp`
+    /// is stale.
     pub(crate) fn drive_input(&mut self, comp: CompKey, value: Value) {
         if self.components.contains_key(&comp) {
             self.apply_output_values(comp, vec![value]);
         }
     }
 
-    /// Writes one word into a ROM component's contents in place, masked to its
-    /// data_width, and re-evaluates it so the change propagates on the next
-    /// settle(). No-op if `comp` isn't a ROM or `index` is out of range. Unlike
-    /// structural edits this bypasses the Command/undo layer entirely (like
-    /// set_input / clock ticks): ROM contents are mutated live, not undoable.
+    /// Writes one word into a ROM's contents. Not undoable. No-op if `comp`
+    /// isn't a ROM or `index` is out of range.
     pub fn write_rom(&mut self, comp: CompKey, index: usize, value: u32) {
-        // set_word takes &self (interior mutability), so this needs only a shared
-        // borrow to write; re-evaluate afterward, once that borrow has ended, to
-        // dirty the output net.
+        // set_word takes &self (interior mutability); re-evaluate after the borrow ends to dirty the output net.
         let wrote = if let Logic::Comb(LogicComb::Rom(rom)) = &self.components[&comp].logic {
             if index < rom.len() {
                 rom.set_word(index, value);
@@ -151,13 +127,10 @@ impl Circuit {
         }
     }
 
-    /// Writes one word into a RAM component's contents in place, masked to
-    /// its data_width. Unlike write_rom this never changes data_out (RAM's
-    /// output is a *registered* read, only updated by tick_clock - see
-    /// RamCell), so there is nothing to re-evaluate; the write is purely a
-    /// debug-time direct memory edit. No-op if `comp` isn't a RAM or `index`
-    /// is out of range. Like write_rom, bypasses the Command/undo layer
-    /// entirely - RAM contents are mutated live, not undoable.
+    /// Writes one word into a RAM's contents. Not undoable. Unlike
+    /// `write_rom`, this never changes `data_out` (a registered read,
+    /// updated only by `tick_clock`). No-op if `comp` isn't a RAM or `index`
+    /// is out of range.
     pub fn write_ram(&mut self, comp: CompKey, index: usize, value: u32) {
         if let Logic::Seq(LogicSeq::Ram(ram)) = &self.components[&comp].logic {
             let contents = ram.contents();
@@ -167,8 +140,7 @@ impl Circuit {
         }
     }
 
-    /// The current value on `comp`'s input, if it's an Output component;
-    /// `Value::Floating` otherwise.
+    /// The value on `comp`'s input if it is an Output component, else `Value::Floating`.
     pub fn read_output(&self, comp: CompKey) -> Value {
         let comp = &self.components[&comp];
 
@@ -187,8 +159,7 @@ impl Circuit {
             comp.clear_pins();
         }
 
-        // Every NetKey is about to become invalid; tunnels must not keep
-        // pointing at one, or they'd hold a dangling key.
+        // Every NetKey is about to become invalid; clear tunnel bindings so none dangle.
         for t in self.tunnels.values_mut() {
             t.net = None;
         }
@@ -197,9 +168,7 @@ impl Circuit {
         self.dirty.clear();
         self.queued.clear();
 
-        // Every input pin now reads Floating, so re-evaluate each component to
-        // refresh its out_cache - otherwise a component would keep a stale
-        // output that a subsequent relink could read back as live.
+        // Every input now reads Floating; re-evaluate each component so a later relink can't read back a stale output.
         let keys: Vec<CompKey> = self.components.keys().copied().collect();
         for key in keys {
             self.eval_component(key);
@@ -210,9 +179,6 @@ impl Circuit {
         self.components.get(&comp).and_then(|c| c.net_of(pin))
     }
 
-    // Returns the net already attached to (comp, pin), or creates and
-    // attaches a fresh one. Shared by link()'s (None, None) case and
-    // link_tunnel().
     fn net_or_create(&mut self, comp: CompKey, pin: PinId) -> NetKey {
         match self.net_of(comp, pin) {
             Some(net) => net,
@@ -225,7 +191,6 @@ impl Circuit {
     }
 
     fn attach(&mut self, net: NetKey, comp: CompKey, pin: PinId) {
-        // Attaches a Component pin to a net, and back-links
         match pin {
             PinId::In(i) => self.nets[net].sinks.push((comp, i)),
             PinId::Out(i) => self.nets[net].sources.push((comp, i)),
@@ -234,8 +199,7 @@ impl Circuit {
             .get_mut(&comp)
             .unwrap()
             .set_pin_net(pin, net);
-        // If attaching a sink pin, immediately evaluate the component since no Net's have changed
-        // so nothing will call eval_component automatically.
+        // A sink pin needs an immediate eval here; nothing else will trigger eval_component for it.
         if let PinId::In(_) = pin {
             self.eval_component(comp);
         }
@@ -248,7 +212,6 @@ impl Circuit {
 
         match (net_a, net_b) {
             (None, None) => {
-                // Need to create a new Net
                 let net = self.net_or_create(a, a_pin);
                 self.attach(net, b, b_pin);
                 self.mark_dirty(net);
@@ -273,10 +236,8 @@ impl Circuit {
         if a == b {
             return a;
         }
-        // Remove the second net
         let b_net = self.nets.remove(b).unwrap();
 
-        // Correct backreferences on Net B, then add them into Net A
         for (comp, i) in b_net.sinks {
             self.components
                 .get_mut(&comp)
@@ -285,9 +246,7 @@ impl Circuit {
             self.nets[a].sinks.push((comp, i));
         }
 
-        // Fold B's drivers into A. If both nets were driven, A ends up with
-        // more than one source and resolve_net will surface it as Invalid
-        // (a driver conflict), rather than silently dropping one.
+        // A may end up with two sources here; resolve_net reports that as Invalid rather than dropping one.
         for (comp, i) in b_net.sources {
             self.components
                 .get_mut(&comp)
@@ -296,8 +255,7 @@ impl Circuit {
             self.nets[a].sources.push((comp, i));
         }
 
-        // Repoint any tunnels attached to the removed net. Same net, new
-        // key, so no extra dirtying beyond mark_dirty(a) below is needed.
+        // Repoint tunnels off the removed net; mark_dirty(a) below covers the dirtying.
         for t in self.tunnels.values_mut() {
             if t.net == Some(b) {
                 t.net = Some(a);
@@ -323,7 +281,6 @@ impl Circuit {
         key
     }
 
-    // Finds or creates the net at (comp, pin) and attaches the tunnel to it.
     pub fn link_tunnel(&mut self, tunnel: TunnelKey, comp: CompKey, pin: PinId) -> NetKey {
         let net = self.net_or_create(comp, pin);
         self.attach_tunnel(tunnel, net);
@@ -334,18 +291,15 @@ impl Circuit {
         let old_net = self.tunnels[&tunnel].net;
         let label = self.tunnels[&tunnel].label.clone();
         self.tunnels.get_mut(&tunnel).unwrap().net = Some(net);
-        // Rewiring away from a previous net: that net must be re-resolved
-        // too, or it keeps showing a stale tunnel-contributed value forever.
+        // The old net must also be re-resolved, or it keeps a stale tunnel-contributed value.
         if let Some(old) = old_net {
             if old != net {
                 self.mark_dirty(old);
             }
         }
         self.mark_dirty(net);
-        // Group membership changed (a new net now contributes to/reads from
-        // this label), independent of whether this net's own value happens
-        // to change - settle()'s "if changed" cross-dirty step alone can't
-        // catch that, so dirty Feed siblings explicitly.
+        // Group membership changed regardless of whether this net's value did; settle()'s
+        // change-only dirtying can't catch that, so dirty Feed siblings explicitly.
         self.dirty_label_feed_nets(&label);
     }
 
@@ -357,9 +311,8 @@ impl Circuit {
         self.dirty_label_feed_nets(&label);
     }
 
-    /// Removes a tunnel outright and returns it (the caller moves it into the
-    /// undo entry). Dropped from its label group with its net binding cleared,
-    /// so it contributes nothing once gone. `None` if the key is already gone.
+    /// Removes and returns a tunnel, dropped from its label group. `None` if
+    /// the key is already gone.
     pub fn remove_tunnel(&mut self, tunnel: TunnelKey) -> Option<Tunnel> {
         let mut t = self.tunnels.remove(&tunnel)?;
         let label = t.label.clone();
@@ -377,9 +330,7 @@ impl Circuit {
         Some(t)
     }
 
-    /// Re-inserts a previously-removed tunnel under its original key - the undo
-    /// of `remove_tunnel` - rejoining its label group. Its net binding is
-    /// re-established by the caller's relink.
+    /// Undo of `remove_tunnel`. The caller re-establishes the net binding via relink.
     pub(crate) fn insert_tunnel(&mut self, key: TunnelKey, tunnel: Tunnel) {
         let label = tunnel.label.clone();
         self.tunnels.insert(key, tunnel);
@@ -430,9 +381,7 @@ impl Circuit {
         self.tunnels.values().filter(move |t| t.net == Some(net))
     }
 
-    // Marks the net of every Feed-role tunnel in `label`'s group dirty, so
-    // they re-resolve against the group's (possibly just-changed) value or
-    // membership.
+    // Dirties every Feed tunnel's net in the group so it re-resolves after a value or membership change.
     fn dirty_label_feed_nets(&mut self, label: &str) {
         let Some(keys) = self.tunnel_labels.get(label) else {
             return;
@@ -449,11 +398,8 @@ impl Circuit {
         }
     }
 
-    // Aggregates a label group's value from its Pull-role tunnels' net
-    // values. `strict` controls disagreement handling: lenient (false) takes
-    // the last differing value and never errors (safe mid-convergence in
-    // resolve_net()); strict (true) returns TunnelConflict, meant to be
-    // called once settle()'s dirty-queue loop has fully drained.
+    // Aggregates Pull tunnels' net values. `strict=false` is lenient (safe mid-convergence);
+    // `strict=true` errors on disagreement, meant to be called once settle() has drained.
     fn tunnel_group_value(&self, label: &str, strict: bool) -> Result<Value, SettleError> {
         let Some(keys) = self.tunnel_labels.get(label) else {
             return Ok(Value::Floating);
@@ -513,12 +459,12 @@ impl Circuit {
         let mut total_iterations = 0;
 
         while let Some(net) = self.dirty.pop_front() {
-            // Check if net key is valid (could have been merged away and now be stale)
+            // Net may have been merged away and become stale.
             if !self.nets.contains_key(net) {
                 continue;
             }
 
-            // Clear visit before eval so that it can be re-evaled in the case of a loop
+            // Clear the visited flag before eval so a loop can re-queue this net.
             self.queued.insert(net, false);
             let changed = self.resolve_net(net);
 
@@ -532,23 +478,16 @@ impl Circuit {
                     });
                 }
 
-                // Re-evaluate every sink, sequential ones included: a
-                // sequential component's observe() can depend on its live
-                // inputs (e.g. an async reset pin), so an input change must
-                // refresh its output within the same settle(), without a clock
-                // tick. This never advances clocked state - eval_component
-                // dispatches Logic::Seq to observe(), not tick() - so it stays
-                // a pure function of (latched state, inputs) and can't
-                // oscillate any more than combinational logic can.
+                // Re-evaluate every sink, including sequential ones: an async reset pin
+                // must take effect within this settle(), with no clock tick.
+                // eval_component calls observe(), never tick(), so latched state never advances here.
                 let sinks: Vec<_> = self.nets[net].sinks.to_vec();
 
                 for (comp, _) in sinks {
                     self.eval_component(comp);
                 }
 
-                // If a Pull tunnel reads this net, the label group's value
-                // may have changed; re-dirty sibling Feed nets so they pick
-                // it up on a later pass of this same settle() call.
+                // If a Pull tunnel reads this net, its group's value may have changed; re-dirty sibling Feed nets.
                 let pull_label: Option<String> = self
                     .tunnels_on_net(net)
                     .find(|t| t.role == TunnelRole::Pull)
@@ -559,9 +498,7 @@ impl Circuit {
             }
             total_iterations += 1;
             if total_iterations > iteration_budget {
-                // Extremely defensive backstop (e.g. many nets oscillating
-                // simultaneously); should be unreachable if the per-net
-                // revisit check above is doing its job.
+                // Defensive backstop; should be unreachable if the per-net revisit check above works.
                 return Err(SettleError::Oscillation {
                     net,
                     revisits: revisits.get(net).copied().unwrap_or(0),
@@ -569,9 +506,7 @@ impl Circuit {
             }
         }
 
-        // All nets have fully converged at this point (the loop only exits
-        // when dirty is empty). Any tunnel-group disagreement found now is
-        // genuine, not a mid-convergence evaluation-order artifact.
+        // All nets have converged; any tunnel-group disagreement found now is genuine, not a mid-convergence artifact.
         let labels: Vec<String> = self.tunnel_labels.keys().cloned().collect();
         for label in &labels {
             self.tunnel_group_value(label, true)?;
@@ -579,9 +514,7 @@ impl Circuit {
         Ok(())
     }
 
-    // True if this net's attached pins declare conflicting expected bit
-    // widths (Component::input_width/output_width) - independent of the
-    // net's current Value, so a mismatch is flagged even while Floating.
+    // True if attached pins declare conflicting widths, independent of the net's current Value.
     fn net_width_conflict(&self, net: NetKey) -> bool {
         let n = &self.nets[net];
         let mut widths = n
@@ -599,10 +532,7 @@ impl Circuit {
         widths.any(|w| w != first)
     }
 
-    // Recomputes the Net's Value from its source(s). Returns whether the value changed.
-    // A net with two or more drivers is a conflict (a short) and resolves to
-    // Value::Invalid, the same structural signal used for a width mismatch and
-    // handled identically downstream (Invalid stays local, never propagates).
+    // Two or more drivers is a conflict (a short); resolves to Value::Invalid, same as a width mismatch.
     fn resolve_net(&mut self, net: NetKey) -> bool {
         puffin::profile_function!();
         let old = self.nets[net].value;
@@ -613,8 +543,7 @@ impl Circuit {
             match self.nets[net].sources.first() {
                 // Net takes value from pins.out_cache, which is updated in eval_component
                 Some(&(comp, i)) => self.components[&comp].pins.out_cache[i.0 as usize],
-                // A component driver always takes priority; only fall back to a
-                // Feed tunnel's group value when this net has no real driver.
+                // A component driver always takes priority over a Feed tunnel's group value.
                 None => self.tunnel_feed_value(net),
             }
         };
@@ -622,18 +551,11 @@ impl Circuit {
         new != old
     }
 
-    // Evaluates component logic, storing the Value in pins.out_cache and marking the net as dirty
-    // if necessary.
     fn eval_component(&mut self, comp: CompKey) {
         puffin::profile_function!();
-        // A sequential component may apply asynchronous, level-sensitive
-        // effects to its own latched state here (e.g. an async reset that
-        // clears the value the instant its pin is held) before its output is
-        // read - so an input change takes effect within this same settle(),
-        // with no clock tick. This is the one place besides tick_clock() where
-        // settle() mutates latched state; it's sound because apply_async is
-        // idempotent, so re-evaluating a component any number of times before
-        // the queue drains converges to the same state.
+        // A sequential component may apply async, level-sensitive effects here (e.g. an
+        // async reset) before its output is read, with no clock tick. This is the only
+        // other place settle() mutates latched state; apply_async is idempotent, so repeat calls converge.
         if self.components[&comp].is_stateful() {
             let inputs = self.components[&comp].read_inputs(&self.nets);
             self.components.get_mut(&comp).unwrap().apply_async(&inputs);
@@ -642,9 +564,7 @@ impl Circuit {
         self.apply_output_values(comp, new_values);
     }
 
-    // Diffs new_values against a component's current out_cache, updates out_cache in place,
-    // and marks any changed output net dirty. Shared by eval_component (combinational path)
-    // and tick_clock (sequential path).
+    // Shared by eval_component (combinational path) and tick_clock (sequential path).
     fn apply_output_values(&mut self, comp: CompKey, new_values: Vec<Value>) {
         puffin::profile_function!();
         let c = self.components.get_mut(&comp).unwrap();
@@ -665,12 +585,7 @@ impl Circuit {
         }
     }
 
-    // Advances the clock by one tick: snapshot every sequential component's
-    // current inputs, compute each one's next state via Component::tick
-    // (updating out_cache/persisted state and dirtying changed nets), then
-    // settle() to propagate through the combinational circuit. Generic over
-    // LogicSeq variants - a new sequential type only needs new match arms in
-    // Component::evaluate/tick, not changes here.
+    // Generic over LogicSeq variants; a new sequential type needs no changes here.
     pub fn tick_clock(&mut self) -> Result<(), SettleError> {
         puffin::profile_function!();
         let seq_comps: Vec<CompKey> = self
@@ -696,11 +611,7 @@ impl Circuit {
         self.settle()
     }
 
-    // Restores every active sequential component's latched state to its
-    // power-on initial value, dirties the changed output nets, and settles to
-    // propagate the reset through the combinational circuit. Drives the GUI's
-    // clock "Stop" (see gui::app). Like tick_clock, generic over LogicSeq
-    // variants - a new sequential type only needs a SeqLogic::reset impl.
+    // Drives the GUI's clock "Stop". Generic over LogicSeq; a new sequential type needs only a SeqLogic::reset impl.
     pub fn reset_sequential(&mut self) -> Result<(), SettleError> {
         puffin::profile_function!();
         let seq_comps: Vec<CompKey> = self
@@ -724,18 +635,12 @@ impl Circuit {
         let output_nets: Vec<NetKey> = comp.pins.outputs.iter().filter_map(|&n| n).collect();
         let input_nets: Vec<NetKey> = comp.pins.inputs.iter().filter_map(|&n| n).collect();
 
-        // Collected now, acted on after the dirty/queued reset below (so the
-        // fresh marks survive): tunnels whose net is about to vanish
-        // (detached, sibling nets re-dirtied), sink components that lose
-        // their driver (re-evaluated so Floating propagates), and surviving
-        // nets whose value may change (re-resolved).
+        // Collected now, applied after the dirty/queued reset below so the fresh marks survive.
         let mut affected_labels: Vec<String> = Vec::new();
         let mut affected_sinks: Vec<CompKey> = Vec::new();
         let mut retained_nets: Vec<NetKey> = Vec::new();
 
-        // Drop this component's driver entry from each net it feeds. A net
-        // with another driver survives; one left driverless is torn down,
-        // freeing each sink's input pin slot.
+        // A net with another driver survives; a driverless one is torn down, freeing sink pin slots.
         for net_key in output_nets {
             let Some(net) = self.nets.get_mut(net_key) else {
                 continue;
@@ -763,7 +668,6 @@ impl Circuit {
             self.nets.remove(net_key);
         }
 
-        // Detach from nets this component receives; remove it from each net's sinks list
         for net_key in input_nets {
             if let Some(net) = self.nets.get_mut(net_key) {
                 net.sinks.retain(|&(ck, _)| ck != key);
@@ -774,34 +678,26 @@ impl Circuit {
         self.dirty.clear();
         self.queued.clear();
 
-        // Remove outright and hand the owned Component back to the caller,
-        // which moves it into the undo entry; undo re-inserts it under this
-        // same key (see insert_component). Its pins are nulled so the moved-out
-        // copy holds no dangling NetKeys - the caller rebuilds nets on re-insert.
-        // A Reg's latched state (kept apart from pins) rides along untouched, so
-        // an undone deletion restores it.
+        // Hand the owned Component back for the undo entry (see insert_component); pins are
+        // nulled so it holds no dangling NetKeys. A Reg's latched state rides along untouched.
         let mut removed = self.components.remove(&key);
         if let Some(c) = &mut removed {
             c.clear_pins();
         }
 
-        // Re-evaluate sinks that lost their driver so their now-Floating input
-        // propagates: eval_component recomputes out_cache and marks any changed
-        // output net dirty for the caller's settle() to carry downstream.
+        // Re-evaluate sinks that lost their driver so the new Floating input propagates on settle().
         for sink in affected_sinks {
             if self.components.contains_key(&sink) {
                 self.eval_component(sink);
             }
         }
 
-        // Re-dirty sibling Feed-tunnel nets now that propagation state has
-        // already been reset above.
+        // Re-dirty sibling Feed-tunnel nets now that propagation state is reset above.
         for label in affected_labels {
             self.dirty_label_feed_nets(&label);
         }
 
-        // Re-resolve nets that kept another driver (e.g. a two-driver conflict
-        // that just became single-driver).
+        // Re-resolve nets that kept another driver, e.g. a conflict that just became single-driver.
         for net_key in retained_nets {
             self.mark_dirty(net_key);
         }
@@ -844,7 +740,7 @@ mod tests {
     fn test_add_component_input_out_cache_populated_immediately() {
         let mut c = Circuit::new();
         let i = c.add_component(Component::input(5, 3));
-        // add_component eagerly evaluates, before any link() or settle().
+        // add_component eagerly evaluates, before link() or settle().
         assert_eq!(c.components[&i].pins.out_cache[0], Value::new(5, 3));
     }
 
@@ -854,8 +750,7 @@ mod tests {
         let i = c.add_component(Component::input(5, 3));
         let o = c.add_component(Component::output());
         c.link(i, PinId::output(0), o, PinId::input(0));
-        // out_cache is populated, but the net's own value isn't resolved
-        // until settle() runs resolve_net.
+        // out_cache is populated, but the net's value isn't resolved until settle() runs resolve_net.
         assert_eq!(c.read_output(o), Value::Floating);
         c.settle().unwrap();
         assert_eq!(c.read_output(o), Value::new(5, 3));
@@ -885,17 +780,15 @@ mod tests {
         let mut c = Circuit::new();
         let i1 = c.add_component(Component::input(1, 1));
         let i2 = c.add_component(Component::input(0, 1));
-        let g1 = c.add_component(Component::gate(GateOp::Not, 1, 1)); // NOT(1) = 0
-        let g2 = c.add_component(Component::gate(GateOp::Not, 1, 1)); // NOT(0) = 1
+        let g1 = c.add_component(Component::gate(GateOp::Not, 1, 1));
+        let g2 = c.add_component(Component::gate(GateOp::Not, 1, 1));
         let o = c.add_component(Component::output());
 
         c.link(i1, PinId::output(0), g1, PinId::input(0));
         c.link(i2, PinId::output(0), g2, PinId::input(0));
 
         c.link(g1, PinId::output(0), o, PinId::input(0));
-        // o's input pin already has a net driven by g1; adding g2 gives the net
-        // two drivers, which resolve_net reports as a conflict (Invalid) rather
-        // than silently picking one.
+        // o already has a net driven by g1; adding g2 gives it two drivers -> Invalid, not silently picked.
         c.link(g2, PinId::output(0), o, PinId::input(0));
 
         c.settle().unwrap();
@@ -914,25 +807,21 @@ mod tests {
 
     #[test]
     fn test_link_merge_two_drivers_yields_invalid() {
-        // Merging two already-driven nets folds both drivers onto the surviving
-        // net, giving it two sources. resolve_net reports that as a conflict
-        // (Invalid) rather than silently keeping one driver.
+        // Merging two driven nets folds both drivers onto the survivor -> Invalid, not silently kept.
         let mut c = Circuit::new();
         let driver1 = c.add_component(Component::input(1, 1));
         let driver2 = c.add_component(Component::input(0, 1));
         let sink1 = c.add_component(Component::output());
         let sink2 = c.add_component(Component::output());
 
-        c.link(driver1, PinId::output(0), sink1, PinId::input(0)); // net1, source = driver1
-        c.link(driver2, PinId::output(0), sink2, PinId::input(0)); // net2, source = driver2
-                                                                   // Resolve both nets before merging: see
-                                                                   // test_link_merge_of_still_dirty_nets_removes_stale_key for what
-                                                                   // happens if a merged-away net is still pending in the dirty queue.
+        c.link(driver1, PinId::output(0), sink1, PinId::input(0));
+        c.link(driver2, PinId::output(0), sink2, PinId::input(0));
+        // Resolve both nets before merging; see
+        // test_link_merge_of_still_dirty_nets_removes_stale_key for the dirty-queue case.
         c.settle().unwrap();
         assert_eq!(c.read_output(sink1), Value::ONE);
         assert_eq!(c.read_output(sink2), Value::ZERO);
 
-        // Merge net1 and net2 by linking their already-attached input pins.
         c.link(sink1, PinId::input(0), sink2, PinId::input(0));
 
         c.settle().unwrap();
@@ -943,22 +832,20 @@ mod tests {
 
     #[test]
     fn test_remove_one_of_two_drivers_clears_conflict() {
-        // A net with two drivers is Invalid; removing one driver leaves a
-        // single-driver net that resolves to the survivor's value (the net is
-        // kept, not torn down).
+        // A two-driver net is Invalid; removing one driver leaves it single-driver, not torn down.
         let mut c = Circuit::new();
         let d1 = c.add_component(Component::input(1, 1));
         let d2 = c.add_component(Component::input(0, 1));
         let o = c.add_component(Component::output());
 
         c.link(d1, PinId::output(0), o, PinId::input(0));
-        c.link(d2, PinId::output(0), o, PinId::input(0)); // two drivers -> Invalid
+        c.link(d2, PinId::output(0), o, PinId::input(0));
         c.settle().unwrap();
         assert_eq!(c.read_output(o), Value::Invalid);
 
         c.remove_component(d2);
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::ONE); // only d1 (=1) left
+        assert_eq!(c.read_output(o), Value::ONE);
     }
 
     #[test]
@@ -969,13 +856,12 @@ mod tests {
         let sink1 = c.add_component(Component::output());
         let sink2 = c.add_component(Component::output());
 
-        c.link(driver1, PinId::output(0), sink1, PinId::input(0)); // net1, still dirty
-        c.link(driver2, PinId::output(0), sink2, PinId::input(0)); // net2, still dirty
-                                                                   // Merging while both nets are still unresolved/dirty removes net2
-                                                                   // from the slotmap while it's still queued.
+        c.link(driver1, PinId::output(0), sink1, PinId::input(0));
+        c.link(driver2, PinId::output(0), sink2, PinId::input(0));
+        // Merging while both nets are still dirty removes net2 from the slotmap while queued.
         c.link(sink1, PinId::input(0), sink2, PinId::input(0));
 
-        c.settle().unwrap(); // stale NetKey should get removed
+        c.settle().unwrap();
     }
 
     // ---- Group 2: propagation / settle behavior ----
@@ -994,7 +880,7 @@ mod tests {
         c.link(not_g, PinId::output(0), o, PinId::input(0));
 
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::ZERO); // NOT(1 AND 1) = 0
+        assert_eq!(c.read_output(o), Value::ZERO);
     }
 
     #[test]
@@ -1005,7 +891,7 @@ mod tests {
         c.link(a, PinId::output(0), o, PinId::input(0));
         c.settle().unwrap();
         assert_eq!(c.read_output(o), Value::ONE);
-        c.settle().unwrap(); // nothing dirty; must be a no-op
+        c.settle().unwrap();
         assert_eq!(c.read_output(o), Value::ONE);
     }
 
@@ -1014,7 +900,7 @@ mod tests {
         let mut c = Circuit::new();
         let g = c.add_component(Component::gate(GateOp::Not, 1, 1));
         let o = c.add_component(Component::output());
-        c.link(g, PinId::output(0), g, PinId::input(0)); // self-feedback
+        c.link(g, PinId::output(0), g, PinId::input(0));
         c.link(g, PinId::output(0), o, PinId::input(0));
 
         c.settle().unwrap(); // must not panic
@@ -1023,12 +909,8 @@ mod tests {
 
     #[test]
     fn test_settle_long_acyclic_chain_settles_successfully() {
-        // Regression test: settle() used to count total net-pops within one
-        // call rather than per-net revisits, so a sufficiently deep but
-        // fully acyclic chain would falsely trip the old MAX_ITERATIONS
-        // panic. With per-net revisit tracking, no net here is ever
-        // revisited (each resolves exactly once), so this succeeds
-        // regardless of chain length.
+        // Regression test: settle() used to count total net-pops, so a deep acyclic chain could
+        // falsely trip the old iteration cap. Per-net revisit tracking fixes this.
         let mut c = Circuit::new();
         let input = c.add_component(Component::input(1, 1));
         let mut prev = input;
@@ -1042,15 +924,8 @@ mod tests {
 
     #[test]
     fn test_settle_second_driver_into_loop_is_invalid_not_oscillation() {
-        // A NOT-gate ring seeded by a concrete Input used to be forced into a
-        // toggling feedback loop by closing it with a *second* driver on n1's
-        // input net (last-link-wins injecting a stale concrete value). Now that
-        // two drivers resolve to Invalid, that net short-circuits to Invalid
-        // and stays there: settle() converges cleanly instead of oscillating.
-        // (With strict single-driver nets a purely combinational loop can never
-        // bootstrap a concrete value - Floating is absorbing through every gate
-        // - so REVISIT_THRESHOLD is now a defensive backstop, not reachable via
-        // legitimate wiring.)
+        // Regression test: a NOT-gate ring used to oscillate when a second driver closed the
+        // loop. Two drivers now resolve to Invalid and stay there, so settle() converges instead.
         let mut c = Circuit::new();
         let seed = c.add_component(Component::input(0, 1));
         let n1 = c.add_component(Component::gate(GateOp::Not, 1, 1));
@@ -1062,12 +937,10 @@ mod tests {
         c.link(n2, PinId::output(0), n3, PinId::input(0));
         c.settle().unwrap(); // seeds n1/n2/n3 with concrete alternating values, no loop yet
 
-        // Close the loop: n3 becomes a second driver of n1's input net.
         c.link(n3, PinId::output(0), n1, PinId::input(0));
         assert!(c.settle().is_ok());
-        // n1's input net has two drivers (seed + n3) -> Invalid, which NOT reads
-        // as Floating, so n1's *output* net (a normal single-driver net) settles
-        // to Floating.
+        // n1's input net is Invalid (two drivers); NOT reads Invalid as Floating,
+        // so n1's single-driver output net settles Floating.
         let o = c.add_component(Component::output());
         c.link(n1, PinId::output(0), o, PinId::input(0));
         c.settle().unwrap();
@@ -1091,7 +964,7 @@ mod tests {
         for v in [1, 2, 3, 4] {
             c.set_input(data, v, 4);
             c.settle().unwrap();
-            assert_eq!(c.read_output(out), Value::new(0, 4)); // settle() never ticks
+            assert_eq!(c.read_output(out), Value::new(0, 4)); // settle() never latches
         }
     }
 
@@ -1108,23 +981,21 @@ mod tests {
         c.link(reg, PinId::output(0), not_g, PinId::input(0));
         c.link(not_g, PinId::output(0), out, PinId::input(0));
         c.settle().unwrap();
-        assert_eq!(c.read_output(out), Value::ONE); // NOT(0) = 1
+        assert_eq!(c.read_output(out), Value::ONE);
 
         c.set_input(data, 1, 1);
         c.settle().unwrap();
         c.tick_clock().unwrap(); // latches 1; trailing settle() propagates through not_g
-        assert_eq!(c.read_output(out), Value::ZERO); // NOT(1) = 0
+        assert_eq!(c.read_output(out), Value::ZERO);
     }
 
     #[test]
     fn test_reg_async_reset_destroys_state_during_settle_without_a_tick() {
-        // The whole point of async-reset support: driving the reset pin clears
-        // the register within settle() alone (no tick_clock()), destructively -
-        // once cleared it stays zero even after the reset pin is released.
+        // Driving reset clears the register within settle() alone, destructively - it stays zero after release.
         let mut c = Circuit::new();
         let data = c.add_component(Component::input(9, 4));
         let we = c.add_component(Component::input(1, 1));
-        let rst = c.add_component(Component::input(0, 1)); // reset deasserted
+        let rst = c.add_component(Component::input(0, 1)); // deasserted
         let reg = c.add_component(Component::reg(4));
         let out = c.add_component(Component::output());
         c.link(
@@ -1147,18 +1018,16 @@ mod tests {
         );
         c.link(reg, PinId::output(0), out, PinId::input(0));
 
-        // Latch 9 into the register.
         c.settle().unwrap();
         c.tick_clock().unwrap();
         assert_eq!(c.read_output(out), Value::new(9, 4));
 
-        // Assert reset and merely settle() - no tick. State clears immediately.
+        // Assert reset with settle() only, no tick: state clears immediately.
         c.set_input(rst, 1, 1);
         c.settle().unwrap();
         assert_eq!(c.read_output(out), Value::new(0, 4));
 
-        // Release reset, still no tick: the clear was destructive, so it stays
-        // 0 - the old 9 is gone.
+        // Release reset, still no tick: the clear was destructive, so it stays 0.
         c.set_input(rst, 0, 1);
         c.settle().unwrap();
         assert_eq!(c.read_output(out), Value::new(0, 4));
@@ -1166,13 +1035,11 @@ mod tests {
 
     #[test]
     fn test_t_flip_flop_async_reset_gui_flow() {
-        // The exact interactive flow: a T input and the async "0" pin wired to
-        // a T flip-flop. Toggle it high over a few clocks, pulse "0" to clear
-        // it mid-run (no tick), then resume ticking from zero.
+        // The interactive flow: toggle a T flip-flop over a few clocks, pulse the async reset mid-run (no tick), then resume.
         use crate::sim::component::TFlipFlopConf as T;
         let mut c = Circuit::new();
-        let toggle = c.add_component(Component::input(1, 1)); // T held high
-        let rst = c.add_component(Component::input(0, 1)); // "0" pin, deasserted
+        let toggle = c.add_component(Component::input(1, 1));
+        let rst = c.add_component(Component::input(0, 1));
         let ff = c.add_component(Component::t_flip_flop());
         let out = c.add_component(Component::output());
         c.link(
@@ -1191,17 +1058,15 @@ mod tests {
         c.tick_clock().unwrap();
         assert_eq!(c.read_output(out), Value::ONE);
 
-        // Toggle "0" on: clears to 0 at once, no tick.
         c.set_input(rst, 1, 1);
         c.settle().unwrap();
         assert_eq!(c.read_output(out), Value::ZERO);
 
-        // Toggle "0" back off: stays 0 (destroyed, not restored).
+        // Stays 0 after release (destroyed, not restored).
         c.set_input(rst, 0, 1);
         c.settle().unwrap();
         assert_eq!(c.read_output(out), Value::ZERO);
 
-        // Resume clocking: toggles from 0 -> 1 as normal.
         c.tick_clock().unwrap();
         assert_eq!(c.read_output(out), Value::ONE);
     }
@@ -1250,12 +1115,11 @@ mod tests {
         c.link(reg2, PinId::output(0), out2, PinId::input(0));
         c.settle().unwrap();
 
-        // tick 1: reg1 latches 5, but reg2 sees reg1's OLD value (0), since
-        // tick_clock snapshots all sequential inputs before mutating.
+        // tick 1: reg2 sees reg1's OLD value (0) - tick_clock snapshots inputs before mutating.
         c.tick_clock().unwrap();
         assert_eq!(c.read_output(out2), Value::new(0, 4));
 
-        // tick 2: reg2 now latches what reg1 captured during tick 1.
+        // tick 2: reg2 latches what reg1 captured during tick 1.
         c.tick_clock().unwrap();
         assert_eq!(c.read_output(out2), Value::new(5, 4));
     }
@@ -1285,7 +1149,6 @@ mod tests {
         let reg = c.add_component(Component::reg(4));
         let out_reg = c.add_component(Component::output());
 
-        // A counter counting up, with its own latched value.
         let load = c.add_component(Component::input(0, 1));
         let count = c.add_component(Component::input(1, 1));
         let counter = c.add_component(Component::counter(4, 15, OverflowAction::Wrap));
@@ -1306,7 +1169,6 @@ mod tests {
         assert_eq!(c.read_output(out_reg), Value::new(5, 4));
         assert_eq!(c.read_output(out_ctr), Value::new(3, 4));
 
-        // Reset returns both to their power-on initial value and propagates it.
         c.reset_sequential().unwrap();
         assert_eq!(c.read_output(out_reg), Value::new(0, 4));
         assert_eq!(c.read_output(out_ctr), Value::new(0, 4));
@@ -1399,16 +1261,15 @@ mod tests {
         c.settle().unwrap();
         assert_eq!(c.read_output(o2), Value::ZERO);
 
-        c.remove_component(g1); // g1 only reads from a's net
+        c.remove_component(g1);
         c.settle().unwrap();
         assert_eq!(c.read_output(o2), Value::ZERO);
     }
 
     #[test]
     fn test_remove_component_refreshes_downstream_sinks() {
-        // Removing a driver re-evaluates the sinks that lose it and re-dirties
-        // their output nets, so a following settle() refreshes values more than
-        // one hop downstream rather than leaving stale out_cache behind.
+        // Removing a driver re-evaluates lost sinks and re-dirties their nets,
+        // refreshing values more than one hop downstream.
         let mut c = Circuit::new();
         let a = c.add_component(Component::input(1, 1));
         let g1 = c.add_component(Component::gate(GateOp::Not, 1, 1));
@@ -1418,13 +1279,12 @@ mod tests {
         c.link(g1, PinId::output(0), g2, PinId::input(0));
         c.link(g2, PinId::output(0), o, PinId::input(0));
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::ONE); // NOT(NOT(1)) = 1
+        assert_eq!(c.read_output(o), Value::ONE);
 
         c.remove_component(g1);
         c.settle().unwrap();
 
-        // g2's input pin was nulled -> it now reads Floating, so g2 =
-        // NOT(Floating) = Floating, and that refresh propagates through to o.
+        // g2's input was nulled -> Floating; NOT(Floating) = Floating propagates through to o.
         assert_eq!(c.read_output(o), Value::Floating);
     }
 
@@ -1452,7 +1312,7 @@ mod tests {
 
         c.set_input(g, 99, 4); // g is a Gate, not an Input; silently no-ops
         c.settle().unwrap();
-        assert_eq!(c.read_output(o), Value::ONE); // unaffected
+        assert_eq!(c.read_output(o), Value::ONE);
     }
 
     // ---- Group 6: tunnels ----
@@ -1500,16 +1360,13 @@ mod tests {
         c.link(driver1, PinId::output(0), sink1, PinId::input(0));
 
         let pull = c.add_tunnel("X".to_string(), TunnelRole::Pull);
-        c.link_tunnel(pull, sink2, PinId::input(0)); // creates + attaches to sink2's net
+        c.link_tunnel(pull, sink2, PinId::input(0));
 
-        // sink1's net (driven by driver1) and sink2's net (undriven, only the
-        // tunnel) both already exist; linking their already-attached input pins
-        // together forces a merge() with a single surviving driver.
+        // sink1's net (driven) and sink2's net (tunnel only) both exist; linking their pins forces a merge().
         c.link(sink1, PinId::input(0), sink2, PinId::input(0));
         c.settle().unwrap();
 
-        // The tunnel must have followed the merge (repointed from the
-        // removed net to the surviving one), not been left dangling.
+        // The tunnel must follow the merge, repointed to the surviving net, not left dangling.
         let feed = c.add_tunnel("X".to_string(), TunnelRole::Feed);
         let out = c.add_component(Component::output());
         c.link_tunnel(feed, out, PinId::input(0));
@@ -1526,8 +1383,7 @@ mod tests {
         c.settle().unwrap();
 
         c.remove_component(driver);
-        // Must not panic (no dangling NetKey held by the tunnel), and a
-        // subsequent settle() must succeed.
+        // Must not panic (no dangling NetKey held by the tunnel).
         c.settle().unwrap();
     }
 
@@ -1543,7 +1399,6 @@ mod tests {
         // Must not panic; the tunnel's net should have been reset to None.
         c.settle().unwrap();
 
-        // Re-linking the same components/tunnel afterward must still work.
         let feed = c.add_tunnel("Z".to_string(), TunnelRole::Feed);
         let out = c.add_component(Component::output());
         c.link_tunnel(pull, driver, PinId::output(0));
@@ -1571,7 +1426,6 @@ mod tests {
         assert_eq!(c.read_output(out_old), Value::ONE); // still "OLD" group
         assert_eq!(c.read_output(out_new), Value::Floating); // "NEW" has no Pull yet
 
-        // Rename the Pull tunnel from "OLD" to "NEW".
         c.rename_tunnel(pull, "NEW".to_string());
         c.settle().unwrap();
 
@@ -1594,18 +1448,14 @@ mod tests {
         c.link(driver, PinId::output(0), out, PinId::input(0));
         c.settle().unwrap();
 
-        // driver's net has a concrete Fixed value, but two sinks disagree on
-        // expected width (4 vs 8), so it resolves to Invalid rather than
-        // whatever driver's out_cache happens to hold.
+        // driver's net has a concrete value, but sinks disagree on width (4 vs 8) -> Invalid, not driver's out_cache.
         assert_eq!(c.read_output(out), Value::Invalid);
     }
 
     #[test]
     fn test_width_conflict_detected_even_with_no_driver() {
         let mut c = Circuit::new();
-        // No component drives this net at all (both endpoints below are input
-        // pins) - it should still be flagged Invalid purely from the two
-        // sinks' conflicting declared widths, not from any concrete Value.
+        // No component drives this net; it must still flag Invalid purely from the sinks' conflicting widths.
         let g4 = c.add_component(Component::gate(GateOp::Not, 1, 4));
         let g8 = c.add_component(Component::gate(GateOp::Not, 1, 8));
         let out = c.add_component(Component::output());
@@ -1620,9 +1470,7 @@ mod tests {
     #[test]
     fn test_lone_widthed_pin_with_unconstrained_sink_is_not_invalid() {
         let mut c = Circuit::new();
-        // Output declares no expected width (input_width returns None), so a
-        // single width-declaring participant (g's output) has nothing to
-        // conflict with - this must stay an ordinary Floating, not Invalid.
+        // Output declares no expected width, so g's output has nothing to conflict with -> Floating, not Invalid.
         let g = c.add_component(Component::gate(GateOp::Not, 1, 4));
         let out = c.add_component(Component::output());
         c.link(g, PinId::output(0), out, PinId::input(0));
@@ -1648,10 +1496,9 @@ mod tests {
         c.link(downstream, PinId::output(0), out, PinId::input(0));
         c.settle().unwrap();
 
-        assert_eq!(c.read_output(probe), Value::Invalid); // the mismatched net itself
-                                                          // One hop downstream: g4 read an Invalid input and produced Floating
-                                                          // (per Value::Not), and that net's own widths agree - so it resolves
-                                                          // as ordinary Floating rather than carrying Invalid any further.
+        assert_eq!(c.read_output(probe), Value::Invalid);
+        // One hop downstream: g4 reads Invalid, produces Floating (Value::Not);
+        // that net's widths agree, so Invalid doesn't propagate further.
         assert_eq!(c.read_output(out), Value::Floating);
     }
 
@@ -1668,15 +1515,12 @@ mod tests {
         c.link(rom_key, PinId::output(0), out, PinId::input(0));
         c.settle().unwrap();
 
-        // Reads the pre-loaded word at address 2.
         assert_eq!(c.read_output(out), Value::new(0x5A, 8));
 
-        // An in-place content write at the addressed cell propagates on settle.
         c.write_rom(rom_key, 2, 0xFF);
         c.settle().unwrap();
         assert_eq!(c.read_output(out), Value::new(0xFF, 8));
 
-        // Writing a *different* address leaves the current output untouched.
         c.write_rom(rom_key, 5, 0x11);
         c.settle().unwrap();
         assert_eq!(c.read_output(out), Value::new(0xFF, 8));
@@ -1684,9 +1528,7 @@ mod tests {
 
     // ── Subcircuits (Logic::Sub) ──────────────────────────────────────────────
 
-    // A fresh subcircuit component wrapping AND(a, b): two 1-bit inputs, one
-    // 1-bit output. Built anew each call (Circuit isn't Clone), so two calls
-    // yield independent instances.
+    // Wraps AND(a, b). Built anew each call (Circuit isn't Clone) so calls yield independent instances.
     fn and_subcircuit() -> Component {
         let mut inner = Circuit::new();
         let a = inner.add_component(Component::input(0, 1));
@@ -1700,8 +1542,7 @@ mod tests {
         Component::subcircuit(inner, vec![a, b], vec![o])
     }
 
-    // A fresh subcircuit component wrapping a 4-bit register: inputs [D, WE],
-    // output [Q].
+    // Wraps a 4-bit register: inputs [D, WE], output [Q].
     fn reg_subcircuit() -> Component {
         let mut inner = Circuit::new();
         let d = inner.add_component(Component::input(0, 4));
@@ -1727,12 +1568,12 @@ mod tests {
         c.link(sub, PinId::output(0), out, PinId::input(0));
 
         c.settle().unwrap();
-        assert_eq!(c.read_output(out), Value::ONE); // 1 AND 1
+        assert_eq!(c.read_output(out), Value::ONE);
 
         // An input change settles through the boundary with no clock tick.
         c.set_input(x, 0, 1);
         c.settle().unwrap();
-        assert_eq!(c.read_output(out), Value::ZERO); // 0 AND 1
+        assert_eq!(c.read_output(out), Value::ZERO);
     }
 
     #[test]
@@ -1749,7 +1590,6 @@ mod tests {
         c.settle().unwrap();
         assert_eq!(c.read_output(out), Value::new(0, 4)); // register power-on 0
 
-        // An outer clock tick drives the inner register one step.
         c.tick_clock().unwrap();
         assert_eq!(c.read_output(out), Value::new(7, 4));
     }
@@ -1783,8 +1623,7 @@ mod tests {
 
     #[test]
     fn nested_subcircuit_settles() {
-        // A subcircuit whose inner circuit itself contains a subcircuit:
-        // outer -> mid(sub) -> and(sub).
+        // Nested: outer -> mid(sub) -> and(sub).
         let mut mid = Circuit::new();
         let ma = mid.add_component(Component::input(0, 1));
         let mb = mid.add_component(Component::input(0, 1));

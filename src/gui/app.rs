@@ -27,8 +27,7 @@ use crate::sim::value::Value;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-// Shared canvas pixel sizes. pub(crate) because gui::canvas_draw draws with the
-// same measurements the hit-testing here uses.
+// pub(crate) so canvas_draw uses the same pixel sizes as hit-testing here.
 pub(crate) const PIN_RADIUS: f32 = 3.0;
 pub(crate) const WIRE_THICKNESS_THIN: f32 = 2.0;
 pub(crate) const WIRE_THICKNESS_THICK: f32 = 4.0;
@@ -39,9 +38,7 @@ const GIT_SHA: &str = env!("OSMILOG_GIT_SHA");
 
 // ── PlacedTunnel ──────────────────────────────────────────────────────────────
 
-// Visual record for a Tunnel (net label / off-page connector). `label`
-// mirrors circuit::Tunnel.label (editing it updates the text and calls
-// circuit.rename_tunnel) - Tunnels are the only entity with a user-editable
+// Visual record for a Tunnel. Tunnels are the only entity with a user-editable
 // label; Components only show hardcoded per-type/pin labels.
 #[derive(Debug)]
 pub struct PlacedTunnel {
@@ -53,9 +50,7 @@ pub struct PlacedTunnel {
 
 // ── Selected ──────────────────────────────────────────────────────────────────
 
-// A component, a tunnel, and a wire segment are all selectable canvas entities;
-// using one enum (rather than parallel Option fields) avoids a "can two be Some,
-// who wins" desync.
+// One enum instead of parallel Option fields avoids a "can two be Some" desync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selected {
     Component(PlacedCompKey),
@@ -63,11 +58,8 @@ pub enum Selected {
     Wire(WireSegKey),
 }
 
-// OsmilogApp::selected's payload: one selected item, or a multi-item bulk
-// selection from a rubber-band drag. No `None`/empty variant - that's what
-// `Option<Selection>` is for, so "nothing selected" has exactly one
-// representation rather than two. A `Bulk` is never constructed empty; an
-// empty bulk selection is `None`.
+// No empty variant: `Option<Selection>` already covers "nothing selected", so
+// `Bulk` is never constructed empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
     Single(Selected),
@@ -85,27 +77,23 @@ pub enum InteractionMode {
     PlacingTunnel {
         role: TunnelRole,
     },
-    // Drawing a wire (drag = quick elbow, click = add a corner). `points` are
-    // the committed grid corners (points[0] = anchor); `dragging` distinguishes
-    // finish-on-release from finish-on-click/double-click/Esc.
+    // Drag draws a quick elbow, click adds a corner. `points[0]` is the anchor.
     WireDraw {
         points: Vec<GridPos>,
         start_attach: NodeAttach,
         cursor: Pos2,
         dragging: bool,
     },
-    // Body-drag of the current selection. `items` pairs each dragged key with
-    // the grid_pos it had at drag-start. `free_nodes` are the Free-attached
-    // WireNodes of any selected wire segment. If not tracked, only wires that are directly
-    // connected between two component pins move.
+    // `items` pairs each dragged key with its pre-drag grid_pos. `free_nodes`
+    // are the Free-attached WireNodes of a selected wire segment; untracked
+    // wires only move if directly connected between two component pins.
     SelectionDrag {
         items: Vec<(Selected, GridPos)>,
         free_nodes: Vec<(WireNodeKey, GridPos)>,
         drag_origin: Pos2,
     },
-    // Rubber-band multi-select from dragging an empty region; `start`/`current`
-    // are the box corners (GridPos, so it snaps to grid) - on release,
-    // everything inside becomes the (bulk) selection.
+    // Rubber-band select from an empty-region drag; `start`/`current` are the
+    // grid-snapped box corners.
     BulkSelect {
         start: GridPos,
         current: GridPos,
@@ -121,12 +109,8 @@ pub(crate) enum PinKind {
 
 // ── OsmilogApp ────────────────────────────────────────────────────────────────
 
-/// Stable, app-assigned id for a [`PlacedComponent`] in a `Document`'s
-/// `components` map. Survives remove + re-insert so undo restores a deleted
-/// record under its original key (see the wiring/circuit key types); never
-/// reused. Distinct from the circuit-layer `CompKey` a record holds, so it
-/// stays valid across a `reconfigure_component` that swaps the underlying
-/// `CompKey`.
+/// Stable id for a [`PlacedComponent`], distinct from the circuit-layer `CompKey` it holds.
+/// It survives remove + re-insert and is never reused.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct PlacedCompKey(pub(crate) u64);
 
@@ -135,52 +119,35 @@ pub struct PlacedCompKey(pub(crate) u64);
 pub struct PlacedTunnelKey(pub(crate) u64);
 
 pub struct OsmilogApp {
-    // Snapshot of the last copied selection, decoupled from live SlotMap
-    // keys so it survives undo/redo and further edits to the copied
-    // originals. See gui::clipboard::Clipboard.
+    // Decoupled from live SlotMap keys so it survives undo/redo. See Clipboard.
     pub clipboard: Clipboard,
-    // File > Save/Load I/O errors. Distinct from a Document's own
-    // settle_error (a simulation-side problem); the menu bar shows whichever
-    // is set, I/O first (see the "Menu bar" section of `ui`).
+    // File I/O errors, distinct from a Document's own settle_error. Shown
+    // first if both are set (see the "Menu bar" section of `ui`).
     pub io_error: Option<String>,
-    // Platform-specific file I/O state and orchestration (native OS dialogs vs.
-    // browser async pick / Blob download + in-app Save As modal), behind one
-    // interface so the call sites below are cfg-free. See `crate::platform` and
-    // the `with_io` helper; native's IoState is a ZST, web's holds the async
-    // load slot + modal contents.
+    // Platform file-I/O state, behind one interface so call sites stay
+    // cfg-free. See `with_io`; native's IoState is a ZST, web's holds the
+    // async load slot + modal contents.
     io: platform::IoState,
-    // Toggles the in-app puffin flamegraph window (Debug menu). puffin
-    // scopes are recorded regardless; this just controls whether the
-    // viewer is drawn.
+    // Toggles the puffin flamegraph window (Debug menu); scopes still record
+    // regardless.
     show_profiler: bool,
     // ── Multiple circuits ──────────────────────────────────────────────────
-    // Every circuit document held in memory, active included - a single
-    // source of truth, with no "parked vs. live" distinction. See
-    // gui::document::Document.
+    // Every circuit document, active one included - a single source of
+    // truth, no parked-vs-live split.
     documents: SlotMap<DocId, CircuitDoc>,
-    // Stable palette display order for `documents` (SlotMap iteration order is
-    // unspecified). Grows as circuits are created.
+    // Palette display order; SlotMap iteration order is unspecified.
     doc_order: Vec<DocId>,
-    // Which document is currently active. See active()/active_mut().
     active_id: DocId,
-    // New-circuit name dialog: Some((buffer, snapshot)) while open (the String
-    // doubles as the live text-field contents), None while closed. Mirrors the
-    // web Save As modal pattern (platform/web.rs) but lives on the app so
-    // native gets it too. The snapshot is installed into the freshly created
-    // document on Create - empty for a plain blank circuit (the palette
-    // header's "+"), or captured from a bulk selection (mirrors Clipboard::
-    // copy) when extracting a selection into its own circuit via the
-    // properties panel's "Add to New Circuit" button, so it can't be
-    // invalidated by edits made to the originals before Create is pressed.
+    // Open state and pending snapshot for the New Circuit dialog; `None`
+    // while closed. The snapshot is captured at dialog-open time so later
+    // edits to the originals can't invalidate it.
     new_circuit_dialog: Option<(String, CircuitSnapshot)>,
 }
 
 impl OsmilogApp {
-    // Split out from `new` so tests (and `load_project_file`) can construct
-    // a fresh app without an eframe::CreationContext, which isn't
-    // constructible outside a running eframe host.
+    // Split from `new` so tests can build an app without an
+    // `eframe::CreationContext`.
     pub fn empty() -> Self {
-        // The single initial "Main" document, active from the start.
         let mut documents = SlotMap::with_key();
         let active_id = documents.insert(CircuitDoc {
             name: "Main".to_string(),
@@ -201,9 +168,8 @@ impl OsmilogApp {
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         puffin::set_scopes_on(true);
-        // `Options` lives in the Context's persistent memory (like styles/widget
-        // state), so this sticks for the app's lifetime - no need to re-set it
-        // every frame in handle_camera_input.
+        // `Options` persists in the context's memory, so this sticks for the
+        // app's lifetime; no need to re-set it per frame.
         cc.egui_ctx
             .options_mut(|o| o.input_options.scroll_zoom_speed = ZOOM_SCROLL_SPEED);
         Self::empty()
@@ -211,8 +177,8 @@ impl OsmilogApp {
 
     // ── Multiple circuits ──────────────────────────────────────────────────
 
-    // The active document's state. All per-document reads/writes go through
-    // these two accessors rather than a separate set of "live" fields.
+    // All per-document reads/writes go through these two accessors, not
+    // separate "live" fields.
     pub(crate) fn active(&self) -> &Document {
         &self.documents[self.active_id].state
     }
@@ -221,18 +187,16 @@ impl OsmilogApp {
         &mut self.documents[self.active_id].state
     }
 
-    // Make `target` the active document.
     pub(crate) fn switch_document(&mut self, target: DocId) {
         if target == self.active_id {
             return;
         }
         self.active_id = target;
-        // Reflect any edits made to child circuits while they were the active
-        // document: re-derive every placed subcircuit here against its source.
+        // Re-derives every placed subcircuit, reflecting edits made while its
+        // child circuits were active.
         self.refresh_subcircuits();
     }
 
-    // Create a new blank circuit document and make it active.
     fn create_document(&mut self, name: String) {
         let id = self.documents.insert(CircuitDoc {
             name,
@@ -242,36 +206,29 @@ impl OsmilogApp {
         self.active_id = id;
     }
 
-    // True while a clock run session is active (Playing or Paused). The single
-    // gate for the edit lockout: canvas interaction, shortcuts, the Add/Edit
-    // menus, File > Load, and the properties panel are all disabled when this
-    // is true. Only Stop (which resets sequential state) returns to editable.
+    // True while a run session (Playing/Paused) is active. Gates canvas
+    // interaction, menus, Load, and the properties panel; only Stop returns
+    // to editable.
     pub fn editing_locked(&self) -> bool {
         self.active().editing_locked()
     }
 
-    // True while live *value* edits must be blocked - an Input's bits, a ROM's
-    // or RAM's contents. Unlike the blanket editing_locked(), these are carved
-    // out of the lock while Paused: a paused run is frozen structurally, but an
-    // Input can still be driven to new stimulus and memory poked between steps,
-    // so this is true only while actively Playing. Structural edits (widths,
-    // wiring, add/delete) stay gated on editing_locked().
+    // True only while actively Playing. Unlike `editing_locked`, this carves
+    // out Input/ROM/RAM value edits during Paused; structural edits stay
+    // gated on `editing_locked`.
     pub fn value_editing_locked(&self) -> bool {
         self.active().value_editing_locked()
     }
 
-    // Builds the live sim Component (needs the document registry, so this part
-    // can't live on Document - see instantiate below) then hands it to
-    // Document::place_component for the per-document record/undo bookkeeping.
+    // Builds the live Component (needs the document registry, so this can't
+    // live on `Document`), then hands it to `Document::place_component`.
     fn place_component(&mut self, spec: ComponentSpec, grid_pos: GridPos) -> PlacedCompKey {
         let comp = self.instantiate(&spec);
         self.active_mut().place_component(comp, spec, grid_pos)
     }
 
-    // Applies one intent collected from the properties panel (see
-    // gui::properties::show_properties, which only *describes* edits over a
-    // read-only &Document). This is the single place those descriptions become
-    // mutations - keeping the panel itself decoupled from OsmilogApp.
+    // The single place `PropGuiAction`s (from the read-only properties panel)
+    // become mutations, keeping the panel decoupled from `OsmilogApp`.
     pub(crate) fn apply_prop_gui_action(&mut self, action: PropGuiAction) {
         match action {
             PropGuiAction::Reconfigure(key, spec) => self.reconfigure_component(key, spec),
@@ -279,16 +236,15 @@ impl OsmilogApp {
             PropGuiAction::OpenCircuit(doc) => self.switch_document(doc),
             PropGuiAction::CreateCircuit => self.open_extract_circuit_dialog(),
             PropGuiAction::SetTunnelLabelLive(key, label) => {
-                // Persist the in-progress edit back to the record (the panel's
-                // text buffer is re-cloned from it next frame). Same-frame with
-                // the render, so the keystroke isn't lost.
+                // Same-frame write-back so the keystroke isn't lost; the
+                // panel's buffer re-clones from this next frame.
                 self.active_mut().tunnels.get_mut(&key).unwrap().label = label;
             }
             PropGuiAction::RenameTunnel(key, label) => {
                 let doc = self.active_mut();
                 let tunnel_key = doc.tunnels[&key].key;
-                // Read the old label from the circuit (the record's copy was
-                // already updated live) to capture undo's restore value.
+                // Reads the old label from the circuit, not the record
+                // (already updated live), to capture undo's restore value.
                 let old_label = doc
                     .circuit
                     .tunnels
@@ -299,8 +255,8 @@ impl OsmilogApp {
                     tunnel: tunnel_key,
                     new_label: label.clone(),
                 });
-                // Record the record-side label change's undo (the Sim
-                // RenameTunnel above only reverses the circuit's copy).
+                // Records the record-side label undo; Command::RenameTunnel
+                // above only reverses the circuit's copy.
                 if let Some(old) = old_label {
                     doc.history
                         .push_gui(GuiUndoAction::SetTunnelLabel { key, label: old });
@@ -318,10 +274,8 @@ impl OsmilogApp {
         }
     }
 
-    // Thin registry-glue wrapper over Document::reconfigure_component: builds
-    // the new component via instantiate (which needs the document registry, so
-    // it can't run inside Document) and hands it to the active document, which
-    // owns all the record/wiring/undo bookkeeping.
+    // Builds the new Component via `instantiate` (needs the document
+    // registry) and hands it to `Document::reconfigure_component`.
     pub(crate) fn reconfigure_component(&mut self, pc_key: PlacedCompKey, new_spec: ComponentSpec) {
         let new_comp = self.instantiate(&new_spec);
         self.active_mut()
@@ -330,20 +284,16 @@ impl OsmilogApp {
 
     // ── Subcircuits ───────────────────────────────────────────────────────────
     //
-    // Builds a live sim Component from a ComponentSpec. Identical to
-    // spec.to_component() for every primitive type; a Subcircuit spec instead
-    // has its inner Circuit built from the referenced document (which
-    // to_component can't do - it has no document registry). This is the one
-    // spec->component build path the GUI uses (place_component /
-    // reconfigure_component), so subcircuits always get a real inner circuit.
+    // Same as `spec.to_component()` except a `Subcircuit` spec gets its inner
+    // `Circuit` built from the referenced document, which `to_component`
+    // cannot do alone.
     pub(crate) fn instantiate(&self, spec: &ComponentSpec) -> Component {
         let mut visited = Vec::new();
         self.instantiate_with(spec, &mut visited)
     }
 
-    // `visited` breaks any accidental reference cycle (placement guards against
-    // real ones via would_cycle): a document already on the stack yields an
-    // empty placeholder instead of recursing forever.
+    // `visited` stops infinite recursion if a document ends up on its own
+    // stack (real cycles are blocked earlier by `would_cycle`).
     fn instantiate_with(&self, spec: &ComponentSpec, visited: &mut Vec<DocId>) -> Component {
         match spec {
             ComponentSpec::Subcircuit {
@@ -361,13 +311,10 @@ impl OsmilogApp {
                 visited.push(*doc);
                 let (inner, inputs, outputs) = self.build_doc_circuit(*doc, visited);
                 visited.pop();
-                // The outer pin arity is always the cached interface. If the
-                // referenced document isn't fully available (e.g. mid-load, a
-                // forward reference to a not-yet-populated doc, or a null/unbound
-                // `doc`), its derived boundary won't match - fall back to a
-                // correctly-sized placeholder so wiring to these pins never goes
-                // out of bounds. refresh_subcircuits rebuilds the real inner once
-                // every document is populated.
+                // If the referenced document isn't fully available yet
+                // (mid-load, forward reference, unbound doc), fall back to a
+                // correctly-sized placeholder so wiring never goes out of
+                // bounds. `refresh_subcircuits` rebuilds the real inner later.
                 if inputs.len() == input_widths.len() && outputs.len() == output_widths.len() {
                     Component::subcircuit(inner, inputs, outputs)
                 } else {
@@ -378,14 +325,10 @@ impl OsmilogApp {
         }
     }
 
-    // Builds a fresh standalone Circuit from a referenced document's records
-    // (its Document in the documents slotmap), translating placed
-    // components/tunnels + the wiring graph the same way Document::
-    // rebuild_circuit translates its own live doc - but into a new Circuit
-    // rather than the active document's, untracked, and recursing through
-    // instantiate_with for nested subcircuits. Returns the inner Input/Output
-    // component keys ordered top-down (then left-to-right), which is the pin
-    // order the subcircuit component exposes and its shape lays out.
+    // Builds a standalone Circuit from a document's records, the same way
+    // Document::rebuild_circuit does but untracked and into a new Circuit.
+    // Returns Input/Output keys ordered top-down then left-to-right, the pin
+    // order the subcircuit exposes.
     fn build_doc_circuit(
         &self,
         doc: DocId,
@@ -451,11 +394,9 @@ impl OsmilogApp {
         )
     }
 
-    // The interface a subcircuit component exposes for a given document: its
-    // display name plus the per-pin widths of the boundary Input/Output
-    // components (top-down). Cached into the ComponentSpec::Subcircuit so the
-    // `&self` spec methods (n_inputs/size/shape/...) need no document registry;
-    // refreshed on switch-back (refresh_subcircuits).
+    // Display name plus boundary pin widths (top-down), cached on
+    // ComponentSpec::Subcircuit so `&self` spec methods need no document
+    // registry.
     fn derive_subcircuit_interface(&self, doc: DocId) -> (String, Vec<u8>, Vec<u8>) {
         let name = self
             .documents
@@ -484,8 +425,6 @@ impl OsmilogApp {
         (name, input_widths, output_widths)
     }
 
-    // Builds the Subcircuit spec for placing `doc` as a component, deriving its
-    // cached interface now.
     fn subcircuit_spec(&self, doc: DocId) -> ComponentSpec {
         let (name, input_widths, output_widths) = self.derive_subcircuit_interface(doc);
         ComponentSpec::Subcircuit {
@@ -496,9 +435,8 @@ impl OsmilogApp {
         }
     }
 
-    // Rebuilds one placed subcircuit's live inner Circuit in place (same
-    // CompKey, same outer pins), so inner edits that didn't change the boundary
-    // are reflected. Used by refresh_subcircuits for the common case.
+    // Rebuilds one placed subcircuit's inner Circuit in place (same CompKey,
+    // same outer pins) for the common no-boundary-change case.
     fn rebuild_subcircuit_inner(&mut self, pck: PlacedCompKey) {
         let ComponentSpec::Subcircuit { doc, .. } = self.active().components[&pck].spec else {
             return;
@@ -515,13 +453,9 @@ impl OsmilogApp {
         }
     }
 
-    // Reconciles every placed subcircuit in the active document against its
-    // referenced document, called after a switch makes this document active so
-    // edits to a child circuit show up here. If the boundary changed (pin
-    // count), reconfigure_component rebuilds the whole record (pruning wires to
-    // dropped pins, positional binding); otherwise the inner circuit is rebuilt
-    // in place and the cached name/widths refreshed. Finishes with a single
-    // rebuild_circuit so the re-derived inner outputs settle outward.
+    // Reconciles every placed subcircuit against its referenced document
+    // after a switch. A pin-count change triggers a full reconfigure_component;
+    // otherwise just the inner circuit and cached name/widths refresh.
     fn refresh_subcircuits(&mut self) {
         let subs: Vec<(PlacedCompKey, DocId)> = self
             .active()
@@ -547,8 +481,8 @@ impl OsmilogApp {
             };
 
             if old_in != input_widths.len() || old_out != output_widths.len() {
-                // Boundary changed: full reconfigure (prunes stale wires, new
-                // shape, rebuilt inner circuit). It rebuild_circuits itself.
+                // Boundary changed: reconfigure_component handles pruning,
+                // reshaping, and its own rebuild.
                 self.reconfigure_component(
                     pck,
                     ComponentSpec::Subcircuit {
@@ -559,9 +493,8 @@ impl OsmilogApp {
                     },
                 );
             } else {
-                // Same boundary: refresh the cached name/widths (display only;
-                // shape is unchanged since pin counts match) and rebuild the
-                // inner circuit in place.
+                // Same boundary: only the cached name/widths (display-only)
+                // and the inner circuit need refreshing.
                 if old_name != name {
                     self.active_mut().components.get_mut(&pck).unwrap().spec =
                         ComponentSpec::Subcircuit {
@@ -581,10 +514,8 @@ impl OsmilogApp {
         }
     }
 
-    // The documents referenced (as subcircuits) directly by `doc`'s placed
-    // components. Every document's records live directly in its
-    // CircuitDoc::state, active or not, so no active-doc special case is
-    // needed here.
+    // Documents referenced as subcircuits directly by `doc`. No active-doc
+    // special case needed - records live directly on CircuitDoc::state.
     fn doc_references(&self, doc: DocId) -> Vec<DocId> {
         self.documents
             .get(doc)
@@ -597,9 +528,7 @@ impl OsmilogApp {
             .collect()
     }
 
-    // Whether placing `target` as a subcircuit in the active document would
-    // create a cycle: true if target is the active doc itself, or target
-    // already (transitively) references the active doc.
+    // True if `target` is the active document, or transitively references it.
     fn would_cycle(&self, target: DocId) -> bool {
         if target == self.active_id {
             return true;
@@ -619,15 +548,11 @@ impl OsmilogApp {
         false
     }
 
-    // Repositions the component's wire-anchor nodes to its current pin grid
-    // positions (after a move or reconfigure). Segments to them stretch.
     // ── Save / load ──────────────────────────────────────────────────────
 
-    // Serializes the whole workspace - every circuit document, not just the
-    // active one - into a ProjectFile, with each placed subcircuit's
-    // cross-circuit link emitted as an index into `circuits` (see
-    // `circuit_entry_of`). `doc_order` fixes both the emitted circuit order and
-    // the index every reference resolves against.
+    // Serializes every circuit document (not just active) into a ProjectFile.
+    // doc_order fixes both the emitted order and the index each subcircuit
+    // reference resolves against.
     pub fn to_project_file(&self) -> ProjectFile {
         let doc_index: HashMap<DocId, usize> = self
             .doc_order
@@ -644,10 +569,8 @@ impl OsmilogApp {
         ProjectFile::new(active, circuits)
     }
 
-    // Builds one document's CircuitEntry. Every document's records live
-    // directly in its CircuitDoc::state, active or not. Subcircuit references
-    // map each placed Subcircuit component (by its emitted index) to the index
-    // of the document it references, via `doc_index`.
+    // Subcircuit references map each placed Subcircuit component's emitted
+    // index to the index of the document it references, via doc_index.
     fn circuit_entry_of(&self, doc: DocId, doc_index: &HashMap<DocId, usize>) -> CircuitEntry {
         let name = self.documents[doc].name.clone();
         let state = &self.documents[doc].state;
@@ -673,19 +596,10 @@ impl OsmilogApp {
         }
     }
 
-    // Replaces the whole workspace with the circuits described by `file`,
-    // restoring its active document. Validates first so a malformed file is
-    // rejected before any existing state is touched.
-    //
-    // Every document is allocated (blank) up front, so a stable DocId exists for
-    // each circuit before any records are placed - subcircuit references then
-    // resolve by index regardless of the order documents are populated in.
-    // Circuits are loaded one at a time by making each one active in turn
-    // (make_live_for_load) and installing its records, which reuses the
-    // ordinary placement machinery. A placed subcircuit's inner Circuit is left
-    // as a placeholder here and rebuilt against its (now fully-populated)
-    // referenced document by the final `refresh_subcircuits`; other documents'
-    // subcircuits are likewise rebuilt when they're later switched to.
+    // Validates first so a malformed file never touches existing state.
+    // Every document is allocated blank up front so DocIds are stable before
+    // subcircuit references resolve by index. Placed subcircuits stay
+    // placeholders until the final refresh_subcircuits.
     pub fn load_project_file(&mut self, file: &ProjectFile) -> Result<(), LoadError> {
         file.validate()?;
 
@@ -706,8 +620,8 @@ impl OsmilogApp {
             self.load_circuit_entry(entry, &doc_ids);
         }
 
-        // Restore the saved active document and reconcile its placed subcircuits
-        // against the now fully-populated referenced documents.
+        // Reconcile the restored document's placed subcircuits now that every
+        // referenced document is populated.
         self.make_live_for_load(doc_ids[file.active]);
         self.active_mut().selected = None;
         self.active_mut().mode = InteractionMode::Idle;
@@ -716,18 +630,14 @@ impl OsmilogApp {
         Ok(())
     }
 
-    // Makes `target` the active document, without the `refresh_subcircuits` a
-    // normal `switch_circuit` runs - during a load the referenced documents
-    // aren't all populated yet, so subcircuit rebuilding is deferred to the end
-    // of `load_project_file`. Just an active_id reassignment: every document
-    // already has its own (blank, freshly allocated) Document in the slotmap.
+    // Like switch_document but skips refresh_subcircuits - during a load,
+    // referenced documents aren't all populated yet.
     fn make_live_for_load(&mut self, target: DocId) {
         self.active_id = target;
     }
 
-    // Loads one circuit's records into the (blank) active document, then
-    // rebuilds its nets. Assumes the active document is the fresh blank state
-    // for this circuit (as arranged by `load_project_file`).
+    // Assumes the active document is already the fresh blank state for this
+    // circuit, arranged by load_project_file.
     fn load_circuit_entry(&mut self, entry: &CircuitEntry, doc_ids: &[DocId]) {
         self.install_circuit_records(&entry.snapshot, &entry.subcircuits, doc_ids);
         self.active_mut().rebuild_circuit();
@@ -736,10 +646,8 @@ impl OsmilogApp {
         self.active_mut().history = History::default();
     }
 
-    // Places one circuit's records (components, tunnels, wire nodes/segments)
-    // into the active document and re-binds subcircuit references, for the
-    // per-circuit `load_circuit_entry`. Does not rebuild nets - the caller does,
-    // once its records are in.
+    // Re-binds subcircuit references after placing records. Does not rebuild
+    // nets - the caller does once all records are in.
     fn install_circuit_records(
         &mut self,
         snapshot: &CircuitSnapshot,
@@ -754,8 +662,8 @@ impl OsmilogApp {
             .map(|entry| self.place_component(entry.spec.clone(), entry.grid_pos))
             .collect();
 
-        // Re-bind each Subcircuit's `doc` (serde-skipped, so it loaded as a null
-        // DocId) to the DocId allocated for the circuit it references.
+        // Re-bind each Subcircuit's doc (serde-skipped, loaded as a null
+        // DocId) to its real allocated DocId.
         for sub in subcircuits {
             if let (Some(&pck), Some(&doc)) =
                 (comp_keys.get(sub.component), doc_ids.get(sub.circuit))
@@ -814,19 +722,15 @@ impl OsmilogApp {
         }
     }
 
-    // Opens the "New Circuit" dialog for a plain blank circuit - just
-    // create_extract_circuit_dialog's dialog with an empty snapshot, so
-    // Create installs nothing extra into the new document.
+    // Same dialog as open_extract_circuit_dialog, but with an empty snapshot -
+    // Create installs nothing extra.
     fn open_new_circuit_dialog(&mut self) {
         let name = default_new_circuit_name(&self.documents);
         self.new_circuit_dialog = Some((name, CircuitSnapshot::default()));
     }
 
-    // Captures the active document's current bulk selection into a
-    // CircuitSnapshot and opens the same "New Circuit" dialog
-    // (create_extract_circuit_dialog) pre-populated with it, so Create
-    // installs a copy of the selection into the new document. No-op if the
-    // selection isn't a Bulk
+    // Pre-populates the New Circuit dialog with the current bulk selection.
+    // No-op unless the selection is a Bulk.
     fn open_extract_circuit_dialog(&mut self) {
         let doc = &self.documents[self.active_id].state;
         let Some(Selection::Bulk(items)) = &doc.selected else {
@@ -837,10 +741,8 @@ impl OsmilogApp {
         self.new_circuit_dialog = Some((name, snapshot));
     }
 
-    // Draws the "New Circuit" name dialog while `new_circuit_dialog` is Some.
-    // The buffer/snapshot pair doubles as open-state. On Create it makes a new
-    // active document and installs the paired snapshot (from an optional bulk
-    // selection), untracked.
+    // Draws the New Circuit dialog while open. On Create, makes a new active
+    // document and installs the paired snapshot, untracked.
     fn create_extract_circuit_dialog(&mut self, ctx: &egui::Context) {
         let Some((name, _)) = &mut self.new_circuit_dialog else {
             return;
@@ -890,8 +792,7 @@ impl OsmilogApp {
         }
     }
 
-    // Snapshots the current selection onto the clipboard. No-op if nothing
-    // is selected. Read-only: never touches history.
+    // No-op if nothing is selected. Read-only: never touches history.
     fn copy_selection(&mut self) {
         let doc = &self.documents[self.active_id].state;
         let items = match &doc.selected {
@@ -903,18 +804,16 @@ impl OsmilogApp {
             .copy(&doc.components, &doc.tunnels, &doc.wiring, &items);
     }
 
-    // Materializes the clipboard's (offset) snapshot as new components,
-    // tunnels, and wiring, as one undoable batch; the pasted items become
-    // the new selection. No-op if the clipboard is empty.
+    // Materializes the clipboard's offset snapshot as one undoable batch;
+    // pasted items become the new selection. No-op if the clipboard is empty.
     fn paste_clipboard(&mut self) {
         let Some(file) = self.clipboard.plan_paste() else {
             return;
         };
         self.active_mut().history.begin_batch();
 
-        // Snapshot indices -> the freshly placed GUI keys, mirroring
-        // install_circuit_records (wiring nodes reference components/tunnels by
-        // these).
+        // Snapshot indices map to freshly placed GUI keys, mirroring
+        // install_circuit_records.
         let comp_keys: Vec<PlacedCompKey> = file
             .components
             .iter()
@@ -976,12 +875,9 @@ impl OsmilogApp {
         doc.history.end_batch();
     }
 
-    // Runs `f` with the platform `IoState` temporarily moved out of `self`, so
-    // the IO methods can take a `&mut OsmilogApp` (to serialize, install a
-    // loaded file, or set an error) without aliasing `self.io`. Both backends'
-    // `IoState` is `Default`, so the take/restore is cheap - web's is an Rc +
-    // Option, native's is a ZST - and it keeps every File-menu / per-frame call
-    // site cfg-free.
+    // Moves IoState out of `self` so IO methods can take `&mut OsmilogApp`
+    // without aliasing `self.io`. Cheap: web's state is an Rc+Option, native's
+    // is a ZST.
     fn with_io<R>(&mut self, f: impl FnOnce(&mut platform::IoState, &mut Self) -> R) -> R {
         let mut io = std::mem::take(&mut self.io);
         let r = f(&mut io, self);
@@ -991,24 +887,22 @@ impl OsmilogApp {
 
     // ── Menu bar ──────────────────────────────────────────────────────────
     fn show_menu_bar(&mut self, ui: &mut egui::Ui, theme: Theme) {
-        // A run session (Playing/Paused) makes the whole editor read-only; the
-        // structural menus, Load, and the properties panel are disabled while
-        // it's true (Save/Debug/clock transport stay live).
+        // A run session makes the editor read-only; Save/Debug/clock
+        // transport stay live regardless.
         let locked = self.editing_locked();
         egui::Panel::top("menu_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Save").clicked() {
-                        // Native opens the OS "Save As" dialog and writes
-                        // synchronously; web opens an in-app filename modal
-                        // (completed by drive_save_dialog on a later frame).
+                        // Native saves synchronously via an OS dialog; web
+                        // opens an in-app modal, completed later by
+                        // drive_save_dialog.
                         self.with_io(|io, app| io.request_save(app));
                         ui.close();
                     }
                     if ui.add_enabled(!locked, egui::Button::new("Load")).clicked() {
-                        // Native picks + reads + installs synchronously; web
-                        // kicks off an async task whose result lands in the IO
-                        // state and is installed by poll_pending_load later.
+                        // Native loads synchronously; web's async result lands
+                        // in IoState and installs via poll_pending_load later.
                         self.with_io(|io, app| io.request_load(app));
                         ui.close();
                     }
@@ -1060,8 +954,7 @@ impl OsmilogApp {
                 });
                 ui.separator();
                 self.active_mut().show_clock_controls(ui);
-                // I/O errors take priority (they're rarer and more actionable);
-                // otherwise show the active document's own settle() error.
+                // I/O errors take priority over the document's own settle() error.
                 if let Some(err) = self
                     .io_error
                     .as_ref()
@@ -1077,15 +970,13 @@ impl OsmilogApp {
     }
 
     // ── Component palette (top half of the left panel) ────────────────────
-    // The whole palette is disabled during a run session (same lock as the
-    // structural menus and the properties panel below it).
+    // Disabled during a run session, like the structural menus and properties
+    // panel.
     fn show_component_palette(&mut self, ui: &mut egui::Ui) {
         let locked = self.editing_locked();
         ui.add_enabled_ui(!locked, |ui| {
-            // User-created circuits: one selectable entry per document, with a
-            // "+" on the header row to create a new one. Selecting an entry
-            // switches the whole editing session to that circuit. Uses a custom
-            // CollapsingState so the "+" button can sit on the header row.
+            // One entry per document; "+" creates a new one. Custom
+            // CollapsingState so the "+" sits on the header row.
             let hdr_id = ui.make_persistent_id("user_created_hdr");
             egui::collapsing_header::CollapsingState::load_with_default_open(
                 ui.ctx(),
@@ -1099,15 +990,10 @@ impl OsmilogApp {
                 }
             })
             .body(|ui| {
-                // Single click places the circuit as a subcircuit on the
-                // current canvas (a ghost that follows the cursor; nothing is
-                // dropped until a canvas click). Double click opens it for
-                // editing. A double click's first click only *enters* placing
-                // mode, which the second click cancels before switching - so no
-                // stray component is ever placed. A circuit that would nest into
-                // itself (directly or transitively) can't be placed. Targets are
-                // recorded and acted on after the loop, so the read-borrow of
-                // `doc_order`/`documents` doesn't overlap the &mut self calls.
+                // Click places as a subcircuit ghost; double-click opens for
+                // editing - its first click's placing mode is cancelled by the
+                // second so nothing stray gets placed. Targets are recorded
+                // and applied after the loop to avoid overlapping borrows.
                 let mut switch_target = None;
                 let mut place_target = None;
                 for &doc_id in &self.doc_order {
@@ -1126,8 +1012,8 @@ impl OsmilogApp {
                     }
                 }
                 if let Some(target) = switch_target {
-                    // Cancel any placing started by this double click's first
-                    // click, so the parent doc isn't parked mid-placement.
+                    // Cancels the placing mode from the double-click's first
+                    // click before switching.
                     self.active_mut().mode = InteractionMode::Idle;
                     self.switch_document(target);
                 } else if let Some(doc) = place_target {
@@ -1305,15 +1191,9 @@ impl OsmilogApp {
     }
 
     // ── Canvas drawing ────────────────────────────────────────────────────
-    // ── Canvas pan / zoom ─────────────────────────────────────────────────
-    // Middle-mouse drag pans; Ctrl(+Cmd)+scroll zooms toward the cursor. Both
-    // gestures are independent of the primary-button gestures the interaction
-    // modes handle (`drag_started`/`clicked`/`drag_delta` are primary-only), so
-    // this runs as a standalone pre-step in `ui()`.
     // ── Global canvas keyboard shortcuts ─────────────────────────────────
-    // Escape (cancel drag/wire-draw, clear selection), Delete/Backspace, and
-    // Undo/Redo. Must run before `handle_canvas_interaction` reads `self.mode`
-    // in the same frame, since Escape can reset it to Idle.
+    // Must run before handle_canvas_interaction reads self.mode in the same
+    // frame, since Escape can reset it to Idle.
     fn handle_canvas_shortcuts(&mut self, ctx: &egui::Context) {
         puffin::profile_function!();
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1337,9 +1217,8 @@ impl OsmilogApp {
                         doc.wiring.nodes.get_mut(key).unwrap().pos = *original_pos;
                     }
                 }
-                // Esc while drawing commits the polyline drawn so far as a
-                // dangling run (end in empty space), matching the double-click
-                // finish; nothing to commit if only the anchor exists.
+                // Esc commits the polyline drawn so far as a dangling run,
+                // like the double-click finish.
                 InteractionMode::WireDraw {
                     points,
                     start_attach,
@@ -1348,9 +1227,8 @@ impl OsmilogApp {
                     let (points, start_attach) = (points.clone(), *start_attach);
                     doc.commit_wire_route(points, start_attach, NodeAttach::Free);
                 }
-                // BulkSelect: Esc cancels the in-progress rubber-band (the
-                // trailing reset to Idle handles it) alongside clearing any
-                // existing bulk selection below.
+                // BulkSelect: the trailing reset to Idle cancels the
+                // in-progress rubber-band.
                 _ => {}
             }
             if matches!(doc.selected, Some(Selection::Bulk(_))) {
@@ -1359,10 +1237,8 @@ impl OsmilogApp {
             doc.mode = InteractionMode::Idle;
         }
 
-        // Backspace/Delete removes the current selection (bulk selection
-        // takes priority). Guarded on widget focus so it edits a focused
-        // text field instead of deleting, and on the clock lock so no editing
-        // shortcut fires during a run session (Playing/Paused).
+        // Guarded on widget focus (so a focused text field edits instead of
+        // deleting) and on the run-session lock.
         let editing_text = ctx.memory(|m| m.focused().is_some());
         let edits_blocked = editing_text || self.editing_locked();
         let delete_pressed =
@@ -1380,9 +1256,7 @@ impl OsmilogApp {
             }
         }
 
-        // Undo (Ctrl/Cmd+Z) / redo (Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z). Same
-        // focus/lock guard as delete so the shortcuts don't fire while typing in
-        // the tunnel-label field (where Ctrl+Z should edit text) or mid-run.
+        // Same focus/lock guard as delete.
         if !edits_blocked {
             let (undo, redo) = ctx.input(|i| {
                 let cmd = i.modifiers.command;
@@ -1399,9 +1273,7 @@ impl OsmilogApp {
             }
         }
 
-        // Copy (Ctrl/Cmd+C) / Paste (Ctrl/Cmd+V). Same focus/lock guard as
-        // delete/undo/redo so the shortcuts don't fire while typing in the
-        // tunnel-label field (where Ctrl+C/V should edit text) or mid-run.
+        // Same focus/lock guard as delete.
         if !edits_blocked {
             let (copy, paste) = ctx.input(|i| {
                 let cmd = i.modifiers.command;
@@ -1479,19 +1351,19 @@ impl OsmilogApp {
 
 impl eframe::App for OsmilogApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Frame boundary for every puffin scope recorded this frame (in both
-        // logic() and ui() - eframe calls them once each, in that order).
+        // Frame boundary for every puffin scope recorded this frame; eframe
+        // calls logic() then ui() once each.
         puffin::GlobalProfiler::lock().new_frame();
         puffin::profile_function!();
 
-        // Installs an async File > Load result if a web load task has delivered
-        // one; no-op on native (and every quiet frame on web).
+        // Installs an async File > Load result if a web task delivered one;
+        // no-op otherwise.
         self.with_io(|io, app| io.poll_pending_load(app));
 
         self.active_mut().advance_clock(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            // Exits the process on native; no-op on web (the canvas just stops).
+            // Exits the process on native; no-op on web.
             platform::quit();
         }
     }
@@ -1506,16 +1378,12 @@ impl eframe::App for OsmilogApp {
         }
 
         self.show_menu_bar(ui, theme);
-
-        // ROM/RAM contents editor windows, drawn while open.
         self.active_mut().show_memory_editors(&ctx);
 
-        // "New Circuit" name dialog, drawn while it's open (covers both a
-        // plain blank circuit and extracting a bulk selection into one).
+        // Covers both a blank circuit and an extracted bulk selection.
         self.create_extract_circuit_dialog(&ctx);
 
-        // Draws the web "Save As" filename modal while it's open (and completes
-        // the download on confirm); no-op on native.
+        // Web-only "Save As" modal; completes the download on confirm.
         // TODO: Figure out if this weird closure stuff is necessary
         self.with_io(|io, app| io.drive_save_dialog(&ctx, app));
 
@@ -1523,12 +1391,9 @@ impl eframe::App for OsmilogApp {
             .min_size(200.0)
             .resizable(true)
             .show(ui, |ui| {
-                // Top half: the component palette (formerly the Add menu).
-                // Bottom half: the properties panel for the current selection.
-                // The split is a resizable inner top panel; each half scrolls.
-                // A min height of half the left panel keeps the palette from
-                // shrinking (and re-laying-out the split) as submenus collapse,
-                // and leaves less to scroll.
+                // Palette on top, properties panel below, in a resizable
+                // split. Min height of half the panel keeps the palette from
+                // shrinking as submenus collapse.
                 let half = ui.available_height() * 0.5;
                 egui::Panel::top("component_palette")
                     .resizable(true)
@@ -1558,8 +1423,7 @@ impl eframe::App for OsmilogApp {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let clip_rect = painter.clip_rect();
 
-        // Update the camera (middle-drag pan, Ctrl+scroll zoom) before drawing so
-        // the change applies this same frame.
+        // Updates before drawing so the change applies this same frame.
         self.active_mut().camera.handle_input(&response, &ctx);
         let camera = self.active().camera;
 
@@ -1579,13 +1443,8 @@ impl eframe::App for OsmilogApp {
 
 // ── Geometry ─────────────────────────────────────────────────────────────────
 
-// Extracts one document's visual records into the
-// index-based entry vectors io.rs persists: PlacedCompKey/PlacedTunnelKey/
-// WireNodeKey become positions in the emitted Vecs, so cross-references are
-// plain indices rather than ephemeral slotmap keys. Tombstones (kept for undo)
-// never reach a file. Also returns the PlacedCompKey -> component-index map, so
-// `circuit_entry_of` can emit per-component references (subcircuit links) by
-// index.
+// Turns slotmap keys into plain vector indices for io.rs's persisted format.
+// Tombstones never reach a file.
 // FIXME: This doesn't use SlotMaps anymore
 fn extract_records(
     components: &HashMap<PlacedCompKey, PlacedComponent>,
@@ -1619,9 +1478,8 @@ fn extract_records(
         })
         .collect();
 
-    // WireNodeKey -> position in `nodes`, so segments can reference nodes by
-    // index. Built before `segments` reads it. Active segments only reference
-    // active nodes, so every SegEntry lookup below resolves.
+    // WireNodeKey to its index in `nodes`, built first so `segments` below
+    // can resolve every lookup.
     let mut node_index: HashMap<crate::gui::wiring::WireNodeKey, usize> = HashMap::new();
     let node_entries: Vec<NodeEntry> = wiring
         .nodes
@@ -1680,8 +1538,7 @@ pub(crate) fn component_bounding_rect(pc: &PlacedComponent, camera: Camera) -> R
     )
 }
 
-// Grid coordinate of a pin: the component's grid_pos plus the anchor's whole-cell
-// offset. This is the wiring counterpart of comp_pin_pos (which returns pixels).
+// The wiring counterpart of comp_pin_pos, in grid cells instead of pixels.
 pub(crate) fn pin_grid_pos(shape: &ComponentShape, grid_pos: GridPos, pin: PinId) -> GridPos {
     let anchor = match pin {
         PinId::In(InIdx(i)) => &shape.input_anchors[i as usize],
@@ -1693,7 +1550,6 @@ pub(crate) fn pin_grid_pos(shape: &ComponentShape, grid_pos: GridPos, pin: PinId
     }
 }
 
-// Grid coordinate of a tunnel's single pin.
 pub(crate) fn tunnel_pin_grid(pt: &PlacedTunnel) -> GridPos {
     let shape = tunnel_shape(pt.role);
     let anchor = match pt.role {
@@ -1706,8 +1562,6 @@ pub(crate) fn tunnel_pin_grid(pt: &PlacedTunnel) -> GridPos {
     )
 }
 
-// The screen-space rectangle spanned by a BulkSelect drag's two grid corners,
-// normalized so either drag direction yields the same box.
 // Takes an already-computed ComponentShape (not &PlacedComponent) so callers
 // needing multiple pins from one component compute shape() once and reuse it.
 pub(crate) fn comp_pin_pos(
@@ -1772,8 +1626,7 @@ pub(crate) fn pin_at_pos<'a>(
     }
     None
 }
-// A tunnel's single pin under `pos`, regardless of role - a wire can now both
-// start and end on either a Feed or a Pull tunnel.
+// Regardless of role - a wire can start or end on either a Feed or a Pull tunnel.
 pub(crate) fn tunnel_pin_at_pos<'a>(
     tunnels: impl Iterator<Item = (&'a PlacedTunnelKey, &'a PlacedTunnel)>,
     camera: Camera,
@@ -1799,8 +1652,6 @@ mod tests {
         app.place_component(spec, GridPos::new(0, 0))
     }
 
-    // Insert a wire (one segment) between two component pins, positioned at each
-    // pin's grid cell, and return the two node keys.
     fn connect_pins(app: &mut OsmilogApp, a: (PlacedCompKey, PinId), b: (PlacedCompKey, PinId)) {
         let pa = pin_grid_pos(
             &app.active().components[&a.0].shape,
@@ -1825,8 +1676,7 @@ mod tests {
 
     #[test]
     fn test_circuit_file_save_reflects_live_graph_after_delete() {
-        // A wiring delete removes nodes/segments outright (no tombstones), and
-        // the save file reflects exactly the live graph.
+        // A wiring delete removes nodes/segments outright (no tombstones).
         let mut app = OsmilogApp::empty();
         let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let g = place(
@@ -1842,8 +1692,8 @@ mod tests {
         connect_pins(&mut app, (g, PinId::output(0)), (o, PinId::input(0)));
         app.active_mut().rebuild_circuit();
 
-        // Delete the a->g wire; its nodes/segment are removed outright, so the
-        // maps hold no leftover tombstones.
+        // Delete the a->g wire; its nodes/segment are removed outright - no
+        // leftover tombstones.
         let seg = app
             .active()
             .wiring
@@ -1951,7 +1801,6 @@ mod tests {
         app.active_mut().selected = Some(Selection::Single(Selected::Component(a)));
         app.copy_selection();
 
-        // Undo the original placement: its record is now removed.
         app.active_mut().undo();
         assert!(!app.active().components.contains_key(&a));
 
@@ -1971,7 +1820,6 @@ mod tests {
         app.active_mut().selected = Some(Selection::Single(Selected::Component(a)));
         app.copy_selection();
 
-        // Move the original after copying.
         app.active_mut().components.get_mut(&a).unwrap().grid_pos = GridPos::new(100, 100);
 
         app.paste_clipboard();
@@ -2052,13 +1900,12 @@ mod tests {
 
         app.create_document("C2".to_string());
 
-        // A second document exists and is now active, with a blank canvas.
         assert_eq!(app.documents.len(), 2);
         assert_eq!(app.doc_order.len(), 2);
         assert_ne!(app.active_id, main);
         assert_eq!(app.documents[app.active_id].name, "C2");
         assert!(app.active().components.is_empty());
-        // The previous document's records are untouched, still reachable by key.
+        // The previous document's records stay reachable by key.
         assert_eq!(app.documents[main].state.components.len(), 1);
     }
 
@@ -2067,7 +1914,7 @@ mod tests {
         let mut app = OsmilogApp::empty();
         let main = app.active_id;
 
-        // Build a settled AND-of-two-highs -> Output on "Main".
+        // Settled AND-of-two-highs -> Output on "Main".
         let a = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let b = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let g = place(
@@ -2086,13 +1933,11 @@ mod tests {
         let o_key = app.active().components[&o].key;
         assert_eq!(app.active().circuit.read_output(o_key), Value::ONE);
 
-        // Create + switch to a blank second circuit: Main's contents vanish
-        // from the live fields.
+        // Main's contents vanish from the live fields once parked.
         app.create_document("C2".to_string());
         assert!(app.active().components.is_empty());
 
-        // Switch back: Main's components and settled net values return intact,
-        // without a rebuild (the parked circuit kept its nets).
+        // Values return without a rebuild - the parked circuit kept its nets.
         app.switch_document(main);
         assert_eq!(app.active_id, main);
         assert_eq!(app.active().components.len(), 4);
@@ -2136,8 +1981,8 @@ mod tests {
         assert_eq!(app.active().components[&sub].spec.n_inputs(), 1);
         assert_eq!(app.active().components[&sub].spec.n_outputs(), 1);
 
-        // Drive it end-to-end: C2 Input(=1) -> sub -> C2 Output. The passthrough
-        // subcircuit settles a 1 out through the boundary.
+        // C2 Input(=1) -> sub -> C2 Output; the passthrough settles a 1
+        // through the boundary.
         let x = place(&mut app, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let y = place(&mut app, ComponentSpec::Output);
         connect_pins(&mut app, (x, PinId::output(0)), (sub, PinId::input(0)));
@@ -2255,10 +2100,8 @@ mod tests {
 
     #[test]
     fn test_load_project_file_upgrades_legacy_v2() {
-        // A hand-built v2 single-circuit file: Input(1) -> Output. (The
-        // upgrade itself - LegacyV2File -> one-circuit ProjectFile - is
-        // covered in crate::io's own tests; this checks that OsmilogApp loads
-        // the upgraded project and simulates it correctly.)
+        // A hand-built v2 file. The upgrade itself is tested in crate::io;
+        // this checks the app loads and simulates it.
         let v2 = crate::io::LegacyV2File {
             version: crate::io::LEGACY_SINGLE_CIRCUIT_VERSION,
             snapshot: CircuitSnapshot {
@@ -2344,8 +2187,8 @@ mod tests {
         let json = file.to_json().unwrap();
         let file2 = ProjectFile::from_json(&json).unwrap();
 
-        // After reload (C2 active), the subcircuit rebinds to the reloaded Main
-        // and the whole thing still settles a 1 through the boundary.
+        // After reload, the subcircuit rebinds to the reloaded Main and
+        // still settles a 1.
         let mut loaded = OsmilogApp::empty();
         loaded.load_project_file(&file2).unwrap();
         let sub_reloaded = loaded
@@ -2368,10 +2211,9 @@ mod tests {
 
     #[test]
     fn test_project_file_subcircuit_forward_reference_round_trip() {
-        // The referencing circuit (Main, index 0) refers to a *later*-indexed
-        // circuit (C2, index 1), so on load Main is populated while C2 is still
-        // blank. The placed subcircuit must still get its cached pin arity (not
-        // a 0-pin placeholder) or wiring to it panics.
+        // Main (index 0) refers to the later C2 (index 1), so C2 is still
+        // blank when Main loads. The subcircuit must still get its cached pin
+        // arity, not a 0-pin placeholder.
         let mut app = OsmilogApp::empty();
         let main = app.active_id;
 

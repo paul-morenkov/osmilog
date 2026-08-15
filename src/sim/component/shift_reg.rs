@@ -1,11 +1,9 @@
 use super::{SeqLogic, SeqState};
 use crate::sim::value::Value;
 
-// Shift register config. The pin layout depends on `parallel_load` and
-// `num_stages`, so (unlike RegConf's fixed pin indices) the pin-index
-// accessors below are methods rather than associated consts. The serial
-// DATA_PIN is present in both modes (parallel_load only adds the per-stage
-// load inputs alongside it, never replaces it), so it alone stays a const.
+// Pin layout depends on `parallel_load`/`num_stages`, so pin indices are
+// methods rather than associated consts, except DATA_PIN which is fixed in
+// both modes.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShiftRegConf {
     pub data_width: u8,
@@ -14,7 +12,6 @@ pub struct ShiftRegConf {
 }
 
 impl ShiftRegConf {
-    // Serial data input: feeds stage 0 on a shift, in both modes.
     pub const DATA_PIN: usize = 0;
 
     pub fn shift_pin(&self) -> usize {
@@ -29,13 +26,10 @@ impl ShiftRegConf {
         self.parallel_load.then_some(1)
     }
 
-    // Per-stage parallel-load input, only meaningful when parallel_load.
     pub fn stage_pin(&self, i: usize) -> usize {
         3 + i
     }
 
-    // Asynchronous reset: forces every stage to zero the instant it's held
-    // (via observe/apply_async), regardless of clock, shift, or load.
     pub fn reset_pin(&self) -> usize {
         if self.parallel_load {
             3 + self.num_stages
@@ -92,8 +86,7 @@ impl ShiftRegConf {
 #[derive(Debug)]
 pub struct ShiftReg {
     conf: ShiftRegConf,
-    // stages[0] is the first stage (fed directly by DATA_PIN on a shift),
-    // stages[num_stages - 1] is the last (the sole output in serial mode).
+    // stages[num_stages - 1] is the sole output in serial mode.
     stages: Vec<Value>,
 }
 
@@ -114,7 +107,6 @@ impl ShiftReg {
         vec![Value::new(0, self.conf.data_width); self.conf.num_stages]
     }
 
-    // Shifts every stage toward the end and feeds `data` into stage 0.
     fn shift_in(&mut self, data: Value) {
         for i in (1..self.conf.num_stages).rev() {
             self.stages[i] = self.stages[i - 1];
@@ -133,8 +125,7 @@ impl SeqLogic for ShiftReg {
     }
 
     fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
-        // Async reset dominates everything else, and destroys the latched
-        // stages so the clear persists after the reset pin is released.
+        // Async reset dominates everything else.
         if matches!(inputs[self.conf.reset_pin()], Value::ONE) {
             self.stages = self.zeroed_stages();
             return self.observe();
@@ -160,10 +151,8 @@ impl SeqLogic for ShiftReg {
     }
 
     fn apply_async(&mut self, inputs: &[Value]) {
-        // Async reset: while held (exactly ONE) it destroys the latched
-        // stages, so the clear takes effect during settle() with no clock
-        // tick and persists after the pin is released. Idempotent -
-        // re-clearing already-zero stages leaves them zero.
+        // Clears immediately while held, so the reset takes effect during
+        // settle() with no clock tick.
         if matches!(inputs[self.conf.reset_pin()], Value::ONE) {
             self.stages = self.zeroed_stages();
         }
@@ -248,12 +237,11 @@ mod tests {
         sr.tick(&serial_ins(Value::new(5, 4), Value::ONE, Value::ZERO)); // stages [5, 9]
         assert_eq!(sr.observe(), vec![Value::new(9, 4)]);
 
-        // shift = 0: holds, regardless of data changing.
         assert_eq!(
             sr.tick(&serial_ins(Value::new(1, 4), Value::ZERO, Value::ZERO)),
             vec![Value::new(9, 4)]
         );
-        // shift = Floating: also holds - only exactly ONE shifts.
+        // Floating shift also holds; only exactly ONE shifts.
         assert_eq!(
             sr.tick(&serial_ins(Value::new(1, 4), Value::Floating, Value::ZERO)),
             vec![Value::new(9, 4)]
@@ -280,7 +268,6 @@ mod tests {
         let mut sr = new_shift_reg(4, 2, false);
         sr.tick(&serial_ins(Value::new(9, 4), Value::ONE, Value::ZERO));
 
-        // reset=1 dominates shift=1: clears instead of shifting in 5.
         assert_eq!(
             sr.tick(&serial_ins(Value::new(5, 4), Value::ONE, Value::ONE)),
             vec![Value::new(0, 4)]
@@ -329,9 +316,9 @@ mod tests {
             Value::ZERO,
             &stages,
             Value::ZERO,
-        )); // load [1, 2, 3]
+        ));
 
-        // shift=1, load=0: shifts in `data` at stage 0, others shift up.
+        // stage0 <- data; other stages shift up.
         assert_eq!(
             sr.tick(&pl_ins(
                 Value::new(9, 4),
@@ -356,7 +343,6 @@ mod tests {
             Value::ZERO,
         ));
 
-        // load=1 and shift=1 together: load wins, shift is ignored entirely.
         let loaded = [Value::new(7, 4), Value::new(8, 4)];
         assert_eq!(
             sr.tick(&pl_ins(

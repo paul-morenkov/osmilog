@@ -21,7 +21,6 @@ impl CombLogic for Divider {
     }
 
     fn n_outputs(&self) -> usize {
-        // Quotient and remainder
         2
     }
 
@@ -94,7 +93,6 @@ mod tests {
     #[test]
     fn test_quotient_and_remainder_no_carry() {
         let d = divider(4);
-        // 7 / 2 = 3 remainder 1
         assert_eq!(
             d.evaluate(&[Value::new(7, 4), Value::new(2, 4), Value::new(0, 4)]),
             vec![Value::new(3, 4), Value::new(1, 4)]

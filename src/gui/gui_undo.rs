@@ -5,22 +5,15 @@ use crate::gui::placed_component::PlacedComponent;
 use crate::gui::wiring::{NodeAttach, WireNodeKey, WiringDelta};
 use crate::sim::component::{CompKey, ComponentSpec};
 
-// Undo data for a GUI-level (Wiring/geometry) edit, recorded onto the same
-// gui::history::History stack. Every Wiring mutator's inverse is just "replay
-// this delta backwards", so OsmilogApp calls the Wiring methods directly and
-// hands the returned WiringDelta to edit_wiring.
+// Undo data for a GUI-level (Wiring/geometry) edit, on the same gui::history::History stack.
 #[derive(Debug)]
 pub enum GuiUndoAction {
-    // Undoes any Wiring-graph edit via the delta it captured.
-    // `forward` picks the replay direction so the same
-    // delta serves undo (false, runs undo_delta) and redo (true, runs
-    // redo_delta) across the two stacks; apply_gui_undo flips it each time.
+    // `forward` picks undo_delta (false) or redo_delta (true); apply_gui_undo flips it each time.
     WiringDelta {
         delta: WiringDelta,
         forward: bool,
     },
-    //  `grid_pos` is overwritten every drag frame, so by drag-end
-    // there's no "before" state left except the drag-start original_grid_pos.
+    // `grid_pos` is overwritten every drag frame, so only the drag-start pos survives to undo.
     MoveComponent {
         key: PlacedCompKey,
         old_pos: GridPos,
@@ -29,17 +22,13 @@ pub enum GuiUndoAction {
         key: PlacedTunnelKey,
         old_pos: GridPos,
     },
-    // Free-attached wire node dragged along with a bulk selection (see
-    // OsmilogApp::free_wire_nodes/interact_component_drag) - same
-    // overwritten-every-frame rationale as MoveComponent/MoveTunnel above.
+    // A Free-attached wire node dragged along with a bulk selection.
     MoveWireNode {
         key: WireNodeKey,
         old_pos: GridPos,
     },
 
-    // Place/delete of a component record. The record is genuinely
-    // inserted/removed; `InsertComponent` carries the moved-out payload so
-    // undo/redo shuttle it between the map and the history entry.
+    // `InsertComponent` carries the moved-out payload; undo/redo shuttle it in and out of the map.
     InsertComponent {
         key: PlacedCompKey,
         comp: Box<PlacedComponent>,
@@ -47,7 +36,6 @@ pub enum GuiUndoAction {
     RemoveComponent {
         key: PlacedCompKey,
     },
-    // Place/delete of a tunnel record (see InsertComponent/RemoveComponent).
     InsertTunnel {
         key: PlacedTunnelKey,
         tunnel: Box<PlacedTunnel>,
@@ -55,14 +43,12 @@ pub enum GuiUndoAction {
     RemoveTunnel {
         key: PlacedTunnelKey,
     },
-    // reconfigure_component swaps the whole underlying record (a new CompKey and
-    // ComponentSpec, keeping grid_pos/active); this restores the old pair.
+    // Restores the pre-reconfigure (CompKey, ComponentSpec) pair.
     SwapComponentSpec {
         key: PlacedCompKey,
         comp_key: CompKey,
         spec: ComponentSpec,
     },
-    // Properties-panel tunnel rename edits the record's label field directly.
     SetTunnelLabel {
         key: PlacedTunnelKey,
         label: String,
@@ -70,7 +56,6 @@ pub enum GuiUndoAction {
 }
 
 impl Document {
-    // Records a Wiring edit's delta into history, iff it changed anything.
     // The GUI counterpart of Document::apply() for the Command path.
     pub(crate) fn edit_wiring(&mut self, delta: WiringDelta) {
         if !delta.is_empty() {
@@ -81,10 +66,8 @@ impl Document {
         }
     }
 
-    // Applies one GUI undo action and returns the action that reverses *this*
-    // application (recorded on the opposite stack) - the GUI counterpart of
-    // Circuit::apply_undo. Does not settle or rebuild nets; refresh_after_history
-    // does that once after the whole entry is applied.
+    // Returns the reversing action, for the opposite stack. Does not settle or rebuild
+    // nets; refresh_after_history does that once after the whole entry is applied.
     pub(crate) fn apply_gui_undo(&mut self, action: GuiUndoAction) -> GuiUndoAction {
         match action {
             GuiUndoAction::WiringDelta { delta, forward } => {
@@ -175,9 +158,7 @@ impl Document {
         }
     }
 
-    // Records a completed component/tunnel drag-move, if it actually moved.
-    // Called once from ComponentDrag's drag_stopped handling; see
-    // GuiUndoAction::MoveComponent/MoveTunnel for why this bypasses edit_wiring.
+    // Called once from ComponentDrag's drag_stopped handling, if it actually moved.
     pub(crate) fn commit_move(&mut self, key: crate::gui::app::Selected, old_pos: GridPos) {
         use crate::gui::app::Selected;
         match key {
@@ -201,9 +182,7 @@ impl Document {
         }
     }
 
-    // Records a completed Free-wire-node drag-move, if it actually moved.
-    // The wire-node counterpart of commit_move, for the Free elbow nodes
-    // interact_component_drag carries along with a bulk selection.
+    // The wire-node counterpart of commit_move.
     pub(crate) fn commit_wire_node_move(&mut self, key: WireNodeKey, old_pos: GridPos) {
         if self.wiring.nodes[&key].pos != old_pos {
             self.history
@@ -211,9 +190,7 @@ impl Document {
         }
     }
 
-    // Draws a wire route and relinks the circuit as one undo entry: batches
-    // the Wiring-graph change with rebuild_circuit's net relink into one
-    // HistoryEntry::Batch instead of two separate entries.
+    // Batches the wiring change with rebuild_circuit's net relink into one undo entry.
     pub(crate) fn commit_wire_route(
         &mut self,
         points: Vec<GridPos>,
@@ -236,8 +213,7 @@ mod tests {
     use crate::gui::wiring::Wiring;
     use crate::sim::component::PinId;
 
-    // These keys are only used as Wiring pin attachments in tests; any distinct
-    // values suffice.
+    // Only used as Wiring pin attachments in tests; any distinct values suffice.
     fn comp_keys(n: usize) -> Vec<PlacedCompKey> {
         (0..n as u64).map(PlacedCompKey).collect()
     }
@@ -286,8 +262,7 @@ mod tests {
             let seg = w.segments.keys().next().unwrap();
             *seg
         };
-        // The segment key belongs to a different Wiring; app.wiring is empty, so
-        // delete produces an empty delta.
+        // Belongs to a different Wiring; app.wiring is empty, so this is a no-op.
         let delta = app.active_mut().wiring.delete_segment(missing);
         app.active_mut().edit_wiring(delta);
         assert_eq!(app.active().history.len(), 0);

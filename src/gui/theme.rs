@@ -1,9 +1,7 @@
 use egui::{Color32, Visuals};
 
-// Canvas colors derived from the ambient egui theme so light/dark switches
-// (including live OS theme changes) are picked up automatically. Recompute
-// once per frame via `Theme::from_visuals` rather than caching - it's just a
-// handful of Color32 copies.
+// Recomputed once per frame via `from_visuals` (cheap) so theme switches, including
+// live OS ones, are picked up automatically.
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub canvas_bg: Color32,
@@ -17,9 +15,7 @@ pub struct Theme {
     pub ghost_preview: Color32,
     pub wire_drag_preview: Color32,
     pub value_floating: Color32,
-    // Signal colors are fixed rather than theme-derived: they encode circuit
-    // data (logic low/high), not UI chrome, so they stay constant across
-    // light/dark. Kept here anyway so every color decision lives in one place.
+    // Fixed, not theme-derived: encodes circuit data, so it stays constant across light/dark.
     pub value_low: Color32,
     pub value_high: Color32,
     pub value_invalid: Color32,
