@@ -34,6 +34,7 @@ use crate::gui::gui_undo::GuiUndoAction;
 use crate::gui::history::{History, HistoryEntry};
 use crate::gui::memory_editor::{MemKind, MemoryEditor};
 use crate::gui::placed_component::PlacedComponent;
+use crate::gui::signal_viewer::{SignalLog, SignalViewer};
 use crate::gui::theme::Theme;
 use crate::gui::utils::CanvasCtx;
 use crate::gui::wiring::{NodeAttach, WireNodeKey, WireSegKey, Wiring};
@@ -42,13 +43,10 @@ use crate::sim::command::{Command, CommandOutput};
 use crate::sim::component::{CompKey, Component, ComponentSpec, PinId};
 use crate::sim::value::Value;
 
-/// Stable identity of a circuit document, independent of display order, and the
-/// handle `ComponentSpec::Subcircuit` references. Defined in `sim::component`
-/// (so the spec can embed it without a gui dependency) and re-exported here,
-/// where the document registry lives.
+/// Defined in `sim::component` so `ComponentSpec::Subcircuit` can embed it without a gui
+/// dependency.
 pub use crate::sim::component::DocId;
 
-/// One circuit document: its display name plus its state.
 pub struct CircuitDoc {
     pub(crate) name: String,
     pub(crate) state: Document,
@@ -63,17 +61,13 @@ impl CircuitDoc {
     }
 }
 
-/// Default name suggested for a new circuit, e.g. "Circuit 2" for the second
-/// document. Only a suggestion (prefilled into the dialog / used when the user
-/// clears the field) - names aren't required to be unique; identity is the `DocId`.
+/// Only a suggestion, prefilled into the dialog. Names need not be unique; identity is the
+/// `DocId`.
 pub(crate) fn default_new_circuit_name(documents: &SlotMap<DocId, CircuitDoc>) -> String {
     format!("Circuit {}", documents.len() + 1)
 }
-/// The per-circuit ("document") state. Every document - active or not - holds
-/// exactly one of these directly in its `CircuitDoc::state`; there's no
-/// separate "live" copy the active document promotes into. `OsmilogApp::
-/// active()`/`active_mut()` reach the active document's fields by indexing
-/// `documents[active_id]`.
+/// Every document holds one of these directly; there is no separate "live" copy the active
+/// document promotes into.
 pub struct Document {
     pub(crate) circuit: Circuit,
     pub(crate) history: History,
@@ -88,16 +82,15 @@ pub struct Document {
     pub(crate) camera: Camera,
     pub(crate) selected: Option<Selection>,
     pub(crate) clock: Clock,
+    // Runtime-only probe history + viewer UI state; never saved.
+    pub(crate) signal_log: SignalLog,
+    pub(crate) signal_viewer: SignalViewer,
     pub(crate) memory_editor: MemoryEditor,
-    // Per-document settle() error surface (an oscillation, a tunnel conflict,
-    // ...). Distinct from OsmilogApp::io_error, which is reserved for File >
-    // Save/Load I/O failures - the menu bar shows whichever is set (I/O errors
-    // take priority; see the "Menu bar" section of OsmilogApp::ui).
+    // Distinct from OsmilogApp::io_error; the menu bar shows I/O errors first.
     pub(crate) settle_error: Option<String>,
 }
 
 impl Document {
-    /// A fresh blank document - the same per-circuit initial values `empty()` uses.
     pub(crate) fn blank() -> Self {
         Self {
             circuit: Circuit::new(),
@@ -111,24 +104,21 @@ impl Document {
             camera: Camera::default(),
             selected: None,
             clock: Clock::default(),
+            signal_log: SignalLog::default(),
+            signal_viewer: SignalViewer::default(),
             memory_editor: MemoryEditor::default(),
             settle_error: None,
         }
     }
 
-    // True while a clock run session is active (Playing or Paused): structural
-    // edits (widths, arity, wiring, add/delete) are locked for its whole
-    // duration. Only Stop returns to editable. Both lock predicates live here
-    // (not just on OsmilogApp) so the properties panel can gate its widgets
-    // from a bare `&Document` - see OsmilogApp::editing_locked, which delegates.
+    // True while a clock run is active (Playing or Paused); structural edits
+    // stay locked until Stop.
     pub(crate) fn editing_locked(&self) -> bool {
         self.clock.run != ClockRun::Stopped
     }
 
-    // True while live *value* edits must be blocked - an Input's bits, a ROM's
-    // or RAM's contents. Carved out of the lock while Paused (a paused run is
-    // frozen structurally but still pokeable), so this is true only while
-    // actively Playing. See OsmilogApp::value_editing_locked, which delegates.
+    // True only while Playing; a Paused run still allows value pokes (Input
+    // bits, ROM/RAM contents). See OsmilogApp::value_editing_locked.
     pub(crate) fn value_editing_locked(&self) -> bool {
         self.clock.run == ClockRun::Playing
     }
@@ -143,38 +133,70 @@ impl Document {
         }
     }
 
-    // Advances the clock exactly one tick and records the settle result. See
-    // Clock::step - untracked, so it never lands on the undo stack. Used by both
-    // the Step button and the auto-advance loop in logic().
+    // Untracked: never lands on the undo stack (see Clock::step). Records one
+    // probe sample on a successful tick.
     pub(crate) fn tick_once(&mut self) {
         let result = self.clock.step(&mut self.circuit);
+        let ok = result.is_ok();
         self.record_settle_result(result);
-    }
-
-    // Stops the clock (see Clock::stop): resets all sequential state to its
-    // power-on value and returns to the editable Stopped state.
-    pub(crate) fn stop_clock(&mut self) {
-        let result = self.clock.stop(&mut self.circuit);
-        self.record_settle_result(result);
-    }
-
-    // Auto-advances the clock while Playing, bridging the frame clock
-    // (ctx.input(|i| i.time), wasm-safe) and repaint request into Clock::advance
-    // and recording the last-fired tick's settle result. All cadence logic lives
-    // on Clock.
-    pub(crate) fn advance_clock(&mut self, ctx: &egui::Context) {
-        let now = ctx.input(|i| i.time);
-        let result = self.clock.advance(&mut self.circuit, now, |wait| {
-            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
-        });
-        if let Some(result) = result {
-            self.record_settle_result(result);
+        if ok {
+            self.sample_probes();
         }
     }
 
-    // Applies a Command and records its UndoAction into history in one place;
-    // callers use it exactly like circuit.apply() (same CommandOutput/unwrap_*
-    // chaining) without touching the undo data themselves.
+    // Resets all sequential state to its power-on value (see Clock::stop) and
+    // clears the probe history so the next run starts clean.
+    pub(crate) fn stop_clock(&mut self) {
+        let result = self.clock.stop(&mut self.circuit);
+        self.record_settle_result(result);
+        self.signal_log.clear();
+    }
+
+    // Bridges the frame clock (wasm-safe) into the cadence math on Clock, then
+    // fires and samples each due tick here so every tick lands in the history
+    // (Clock::poll may report several ticks in one late frame). Auto-pauses on a
+    // settle failure so we don't hammer a broken circuit every frame.
+    pub(crate) fn advance_clock(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let n_ticks = self.clock.poll(now, |wait| {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
+        });
+        for _ in 0..n_ticks {
+            let result = self.clock.step(&mut self.circuit);
+            let failed = result.is_err();
+            self.record_settle_result(result);
+            if failed {
+                self.clock.pause();
+                return;
+            }
+            self.sample_probes();
+        }
+    }
+
+    // Appends the current value of every placed Probe to the signal log, one
+    // sample per clock tick. Reads three disjoint Document fields.
+    pub(crate) fn sample_probes(&mut self) {
+        let samples: Vec<(PlacedCompKey, Value)> = self
+            .components
+            .iter()
+            .filter(|(_, pc)| matches!(pc.spec, ComponentSpec::Probe(_)))
+            .map(|(&k, pc)| (k, self.circuit.read_output(pc.key)))
+            .collect();
+        self.signal_log.record(&samples);
+    }
+
+    // A suggested unique-ish name for a newly placed probe. Names need not be
+    // unique (like tunnels), so this is only a convenience default.
+    pub(crate) fn next_probe_name(&self) -> String {
+        let n = self
+            .components
+            .values()
+            .filter(|pc| matches!(pc.spec, ComponentSpec::Probe(_)))
+            .count();
+        format!("probe{}", n + 1)
+    }
+
+    // Like circuit.apply(), but also records the UndoAction into history.
     pub(crate) fn apply(&mut self, command: Command) -> CommandOutput {
         let (output, undo) = self.circuit.apply(command);
         self.history.push_sim(undo);
@@ -183,12 +205,8 @@ impl Document {
 
     // ── Undo / redo ───────────────────────────────────────────────────────────
 
-    // Applies one history entry (reversing what it recorded) and returns the
-    // entry that reverses *this* application, for the opposite stack - undo
-    // and redo are the same operation in opposite directions.
-    //
-    // A Batch applies child-last-first; the collected inverses reproduce the
-    // original order, so redo of an undone batch replays it forward.
+    // Reverses one entry, returning its inverse for the opposite stack. A Batch
+    // applies child-last-first, so the inverses replay in original order.
     fn apply_entry(&mut self, entry: HistoryEntry) -> HistoryEntry {
         match entry {
             HistoryEntry::Sim(action) => HistoryEntry::Sim(self.circuit.apply_undo(action)),
@@ -204,7 +222,6 @@ impl Document {
         }
     }
 
-    // Reverses the most recent edit, moving its inverse onto the redo stack.
     pub(crate) fn undo(&mut self) {
         if let Some(entry) = self.history.pop_undo() {
             let inverse = self.apply_entry(entry);
@@ -213,8 +230,6 @@ impl Document {
         }
     }
 
-    // Re-applies the most recently undone edit, moving its inverse back onto the
-    // undo stack.
     pub(crate) fn redo(&mut self) {
         if let Some(entry) = self.history.pop_redo() {
             let inverse = self.apply_entry(entry);
@@ -223,10 +238,8 @@ impl Document {
         }
     }
 
-    // Restores derived state after an undo/redo: re-sync wire-node geometry
-    // (needed for a move-undo, whose MoveComponent carries no wiring delta),
-    // clear any selection that may now point at a tombstoned record, then
-    // rebuild the circuit's nets + settle.
+    // Resyncs wire-node geometry (MoveComponent carries no wiring delta),
+    // clears stale selection, and rebuilds nets.
     fn refresh_after_history(&mut self) {
         let comp_keys: Vec<_> = self.components.keys().copied().collect();
         for k in comp_keys {
@@ -240,10 +253,8 @@ impl Document {
         self.rebuild_circuit();
     }
 
-    // (Split from the old place_component: the Component is built by
-    // OsmilogApp::instantiate, which needs the document registry for
-    // subcircuits and so can't live here - see OsmilogApp::place_component.
-    // This only handles the per-document record/undo bookkeeping.)
+    // comp is built by OsmilogApp::instantiate (needs the document registry
+    // for subcircuits); this only does per-document bookkeeping.
     pub(crate) fn place_component(
         &mut self,
         comp: Component,
@@ -256,21 +267,17 @@ impl Document {
         let pc_key = PlacedCompKey(self.next_placed_comp);
         self.next_placed_comp += 1;
         self.components.insert(pc_key, pc);
-        // Record the placement's undo: remove this record. Its InsertComponent
-        // inverse carries it back for redo. Paired with the Sim RemoveComponent
-        // already recorded by apply() above, so undo both drops the circuit
-        // component and removes the visual record.
+        // Undo removes this record; paired with the Sim RemoveComponent already
+        // recorded above.
         self.history
             .push_gui(GuiUndoAction::RemoveComponent { key: pc_key });
         self.history.end_batch();
         pc_key
     }
 
-    // Swaps a placed component's parameters. PlacedCompKey stays stable, so
-    // attached wires survive - we only drop wire nodes for pins the new arity
-    // no longer has, re-sync the rest, then rebuild. `new_comp` is built by the
-    // caller (`OsmilogApp::reconfigure_component`) via `instantiate`, the one
-    // step needing the document registry a `Document` doesn't have.
+    // PlacedCompKey stays stable so wires survive; only pins the new arity
+    // drops lose their wire nodes. new_comp is built by the caller via
+    // instantiate (needs the document registry).
     pub(crate) fn reconfigure_component(
         &mut self,
         pc_key: PlacedCompKey,
@@ -285,9 +292,8 @@ impl Document {
         self.history.begin_batch();
         self.apply(Command::RemoveComponent(old_key));
         let new_key = self.apply(Command::comp(new_comp)).unwrap_comp();
-        // Record the record swap's undo before overwriting: restores the old
-        // CompKey + def (the Sim actions above re-insert the old circuit comp
-        // and remove the new one, but the record itself needs restoring).
+        // Undo restores the old CompKey + spec; the Sim actions above only
+        // handle the circuit component.
         let old_spec = self
             .components
             .insert(pc_key, PlacedComponent::new(new_key, new_spec, grid_pos))
@@ -312,9 +318,8 @@ impl Document {
         self.place_tunnel_labeled(label, role, grid_pos)
     }
 
-    // Shared by place_tunnel (auto-generated label) and install_circuit_records
-    // (label restored from a saved file - tunnels connect to each other by
-    // matching label, so a loaded tunnel must keep its exact saved label).
+    // Shared by place_tunnel (auto label) and install_circuit_records (saved
+    // label) - tunnels connect by matching label.
     pub(crate) fn place_tunnel_labeled(
         &mut self,
         label: String,
@@ -337,32 +342,21 @@ impl Document {
         let pt_key = PlacedTunnelKey(self.next_placed_tunnel);
         self.next_placed_tunnel += 1;
         self.tunnels.insert(pt_key, pt);
-        // Record the placement's undo: remove this record (paired with the Sim
-        // RemoveTunnel from apply() above).
+        // Undo removes this record; paired with the Sim RemoveTunnel recorded
+        // above.
         self.history
             .push_gui(GuiUndoAction::RemoveTunnel { key: pt_key });
         self.history.end_batch();
         pt_key
     }
 
-    // Live (non-tombstoned) placed components/tunnels, mirroring
-    // Wiring::active_nodes/active_segments. Raw indexing on a known-live key
-    // is still fine - a tombstone is simply never iterated.
-    // FIXME: Remove this, it's unnecessary
-    // pub(crate) fn active_components(
-    //     &self,
-    // ) -> impl Iterator<Item = (PlacedCompKey, &PlacedComponent)> {
-    //     self.components.iter().map(|(k, pc)| (*k, pc))
-    // }
-
+    // Live tunnels only, mirroring Wiring::active_nodes/active_segments.
     pub(crate) fn active_tunnels(&self) -> impl Iterator<Item = (PlacedTunnelKey, &PlacedTunnel)> {
         self.tunnels.iter().map(|(k, pt)| (*k, pt))
     }
 
-    // Rebuilds every circuit net from the GUI wiring graph: clear_nets() drops
-    // all nets, then each connected wire group is replayed as circuit links
-    // (fan-out/driver-conflict handling lives in Circuit::link). A group with
-    // no component pin is skipped. Called after any wiring edit.
+    // Rebuilds nets from the wiring graph; fan-out/driver-conflict handling
+    // lives in Circuit::link.
     pub(crate) fn rebuild_circuit(&mut self) {
         puffin::profile_function!();
         // Reconcile each circuit tunnel's label from its GUI record
@@ -413,8 +407,7 @@ impl Document {
         self.record_settle_result(result);
     }
 
-    // Repositions the component's wire-anchor nodes to its current pin grid
-    // positions (after a move or reconfigure). Segments to them stretch.
+    // Attached segments stretch automatically; only the anchor nodes move here.
     pub(crate) fn sync_component_wire_nodes(&mut self, pck: PlacedCompKey) {
         let Some(pc) = self.components.get(&pck) else {
             return;
@@ -432,9 +425,8 @@ impl Document {
         self.wiring.sync_tunnel_nodes(ptk, tunnel_pin_grid(pt));
     }
 
-    // The resolved circuit Value at each wire node, for colouring segments. All
-    // nodes in a connected group share one net, so we resolve the group's value
-    // from any pin/tunnel endpoint on it (Floating if it has none).
+    // All nodes in a connected group share one net; the group's value comes
+    // from any pin/tunnel endpoint on it.
     pub(crate) fn wire_node_values(&self) -> HashMap<WireNodeKey, Value> {
         puffin::profile_function!();
         let mut out = HashMap::new();
@@ -472,9 +464,8 @@ impl Document {
         painter.rect_filled(clip_rect, 0.0, theme.canvas_bg);
         draw_grid(painter, clip_rect, camera, theme);
 
-        // Draw wire segments. Colour comes from each connected group's net
-        // value: any component pin / tunnel on the group resolves (live) to
-        // that net's Value; a dangling group (no endpoints) is Floating.
+        // Colour comes from the group's net value; a dangling group (no
+        // endpoints) is Floating.
         let node_value = self.wire_node_values();
 
         for (seg_key, seg) in &self.wiring.segments {
@@ -493,9 +484,7 @@ impl Document {
             painter.line_segment([p0, p1], stroke);
         }
 
-        // Junction dots where three or more segments meet, so a real branch
-        // reads differently from a mere crossing. All degrees in one pass, not
-        // a per-node scan of every segment.
+        // Junction dots mark 3+-way branches, distinct from a mere crossing.
         let degrees = self.wiring.degrees();
         for (nk, node) in &self.wiring.nodes {
             if degrees.get(nk).copied().unwrap_or(0) >= 3 {
@@ -508,14 +497,10 @@ impl Document {
             }
         }
 
-        // Draw components
-
         for (&pc_key, pc) in &self.components {
             let is_selected = self.is_highlighted(Selected::Component(pc_key));
             draw_component(painter, pc, camera, &self.circuit, is_selected, theme);
         }
-
-        // Draw tunnels
 
         for (pt_key, pt) in self.active_tunnels() {
             let is_selected = self.is_highlighted(Selected::Tunnel(pt_key));
@@ -523,10 +508,8 @@ impl Document {
         }
     }
 
-    // Resolves what lies under a screen position for wiring: the attachment
-    // to bind, the on-grid point to route to, and whether it's a real
-    // terminal vs. empty space. Priority: pin (out, then in), tunnel, wire
-    // node, wire segment, else the snapped cursor cell.
+    // Priority: output pin, input pin, tunnel, wire node, wire segment, else
+    // the snapped cursor cell.
     pub(crate) fn wire_target_at(&self, pos: Pos2, camera: Camera) -> (NodeAttach, GridPos, bool) {
         puffin::profile_function!();
         if let Some((pck, pin)) = pin_at_pos(self.components.iter(), camera, pos, PinKind::Output) {
@@ -568,11 +551,8 @@ impl Document {
         terminal.then_some((attach, gp))
     }
 
-    // Writes one word into a placed ROM's contents, then settles so a downstream
-    // read updates. The placed spec and the live component share one buffer (see
-    // Rom::shared), so write_rom mutates what the spec sees too - no separate
-    // mirror write. Deliberately not routed through Command/History: ROM contents
-    // are mutated in place and are not undoable (like clock ticks).
+    // Spec and live component share one buffer (Rom::shared), so this updates
+    // both. Not undoable, like a clock tick.
     pub(crate) fn write_rom_cell(&mut self, pc: PlacedCompKey, index: usize, value: u32) {
         let comp_key = self.components[&pc].key;
         self.circuit.write_rom(comp_key, index, value);
@@ -580,22 +560,15 @@ impl Document {
         self.record_settle_result(result);
     }
 
-    // Writes one word directly into a placed RAM's contents. Unlike
-    // write_rom_cell this never needs a settle(): RAM's data_out is a
-    // registered output only updated by tick_clock (see RamCell), so a
-    // direct memory edit here has nothing downstream to propagate until the
-    // next tick. The placed spec and the live component share one buffer
-    // (see Ram::shared), so this mutates what the spec sees too. Not routed
-    // through Command/History: RAM contents are mutated in place and are not
-    // undoable, like a ROM's.
+    // No settle() needed: RAM's data_out is a registered output, only updated
+    // by tick_clock. Not undoable, like a ROM's.
     pub(crate) fn write_ram_cell(&mut self, pc: PlacedCompKey, index: usize, value: u32) {
         let comp_key = self.components[&pc].key;
         self.circuit.write_ram(comp_key, index, value);
     }
 
-    // Draws any open ROM/RAM contents editor windows (see gui::memory_editor)
-    // and applies the word edits they collected. Applying stays here because the
-    // write paths need &mut Circuit + settle (ROM) that MemoryEditor doesn't own.
+    // Applying stays here: the write paths need &mut Circuit + settle, which
+    // MemoryEditor doesn't own.
     pub(crate) fn show_memory_editors(&mut self, ctx: &egui::Context) {
         let value_locked = self.value_editing_locked();
         let edits = self.memory_editor.show(ctx, &self.components, value_locked);
@@ -607,16 +580,14 @@ impl Document {
         }
     }
 
-    // Removes a placed component: drop it from the circuit and its wire nodes
-    // from the wiring graph, then rebuild the circuit's nets from what remains.
     pub(crate) fn delete_component(&mut self, key: PlacedCompKey) {
         self.history.begin_batch();
         let comp_key = self.components[&key].key;
         self.apply(Command::RemoveComponent(comp_key));
         let delta = self.wiring.remove_component_nodes(key);
         self.edit_wiring(delta);
-        // Remove the record outright, moving it into the undo entry; undo
-        // re-inserts it under this same PlacedCompKey (see apply_gui_undo).
+        // Undo re-inserts this record under the same PlacedCompKey (see
+        // apply_gui_undo).
         if let Some(pc) = self.components.remove(&key) {
             self.history.push_gui(GuiUndoAction::InsertComponent {
                 key,
@@ -630,8 +601,6 @@ impl Document {
         self.history.end_batch();
     }
 
-    // Removes a placed tunnel: drop it from the circuit and its wire nodes from
-    // the wiring graph, then rebuild.
     pub(crate) fn delete_tunnel(&mut self, key: PlacedTunnelKey) {
         self.history.begin_batch();
         let tunnel_key = self.tunnels[&key].key;
@@ -653,8 +622,7 @@ impl Document {
         self.history.end_batch();
     }
 
-    // Removes a single wire segment; the wiring graph handles orphan cleanup and
-    // any net split, then the circuit is rebuilt.
+    // The wiring graph handles orphan cleanup and any net split.
     pub(crate) fn delete_wire(&mut self, seg: WireSegKey) {
         self.history.begin_batch();
         let delta = self.wiring.delete_segment(seg);
@@ -666,8 +634,7 @@ impl Document {
         self.history.end_batch();
     }
 
-    // True if `sel` is either the single selection or part of the bulk
-    // selection, i.e. it should be drawn highlighted.
+    // True if `sel` is the single selection or part of a bulk selection.
     pub(crate) fn is_highlighted(&self, sel: Selected) -> bool {
         match &self.selected {
             Some(Selection::Single(s)) => *s == sel,
@@ -676,10 +643,7 @@ impl Document {
         }
     }
 
-    // A selected item's screen-space bounding rect and current grid_pos, for
-    // deciding whether a drag-start point hits it and what "original
-    // position" a ComponentDrag should restore on cancel/undo. `None` for a
-    // Selected::Wire (no draggable body) or a stale key.
+    // `None` for a Selected::Wire (no draggable body) or a stale key.
     pub(crate) fn drag_grid_pos(&self, sel: Selected, camera: Camera) -> Option<(Rect, GridPos)> {
         match sel {
             Selected::Component(key) => self
@@ -694,12 +658,8 @@ impl Document {
         }
     }
 
-    // The Free-attached WireNodes belonging to any Selected::Wire in `sels`
-    // (deduped - a route's interior node can be shared by two selected
-    // segments), each paired with its current grid_pos. Pin/Tunnel-attached
-    // nodes are excluded: those follow their owning component/tunnel via
-    // sync_component_wire_nodes/sync_tunnel_wire_nodes instead, and must
-    // stay put if that owner isn't itself part of the drag.
+    // Deduped Free-attached WireNodes only; Pin/Tunnel-attached nodes follow
+    // their owner via sync_*_wire_nodes instead.
     pub(crate) fn free_wire_nodes(&self, sels: &[Selected]) -> Vec<(WireNodeKey, GridPos)> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
@@ -722,9 +682,8 @@ impl Document {
         out
     }
 
-    // Every component, tunnel, and wire segment fully contained in `rect`
-    // (screen space): a component/tunnel counts when its bounding rect is
-    // inside, a wire when both endpoints are.
+    // A component/tunnel counts when its bounding rect is inside `rect`; a
+    // wire counts when both endpoints are.
     pub(crate) fn items_in_rect(&self, rect: Rect, camera: Camera) -> Vec<Selected> {
         puffin::profile_function!();
         let mut out = Vec::new();
@@ -748,13 +707,11 @@ impl Document {
         out
     }
 
-    // Removes everything in the current bulk selection: wire segments first,
-    // then components/tunnels (which drop their own wire nodes too). Each
-    // removal is existence-checked since deleting a component can take a
-    // wire in the same set with it. Rebuilds once at the end.
-    // TODO: `delete_bulk` is slow because each call to `remove_component_nodes` Does many
-    // unnecessary loops. Refactor this so that all nodes to remove are aggregated and removed in
-    // one pass.
+    // Wire segments first, then components/tunnels; each removal is
+    // existence-checked since deleting a component can take a wire in the
+    // same set with it.
+    // TODO: slow - each remove_component_nodes call loops unnecessarily. Aggregate the nodes to
+    // remove into one pass instead.
     pub(crate) fn delete_bulk(&mut self) {
         let Some(Selection::Bulk(items)) = self.selected.take() else {
             return;
@@ -805,12 +762,9 @@ impl Document {
 
     // ── Canvas mode dispatch ─────────────────────────────────────────────────
     //
-    // One method per InteractionMode variant (see OsmilogApp::handle_canvas_
-    // interaction, the dispatcher). Every variant except Placing only needs the
-    // active document plus the ambient CanvasCtx (egui handles, no app state) -
-    // Placing needs OsmilogApp::place_component (instantiate, for subcircuits),
-    // so it stays a thin OsmilogApp method; the dispatcher calls into `self` for
-    // everything else.
+    // One method per InteractionMode variant (see
+    // OsmilogApp::handle_canvas_interaction). Placing stays on OsmilogApp since
+    // it needs instantiate (subcircuits); everything else lives here.
     pub(crate) fn interact_idle(&mut self, cc: &CanvasCtx, pointer: Option<Pos2>) {
         puffin::profile_function!();
         let locked = self.editing_locked();
@@ -833,12 +787,9 @@ impl Document {
             }
         }
 
-        // All drag gestures (wire draw, component/bulk move, rubber-band
-        // select) mutate the circuit or selection - suppressed during a run
-        // session. Plain click-to-select below stays available for inspection.
-        // egui's `drag_started`/`dragged` flags are button-agnostic, so exclude
-        // a middle-button drag here - that gesture pans the camera
-        // (`handle_camera_input`) and must not also start an edit gesture.
+        // Suppressed during a run session; click-to-select stays available.
+        // Middle-button drags pan the camera instead (handle_camera_input) and
+        // must not also start an edit gesture.
         if !locked
             && cc.response.drag_started()
             && !cc.response.dragged_by(egui::PointerButton::Middle)
@@ -856,20 +807,18 @@ impl Document {
                     };
                 } else if let Some((items, free_nodes)) = match &self.selected {
                     Some(Selection::Single(sel)) => {
-                        // Selected component/tunnel body drag → move it,
-                        // but only when the drag actually began inside its
-                        // bounding rect. A lone selected wire has no body to
-                        // drag (drag_grid_pos returns None for it).
+                        // Move it, but only if the drag began inside its
+                        // bounding rect. A selected wire has no body to drag
+                        // (drag_grid_pos returns None).
                         let sel = *sel;
                         self.drag_grid_pos(sel, cc.camera)
                             .filter(|(rect, _)| rect.contains(pos))
                             .map(|(_, grid_pos)| (vec![(sel, grid_pos)], Vec::new()))
                     }
                     Some(Selection::Bulk(sels)) => {
-                        // Bulk body drag → move every selected component/
-                        // tunnel together, plus any Free wire node the
-                        // selection also covers, as long as the drag began
-                        // inside *any one* component/tunnel's bounding rect.
+                        // Move every selected item together, plus any covered
+                        // Free wire node, if the drag began inside any one
+                        // item's bounding rect.
                         let started_inside = sels.iter().any(|sel| {
                             self.drag_grid_pos(*sel, cc.camera)
                                 .is_some_and(|(rect, _)| rect.contains(pos))
@@ -907,10 +856,9 @@ impl Document {
 
         if cc.response.clicked() {
             if let Some(pos) = pointer {
-                // A click starts a polyline only from a pin/tunnel;
-                // clicking a bare wire selects it instead (branching
-                // off a wire is a drag gesture, handled above). Suppressed
-                // during a run session so only selection remains.
+                // A click starts a polyline only from a pin/tunnel; a bare
+                // wire click selects it instead (branching off a wire is a
+                // drag, handled above).
                 let pin_start = self
                     .wire_start_at(pos, cc.camera)
                     .filter(|(a, _)| matches!(a, NodeAttach::Pin(..) | NodeAttach::Tunnel(_)))
@@ -923,8 +871,7 @@ impl Document {
                         dragging: false,
                     };
                 } else {
-                    // Click a component/tunnel body (components take
-                    // priority), then a wire segment, else deselect.
+                    // Priority: component, then tunnel, then wire, else deselect.
                     let maybe_comp = self
                         .components
                         .iter()
@@ -942,6 +889,28 @@ impl Document {
                         .or(maybe_tunnel)
                         .or(maybe_wire)
                         .map(Selection::Single);
+                }
+            }
+        }
+
+        if cc.response.double_clicked() {
+            if let Some(pos) = pointer {
+                // Same guard intent as single-click priority: ignore if over a component.
+                let on_component = self
+                    .components
+                    .iter()
+                    .any(|(_, pc)| component_bounding_rect(pc, cc.camera).contains(pos));
+                if !on_component {
+                    if let Some((seg, _)) = self.wiring.segment_at_pos(pos, cc.camera) {
+                        let segs = self.wiring.net_segments(seg);
+                        self.selected = match segs.len() {
+                            0 => None,
+                            1 => Some(Selection::Single(Selected::Wire(segs[0]))),
+                            _ => Some(Selection::Bulk(
+                                segs.into_iter().map(Selected::Wire).collect(),
+                            )),
+                        };
+                    }
                 }
             }
         }
@@ -1069,15 +1038,13 @@ impl Document {
             let step = cc.camera.grid_scale();
             let delta_x = ((pos.x - drag_origin.x) / step).round() as i32;
             let delta_y = ((pos.y - drag_origin.y) / step).round() as i32;
-            // Every dragged item moves by the same delta from its own
-            // drag-start position, so a bulk drag keeps the selection's
-            // relative layout intact.
+            // Every item moves by the same delta, so bulk drags keep relative
+            // layout intact.
             for &(key, original_grid_pos) in &items {
                 let new_grid_pos =
                     GridPos::new(original_grid_pos.x + delta_x, original_grid_pos.y + delta_y);
-                // Moving a component/tunnel drags its wire-anchor nodes
-                // along; the rest of each attached segment stretches.
-                // Topology is unchanged, so no circuit rebuild is needed.
+                // Wire-anchor nodes move with the item; attached segments
+                // stretch. Topology is unchanged, so no rebuild is needed.
                 match key {
                     Selected::Component(k) => {
                         self.components.get_mut(&k).unwrap().grid_pos = new_grid_pos;
@@ -1090,19 +1057,17 @@ impl Document {
                     Selected::Wire(_) => {}
                 }
             }
-            // Free-attached wire-elbow nodes have no owning component/tunnel
-            // to carry them along via sync_*_wire_nodes, so they're moved
-            // directly by the same delta - otherwise a selected wire run
-            // with an interior corner would stay pinned while its ends move.
+            // Free-attached nodes have no owner to carry them along, so they
+            // move by the same delta directly, or an interior corner would
+            // stay pinned while its ends move.
             for &(key, original_pos) in &free_nodes {
                 self.wiring.nodes.get_mut(&key).unwrap().pos =
                     GridPos::new(original_pos.x + delta_x, original_pos.y + delta_y);
             }
         }
         if cc.response.drag_stopped() {
-            // One undo batch restores every moved item's/node's original
-            // position at once, even when only some of them actually moved
-            // (e.g. the pointer didn't clear a whole grid cell).
+            // One undo batch restores every original position at once, even
+            // if some items never moved (pointer stayed in one grid cell).
             self.history.begin_batch();
             for (key, original_grid_pos) in items {
                 self.commit_move(key, original_grid_pos);
@@ -1123,7 +1088,6 @@ impl Document {
         current: GridPos,
     ) {
         puffin::profile_function!();
-        // Track the live corner, then paint the rubber-band box.
         let current = pointer
             .map(|p| cc.camera.screen_to_grid(p))
             .unwrap_or(current);
@@ -1137,12 +1101,10 @@ impl Document {
         cc.painter
             .rect_stroke(rect, 0.0, Stroke::new(1.0, c), StrokeKind::Inside);
 
-        // Finish on release. The `!dragged` guard also recovers from a
-        // flick released the same frame it started (drag_stopped never
-        // fires in the BulkSelect arm then), so the mode can't stick.
+        // The `!dragged` guard recovers from a flick released the same frame
+        // it started (drag_stopped never fires then), so the mode can't stick.
         if cc.response.drag_stopped() || !cc.response.dragged() {
             let selected_items = self.items_in_rect(rect, cc.camera);
-            // If only one item in bounds, directly select it
             self.selected = match selected_items.len() {
                 0 => None,
                 1 => Some(Selection::Single(selected_items[0])),
@@ -1155,15 +1117,13 @@ impl Document {
     }
 }
 
-// The screen-space rectangle spanned by a BulkSelect drag's two grid corners,
-// normalized so either drag direction yields the same box.
+// Normalized so either drag direction yields the same box.
 pub(crate) fn selection_screen_rect(start: GridPos, current: GridPos, camera: Camera) -> Rect {
     Rect::from_two_pos(camera.grid_to_screen(start), camera.grid_to_screen(current))
 }
 
-// A quick L-elbow (one horizontal then one vertical run) from `from` to `to`,
-// returning the intermediate corner (if any) and `to`, but not `from`. Both
-// endpoints are on-grid, so the corner is too.
+// One horizontal then vertical run from `from` to `to`; returns the corner
+// (if any) and `to`, not `from`.
 fn route_elbow(from: GridPos, to: GridPos) -> Vec<GridPos> {
     if from == to {
         vec![]
@@ -1189,8 +1149,6 @@ mod tests {
         doc.place_component(comp, spec, grid_pos)
     }
 
-    // Insert a wire (one segment) between two component pins, positioned at each
-    // pin's grid cell, and return the two node keys.
     fn connect_pins(doc: &mut Document, a: (PlacedCompKey, PinId), b: (PlacedCompKey, PinId)) {
         let pa = pin_grid_pos(
             &doc.components[&a.0].shape,
@@ -1213,7 +1171,6 @@ mod tests {
         doc.wiring.insert_segment_untracked(na, nb);
     }
 
-    // Insert a wire (one segment) between a component pin and a tunnel.
     fn connect_pin_tunnel(doc: &mut Document, c: (PlacedCompKey, PinId), ptk: PlacedTunnelKey) {
         let pc = pin_grid_pos(
             &doc.components[&c.0].shape,
@@ -1234,10 +1191,8 @@ mod tests {
 
     #[test]
     fn test_delete_component_drops_wire_nodes_and_refreshes_downstream() {
-        // Input -> NOT(g) -> Output, then delete the middle gate: its wire nodes
-        // (and their now-orphaned neighbours) must be gone, the circuit component
-        // removed, the selection cleared, and the downstream Output refreshed
-        // (its input is now Floating).
+        // NOT gate wired Input -> Output; deleting it must clean up nodes,
+        // selection, and downstream state.
         let mut doc = Document::blank();
         let a = place(&mut doc, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let g = place(
@@ -1260,13 +1215,11 @@ mod tests {
 
         doc.delete_component(g);
 
-        // The placed record is genuinely removed (its payload moved into the
-        // undo entry), so its key no longer resolves.
+        // Payload moved into the undo entry; the key no longer resolves.
         assert!(!doc.components.contains_key(&g));
-        // Circuit-side removal also deletes the component outright.
         assert!(!doc.circuit.components.contains_key(&g_key));
-        // No wire node references the deleted component; orphan neighbours were
-        // cleaned up too, leaving no segments.
+        // No wire node references the deleted component; orphaned neighbours
+        // are gone too.
         assert!(doc
             .wiring
             .nodes
@@ -1280,8 +1233,6 @@ mod tests {
 
     #[test]
     fn test_delete_tunnel_drops_wire_nodes() {
-        // A component pin wired to a tunnel: deleting the tunnel removes its wire
-        // nodes and clears the selection.
         let mut doc = Document::blank();
         let a = place(&mut doc, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let t = doc.place_tunnel(TunnelRole::Pull, GridPos::new(1, 1));
@@ -1292,9 +1243,7 @@ mod tests {
 
         doc.delete_tunnel(t);
 
-        // Placed record genuinely removed (payload moved into the undo entry).
         assert!(!doc.tunnels.contains_key(&t));
-        // Circuit-side removal also deletes the tunnel outright.
         assert!(!doc.circuit.tunnels.contains_key(&t_key));
         assert!(doc
             .wiring
@@ -1306,11 +1255,9 @@ mod tests {
 
     #[test]
     fn test_rebuild_circuit_reconciles_tunnel_labels() {
-        // Regression for the tunnel-rename bug: if the GUI's PlacedTunnel.label
-        // is changed without a matching circuit.rename_tunnel (e.g. the user
-        // committed the rename by clicking away rather than pressing Enter),
-        // rebuild_circuit must reconcile the circuit's label from the GUI's, so
-        // the renamed Feed/Pull pair form one group and the value propagates.
+        // Regression: if PlacedTunnel.label changes without a matching
+        // circuit.rename_tunnel (e.g. rename committed by clicking away),
+        // rebuild_circuit must reconcile the label so Feed/Pull still link.
         let mut doc = Document::blank();
         let inp = place(&mut doc, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let out = place(&mut doc, ComponentSpec::Output);
@@ -1464,11 +1411,9 @@ mod tests {
         let orig_b = doc.components[&b].grid_pos;
         let stack_before = doc.history.len();
 
-        // Mirrors what interact_component_drag's drag_stopped branch does for
-        // a Selection::Bulk: every dragged item already moved (one frame at
-        // a time, by the same pointer delta - simulated here directly since
-        // driving the gesture needs a live egui::Response), then the whole
-        // set is committed inside one begin_batch/end_batch.
+        // Mirrors interact_component_drag's drag_stopped branch: items already
+        // moved (simulated directly, since driving the gesture needs a live
+        // egui::Response), then commit as one batch.
         doc.components.get_mut(&a).unwrap().grid_pos = GridPos::new(orig_a.x + 3, orig_a.y + 2);
         doc.components.get_mut(&b).unwrap().grid_pos = GridPos::new(orig_b.x + 3, orig_b.y + 2);
 
@@ -1513,9 +1458,7 @@ mod tests {
             .is_some());
     }
 
-    // Builds a two-segment route (pin -> Free elbow -> pin) between two
-    // freshly placed components, returning the components, the elbow's
-    // WireNodeKey, and both segment keys.
+    // Builds a pin -> Free elbow -> pin route between two fresh components.
     fn place_route_with_elbow(
         doc: &mut Document,
     ) -> (PlacedCompKey, PlacedCompKey, WireNodeKey, Vec<WireSegKey>) {
@@ -1579,10 +1522,8 @@ mod tests {
         let orig_b = doc.components[&b].grid_pos;
         let orig_elbow = doc.wiring.nodes[&elbow].pos;
 
-        // What interact_component_drag does for one drag frame of a bulk
-        // selection covering both components and the whole wire run: move
-        // every component (syncing its pin-attached nodes) and every Free
-        // elbow node by the same delta.
+        // Mirrors one drag frame of a bulk selection: move every component
+        // (syncing pin nodes) and every Free elbow node by the same delta.
         let new_a = GridPos::new(orig_a.x + 3, orig_a.y + 2);
         let new_b = GridPos::new(orig_b.x + 3, orig_b.y + 2);
         let new_elbow = GridPos::new(orig_elbow.x + 3, orig_elbow.y + 2);
@@ -1790,8 +1731,8 @@ mod tests {
         let tunnel_key = doc.tunnels[&t].key;
         let original = doc.tunnels[&t].label.clone();
 
-        // Simulate a rename commit: record label change live, then the batched
-        // Sim rename + record-label undo (mirrors show_tunnel_properties).
+        // Mirrors show_tunnel_properties: live label change, then batched Sim
+        // rename + record undo.
         doc.tunnels.get_mut(&t).unwrap().label = "RENAMED".to_string();
         doc.history.begin_batch();
         doc.apply(Command::RenameTunnel {
@@ -1839,8 +1780,8 @@ mod tests {
         // Stopped: fully editable, so value edits are allowed.
         assert!(!doc.value_editing_locked());
 
-        // Paused carves value edits (Input bits, ROM/RAM contents) out of the
-        // structural lock: still not value-locked, even though editing_locked().
+        // Paused carves value edits out of the structural lock: not
+        // value-locked even though editing_locked() is true.
         doc.clock.run = ClockRun::Paused;
         assert!(doc.editing_locked());
         assert!(!doc.value_editing_locked());
@@ -1883,9 +1824,8 @@ mod tests {
 
     #[test]
     fn undo_redo_delete_register_preserves_latched_state() {
-        // The move-based model: deleting a register moves its live Component
-        // (latch and all) into the undo entry, so undo restores the exact
-        // latched value - what a spec-based re-creation would lose.
+        // Deleting a register moves its live Component into the undo entry, so
+        // undo restores the exact latched value a spec-based re-creation would lose.
         let mut doc = Document::blank();
         let data = place(&mut doc, ComponentSpec::Input(Input { bits: 1, width: 1 }));
         let we = place(&mut doc, ComponentSpec::Input(Input { bits: 1, width: 1 }));
@@ -1904,8 +1844,8 @@ mod tests {
         doc.delete_component(reg);
         assert!(!doc.components.contains_key(&reg));
 
-        // Undo restores it under the same PlacedCompKey with its latch intact:
-        // the output reads 1 again with no re-tick.
+        // Undo restores it under the same PlacedCompKey with its latch intact,
+        // no re-tick needed.
         doc.undo();
         assert!(doc.components.contains_key(&reg));
         assert_eq!(

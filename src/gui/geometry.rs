@@ -8,26 +8,18 @@ use crate::sim::component::{FanDirection, GateOp};
 
 // ── Grid unit ───────────────────────────────────────────────────────────────
 //
-// Everything below is declared in whole grid CELLS (u32). Pixels enter the
-// picture only through `px()`
+// Everything below is declared in whole grid CELLS (u32); pixels enter only through `px()`.
 
 /// Pixels per grid cell at zoom 1.0 - the sole cell-pixel conversion factor.
 pub const GRID_SIZE: f32 = 10.0;
 pub const LABEL_FONT_SIZE: f32 = 8.0;
 
-/// Zoom limits for the canvas camera.
 pub const ZOOM_MIN: f32 = 0.25;
 pub const ZOOM_MAX: f32 = 4.0;
 
-/// Log-zoom change per pixel of ctrl(+cmd)+scroll, fed directly into egui's own
-/// `Options::input_options.scroll_zoom_speed` (see `handle_camera_input`) - egui
-/// computes its ctrl-scroll zoom factor as `exp(scroll_px * scroll_zoom_speed)`,
-/// so setting this constant *is* the sensitivity knob rather than a second scaling
-/// stacked on top of egui's own default. Pinch-to-zoom (multi-touch) is a direct
-/// physical finger-distance ratio and is unaffected by this constant.
+/// Fed into egui's own `scroll_zoom_speed` (`exp(scroll_px * speed)`); pinch-zoom is unaffected.
 pub const ZOOM_SCROLL_SPEED: f32 = 1.0 / 400.0;
 
-/// A whole-cell count converted to pixels (at zoom 1.0).
 pub const fn px(cells: u32) -> f32 {
     cells as f32 * GRID_SIZE
 }
@@ -35,12 +27,9 @@ pub const fn px(cells: u32) -> f32 {
 /// Width of components whose pins sit only on the left/right edges
 const EDGE_BODY_W: u32 = 2;
 
-/// Half-width of components that also carry a centered top/bottom-edge pin
-/// (mux/demux selector, arithmetic carry, encoder enable). Kept even so
-/// `MUX_CENTER_COL` lands on a whole cell.
+/// Half-width for components with a centered top/bottom pin; kept even so `MUX_CENTER_COL` lands on a whole cell.
 const MUX_HALF_W: u32 = 1;
 const MUX_W: u32 = 2 * MUX_HALF_W;
-/// Center column of a `MUX_W`-wide body.
 const MUX_CENTER_COL: u32 = MUX_HALF_W;
 
 /// Similar strategy as `MUX_HALF_W` for arithmetic components, but wider.
@@ -48,26 +37,25 @@ const ARITH_HALF_W: u32 = 2;
 const ARITH_W: u32 = 2 * ARITH_HALF_W;
 const ARITH_CENTER_COL: u32 = ARITH_HALF_W;
 
-/// Input / Output box width.
 const IO_W: u32 = 2;
 
-// Splitter/combine doesn't compute anything - it just re-routes bits - so it's
-// drawn narrow to read as a connector rather than a processing block; only
-// left/right-edge pins, so any whole-cell width is on-grid. See splitter_shape()
-// for the comb-shaped body this pairs with.
+// Drawn narrow to read as a connector, not a processing block. Pairs with the
+// comb-shaped body in splitter_shape().
 const SPLITTER_W: u32 = 2;
-// Normalized x-band of the thin "spine" rectangle; trunk/teeth strokes
-// extend from here out to x=0.0/x=1.0 to reach the pins. Kept narrow so each
-// side clears the ~3px pin dot radius, or teeth end up hidden under it.
+// Normalized x-band of the spine rectangle; trunk/teeth strokes extend from here
+// to the pins. Kept narrow so each side clears the ~3px pin dot radius.
 const SPLITTER_BODY_X: (f32, f32) = (0.25, 0.60);
 
 // Tunnels have their own width to account for a potentially long label.
 const TUNNEL_W: u32 = 4;
 
-// Constant carries its current value as a dynamic on-canvas label (like a
-// Tunnel's), so it gets the same wider footprint rather than Input/Output's
-// bare IO_W box.
+// Constant shows its value as a dynamic label (like a Tunnel), so it needs a
+// wider footprint than Input/Output's bare IO_W box.
 const CONST_W: u32 = 4;
+
+// A Probe shows its name as a dynamic label, so it needs a wider box than the
+// bare IO_W, like a Constant.
+const PROBE_W: u32 = 4;
 
 const REG_W: u32 = 3;
 
@@ -77,13 +65,12 @@ const SHIFT_REG_W: u32 = 3;
 
 const ROM_W: u32 = 7;
 
-// Same width as Rom - the spec calls for a RAM box "similarly sized to the
-// ROM component" - taller instead of wider to fit the 4 stacked left-edge
-// pins (see ram_size).
+// Same width as Rom per spec ("similarly sized"); taller to fit the 4 stacked
+// left-edge pins (see ram_size).
 const RAM_W: u32 = ROM_W;
 
-// A subcircuit is a plain box carrying the referenced document's name; wide
-// enough for a short name and for pins to read as belonging to distinct sides.
+// Wide enough for a short document name and for pins to read as belonging to
+// distinct sides.
 const SUBCIRCUIT_W: u32 = 6;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -115,12 +102,8 @@ impl From<GridPos> for [i32; 2] {
 
 // ── Camera ────────────────────────────────────────────────────────────────────
 //
-// The view transform for the canvas: a screen-pixel `pan` offset plus a `zoom`
-// scale factor. The screen<->grid transform is
-//   screen = grid * (GRID_SIZE * zoom) + pan
-// and everything drawn/hit-tested funnels through `grid_to_screen`/
-// `screen_to_grid`. Fixed pixel sizes (radii, strokes, fonts) scale via `scale`
-// so the whole canvas zooms as one, not just the spacing between things.
+// screen = grid * (GRID_SIZE * zoom) + pan. Fixed pixel sizes (radii, strokes,
+// fonts) scale via `scale` so the whole canvas zooms as one.
 #[derive(Debug, Clone, Copy)]
 pub struct Camera {
     /// Screen-pixel offset of the grid origin.
@@ -139,7 +122,6 @@ impl Default for Camera {
 }
 
 impl Camera {
-    /// Pixels per grid cell at the current zoom.
     pub fn grid_scale(&self) -> f32 {
         GRID_SIZE * self.zoom
     }
@@ -162,23 +144,17 @@ impl Camera {
         px * self.zoom
     }
 
-    /// Applies one frame of camera input over the canvas `response`: middle-drag
-    /// pan and Ctrl(+Cmd)/pinch cursor-anchored zoom. Called before drawing so
-    /// the view transform is current for the frame.
+    /// Applies one frame of camera input: middle-drag pan, Ctrl(+Cmd)/pinch zoom anchored on the cursor.
     pub fn handle_input(&mut self, response: &egui::Response, ctx: &egui::Context) {
         puffin::profile_function!();
-        // Pan: middle-button drag. Use the raw pointer delta - `drag_delta`
-        // tracks only the primary button.
+        // Use the raw pointer delta - drag_delta tracks only the primary button.
         if response.dragged_by(egui::PointerButton::Middle) {
             self.pan += ctx.input(|i| i.pointer.delta());
         }
 
-        // Zoom: Ctrl(+Cmd)+scroll, only while hovering the canvas. egui folds a
-        // ctrl-scroll (its default `zoom_modifier`) - and any trackpad pinch -
-        // into `zoom_delta()`, a multiplicative factor (1.0 = no change). egui's
-        // own scroll-zoom sensitivity is set directly at startup (see
-        // ZOOM_SCROLL_SPEED, set in `OsmilogApp::new`) rather than rescaled here
-        // - `zoom_delta()` is already exactly the factor we want to apply.
+        // egui folds ctrl-scroll and trackpad pinch into zoom_delta(), a
+        // multiplicative factor already scaled by ZOOM_SCROLL_SPEED (set in
+        // OsmilogApp::new).
         if response.hovered() {
             let zoom_delta = ctx.input(|i| i.zoom_delta());
             if zoom_delta != 1.0 {
@@ -200,15 +176,12 @@ impl Camera {
 
 // ── Stack geometry (in cells) ─────────────────────────────────────────────────
 
-/// How a stack of pins is distributed along a component edge. Both layouts
-/// keep the stack's centre row whole (height is always even), so an
-/// opposite centred pin always has a definite row to line up with.
+/// How a stack of pins is distributed along an edge; both layouts keep the centre row whole.
 #[derive(Clone, Copy)]
 enum Pitch {
     /// 2 cells per pin: rows 1, 3, 5, … A roomy, Logisim-style stack.
     Spread,
-    /// 1 cell per pin. An even pin count leaves the centre row empty (a
-    /// 2-cell gap) so it stays whole; an odd count's middle pin sits there.
+    /// 1 cell per pin; an even count leaves the centre row empty, an odd count's middle pin sits there.
     Tight,
 }
 
@@ -218,30 +191,26 @@ impl Pitch {
         match self {
             Pitch::Spread => 2 * (i as u32) + 1,
             Pitch::Tight => {
-                // Pack up from row 1; once past the lower half, bump down by the
-                // gap size - 1 cell for an even stack (leaving the centre row
-                // empty), 0 for an odd one (its middle pin sits on the centre).
+                // Pack up from row 1; past the lower half, bump down by the gap -
+                // 1 cell if even (empty centre row), 0 if odd (middle pin on centre).
                 let bump: u32 = if i >= k / 2 { 1 - (k as u32 % 2) } else { 0 };
                 i as u32 + 1 + bump
             }
         }
     }
 
-    /// Height (in cells) of an edge with `k` pins (k>=1). Always even, so
-    /// `height / 2` is a whole centre row.
+    /// Height of an edge with `k` pins (k>=1); always even, so `height / 2` is a whole centre row.
     const fn height(self, k: usize) -> u32 {
         let k = if k == 0 { 1 } else { k };
         match self {
             Pitch::Spread => 2 * (k as u32),
-            // k+1 when odd (contiguous rows), k+2 when even (one extra for the
-            // gap). `(k+1) % 2` is 0 for odd k and 1 for even k.
+            // k+1 rows if odd (contiguous), k+2 if even (extra gap row).
             Pitch::Tight => k as u32 + 1 + (k as u32 + 1) % 2,
         }
     }
 }
 
-/// Gates pack inputs tightly once there are enough that a roomy spread would
-/// make the body needlessly tall.
+/// Gates pack tightly once a roomy spread would make the body needlessly tall.
 const fn gate_pitch(n_inputs: usize) -> Pitch {
     if n_inputs > 3 {
         Pitch::Tight
@@ -250,9 +219,7 @@ const fn gate_pitch(n_inputs: usize) -> Pitch {
     }
 }
 
-/// Mux/demux/encoder branches pack tightly once there are enough of them
-/// (sel_width >= 2, i.e. >= 4 branches) that a roomy spread would make the
-/// body needlessly tall.
+/// Mux/demux/encoder branches pack tightly once there are enough (sel_width >= 2) to need it.
 const fn sel_pitch(sel_width: u8) -> Pitch {
     if sel_width >= 2 {
         Pitch::Tight
@@ -261,9 +228,7 @@ const fn sel_pitch(sel_width: u8) -> Pitch {
     }
 }
 
-/// A subcircuit's boundary pins (variable count, derived from the referenced
-/// document's Input/Output components) pack tightly once a roomy spread would
-/// make the body needlessly tall - same threshold as gates.
+/// A subcircuit's boundary pins pack tightly past the same threshold as gates.
 const fn sub_pitch(k: usize) -> Pitch {
     if k > 3 {
         Pitch::Tight
@@ -272,8 +237,8 @@ const fn sub_pitch(k: usize) -> Pitch {
     }
 }
 
-// Spread is the default layout; these terse wrappers keep the many spread call
-// sites readable (Spread ignores the pin count, so the `0` below is a placeholder).
+// Terse wrappers for the common Spread case (which ignores pin count, hence
+// the placeholder `0`).
 fn pin_row(i: usize) -> u32 {
     Pitch::Spread.row(i, 0)
 }
@@ -310,10 +275,9 @@ fn or_outline() -> Vec<ShapeCmd> {
     ]
 }
 
-// Convex-only outline for the OR gate fill (no concave left curve).
-// epaint's fill tessellator uses a triangle fan + per-vertex feathering normals,
-// which both assume convexity. The concave left side causes fill to bleed outside
-// the boundary. We fill with this simpler convex shape and stroke with or_outline().
+// epaint's fill tessellator assumes convexity; the OR gate's concave left side
+// would bleed fill outside the boundary. Filled with this convex shape instead,
+// stroked with or_outline().
 fn or_fill_outline() -> Vec<ShapeCmd> {
     vec![
         ShapeCmd::MoveTo(vec2(0.0, 0.0)),
@@ -341,10 +305,9 @@ fn xor_extra_arc() -> Vec<ShapeCmd> {
 
 // ── Bounding-box sizes ────────────────────────────────────────────────────────
 //
-// Zero-allocation size queries, the single source of truth for the
-// width/height formulas - the *_shape() functions call the same cell
-// helpers, so callers like component_bounding_rect needn't build a full
-// ComponentShape just to read its size.
+// Single source of truth for width/height formulas; *_shape() functions call the
+// same cell helpers, so callers needn't build a full ComponentShape just to read
+// its size.
 
 pub const fn gate_size(op: GateOp, n_inputs: usize) -> Vec2 {
     let n = if matches!(op, GateOp::Not) {
@@ -375,61 +338,52 @@ pub const fn reg_size() -> Vec2 {
 }
 
 pub const fn counter_size() -> Vec2 {
-    // 3 inputs (load/data/count) stacked on the left, sizing the body; the 2
-    // outputs (Q/carry) center on the right within that same height, same
-    // technique as comparator_size's busier-side-drives-height.
+    // 3 left-side inputs size the body; the 2 outputs center within that height
+    // (same busier-side-drives-height technique as comparator_size).
     vec2(px(REG_W), px(stack_h(3)))
 }
 
-// Height packs one row per preamble pin (D, optionally L, SH) plus one row
-// per stage, contiguously (no Pitch stack - there's no symmetric centre row
-// to preserve here since the bottom-edge reset pin isn't centered on it),
-// plus one extra row so the reset pin has the same 1-cell gap off the last
-// stage row that reg_size/flip_flop_size leave before their bottom pins.
+// One row per preamble pin plus one per stage, contiguous (no symmetric centre
+// row to preserve). One extra row gives the reset pin the same 1-cell gap
+// reg_size/flip_flop_size use.
 pub const fn shift_reg_size(num_stages: usize, parallel_load: bool) -> Vec2 {
     let preamble = if parallel_load { 3 } else { 2 };
     let total_rows = preamble + num_stages as u32;
     vec2(px(SHIFT_REG_W), px(total_rows + 1))
 }
 
-// Square body, same proportions as op2_size (ARITH_W == stack_h(2)) even though
-// a flip-flop only has one data-side input - the write-enable pin lives on the
-// bottom edge instead of stacking with it on the left.
+// Same proportions as op2_size even though there's only one data-side input;
+// write-enable lives on the bottom edge instead of stacking with it.
 pub const fn flip_flop_size() -> Vec2 {
     vec2(px(ARITH_W), px(stack_h(2)))
 }
 
-// Height accounts only for the two addend pins on the left edge, same formula as a
-// 2-input gate - the carry-in/carry-out pins sit at the bottom/top edges (like
-// encoder's enable_in/enable_out) and don't consume extra vertical space of their own.
+// Height only counts the two left-edge pins; carry-in/out sit at bottom/top
+// edges (like encoder's enable_in/out) and add no extra height.
 pub const fn op2_size() -> Vec2 {
     vec2(px(ARITH_W), px(stack_h(2)))
 }
 
-// Height scales off the busier side - the 3 comparison outputs on the right,
-// packed tightly (1 cell each) - rather than the 2 operand inputs on the left.
+// Height scales off the busier side (3 right-edge outputs), not the 2
+// left-edge inputs.
 pub const fn comparator_size() -> Vec2 {
     vec2(px(EDGE_BODY_W), px(Pitch::Tight.height(3)))
 }
 
-// Height scales with the arm count on the left edge, but never below 4 cells so
-// the three right-side pins (enable_out at top, selector + group as a centered
-// pair) always have room - the bottom/top pins (enable_in/enable_out) sit at the
-// edges and don't consume extra vertical space of their own.
+// Height scales with arm count, never below 4 cells so the 3 right-side pins
+// always have room; enable_in/out sit at the edges and add no extra height.
 pub const fn encoder_size(sel_width: u8) -> Vec2 {
     let arms = 1usize << sel_width;
     let k = if arms < 2 { 2 } else { arms };
     vec2(px(MUX_W), px(sel_pitch(sel_width).height(k)))
 }
 
-// A plain box, same footprint as reg_size (REG_W wide, 4 cells tall) so the
-// single A input on the left and D output on the right both center on grid row 2.
+// Same footprint as reg_size so A/D both center on grid row 2.
 pub const fn rom_size() -> Vec2 {
     vec2(px(ROM_W), px(stack_h(2)))
 }
 
-// Same width as Rom (RAM_W == ROM_W); height scales for the 4 stacked
-// left-edge pins (A/WE/LE/DI), one more stack level than Reg's D/WE pair.
+// Same width as Rom; height fits the 4 stacked left-edge pins (A/WE/LE/DI).
 pub const fn ram_size() -> Vec2 {
     vec2(px(RAM_W), px(stack_h(4)))
 }
@@ -443,9 +397,12 @@ pub const fn constant_size() -> Vec2 {
     vec2(px(CONST_W), px(stack_h(1)))
 }
 
-// Height scales off whichever boundary side (inputs on the left, outputs on the
-// right) has more pins; each side packs top-down from row 1 with its own pitch.
-// Both pitch heights are even, so their max is too.
+pub const fn probe_size() -> Vec2 {
+    vec2(px(PROBE_W), px(stack_h(1)))
+}
+
+// Height scales off whichever side has more pins; each side packs from row 1
+// with its own pitch. Both pitch heights are even, so their max is too.
 pub fn subcircuit_size(n_in: usize, n_out: usize) -> Vec2 {
     let h_cells = sub_pitch(n_in)
         .height(n_in)
@@ -463,8 +420,8 @@ pub fn output_shape() -> ComponentShape {
     io_shape(false)
 }
 
-// Input (source, pin on the right) and Output (sink, pin on the left) share a
-// plain box; the single pin centers on the middle grid row.
+// Input (pin right) and Output (pin left) share a box; the pin centers on the
+// middle row.
 fn io_shape(is_input: bool) -> ComponentShape {
     let center_row = stack_h(1) / 2; // 1
     let (input_anchors, output_anchors, output_bubbles) = if is_input {
@@ -490,9 +447,8 @@ fn io_shape(is_input: bool) -> ComponentShape {
     }
 }
 
-// A single-output source, like Input, but its current value is drawn as a
-// dynamic label (see draw_component) rather than left blank - so it gets its
-// own wider box (CONST_W) to fit that text instead of reusing io_shape.
+// Like Input, but its value is drawn as a dynamic label (see draw_component),
+// so it needs its own wider box (CONST_W) instead of reusing io_shape.
 pub fn constant_shape() -> ComponentShape {
     let center_row = stack_h(1) / 2; // 1
     ComponentShape {
@@ -503,6 +459,23 @@ pub fn constant_shape() -> ComponentShape {
         output_anchors: vec![PinAnchor::right(CONST_W, center_row)],
         extra_strokes: vec![],
         output_bubbles: vec![false],
+        labels: vec![],
+        dynamic_label_pos: vec2(0.5, 0.5),
+    }
+}
+
+// Like Output (one left pin), but wider and with a dynamic label so its name
+// draws inside the box (see draw_component).
+pub fn probe_shape() -> ComponentShape {
+    let center_row = stack_h(1) / 2; // 1
+    ComponentShape {
+        size: probe_size(),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors: vec![PinAnchor::left(center_row)],
+        output_anchors: vec![],
+        extra_strokes: vec![],
+        output_bubbles: vec![],
         labels: vec![],
         dynamic_label_pos: vec2(0.5, 0.5),
     }
@@ -591,19 +564,16 @@ pub fn mux_shape(sel_width: u8) -> ComponentShape {
 pub fn reg_shape() -> ComponentShape {
     let h_cells = stack_h(2); // 4
 
-    // input[0] = data (row 1), input[1] = write_enable (row 3), both on the
-    // left edge; input[2] = async reset on the bottom edge, toward the right
-    // (one cell in from the corner); output[0] centers on the right (row 2).
+    // input[0]=data, input[1]=write_enable (left edge); input[2]=async reset
+    // (bottom edge, one cell in from the corner); output[0] centers on the right.
     let input_anchors = vec![
         PinAnchor::left(pin_row(0)),
         PinAnchor::left(pin_row(1)),
         PinAnchor::bottom(REG_W - 1, h_cells),
     ];
 
-    // "D"/"WE" sit level with their pins (same y as the anchors above), offset
-    // right of the left-edge pin dot with room to spare in the box. The reset
-    // "0" sits just above its bottom-edge pin, a fixed pixel inset up (like the
-    // flip-flops' bottom-edge labels).
+    // Labels sit level with their pins; the reset "0" sits a fixed pixel inset
+    // above its bottom-edge pin (like the flip-flops' bottom labels).
     let row_y = |i: usize| pin_row(i) as f32 / h_cells as f32;
     const EDGE_LABEL_INSET_PX: f32 = 6.0;
     let reset_y = 1.0 - EDGE_LABEL_INSET_PX / px(h_cells);
@@ -638,13 +608,9 @@ pub fn reg_shape() -> ComponentShape {
     }
 }
 
-// Pin layout matches CounterConf's fixed pin order: input[0] = data, input[1]
-// = load, input[2] = count (left edge), but the requested visual order
-// top-to-bottom is load/data/count, so pin index and grid row diverge here -
-// unlike reg_shape/comparator_shape, where index order and row order agree.
-// output[0] = Q, output[1] = carry, centered as a pair on the right within
-// the busier (3-pin) left stack's height - same "fewer side centers on the
-// busier side" technique as comparator_shape.
+// input order (data, load, count) diverges from visual row order (load, data,
+// count) - unlike reg_shape/comparator_shape, where they agree. output[0]=Q,
+// output[1]=carry center as a pair (same technique as comparator_shape).
 pub fn counter_shape() -> ComponentShape {
     let h_cells = stack_h(3); // 6
     let center_row = h_cells / 2; // 3
@@ -701,12 +667,9 @@ pub fn counter_shape() -> ComponentShape {
     }
 }
 
-// A subcircuit: a plain box with `n_in` inputs on the left edge and `n_out`
-// outputs on the right, each side packed top-down from row 1 in the pin order
-// the component exposes (the GUI derives that from the inner Input/Output
-// component positions). The referenced document's name is drawn at
-// `dynamic_label_pos` (like a tunnel label) since it isn't known at 'static
-// time; `labels` therefore stays empty.
+// n_in inputs left, n_out outputs right, packed top-down in exposed pin order.
+// The document's name draws at dynamic_label_pos (not 'static, so `labels`
+// stays empty).
 pub fn subcircuit_shape(n_in: usize, n_out: usize) -> ComponentShape {
     let in_pitch = sub_pitch(n_in);
     let out_pitch = sub_pitch(n_out);
@@ -732,15 +695,9 @@ pub fn subcircuit_shape(n_in: usize, n_out: usize) -> ComponentShape {
     }
 }
 
-// Pin layout matches ShiftRegConf's pin order: input[0] = serial data (row 0),
-// input[1] = load (row 1, parallel_load only), input[next] = shift, then one
-// stage input per row (parallel_load only), then the async reset (bottom
-// edge, toward the right, like reg_shape). Rows are simply contiguous
-// top-to-bottom - unlike the Pitch stacks elsewhere, there's no symmetric
-// centre row to preserve since the bottom-edge reset pin isn't centered.
-// Serial mode has a single output (the last stage, right edge, aligned with
-// its row); parallel_load mode has one output per stage, each aligned with
-// its own input row.
+// input order: data, load (parallel_load only), shift, then one per stage,
+// then async reset. Rows are contiguous, not a symmetric Pitch stack. Serial
+// mode has one output (last stage); parallel_load has one output per stage.
 pub fn shift_reg_shape(num_stages: usize, parallel_load: bool) -> ComponentShape {
     let num_stages = num_stages.max(1);
     let preamble = if parallel_load { 3 } else { 2 };
@@ -790,8 +747,8 @@ pub fn shift_reg_shape(num_stages: usize, parallel_load: bool) -> ComponentShape
         )]
     };
 
-    // Async reset: bottom edge, toward the right (one cell in from the
-    // corner), same placement as reg_shape/flip_flop_shape's reset pin.
+    // Async reset: bottom edge, toward the right, same placement as
+    // reg_shape's reset pin.
     input_anchors.push(PinAnchor::bottom(SHIFT_REG_W - 1, h_cells));
     const EDGE_LABEL_INSET_PX: f32 = 6.0;
     let reset_y = 1.0 - EDGE_LABEL_INSET_PX / px(h_cells);
@@ -815,9 +772,7 @@ pub fn shift_reg_shape(num_stages: usize, parallel_load: bool) -> ComponentShape
     }
 }
 
-// D flip-flop: data in on the left edge, write-enable in on the bottom edge
-// (like op2_shape's carry-in), Q out on the right edge - all centered on the
-// square body.
+// Data in (left), write-enable in (bottom, like op2_shape's carry-in), Q out (right).
 pub fn d_flip_flop_shape() -> ComponentShape {
     flip_flop_shape("D")
 }
@@ -827,9 +782,8 @@ pub fn t_flip_flop_shape() -> ComponentShape {
     flip_flop_shape("T")
 }
 
-// JK/SR flip-flop: both control inputs stack on the left edge (like reg's
-// D/WE), write-enable in on the bottom edge (like op2's carry-in), Q out on
-// the right edge - all centered on the square body.
+// Both control inputs stack on the left (like reg's D/WE), write-enable on
+// the bottom (like op2's carry-in), Q out on the right.
 pub fn jk_flip_flop_shape() -> ComponentShape {
     two_input_flip_flop_shape("J", "K")
 }
@@ -839,9 +793,8 @@ pub fn sr_flip_flop_shape() -> ComponentShape {
     two_input_flip_flop_shape("S", "R")
 }
 
-// Pin layout matches JKFlipFlop/SRFlipFlop's fixed order: input[0]/[1] = the
-// two control inputs (left edge, stacked like reg's D/WE), input[2] =
-// write-enable (bottom edge, centered); output[0] = Q (right edge, centered).
+// input[0]/[1] = control inputs (left, stacked); input[2] = write-enable
+// (bottom center); output[0] = Q (right center).
 fn two_input_flip_flop_shape(
     top_label: &'static str,
     bottom_label: &'static str,
@@ -899,15 +852,13 @@ fn two_input_flip_flop_shape(
     }
 }
 
-// Pin layout matches DFlipFlop/TFlipFlop's fixed order: input[0] = data/toggle
-// (left edge, centered), input[1] = write-enable (bottom edge, centered);
-// output[0] = Q (right edge, centered).
+// input[0] = data/toggle (left center); input[1] = write-enable (bottom
+// center); output[0] = Q (right center).
 fn flip_flop_shape(data_label: &'static str) -> ComponentShape {
     let h_cells = stack_h(2); // 4, matching op2's square proportions
     let center_row = h_cells / 2;
 
-    // input[0] = data/toggle (left center), input[1] = write-enable (bottom
-    // center), input[2] = async reset (bottom edge, toward the right).
+    // input[2] = async reset (bottom edge, toward the right).
     let input_anchors = vec![
         PinAnchor::left(center_row),
         PinAnchor::bottom(ARITH_CENTER_COL, h_cells),
@@ -1020,9 +971,8 @@ pub fn encoder_shape(sel_width: u8) -> ComponentShape {
         PinAnchor::right(MUX_W, grp_row),
     ];
 
-    // EN sits just above the bottom edge by a fixed pixel distance rather than a fixed
-    // fraction of height - height grows with sel_width (more arms), but the label should
-    // stay close to the pin it names instead of drifting toward the middle of a tall body.
+    // Fixed pixel inset, not a fraction of height, so EN stays close to its pin
+    // as the body grows taller with more arms.
     const BOTTOM_LABEL_INSET_PX: f32 = 6.0;
     let en_y = 1.0 - BOTTOM_LABEL_INSET_PX / h;
     let row_y = |row: u32| row as f32 / h_cells as f32;
@@ -1058,10 +1008,8 @@ pub fn encoder_shape(sel_width: u8) -> ComponentShape {
     }
 }
 
-// Pin layout matches Component::adder's fixed order: input[0]/[1] = addends (left
-// edge), input[2] = carry-in (bottom edge); output[0] = sum (right edge, centered),
-// output[1] = carry-out (top edge) - carry-in/out mirror encoder's enable_in/enable_out
-// corner placement so they read as "flow-through" pins distinct from the data pins.
+// input[0]/[1]=addends (left), input[2]=carry-in (bottom); output[0]=sum
+// (right), output[1]=carry-out (top) - mirrors encoder's enable_in/out placement.
 pub fn adder_shape() -> ComponentShape {
     op2_shape("+", 12.0, "CIN", "CO")
 }
@@ -1082,9 +1030,8 @@ pub fn divider_shape() -> ComponentShape {
     op2_shape("÷", 12.0, "UP", "REM")
 }
 
-// Shared body for the two-operand arithmetic units (adder/subtractor/multiplier/
-// divider): two data inputs on the left, a centered result output on the right, and
-// carry/borrow-style flow-through pins on the bottom (in) and top (out) edges.
+// Shared body for adder/subtractor/multiplier/divider: two data inputs left,
+// centered result right, flow-through pins bottom (in) / top (out).
 fn op2_shape(
     op_label: &'static str,
     op_font: f32,
@@ -1104,8 +1051,8 @@ fn op2_shape(
     let carry_out_anchor = PinAnchor::top(ARITH_CENTER_COL);
     let output_anchors = vec![PinAnchor::right(ARITH_W, h_cells / 2), carry_out_anchor];
 
-    // Flow-through labels sit a fixed pixel distance in from the bottom/top edges,
-    // next to their pins; the op symbol sits just inside the right edge.
+    // Flow-through labels sit a fixed pixel inset from the bottom/top edges,
+    // next to their pins.
     const EDGE_LABEL_INSET_PX: f32 = 6.0;
     let bottom_y = 1.0 - EDGE_LABEL_INSET_PX / h;
     let top_y = EDGE_LABEL_INSET_PX / h;
@@ -1141,8 +1088,8 @@ fn op2_shape(
     }
 }
 
-// A memory block: single address input "A" on the left edge, single data output
-// "D" on the right edge, both centered vertically, with a "ROM" label in the body.
+// Single "A" input left, single "D" output right, both centered; "ROM" label
+// in the body.
 pub fn rom_shape() -> ComponentShape {
     let h_cells = stack_h(2); // 4
     let center_row = h_cells / 2; // 2
@@ -1179,11 +1126,8 @@ pub fn rom_shape() -> ComponentShape {
     }
 }
 
-// A read/write memory block: address "A", write_enable "WE", load_enable
-// "LE" and data_in "DI" stack on the left edge (input order matches Ram's
-// fixed pin order); the registered data_out "DO" centers on the right, with
-// a "RAM" label in the body - same layout idea as rom_shape, just with 3
-// more left-edge control pins.
+// A/WE/LE/DI stack on the left (matches Ram's fixed pin order); registered
+// "DO" centers on the right - same idea as rom_shape with 3 more control pins.
 pub fn ram_shape() -> ComponentShape {
     let h_cells = stack_h(4); // 8
     let center_row = h_cells / 2; // 4
@@ -1242,9 +1186,8 @@ pub fn ram_shape() -> ComponentShape {
     }
 }
 
-// Pin layout matches Component::comparator's fixed order: input[0]/[1] = the two
-// compared operands (left edge, centered on the output stack); output[0] = greater-than,
-// output[1] = equal, output[2] = less-than (right edge, evenly spaced, each labeled).
+// input[0]/[1]=operands (left, centered on the output stack); output[0..2] =
+// >/=/< (right, evenly spaced).
 pub fn comparator_shape() -> ComponentShape {
     let pitch = Pitch::Tight; // the 3 outputs pack tightly
     let h_cells = pitch.height(3); // 4
@@ -1292,10 +1235,8 @@ pub fn comparator_shape() -> ComponentShape {
     }
 }
 
-// Right draws the classic splitter (trunk in on the left, arms fanning out
-// on the right); Left mirrors it horizontally via `mx` and swaps trunk/arm
-// anchor lists into a combiner - must match Component::splitter's Left-mode
-// pin order (arm index == input pin index, ascending).
+// Right: trunk left, arms fan right. Left mirrors via `mx`, swapping into a
+// combiner - must match Component::splitter's Left-mode pin order.
 pub fn splitter_shape(arms: u8, direction: FanDirection) -> ComponentShape {
     let n = arms as usize;
     let pitch = Pitch::Tight; // arms pack tightly
@@ -1308,8 +1249,7 @@ pub fn splitter_shape(arms: u8, direction: FanDirection) -> ComponentShape {
     // (lo, hi) for a well-formed spine rect either way.
     let (bx0, bx1) = if flip { (mx(x1), mx(x0)) } else { (x0, x1) };
 
-    // Thin rectangular "spine" - kept convex so it needs no separate
-    // fill_outline, unlike the comb shape a full concave outline would need.
+    // Spine kept convex so it needs no separate fill_outline.
     let outline = vec![
         ShapeCmd::MoveTo(vec2(bx0, 0.0)),
         ShapeCmd::LineTo(vec2(bx1, 0.0)),
@@ -1317,17 +1257,14 @@ pub fn splitter_shape(arms: u8, direction: FanDirection) -> ComponentShape {
         ShapeCmd::LineTo(vec2(bx0, 1.0)),
     ];
 
-    // arm 0's tooth sits at the smallest y (grid row 1), i.e. the top. The data
-    // pin lines up with it rather than sitting at mid-height, so the shape itself
-    // communicates "arm 0 is the near/top one, arm N-1 is the far/bottom one".
-    // Normalized y of a grid row = row / h_cells.
+    // arm 0's tooth sits at the top (smallest y); the data pin lines up with it
+    // so the shape itself communicates arm ordering.
     let row_y = |row: u32| row as f32 / h_cells as f32;
     let data_y = row_y(pitch.row(0, n));
 
-    // One trunk line from the data pin into the spine, then one tooth line
-    // per arm fanning out from the spine to that arm's pin - drawn past the
-    // spine's own edges to form the comb, rather than baking the fan into
-    // the (concave) outline itself.
+    // One trunk line into the spine, one tooth line per arm out - drawn past
+    // the spine's edges to form the comb, rather than baking the fan into a
+    // concave outline.
     let trunk = vec![
         ShapeCmd::MoveTo(vec2(mx(0.0), data_y)),
         ShapeCmd::LineTo(vec2(mx(x0), data_y)),

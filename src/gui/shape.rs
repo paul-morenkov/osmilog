@@ -10,54 +10,43 @@ pub enum ShapeCmd {
     CubicTo(Vec2, Vec2, Vec2),
 }
 
-/// A pin's location as an integer grid-cell offset from the component's
-/// top-left corner - guarantees every pin lands on a grid intersection.
+/// A pin's location as an integer grid-cell offset. This keeps every pin on a grid intersection.
 #[derive(Clone, Debug)]
 pub struct PinAnchor {
-    /// Grid-cell offset from the component's top-left (in cells, not pixels).
+    /// Offset in cells, not pixels.
     pub cell: Vec2,
-    /// Unit direction the wire exits the pin (away from the component body).
+    /// Unit vector, away from the component body.
     pub wire_dir: Vec2,
 }
 
 impl PinAnchor {
-    // Cell coordinates are `u32`: a pin can only be placed at a whole grid cell,
-    // so it is impossible to construct an off-grid anchor. Callers pass cell
-    // counts (columns/rows), never pixels or fractions.
+    // `u32` cell coordinates make an off-grid anchor impossible to construct.
     fn at(col: u32, row: u32, wire_dir: Vec2) -> Self {
         Self {
             cell: vec2(col as f32, row as f32),
             wire_dir,
         }
     }
-    /// Pin on the left edge (col 0) at the given grid row.
     pub fn left(row: u32) -> Self {
         Self::at(0, row, vec2(-1.0, 0.0))
     }
-    /// Pin on the right edge (col = body width in cells) at the given grid row.
     pub fn right(w_cells: u32, row: u32) -> Self {
         Self::at(w_cells, row, vec2(1.0, 0.0))
     }
-    /// Bubble output pin: one cell beyond the right edge, so the inversion
-    /// bubble drawn in the gap doesn't push the pin off-grid.
+    /// One cell past the right edge, so the inversion bubble drawn in the gap stays on-grid.
     pub fn right_bubble(w_cells: u32, row: u32) -> Self {
         Self::at(w_cells + 1, row, vec2(1.0, 0.0))
     }
-    /// Pin on the bottom edge (row = body height in cells) at the given grid col.
     pub fn bottom(col: u32, h_cells: u32) -> Self {
         Self::at(col, h_cells, vec2(0.0, 1.0))
     }
-    /// Pin on the top edge (row 0) at the given grid col.
     pub fn top(col: u32) -> Self {
         Self::at(col, 0, vec2(0.0, -1.0))
     }
 }
 
-// A hardcoded, non-editable label (e.g. a Register's "D"/"WE" pin
-// annotations) at a fixed position within the component's normalized
-// [0,1]^2 box. Only meaningful for Components - Tunnels use
-// `ComponentShape::dynamic_label_pos` instead, since their single label's
-// *text* is user-editable at runtime rather than known at shape() time.
+// A fixed-position, non-editable label at a position in the component's normalized
+// [0,1]^2 box (e.g. a Register's "D"/"WE" pins). Tunnels use `dynamic_label_pos` instead.
 #[derive(Debug)]
 pub struct ComponentLabel {
     pub text: &'static str,
@@ -78,25 +67,22 @@ impl Default for ComponentLabel {
 #[derive(Debug)]
 pub struct ComponentShape {
     pub size: Vec2,
-    /// Full outline used for the stroke (may be concave).
+    /// May be concave.
     pub outline: Vec<ShapeCmd>,
-    /// Convex-only outline for the fill (epaint's fill tessellator requires
-    /// convexity even when `outline` is concave). `None` reuses `outline`.
+    /// Convex-only version of `outline`, since epaint's fill tessellator needs convexity.
+    /// `None` reuses `outline`.
     pub fill_outline: Option<Vec<ShapeCmd>>,
     pub input_anchors: Vec<PinAnchor>,
     pub output_anchors: Vec<PinAnchor>,
     pub extra_strokes: Vec<Vec<ShapeCmd>>,
     pub output_bubbles: Vec<bool>,
-    /// Hardcoded pin/section labels; empty when nothing needs annotating.
     pub labels: Vec<ComponentLabel>,
-    /// Position for a tunnel's user-editable label (`PlacedTunnel.label`);
-    /// unused by Components.
+    /// A tunnel's user-editable label position (`PlacedTunnel.label`). Unused by Components.
     pub dynamic_label_pos: Vec2,
 }
 
 pub fn tessellate_path(cmds: &[ShapeCmd], rect: Rect) -> Vec<Pos2> {
     puffin::profile_function!();
-    // Converts from normalized coordinate to rect coordinate
     let scale = |v: Vec2| {
         pos2(
             rect.left() + v.x * rect.width(),

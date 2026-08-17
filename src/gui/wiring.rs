@@ -28,20 +28,16 @@ use crate::gui::app::{PlacedCompKey, PlacedTunnelKey};
 use crate::gui::geometry::{Camera, GridPos};
 use crate::sim::component::PinId;
 
-/// Stable, app-assigned id for a [`WireNode`]. Survives remove + re-insert so
-/// undo restores a deleted node under its original key; never reused.
+/// Stable id for a [`WireNode`]; survives remove + re-insert, never reused.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct WireNodeKey(pub(crate) u64);
 
-/// Stable, app-assigned id for a [`WireSegment`] (see [`WireNodeKey`]).
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct WireSegKey(pub(crate) u64);
 
-// How close (in pixels) the cursor must be to a segment/node to hit it.
 const HIT_RADIUS: f32 = 5.0;
 
-/// What a wire node is bound to. `Free` nodes are corners, junctions, or
-/// dangling endpoints; the other two tie a node to a pin.
+/// What a node connects to. `Free` means an unbound corner or junction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeAttach {
     Free,
@@ -56,28 +52,21 @@ pub struct WireNode {
     pub attach: NodeAttach,
 }
 
-/// An axis-aligned segment between two nodes (invariant: `a.pos` and `b.pos`
-/// share a row or a column).
+/// A segment between two nodes. `a` and `b` share a row or a column.
 #[derive(Clone, Copy, Debug)]
 pub struct WireSegment {
     pub a: WireNodeKey,
     pub b: WireNodeKey,
 }
 
-/// One connected group of wire nodes. `pins`/`tunnels` are what gets linked
-/// into a circuit net; `nodes` is the full set (used for colouring).
+/// A connected group of wire nodes. `pins`/`tunnels` feed circuit nets; `nodes` is the full set.
 pub struct Group {
     pub nodes: Vec<WireNodeKey>,
     pub pins: Vec<(PlacedCompKey, PinId)>,
     pub tunnels: Vec<PlacedTunnelKey>,
 }
 
-/// One invertible change to a [`Wiring`], recorded into a [`WiringDelta`] and
-/// consumed by `undo_delta`/`redo_delta`. Each op is the before/after value of
-/// a single node or segment slot (`None` = the slot is empty). `after` is what
-/// redo installs; `before` is what undo restores. This uniformly covers
-/// insertion (`before: None`), deletion (`after: None`), and in-place edits
-/// such as an attach change (both `Some`).
+/// One invertible change to a [`Wiring`]. `after` is what redo installs; `before` is what undo restores.
 #[derive(Clone, Copy, Debug)]
 pub enum WiringOp {
     SetNode {
@@ -92,8 +81,7 @@ pub enum WiringOp {
     },
 }
 
-/// The recorded effect of one wiring edit. Size is proportional to what the
-/// edit touched, never the whole graph. Empty means nothing changed.
+/// Size is proportional to what the edit touched, not the whole graph.
 #[derive(Clone, Debug, Default)]
 pub struct WiringDelta(Vec<WiringOp>);
 
@@ -107,8 +95,7 @@ impl WiringDelta {
 pub struct Wiring {
     pub nodes: HashMap<WireNodeKey, WireNode>,
     pub segments: HashMap<WireSegKey, WireSegment>,
-    // Monotonic id allocators; never reused, so undo re-inserts a removed
-    // node/segment under its original key with no risk of aliasing a later one.
+    // Monotonic, never reused, so undo never aliases a removed key onto a new one.
     next_node: u64,
     next_seg: u64,
 }
@@ -130,16 +117,13 @@ impl Wiring {
         k
     }
 
-    /// Inserts a node under a fresh key without recording an undo op - for the
-    /// history-free snapshot/clipboard install paths. Returns the key.
+    /// Inserts without recording undo — for snapshot/clipboard install paths.
     pub fn insert_node_untracked(&mut self, node: WireNode) -> WireNodeKey {
         let key = self.next_node_key();
         self.nodes.insert(key, node);
         key
     }
 
-    /// Inserts a segment under a fresh key without recording an undo op (see
-    /// `insert_node_untracked`). Returns the key.
     pub fn insert_segment_untracked(&mut self, a: WireNodeKey, b: WireNodeKey) -> WireSegKey {
         let key = self.next_seg_key();
         self.segments.insert(key, WireSegment { a, b });
@@ -155,10 +139,7 @@ impl Wiring {
             .map(|(k, _)| *k)
     }
 
-    // Count of active segments incident on a node (its degree). Scans every
-    // segment, so callers needing the degree of *one* node use this; callers
-    // needing *many* (drawing all junction dots) use `degrees` instead, which
-    // computes them all in a single pass rather than one scan per node.
+    // For one node's degree. `degrees` computes all of them in one pass instead.
     pub fn degree(&self, node: WireNodeKey) -> usize {
         self.segments
             .values()
@@ -166,10 +147,8 @@ impl Wiring {
             .count()
     }
 
-    // Incident active-segment count for every node that has at least one, in a
-    // single pass over the segments (nodes with degree 0 are simply absent, so
-    // look them up with `.get(&k).copied().unwrap_or(0)`). Replaces per-node
-    // `degree` calls in the per-frame drawing path, which were O(nodes x segments).
+    // Degree of every node with at least one segment, in a single pass. Nodes with
+    // degree 0 are absent from the map. Avoids per-node `degree` calls in drawing.
     pub fn degrees(&self) -> HashMap<WireNodeKey, usize> {
         let mut counts: HashMap<WireNodeKey, usize> = HashMap::new();
         for s in self.segments.values() {
@@ -179,9 +158,7 @@ impl Wiring {
         counts
     }
 
-    // The active segment (if any) that `pos` lies strictly inside: colinear,
-    // axis-aligned, and between (not on) the endpoints. Splitting here is what
-    // turns a mid-wire tap into a real junction.
+    // The segment `pos` lies strictly between its endpoints on, if any.
     fn segment_through(&self, pos: GridPos) -> Option<WireSegKey> {
         self.segments.iter().find_map(|(k, seg)| {
             let a = self.nodes[&seg.a].pos;
@@ -200,13 +177,8 @@ impl Wiring {
     }
 
     // ── Editing primitives ──────────────────────────────────────────────────
-    //
-    // Each of these threads `&mut Vec<WiringOp>` so its caller (one of the five
-    // public mutators) accumulates a single delta. "Delete" genuinely removes
-    // the node/segment; the recorded op carries its payload so undo re-inserts
-    // it under the same key.
+    // Each threads `&mut Vec<WiringOp>` so its caller accumulates one delta.
 
-    // Inserts a node under a fresh key and records the op. Returns the key.
     fn insert_node(&mut self, node: WireNode, ops: &mut Vec<WiringOp>) -> WireNodeKey {
         let key = self.next_node_key();
         self.nodes.insert(key, node);
@@ -218,7 +190,6 @@ impl Wiring {
         key
     }
 
-    // Removes a node (if present) and records the op.
     fn take_node(&mut self, key: WireNodeKey, ops: &mut Vec<WiringOp>) {
         if let Some(before) = self.nodes.remove(&key) {
             ops.push(WiringOp::SetNode {
@@ -249,7 +220,6 @@ impl Wiring {
         }
     }
 
-    // Removes a segment (if present) and records the op.
     fn take_segment(&mut self, key: WireSegKey, ops: &mut Vec<WiringOp>) {
         if let Some(before) = self.segments.remove(&key) {
             ops.push(WiringOp::SetSeg {
@@ -260,9 +230,8 @@ impl Wiring {
         }
     }
 
-    // Find-or-create the node at gp. If gp lands partway along a segment, that
-    // segment is split so the returned node becomes a real junction. New nodes
-    // start `Free`.
+    // Finds or creates the node at gp. If gp lands partway along a segment,
+    // this splits the segment so the returned node becomes a real junction.
     fn resolve_point(&mut self, gp: GridPos, ops: &mut Vec<WiringOp>) -> WireNodeKey {
         if let Some(k) = self.node_at_grid(gp) {
             return k;
@@ -290,8 +259,7 @@ impl Wiring {
         )
     }
 
-    // Only sets an attachment onto a node that is still Free, so a wire ending
-    // on a pin binds that pin without clobbering an already-bound node.
+    // Only binds a node that is still Free, so an already-bound node is never clobbered.
     fn set_attach_if_free(
         &mut self,
         node: WireNodeKey,
@@ -313,8 +281,7 @@ impl Wiring {
         }
     }
 
-    /// Add a polyline wire through `points` (grid coords, each adjacent pair
-    /// axis-aligned), binding the first/last node to `start_attach`/`end_attach`.
+    /// Adds a route through `points`; each adjacent pair must be axis-aligned.
     pub fn add_route(
         &mut self,
         points: &[GridPos],
@@ -337,10 +304,8 @@ impl Wiring {
         WiringDelta(ops)
     }
 
-    /// Insert a wholly new, disjoint node/segment subgraph.
-    /// Unlike `add_route`, this never merges with existing geometry at a
-    /// shared `GridPos`. `segments` are index pairs into `nodes`. Returns the
-    /// fresh node keys, the fresh segment keys, and the undo delta.
+    /// Inserts a disjoint subgraph. Unlike `add_route`, this never merges with
+    /// existing geometry at a shared `GridPos`.
     pub fn add_subgraph(
         &mut self,
         nodes: &[(GridPos, NodeAttach)],
@@ -380,7 +345,6 @@ impl Wiring {
         WiringDelta(ops)
     }
 
-    // Remove a node and every segment touching it.
     fn remove_node(&mut self, node: WireNodeKey, ops: &mut Vec<WiringOp>) {
         let touching: Vec<WireSegKey> = self
             .segments
@@ -426,8 +390,7 @@ impl Wiring {
         WiringDelta(ops)
     }
 
-    /// After a reconfigure drops pins, remove wire nodes bound to pins that no
-    /// longer exist.
+    /// Removes wire nodes bound to pins a reconfigure dropped.
     pub fn prune_stale_pins(
         &mut self,
         pck: PlacedCompKey,
@@ -452,8 +415,7 @@ impl Wiring {
         WiringDelta(ops)
     }
 
-    /// Reposition every node bound to `pck`'s pins (called after a move or
-    /// reconfigure); attached segments simply stretch to follow.
+    /// Repositions nodes bound to `pck`'s pins after a move or reconfigure.
     pub fn sync_component_nodes(
         &mut self,
         pck: PlacedCompKey,
@@ -468,7 +430,6 @@ impl Wiring {
         }
     }
 
-    /// Reposition every node bound to `ptk` to the tunnel's current position.
     pub fn sync_tunnel_nodes(&mut self, ptk: PlacedTunnelKey, gp: GridPos) {
         for n in self.nodes.values_mut() {
             if let NodeAttach::Tunnel(k) = n.attach {
@@ -494,7 +455,6 @@ impl Wiring {
 
     // ── Undo / redo replay ──────────────────────────────────────────────────
 
-    // Install `val` into the node slot (`Some` inserts, `None` removes).
     fn set_node_slot(&mut self, key: WireNodeKey, val: Option<WireNode>) {
         match val {
             Some(n) => {
@@ -531,17 +491,15 @@ impl Wiring {
         }
     }
 
-    /// Re-apply a delta (redo). Ops run in recorded order, so nodes are
-    /// created before segments that reference them.
+    /// Replays ops in recorded order, so nodes exist before segments reference them.
     pub fn redo_delta(&mut self, delta: &WiringDelta) {
         for op in &delta.0 {
             self.apply_op(op);
         }
     }
 
-    /// Reverse a delta (undo). Ops run in reverse order, so segments are
-    /// removed before the nodes they reference, and a split's original segment
-    /// is restored after its halves are gone.
+    /// Replays ops in reverse, removing segments before their nodes. Restores a
+    /// split's original segment after its halves are gone.
     pub fn undo_delta(&mut self, delta: &WiringDelta) {
         for op in delta.0.iter().rev() {
             self.revert_op(op);
@@ -550,13 +508,10 @@ impl Wiring {
 
     // ── Connectivity ────────────────────────────────────────────────────────
 
-    /// Connected groups of the active segment graph. Isolated nodes (no
-    /// active segments) are skipped. Drives both the circuit rebuild and
-    /// per-segment colouring.
+    /// Connected groups of the active segment graph. Isolated nodes are skipped.
     pub fn groups(&self) -> Vec<Group> {
         puffin::profile_function!();
-        // Union-find over active node keys, unioning the two ends of every
-        // active segment.
+        // Union-find over active node keys.
         let mut parent: HashMap<WireNodeKey, WireNodeKey> =
             self.nodes.keys().map(|&k| (k, k)).collect();
 
@@ -575,10 +530,7 @@ impl Wiring {
             root
         }
 
-        // Nodes touched by at least one active segment, recorded during the same
-        // pass. Only these form a group; an orphan node (should not normally
-        // exist post-cleanup) contributes nothing. Tracking membership here
-        // avoids a per-node `degree` scan below, which was O(nodes x segments).
+        // Nodes touched by an active segment; an orphan node contributes nothing.
         let mut connected: HashSet<WireNodeKey> = HashSet::new();
         for s in self.segments.values() {
             connected.insert(s.a);
@@ -612,6 +564,35 @@ impl Wiring {
         by_root.into_values().collect()
     }
 
+    /// Every segment in the same connected net as `seg`, including `seg` itself.
+    pub fn net_segments(&self, seg: WireSegKey) -> Vec<WireSegKey> {
+        if !self.segments.contains_key(&seg) {
+            return Vec::new();
+        }
+        // node -> incident segments, built once: O(E).
+        let mut incident: HashMap<WireNodeKey, Vec<WireSegKey>> = HashMap::new();
+        for (&k, s) in &self.segments {
+            incident.entry(s.a).or_default().push(k);
+            incident.entry(s.b).or_default().push(k);
+        }
+        let mut seen: HashSet<WireSegKey> = HashSet::new();
+        let mut frontier = vec![seg];
+        while let Some(k) = frontier.pop() {
+            if !seen.insert(k) {
+                continue;
+            }
+            let s = self.segments[&k];
+            for node in [s.a, s.b] {
+                for &next in &incident[&node] {
+                    if !seen.contains(&next) {
+                        frontier.push(next);
+                    }
+                }
+            }
+        }
+        seen.into_iter().collect()
+    }
+
     // ── Hit testing (screen space) ──────────────────────────────────────────
 
     /// The active node under `pos`, if any (within the pin hit radius).
@@ -623,8 +604,7 @@ impl Wiring {
             .map(|(k, _)| *k)
     }
 
-    /// The active segment nearest to `pos` (within the hit radius) and the
-    /// on-grid point along it closest to `pos` - the point a branch would tap.
+    /// Nearest active segment to `pos`, plus the on-grid point a branch would tap.
     pub fn segment_at_pos(&self, pos: Pos2, camera: Camera) -> Option<(WireSegKey, GridPos)> {
         let hit_r = camera.scale(HIT_RADIUS);
         let mut best: Option<(WireSegKey, GridPos, f32)> = None;
@@ -688,26 +668,71 @@ mod tests {
     fn test_branch_midwire_splits_and_joins() {
         let mut w = Wiring::new();
         let c = comp_keys(3);
-        // A horizontal wire between two pins.
         w.add_route(
             &[GridPos::new(0, 0), GridPos::new(10, 0)],
             NodeAttach::Pin(c[0], PinId::output(0)),
             NodeAttach::Pin(c[1], PinId::input(0)),
         );
-        // Branch straight down from the middle of that wire to a third pin.
         w.add_route(
             &[GridPos::new(5, 0), GridPos::new(5, 5)],
             NodeAttach::Free,
             NodeAttach::Pin(c[2], PinId::input(0)),
         );
-        // The original segment was split at [5,0] (a junction), and all three
-        // pins now share one group.
+        // Split at [5,0] joins all three pins into one group.
         let groups = w.groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].pins.len(), 3);
-        // Two halves of the split + the branch = 3 active segments (the
-        // pre-split segment is tombstoned, not counted).
+        // Two split halves + the branch = 3 active segments (pre-split segment gone).
         assert_eq!(w.segments.len(), 3);
+    }
+
+    #[test]
+    fn test_net_segments_returns_connected_net_only() {
+        let mut w = Wiring::new();
+        let c = comp_keys(5);
+        // Branched net: 3 segments after the mid-wire split.
+        w.add_route(
+            &[GridPos::new(0, 0), GridPos::new(10, 0)],
+            NodeAttach::Pin(c[0], PinId::output(0)),
+            NodeAttach::Pin(c[1], PinId::input(0)),
+        );
+        w.add_route(
+            &[GridPos::new(5, 0), GridPos::new(5, 5)],
+            NodeAttach::Free,
+            NodeAttach::Pin(c[2], PinId::input(0)),
+        );
+        // Disjoint net, far away: a single segment.
+        w.add_route(
+            &[GridPos::new(100, 100), GridPos::new(110, 100)],
+            NodeAttach::Pin(c[3], PinId::output(0)),
+            NodeAttach::Pin(c[4], PinId::input(0)),
+        );
+
+        let branch_keys: HashSet<WireSegKey> = w
+            .segments
+            .iter()
+            .filter(|(_, s)| w.nodes[&s.a].pos.x < 100 || w.nodes[&s.b].pos.x < 100)
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(branch_keys.len(), 3);
+
+        let disjoint_key = *w
+            .segments
+            .iter()
+            .find(|(_, s)| w.nodes[&s.a].pos.x >= 100 && w.nodes[&s.b].pos.x >= 100)
+            .map(|(k, _)| k)
+            .unwrap();
+
+        // From any segment of the branched net, net_segments returns exactly those 3.
+        for &seg in &branch_keys {
+            let result: HashSet<WireSegKey> = w.net_segments(seg).into_iter().collect();
+            assert_eq!(result, branch_keys);
+            assert!(!result.contains(&disjoint_key));
+        }
+
+        // From the disjoint net's lone segment, net_segments returns exactly itself.
+        let result = w.net_segments(disjoint_key);
+        assert_eq!(result, vec![disjoint_key]);
     }
 
     #[test]
@@ -724,7 +749,6 @@ mod tests {
             NodeAttach::Free,
             NodeAttach::Pin(c[2], PinId::input(0)),
         );
-        // Delete the vertical branch segment (the one that is not horizontal).
         let branch = w
             .segments
             .iter()
@@ -732,8 +756,6 @@ mod tests {
             .map(|(k, _)| k)
             .unwrap();
         w.delete_segment(*branch);
-        // The third pin's node is gone (orphaned), and the main wire still joins
-        // the first two pins.
         let groups = w.groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].pins.len(), 2);
@@ -770,10 +792,8 @@ mod tests {
         let after = snapshot(&w);
         assert_ne!(before, after);
 
-        // Undo restores the pre-delete graph exactly...
         w.undo_delta(&delta);
         assert_eq!(snapshot(&w), before);
-        // ...and redo reproduces the post-delete graph exactly.
         w.redo_delta(&delta);
         assert_eq!(snapshot(&w), after);
     }
@@ -898,9 +918,7 @@ mod tests {
         );
         let before_nodes = w.nodes.len();
 
-        // A subgraph node landing on an already-occupied GridPos must not be
-        // deduped/spliced into the existing node there (unlike add_route's
-        // resolve_point) - it's an independent copy.
+        // Unlike add_route, a coincident GridPos does not dedupe into the existing node.
         w.add_subgraph(&[(GridPos::new(0, 0), NodeAttach::Free)], &[]);
         assert_eq!(w.nodes.len(), before_nodes + 1);
     }

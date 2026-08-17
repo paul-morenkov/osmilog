@@ -22,12 +22,9 @@ use crate::sim::circuit::{Circuit, TunnelRole};
 use crate::sim::component::{ComponentSpec, Constant, PinId};
 use crate::sim::value::Value;
 
-/// Minimum on-screen spacing (px) kept between drawn grid dots; `draw_grid`
-/// thins to a coarser stride of grid cells rather than let dots crowd closer
-/// than this as the view zooms out.
+/// `draw_grid` thins to a coarser cell stride rather than let dots crowd closer as it zooms out.
 const GRID_DOT_MIN_SPACING_PX: f32 = 16.0;
 
-/// The stroke (color + weight) a wire/pin at value `val` is drawn with.
 pub(crate) fn value_stroke(theme: Theme, val: Value) -> Stroke {
     let (color, weight) = match val {
         Value::Floating => (theme.value_floating, WIRE_THICKNESS_THIN),
@@ -48,11 +45,9 @@ pub(crate) fn value_stroke(theme: Theme, val: Value) -> Stroke {
     Stroke::new(weight, color)
 }
 
-// egui's line segments use butt caps with no joins, so two segments meeting
-// at a grid-node corner leave a visible notch (the stroke doesn't reach past
-// the shared center point in the perpendicular direction). Extending each
-// end by half the stroke width fills that gap, at the cost of slightly
-// overshooting unjoined endpoints (wire tips, pins) by the same amount.
+// egui's butt-capped, unjoined line segments leave a notch at a grid-node corner.
+// Extending each end by half the stroke width fills it, at the cost of overshooting
+// unjoined endpoints (wire tips, pins) by the same amount.
 pub(crate) fn extend_segment(p0: Pos2, p1: Pos2, extend: f32) -> (Pos2, Pos2) {
     let delta = p1 - p0;
     let len = delta.length();
@@ -65,9 +60,7 @@ pub(crate) fn extend_segment(p0: Pos2, p1: Pos2, extend: f32) -> (Pos2, Pos2) {
 
 pub(crate) fn draw_grid(painter: &Painter, clip_rect: Rect, camera: Camera, theme: Theme) {
     let step = camera.grid_scale();
-    // As the view zooms out, thin the drawn dots to every `stride`-th grid
-    // cell so on-screen spacing never crowds below GRID_DOT_MIN_SPACING_PX -
-    // otherwise a wide-out view would paint thousands of near-touching dots.
+    // Thin to every `stride`-th cell so a wide-out view doesn't paint thousands of dots.
     let stride = grid_dot_stride(step);
     let cell_x1 = ((clip_rect.right() - camera.pan.x) / step).ceil() as i32;
     let cell_y1 = ((clip_rect.bottom() - camera.pan.y) / step).ceil() as i32;
@@ -90,10 +83,8 @@ pub(crate) fn draw_grid(painter: &Painter, clip_rect: Rect, camera: Camera, them
     }
 }
 
-/// Smallest stride (in grid cells, one of 1/2/5 times a power of ten) that
-/// keeps on-screen dot spacing at least `GRID_DOT_MIN_SPACING_PX` given
-/// `cell_px` pixels per grid cell - the standard "nice numbers" tick-spacing
-/// pick, applied to grid dots instead of axis labels.
+/// The standard "nice numbers" tick-spacing pick (1/2/5 times a power of ten), applied to
+/// grid dots instead of axis labels.
 fn grid_dot_stride(cell_px: f32) -> i32 {
     if cell_px >= GRID_DOT_MIN_SPACING_PX {
         return 1;
@@ -138,8 +129,7 @@ pub(crate) fn draw_component(
     };
     let outline_stroke = Stroke::new(stroke_w, stroke_col);
 
-    // Fill: use the convex fill_outline if provided (avoids epaint's concave polygon artifact),
-    // otherwise fall back to the regular outline.
+    // Uses the convex fill_outline if provided, to avoid epaint's concave polygon artifact.
     let fill_pts = tessellate_path(
         shape.fill_outline.as_deref().unwrap_or(&shape.outline),
         rect,
@@ -151,7 +141,6 @@ pub(crate) fn draw_component(
         stroke: Stroke::NONE.into(),
     }));
 
-    // Stroke: always use the full outline (may include concave curves).
     let stroke_pts = tessellate_path(&shape.outline, rect);
     painter.add(egui::Shape::Path(PathShape {
         points: stroke_pts,
@@ -169,8 +158,7 @@ pub(crate) fn draw_component(
     for (i, &has_bubble) in shape.output_bubbles.iter().enumerate() {
         if has_bubble {
             let anchor = &shape.output_anchors[i];
-            // The pin sits one cell beyond the body edge; the bubble is drawn in
-            // the gap, just outside the edge (one cell back from the pin).
+            // Drawn in the gap between the body edge and the pin, one cell beyond it.
             let pin = comp_pin_pos(shape, pc.grid_pos, camera, PinId::output(i as u8));
             let edge = pin - anchor.wire_dir * camera.grid_scale();
             let center = edge + anchor.wire_dir * bubble_r;
@@ -193,8 +181,7 @@ pub(crate) fn draw_component(
         );
     }
 
-    // A subcircuit's on-canvas label is the referenced document's name, drawn
-    // dynamically (like a tunnel label) since it isn't a &'static str.
+    // Drawn dynamically since the referenced document's name isn't a &'static str.
     if let ComponentSpec::Subcircuit { name, .. } = &pc.spec {
         let label_pos = egui::pos2(
             rect.left() + shape.dynamic_label_pos.x * rect.width(),
@@ -209,9 +196,7 @@ pub(crate) fn draw_component(
         );
     }
 
-    // A Constant's on-canvas label is its current value, drawn dynamically
-    // for the same reason a Subcircuit's name is - distinguishing it visually
-    // from an Input at a glance, without a boundary pin to inspect.
+    // Drawn dynamically so it reads apart from an Input at a glance.
     if let ComponentSpec::Constant(Constant { bits, .. }) = &pc.spec {
         let label_pos = egui::pos2(
             rect.left() + shape.dynamic_label_pos.x * rect.width(),
@@ -221,6 +206,21 @@ pub(crate) fn draw_component(
             label_pos,
             Align2::CENTER_CENTER,
             format!("0x{:X}", bits),
+            FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
+            theme.label_text,
+        );
+    }
+
+    // Drawn dynamically since the probe's name is user-set, not a &'static str.
+    if let ComponentSpec::Probe(probe) = &pc.spec {
+        let label_pos = egui::pos2(
+            rect.left() + shape.dynamic_label_pos.x * rect.width(),
+            rect.top() + shape.dynamic_label_pos.y * rect.height(),
+        );
+        painter.text(
+            label_pos,
+            Align2::CENTER_CENTER,
+            &probe.name,
             FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
             theme.label_text,
         );
@@ -252,8 +252,6 @@ pub(crate) fn draw_tunnel(
     puffin::profile_function!();
     let shape = tunnel_shape(pt.role);
     let rect = tunnel_bounding_rect(pt, camera);
-    // Distinct fill from components (theme's "open" widget tone), to visually
-    // distinguish tunnels.
     let fill = theme.tunnel_fill;
     let (stroke_w, stroke_col) = if is_selected {
         (camera.scale(COMP_STROKE + 1.0), theme.outline_selected)

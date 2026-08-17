@@ -16,12 +16,10 @@ impl Adder {
 
 impl CombLogic for Adder {
     fn n_inputs(&self) -> usize {
-        // Two addends and a carry-in
         3
     }
 
     fn n_outputs(&self) -> usize {
-        // Sum and carry-out
         2
     }
 
@@ -38,9 +36,11 @@ impl CombLogic for Adder {
             inputs[Self::ADDEND_2_PIN],
             carry_in,
         ) {
-            (Value::Fixed { bits: a, width: aw }, Value::Fixed { bits: b, width: bw }, Some(cin))
-                if aw == self.data_width && bw == self.data_width =>
-            {
+            (
+                Value::Fixed { bits: a, width: aw },
+                Value::Fixed { bits: b, width: bw },
+                Some(cin),
+            ) if aw == self.data_width && bw == self.data_width => {
                 // Widen to u64 so a+b+cin can't overflow u32 (both addends can be up
                 // to Value::mask(32) = u32::MAX) before it's split back into sum/carry.
                 let sum_full = a as u64 + b as u64 + cin as u64;

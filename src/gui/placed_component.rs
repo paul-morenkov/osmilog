@@ -11,18 +11,12 @@ pub struct PlacedComponent {
     pub key: CompKey,
     pub spec: ComponentSpec,
     pub grid_pos: GridPos,
-    // Cached `spec.shape()`. Building a ComponentShape allocates several Vecs,
-    // and drawing/hit-testing reads it multiple times per component per frame,
-    // so it's built once here (only `spec` determines it) instead of rebuilt on
-    // every read. Kept in lockstep with `spec` by only constructing through
-    // `PlacedComponent::new` - `reconfigure_component` rebuilds via that path.
+    // Cached `spec.shape()`: drawing/hit-testing reads it many times per frame.
+    // Stays in lockstep with `spec` by only being built here, in `new`.
     pub shape: ComponentShape,
 }
 
 impl PlacedComponent {
-    // Builds a placed component, caching its ComponentShape (see the `shape`
-    // field). This is the only place a PlacedComponent is created, so `shape`
-    // can never drift from `spec`.
     pub fn new(key: CompKey, spec: ComponentSpec, grid_pos: GridPos) -> Self {
         let shape = spec.shape();
         Self {
@@ -35,18 +29,14 @@ impl PlacedComponent {
 }
 
 // ── GUI-only visual concerns for ComponentSpec ────────────────────────────────
-//
-// ComponentSpec itself (construction params per component type) lives in
-// sim::component. This impl block adds display-only methods depending on
-// gui::geometry/gui::shape types the sim layer must not depend on - a plain
-// second inherent impl, no wrapper/newtype needed.
+// Depends on gui::geometry/gui::shape, which sim::component must not depend on.
 impl ComponentSpec {
-    // Zero-allocation bounding-box size, matching shape().size without
-    // building the full ComponentShape - used every frame for hit-testing.
+    // Matches shape().size without building the full ComponentShape; used every frame.
     pub fn size(&self) -> Vec2 {
         match self {
             Self::Input(_) | Self::Output => io_size(),
             Self::Constant(_) => constant_size(),
+            Self::Probe(_) => probe_size(),
             Self::Gate(g) => gate_size(g.op, g.n_inputs),
             Self::Mux(m) => mux_size(m.sel_width),
             Self::Demux(d) => demux_size(d.sel_width),
@@ -76,12 +66,11 @@ impl ComponentSpec {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Input(_) => "IN",
-            // The on-canvas label is the current value, drawn dynamically
-            // from the spec (see draw_component); this static fallback is
-            // only used where a &'static str is required (properties panel
-            // heading).
+            // Fallback only; the canvas draws the live value dynamically (see draw_component).
             Self::Constant(_) => "CONST",
             Self::Output => "OUT",
+            // Fallback only; the canvas draws the probe's name dynamically.
+            Self::Probe(_) => "PROBE",
             Self::Gate(g) => match g.op {
                 GateOp::And => "AND",
                 GateOp::Or => "OR",
@@ -112,10 +101,7 @@ impl ComponentSpec {
                 FanDirection::Right => "SPLIT",
                 FanDirection::Left => "COMBINE",
             },
-            // The on-canvas label is the referenced document's name, drawn
-            // dynamically from the spec (see draw_component); this static
-            // fallback is only used where a &'static str is required (e.g. the
-            // properties-panel heading).
+            // Fallback only; the canvas draws the referenced document's name dynamically.
             Self::Subcircuit { .. } => "SUB",
         }
     }
@@ -126,6 +112,7 @@ impl ComponentSpec {
             Self::Input(_) => input_shape(),
             Self::Constant(_) => constant_shape(),
             Self::Output => output_shape(),
+            Self::Probe(_) => probe_shape(),
             Self::Gate(g) => gate_shape(g.op, g.n_inputs),
             Self::Mux(m) => mux_shape(m.sel_width),
             Self::Demux(d) => demux_shape(d.sel_width),

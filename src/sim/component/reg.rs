@@ -1,8 +1,7 @@
 use super::{SeqLogic, SeqState};
 use crate::sim::value::Value;
 
-// Register config only - the latched runtime value lives in LogicSeq::Reg::value, not here,
-// so this struct stays a pure construction record (embeddable directly in ComponentDef).
+// Construction record only; the latched runtime value lives in LogicSeq::Reg::value.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RegConf {
     pub data_width: u8,
@@ -11,9 +10,8 @@ pub struct RegConf {
 impl RegConf {
     pub const DATA_PIN: usize = 0;
     pub const WRITE_EN_PIN: usize = 1;
-    // Asynchronous reset: forces the output to zero the instant it's held
-    // (via observe), and clears the latched value on the next tick so the
-    // reset sticks. Active only on exactly Value::ONE.
+    // Forces the output to zero the instant it's held. Active only on
+    // exactly Value::ONE.
     pub const RESET_PIN: usize = 2;
 }
 
@@ -28,9 +26,9 @@ impl RegConf {
 
     pub fn input_width(&self, i: usize) -> Option<u8> {
         match i {
-            RegConf::DATA_PIN => Some(self.data_width), // data
-            RegConf::WRITE_EN_PIN => Some(1),           // write_enable
-            RegConf::RESET_PIN => Some(1),              // async reset
+            RegConf::DATA_PIN => Some(self.data_width),
+            RegConf::WRITE_EN_PIN => Some(1),
+            RegConf::RESET_PIN => Some(1),
             _ => None,
         }
     }
@@ -68,8 +66,7 @@ impl SeqLogic for Reg {
     }
 
     fn tick(&mut self, inputs: &[Value]) -> Vec<Value> {
-        // Async reset dominates the clocked write, and destroys the latched
-        // value so the clear persists after the reset pin is released.
+        // Async reset dominates the clocked write.
         if matches!(inputs[RegConf::RESET_PIN], Value::ONE) {
             self.value = Value::new(0, self.conf.data_width);
         } else {
@@ -83,10 +80,8 @@ impl SeqLogic for Reg {
     }
 
     fn apply_async(&mut self, inputs: &[Value]) {
-        // Async reset: while held (exactly ONE) it destroys the latched value,
-        // so the clear takes effect during settle() with no clock tick and
-        // persists after the pin is released. Idempotent - re-clearing zero
-        // leaves it zero.
+        // Clears immediately while held, so the reset takes effect during
+        // settle() with no clock tick.
         if matches!(inputs[RegConf::RESET_PIN], Value::ONE) {
             self.value = Value::new(0, self.conf.data_width);
         }
@@ -124,10 +119,8 @@ mod tests {
         LogicSeq::Reg(Reg::new(data_width))
     }
 
-    // No async reset asserted (the common case in these tests).
     const NO_RST: Value = Value::ZERO;
 
-    // Full input vector with the reset pin deasserted, for the common case.
     fn ins(data: Value, we: Value) -> [Value; 3] {
         [data, we, NO_RST]
     }
@@ -145,10 +138,8 @@ mod tests {
         // Zero-initialized, unaffected by data already present pre-tick.
         assert_eq!(reg.observe(), vec![Value::new(0, 4)]);
 
-        // write_enable=1, tick: latches data.
         assert_eq!(reg.tick(&ins(Value::new(5, 4), we)), vec![Value::new(5, 4)]);
 
-        // write_enable=0, data changes, tick: holds previous value.
         assert_eq!(
             reg.tick(&ins(Value::new(9, 4), Value::ZERO)),
             vec![Value::new(5, 4)]
@@ -165,7 +156,7 @@ mod tests {
     #[test]
     fn test_apply_async_reset_clears_state_destructively() {
         let mut reg = new_reg(4);
-        reg.tick(&ins(Value::new(9, 4), Value::ONE)); // latch 9
+        reg.tick(&ins(Value::new(9, 4), Value::ONE));
         assert_eq!(reg.observe(), vec![Value::new(9, 4)]);
 
         // Reset held (exactly ONE): apply_async clears the latch, no tick.
@@ -181,7 +172,7 @@ mod tests {
     #[test]
     fn test_async_reset_dominates_on_tick() {
         let mut reg = new_reg(4);
-        reg.tick(&ins(Value::new(9, 4), Value::ONE)); // latch 9
+        reg.tick(&ins(Value::new(9, 4), Value::ONE));
 
         // reset=1 dominates write_enable=1/data=5: latches 0, not 5.
         assert_eq!(
@@ -196,7 +187,7 @@ mod tests {
     fn test_reset_only_activates_on_exactly_one(rst: Value) {
         let mut reg = new_reg(4);
         // reset not exactly ONE: apply_async leaves state alone...
-        reg.tick(&ins(Value::new(6, 4), Value::ONE)); // latch 6
+        reg.tick(&ins(Value::new(6, 4), Value::ONE));
         reg.apply_async(&[Value::new(9, 4), Value::ONE, rst]);
         assert_eq!(reg.observe(), vec![Value::new(6, 4)]);
         // ...and a normal write_enable=1 latch still proceeds through tick.

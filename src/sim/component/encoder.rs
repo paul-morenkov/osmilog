@@ -48,12 +48,10 @@ impl CombLogic for Encoder {
                     .rposition(|v| v == Value::ONE);
 
                 if let Some(i) = highest_set {
-                    // If an input is 1: selector = i, EN_OUT = 0, GRP_OUT = 1.
                     sel = Value::new(i as u32, self.sel_width);
                     en_out = Value::ZERO;
                     grp_out = Value::ONE;
                 } else {
-                    // If enabled but no inputs 1: selector = Floating, EN_OUT = 1, GRP_OUT = 0.
                     sel = Value::Floating;
                     en_out = Value::ONE;
                     grp_out = Value::ZERO;
@@ -67,8 +65,8 @@ impl CombLogic for Encoder {
     }
     fn output_width(&self, i: usize) -> Option<u8> {
         match i {
-            0 => Some(self.sel_width), // selector
-            _ => Some(1),              // enable_out / group_out
+            0 => Some(self.sel_width),
+            _ => Some(1),
         }
     }
 }
@@ -78,8 +76,7 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    // Builds the evaluate() input vector: [enable, arm0, arm1, ...], with each
-    // arm set to bit i of `mask`.
+    // [enable, arm0, arm1, ...], with each arm set to bit i of `mask`.
     fn make_inputs(sel_width: u8, enable: Value, mask: u32) -> Vec<Value> {
         let n_arms = 1usize << sel_width;
         let mut inputs = vec![enable];
@@ -145,8 +142,7 @@ mod tests {
     #[test]
     fn test_enable_in_floating_passes_through() {
         let enc = Encoder { sel_width: 2 };
-        // A Floating enable_in is not treated as disabled - it falls through to the
-        // normal arm scan, same as an explicitly-enabled encoder.
+        // Floating enable_in falls through to the normal arm scan.
         assert_eq!(
             enc.evaluate(&make_inputs(2, Value::Floating, 0b0010)),
             vec![Value::new(1, 2), Value::ZERO, Value::ONE]
@@ -183,8 +179,7 @@ mod tests {
     #[test]
     fn test_wide_arm_value_never_registers_as_set() {
         let enc = Encoder { sel_width: 2 };
-        // Arm 2 never registers as "set" despite bits=1, because its width (2) != 1:
-        // the encoder's arm comparison requires an exact Value::Fixed{bits:1,width:1}.
+        // Arm comparison requires an exact Value::Fixed{bits:1,width:1}.
         assert_eq!(
             enc.evaluate(&[
                 Value::ONE,
@@ -207,17 +202,15 @@ mod tests {
             vec![Value::Floating, Value::ONE, Value::ZERO]
         );
 
-        // A 0-bit-wide selector: the only possible index (0) is still a well-formed
-        // Value::Fixed{bits:0,width:0} rather than Floating.
+        // A 0-bit selector is a well-formed Fixed{bits:0,width:0}, not Floating.
         assert_eq!(
             enc.evaluate(&[Value::new(1, 1), Value::new(1, 1)]),
             vec![Value::new(0, 0), Value::ZERO, Value::new(1, 1)]
         );
     }
 
-    // Cascades two 4-arm priority encoders: enc1's enable_out feeds enc2's enable_in, so
-    // enc2 only ever gets a chance to fire when enc1 found nothing. Only the top-level
-    // enable_in (enc1's) is externally driven.
+    // Cascades two 4-arm encoders: enc1's enable_out feeds enc2's enable_in, so
+    // enc2 only fires when enc1 found nothing.
     #[test_case(0, 0b0000, 0b0000, false, false ; "top disabled, no arms hot anywhere")]
     #[test_case(0, 0b0101, 0b1111, false, false ; "top disabled, arms hot on both sides, still fully quiet")]
     #[test_case(1, 0b0101, 0b1111, true,  false ; "enc1 fires, suppresses enc2 despite its arms being hot")]
@@ -241,7 +234,6 @@ mod tests {
         ));
         let (sel1, en1_out, grp1_out) = (out1[0], out1[1], out1[2]);
 
-        // Cascade: enc1's enable_out feeds enc2's enable_in.
         let out2 = enc2.evaluate(&make_inputs(sel_width, en1_out, arms2_mask));
         let (sel2, en2_out, grp2_out) = (out2[0], out2[1], out2[2]);
 
@@ -254,8 +246,7 @@ mod tests {
             let expected_i = 31 - arms1_mask.leading_zeros(); // highest set bit index
             assert_eq!(sel1, Value::new(expected_i, sel_width));
             assert_eq!(en1_out, Value::ZERO);
-            // enc2 never got an enabled enable_in, so it stays fully quiet even
-            // though arms2_mask may be hot.
+            // enc2's enable_in was never asserted, so it stays quiet.
             assert_eq!(sel2, Value::Floating);
             assert_eq!(en2_out, Value::ZERO);
         } else if expect_enc2_fires {
@@ -265,14 +256,12 @@ mod tests {
             assert_eq!(sel2, Value::new(expected_i, sel_width));
             assert_eq!(en2_out, Value::ZERO);
         } else if top_enable == 1 {
-            // Chain fully enabled but nothing anywhere is set.
             assert_eq!(sel1, Value::Floating);
             assert_eq!(en1_out, Value::ONE);
             assert_eq!(sel2, Value::Floating);
             assert_eq!(en2_out, Value::ONE);
         } else {
-            // Top disabled: enc1 is disabled outright (en1_out forced to 0), so enc2's
-            // enable_in sees an explicit 0 too and is disabled regardless of its arms.
+            // Top disabled: en1_out is forced to 0, so enc2 is disabled too.
             assert_eq!(sel1, Value::Floating);
             assert_eq!(en1_out, Value::ZERO);
             assert_eq!(sel2, Value::Floating);

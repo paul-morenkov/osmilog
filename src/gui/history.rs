@@ -3,17 +3,11 @@ use std::collections::VecDeque;
 use crate::gui::gui_undo::GuiUndoAction;
 use crate::sim::command::UndoAction;
 
-// Default cap on undo_stack/redo_stack length. A VecDeque (not Vec) backs
-// both stacks so the oldest entries can be evicted from the front in O(1)
-// when a push exceeds the cap, and so the cap itself can be changed mid-run
-// (see History::set_limit) without rebuilding the stack.
+// VecDeque backs both stacks so evicting from the front on cap overflow is O(1).
 pub const DEFAULT_HISTORY_LIMIT: usize = 100;
 
-// One entry in the undo history: a Circuit-level UndoAction, a GUI-level
-// GuiUndoAction, or a Batch of either/both collapsed into one user-visible
-// step. Sim and GUI actions stay separate types (Circuit has no notion of
-// grid_pos/Wiring) but share one interleaved stack, so a gesture touching
-// both (e.g. drawing a wire also relinks nets) stays one entry.
+// Sim and GUI actions stay separate types but share one interleaved stack, so a
+// gesture touching both (e.g. drawing a wire also relinks nets) stays one entry.
 #[derive(Debug)]
 pub enum HistoryEntry {
     Sim(UndoAction),
@@ -21,27 +15,12 @@ pub enum HistoryEntry {
     Batch(Vec<HistoryEntry>),
 }
 
-// Accumulates HistoryEntrys from every OsmilogApp::apply()/edit_wiring() call.
-// Lives on the GUI side, not Circuit, since batching boundaries ("this delete
-// is one undo step") are a GUI-level concept.
-//
-// begin_batch/end_batch use a depth counter, not a flag, because top-level
-// methods that issue multiple apply()/edit_wiring() calls can themselves be
-// called from inside other such methods (e.g. delete_component calls
-// apply(RemoveComponent) then rebuild_circuit()) - without depth-counting, an
-// inner batch would close before the outer edit was accounted for, splitting
-// one user gesture into two undo entries.
-//
-// Two stacks: `undo_stack` grows via push_sim/push_gui/end_batch; `redo_stack`
-// holds entries popped by undo() so redo() can replay them. Any fresh edit
-// clears redo_stack (standard branch-invalidation). pop_*/push_* deliberately
-// do NOT clear the opposite stack.
-//
-// Both stacks are capped at `limit` entries (default DEFAULT_HISTORY_LIMIT):
-// every push evicts from the front until the stack fits, so the oldest edits
-// age out first. `limit` isn't a const because it's meant to be adjustable
-// mid-run (e.g. a future settings UI) via set_limit, which re-trims both
-// stacks immediately to the new value.
+// Batching lives here, not on Circuit, since batch boundaries are a GUI-level concept.
+// begin_batch/end_batch use a depth counter, not a flag: a top-level method issuing
+// multiple apply()/edit_wiring() calls can itself be called from inside another such
+// method, and without depth-counting an inner batch would close early, splitting one
+// gesture into two undo entries. `redo_stack` is cleared on any fresh edit, but not by
+// pop_*/push_* (undo/redo replay). Both stacks cap at `limit`, evicting from the front.
 pub struct History {
     undo_stack: VecDeque<HistoryEntry>,
     redo_stack: VecDeque<HistoryEntry>,
@@ -90,10 +69,7 @@ impl History {
         }
     }
 
-    // Commits one finished top-level entry onto the undo stack and invalidates
-    // any pending redo branch. Every new edit funnels through here (directly, or
-    // via end_batch's collapse), so this is the single place redo_stack is
-    // cleared.
+    // Every new edit funnels through here, so this is the one place redo_stack is cleared.
     fn commit(&mut self, entry: HistoryEntry) {
         push_capped(&mut self.undo_stack, entry, self.limit);
         self.redo_stack.clear();
@@ -132,12 +108,8 @@ impl History {
         self.redo_stack.pop_back()
     }
 
-    // Pushes an entry produced by the undo/redo engine onto the opposite stack.
-    // Unlike a fresh edit, these must NOT clear the other stack - undoing must
-    // leave the rest of the redo branch intact, and vice versa. Still capped:
-    // in practice this can't exceed `limit` (it only ever replays entries
-    // popped off a stack that's itself capped), but capping here too keeps the
-    // invariant self-evidently true rather than relying on that reasoning.
+    // Unlike a fresh edit, must NOT clear the other stack: undoing leaves the rest
+    // of the redo branch intact, and vice versa.
     pub fn push_redo(&mut self, entry: HistoryEntry) {
         push_capped(&mut self.redo_stack, entry, self.limit);
     }
@@ -146,15 +118,11 @@ impl History {
         push_capped(&mut self.undo_stack, entry, self.limit);
     }
 
-    /// Current cap on undo_stack/redo_stack length.
     pub fn limit(&self) -> usize {
         self.limit
     }
 
-    /// Changes the cap, trimming from the front of both stacks immediately if
-    /// it shrinks below their current length. Lets the limit be adjusted
-    /// mid-run (e.g. from a future settings UI) without losing the invariant
-    /// that neither stack exceeds `limit`.
+    /// Trims both stacks from the front immediately if the new limit is smaller.
     pub fn set_limit(&mut self, limit: usize) {
         self.limit = limit;
         while self.undo_stack.len() > limit {
@@ -324,8 +292,7 @@ mod tests {
         for label in ["a", "b", "c"] {
             push_labeled(&mut h, label);
         }
-        // Move all three onto the redo stack via pop_undo/push_redo, mirroring
-        // what Document::undo does.
+        // Mirrors what Document::undo does.
         while let Some(entry) = h.pop_undo() {
             h.push_redo(entry);
         }

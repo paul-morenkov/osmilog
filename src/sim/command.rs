@@ -84,8 +84,7 @@ impl CommandOutput {
         }
     }
 
-    /// Panics unless this came from `Command::TickClock` or
-    /// `Command::ResetSequential`.
+    /// Panics unless this came from `Command::TickClock` or `Command::ResetSequential`.
     pub fn unwrap_settle(self) -> Result<(), SettleError> {
         match self {
             Self::Settle(r) => r,
@@ -108,39 +107,30 @@ impl CommandOutput {
 pub enum UndoAction {
     /// No-op, or a derived-net command that undo re-derives instead.
     NoOp,
-    /// Undoes `Command::comp`: remove the component that was added (applying
-    /// this hands its owned `Component` back on the returned `InsertComponent`).
     RemoveComponent(CompKey),
-    /// Undoes `Command::RemoveComponent`: re-insert the removed component under
-    /// its original key, carrying the moved-out `Component` (a `Reg`'s latched
-    /// state comes back with it).
+    /// Re-inserts under the original key; a `Reg`'s latched state comes back with it.
     InsertComponent(CompKey, Box<Component>),
-    /// Undoes `Command::SetInput`.
     SetInput {
         comp: CompKey,
         old_bits: u32,
         old_width: u8,
     },
-    /// Undoes `Command::AddTunnel`: remove the tunnel that was added.
     RemoveTunnel(TunnelKey),
-    /// Undoes `Command::RemoveTunnel`: re-insert the removed tunnel under its
-    /// original key, carrying the moved-out `Tunnel`.
     InsertTunnel(TunnelKey, Box<Tunnel>),
-    /// Undoes `Command::RenameTunnel`.
     RenameTunnel {
         tunnel: TunnelKey,
         old_label: String,
     },
-    /// Would undo `Command::TickClock`, but ticks are issued untracked (see
-    /// `apply_undo`), so this variant is never actually reached.
-    RestoreSeqState { snapshots: Vec<(CompKey, SeqState)> },
+    /// Never actually reached: `TickClock` undo is issued untracked (see `apply_undo`).
+    RestoreSeqState {
+        snapshots: Vec<(CompKey, SeqState)>,
+    },
 }
 
 impl Circuit {
-    /// Applies a `Command`, returning its output and the `UndoAction` that
-    /// reverses it. Does NOT call `settle()` (callers are responsible, except
-    /// `TickClock` which settles internally). Callers that don't need the
-    /// undo take `.0`.
+    /// Applies a `Command` and returns its output and the reversing
+    /// `UndoAction`. Does not call `settle()`, except `TickClock` which
+    /// settles internally.
     pub fn apply(&mut self, command: Command) -> (CommandOutput, UndoAction) {
         puffin::profile_function!();
         match command {
@@ -237,10 +227,9 @@ impl Circuit {
         }
     }
 
-    /// Reverses the `Command` that produced `action`, and returns the
-    /// `UndoAction` that reverses *this* application - so undo/redo is one
-    /// symmetric operation. Touches only authoritative state; net structure
-    /// is derived and rebuilt separately by the GUI.
+    /// Reverses the `Command` that produced `action` and returns the
+    /// `UndoAction` that reverses this reversal, so undo/redo stays
+    /// symmetric. Net structure is rebuilt separately by the GUI.
     pub fn apply_undo(&mut self, action: UndoAction) -> UndoAction {
         match action {
             UndoAction::NoOp => UndoAction::NoOp,

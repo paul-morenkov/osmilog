@@ -19,14 +19,12 @@ impl CombLogic for Demux {
     fn n_outputs(&self) -> usize {
         1usize << self.sel_width
     }
-    // inputs[0] => data, inputs[1] => selector
     fn evaluate(&self, inputs: &[Value]) -> Vec<Value> {
         let branches = 1 << self.sel_width;
         match inputs[Self::SEL_PIN] {
             Value::Fixed { bits: sel, width } if width == self.sel_width => {
                 let data = inputs[Self::DATA_PIN];
 
-                // Fallback to Floating if data input width is incorrect
                 if let Value::Fixed { width, .. } = data {
                     if width != self.data_width {
                         return vec![Value::Floating; branches];
@@ -41,9 +39,9 @@ impl CombLogic for Demux {
     }
     fn input_width(&self, i: usize) -> Option<u8> {
         if i == Self::DATA_PIN {
-            Some(self.data_width) // data
+            Some(self.data_width)
         } else if i == Self::SEL_PIN {
-            Some(self.sel_width) // selector
+            Some(self.sel_width)
         } else {
             None
         }

@@ -25,9 +25,9 @@ impl DFlipFlopConf {
 
     pub fn input_width(&self, i: usize) -> Option<u8> {
         match i {
-            DFlipFlopConf::DATA_PIN => Some(1),     // data
-            DFlipFlopConf::WRITE_EN_PIN => Some(1), // write_enable
-            DFlipFlopConf::RESET_PIN => Some(1),    // async reset
+            DFlipFlopConf::DATA_PIN => Some(1),
+            DFlipFlopConf::WRITE_EN_PIN => Some(1),
+            DFlipFlopConf::RESET_PIN => Some(1),
             _ => None,
         }
     }
@@ -162,8 +162,8 @@ mod tests {
     #[test]
     fn test_apply_async_reset_clears_state_destructively() {
         let mut ff = new_d_flip_flop();
-        ff.tick(&[Value::ONE, Value::ONE, NO_RST]); // latch 1
-                                                    // Reset held: apply_async clears Q, no tick.
+        ff.tick(&[Value::ONE, Value::ONE, NO_RST]);
+        // Reset held: apply_async clears Q, no tick.
         ff.apply_async(&[Value::Floating, Value::Floating, Value::ONE]);
         assert_eq!(ff.observe(), vec![Value::ZERO]);
         // Reset released: stays 0 (destroyed, not restored).
@@ -174,9 +174,12 @@ mod tests {
     #[test]
     fn test_async_reset_dominates_on_tick() {
         let mut ff = new_d_flip_flop();
-        ff.tick(&[Value::ONE, Value::ONE, NO_RST]); // latch 1
-                                                    // reset=1 dominates write_enable=1/data=1: latches 0.
-        assert_eq!(ff.tick(&[Value::ONE, Value::ONE, Value::ONE]), vec![Value::ZERO]);
+        ff.tick(&[Value::ONE, Value::ONE, NO_RST]);
+        // reset=1 dominates write_enable=1/data=1: latches 0.
+        assert_eq!(
+            ff.tick(&[Value::ONE, Value::ONE, Value::ONE]),
+            vec![Value::ZERO]
+        );
     }
 
     #[test_case(Value::ZERO; "reset exactly zero")]
@@ -184,8 +187,8 @@ mod tests {
     #[test_case(Value::new(1, 2); "reset wrong width")]
     fn test_reset_only_activates_on_exactly_one(rst: Value) {
         let mut ff = new_d_flip_flop();
-        ff.tick(&[Value::ONE, Value::ONE, NO_RST]); // latch 1
-                                                    // reset not exactly ONE: apply_async leaves state alone.
+        ff.tick(&[Value::ONE, Value::ONE, NO_RST]);
+        // reset not exactly ONE: apply_async leaves state alone.
         ff.apply_async(&[Value::ZERO, Value::ONE, rst]);
         assert_eq!(ff.observe(), vec![Value::ONE]);
     }

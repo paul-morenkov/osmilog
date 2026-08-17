@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn test_increment() {
         let mut c = new_counter(4, 15, OverflowAction::Wrap);
-        tick(&mut c, Value::new(0, 4), Value::ONE, Value::ZERO); // load 0
+        tick(&mut c, Value::new(0, 4), Value::ONE, Value::ZERO);
         assert_eq!(
             tick(&mut c, Value::Floating, Value::ZERO, Value::ONE),
             vec![Value::new(1, 4), Value::ZERO]
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn test_decrement() {
         let mut c = new_counter(4, 15, OverflowAction::Wrap);
-        tick(&mut c, Value::new(5, 4), Value::ONE, Value::ZERO); // load 5
+        tick(&mut c, Value::new(5, 4), Value::ONE, Value::ZERO);
         assert_eq!(
             tick(&mut c, Value::Floating, Value::ONE, Value::ONE),
             vec![Value::new(4, 4), Value::ZERO]
@@ -292,7 +292,7 @@ mod tests {
     #[test_case(OverflowAction::PassMax, 15 ; "pass_max wraps via natural bit width")]
     fn test_decrement_underflow(action: OverflowAction, expect: u32) {
         let mut c = new_counter(4, 9, action);
-        tick(&mut c, Value::new(0, 4), Value::ONE, Value::ZERO); // load 0
+        tick(&mut c, Value::new(0, 4), Value::ONE, Value::ZERO);
         assert_eq!(
             tick(&mut c, Value::Floating, Value::ONE, Value::ONE),
             vec![Value::new(expect, 4), Value::ONE]
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn test_decrement_underflow_load_next() {
         let mut c = new_counter(4, 9, OverflowAction::LoadNext);
-        tick(&mut c, Value::new(0, 4), Value::ONE, Value::ZERO); // load 0
+        tick(&mut c, Value::new(0, 4), Value::ONE, Value::ZERO);
         assert_eq!(
             tick(&mut c, Value::new(6, 4), Value::ONE, Value::ONE),
             vec![Value::new(6, 4), Value::ONE]
@@ -314,7 +314,7 @@ mod tests {
     #[test_case(Value::new(1, 2), Value::ZERO ; "load wrong width")]
     fn test_invalid_control_combo_floats_and_corrupts_value(load: Value, count: Value) {
         let mut c = new_counter(4, 15, OverflowAction::Wrap);
-        tick(&mut c, Value::new(5, 4), Value::ONE, Value::ZERO); // load 5
+        tick(&mut c, Value::new(5, 4), Value::ONE, Value::ZERO);
         assert_eq!(
             tick(&mut c, Value::new(1, 4), load, count),
             vec![Value::Floating, Value::Floating]
