@@ -564,6 +564,35 @@ impl Wiring {
         by_root.into_values().collect()
     }
 
+    /// Every segment in the same connected net as `seg`, including `seg` itself.
+    pub fn net_segments(&self, seg: WireSegKey) -> Vec<WireSegKey> {
+        if !self.segments.contains_key(&seg) {
+            return Vec::new();
+        }
+        // node -> incident segments, built once: O(E).
+        let mut incident: HashMap<WireNodeKey, Vec<WireSegKey>> = HashMap::new();
+        for (&k, s) in &self.segments {
+            incident.entry(s.a).or_default().push(k);
+            incident.entry(s.b).or_default().push(k);
+        }
+        let mut seen: HashSet<WireSegKey> = HashSet::new();
+        let mut frontier = vec![seg];
+        while let Some(k) = frontier.pop() {
+            if !seen.insert(k) {
+                continue;
+            }
+            let s = self.segments[&k];
+            for node in [s.a, s.b] {
+                for &next in &incident[&node] {
+                    if !seen.contains(&next) {
+                        frontier.push(next);
+                    }
+                }
+            }
+        }
+        seen.into_iter().collect()
+    }
+
     // ── Hit testing (screen space) ──────────────────────────────────────────
 
     /// The active node under `pos`, if any (within the pin hit radius).
@@ -655,6 +684,55 @@ mod tests {
         assert_eq!(groups[0].pins.len(), 3);
         // Two split halves + the branch = 3 active segments (pre-split segment gone).
         assert_eq!(w.segments.len(), 3);
+    }
+
+    #[test]
+    fn test_net_segments_returns_connected_net_only() {
+        let mut w = Wiring::new();
+        let c = comp_keys(5);
+        // Branched net: 3 segments after the mid-wire split.
+        w.add_route(
+            &[GridPos::new(0, 0), GridPos::new(10, 0)],
+            NodeAttach::Pin(c[0], PinId::output(0)),
+            NodeAttach::Pin(c[1], PinId::input(0)),
+        );
+        w.add_route(
+            &[GridPos::new(5, 0), GridPos::new(5, 5)],
+            NodeAttach::Free,
+            NodeAttach::Pin(c[2], PinId::input(0)),
+        );
+        // Disjoint net, far away: a single segment.
+        w.add_route(
+            &[GridPos::new(100, 100), GridPos::new(110, 100)],
+            NodeAttach::Pin(c[3], PinId::output(0)),
+            NodeAttach::Pin(c[4], PinId::input(0)),
+        );
+
+        let branch_keys: HashSet<WireSegKey> = w
+            .segments
+            .iter()
+            .filter(|(_, s)| w.nodes[&s.a].pos.x < 100 || w.nodes[&s.b].pos.x < 100)
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(branch_keys.len(), 3);
+
+        let disjoint_key = *w
+            .segments
+            .iter()
+            .find(|(_, s)| w.nodes[&s.a].pos.x >= 100 && w.nodes[&s.b].pos.x >= 100)
+            .map(|(k, _)| k)
+            .unwrap();
+
+        // From any segment of the branched net, net_segments returns exactly those 3.
+        for &seg in &branch_keys {
+            let result: HashSet<WireSegKey> = w.net_segments(seg).into_iter().collect();
+            assert_eq!(result, branch_keys);
+            assert!(!result.contains(&disjoint_key));
+        }
+
+        // From the disjoint net's lone segment, net_segments returns exactly itself.
+        let result = w.net_segments(disjoint_key);
+        assert_eq!(result, vec![disjoint_key]);
     }
 
     #[test]

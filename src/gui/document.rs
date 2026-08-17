@@ -847,6 +847,28 @@ impl Document {
                 }
             }
         }
+
+        if cc.response.double_clicked() {
+            if let Some(pos) = pointer {
+                // Same guard intent as single-click priority: ignore if over a component.
+                let on_component = self
+                    .components
+                    .iter()
+                    .any(|(_, pc)| component_bounding_rect(pc, cc.camera).contains(pos));
+                if !on_component {
+                    if let Some((seg, _)) = self.wiring.segment_at_pos(pos, cc.camera) {
+                        let segs = self.wiring.net_segments(seg);
+                        self.selected = match segs.len() {
+                            0 => None,
+                            1 => Some(Selection::Single(Selected::Wire(segs[0]))),
+                            _ => Some(Selection::Bulk(
+                                segs.into_iter().map(Selected::Wire).collect(),
+                            )),
+                        };
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn interact_placing_tunnel(
