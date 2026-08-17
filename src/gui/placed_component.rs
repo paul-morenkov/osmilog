@@ -36,6 +36,7 @@ impl ComponentSpec {
         match self {
             Self::Input(_) | Self::Output => io_size(),
             Self::Constant(_) => constant_size(),
+            Self::Probe(_) => probe_size(),
             Self::Gate(g) => gate_size(g.op, g.n_inputs),
             Self::Mux(m) => mux_size(m.sel_width),
             Self::Demux(d) => demux_size(d.sel_width),
@@ -68,6 +69,8 @@ impl ComponentSpec {
             // Fallback only; the canvas draws the live value dynamically (see draw_component).
             Self::Constant(_) => "CONST",
             Self::Output => "OUT",
+            // Fallback only; the canvas draws the probe's name dynamically.
+            Self::Probe(_) => "PROBE",
             Self::Gate(g) => match g.op {
                 GateOp::And => "AND",
                 GateOp::Or => "OR",
@@ -109,6 +112,7 @@ impl ComponentSpec {
             Self::Input(_) => input_shape(),
             Self::Constant(_) => constant_shape(),
             Self::Output => output_shape(),
+            Self::Probe(_) => probe_shape(),
             Self::Gate(g) => gate_shape(g.op, g.n_inputs),
             Self::Mux(m) => mux_shape(m.sel_width),
             Self::Demux(d) => demux_shape(d.sel_width),

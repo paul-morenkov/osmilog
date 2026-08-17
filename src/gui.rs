@@ -10,6 +10,7 @@ pub mod memory_editor;
 pub mod placed_component;
 pub mod properties;
 pub mod shape;
+pub mod signal_viewer;
 pub mod theme;
 pub mod utils;
 pub mod wiring;

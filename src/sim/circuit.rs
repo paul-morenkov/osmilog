@@ -140,12 +140,13 @@ impl Circuit {
         }
     }
 
-    /// The value on `comp`'s input if it is an Output component, else `Value::Floating`.
+    /// The value on `comp`'s input if it is a single-input sink (Output or
+    /// Probe), else `Value::Floating`.
     pub fn read_output(&self, comp: CompKey) -> Value {
         let comp = &self.components[&comp];
 
         match comp.logic {
-            Logic::Comb(LogicComb::Output) => match comp.pins.inputs[0] {
+            Logic::Comb(LogicComb::Output | LogicComb::Probe) => match comp.pins.inputs[0] {
                 Some(net) => self.nets[net].value,
                 None => Value::Floating,
             },
@@ -1524,6 +1525,21 @@ mod tests {
         c.write_rom(rom_key, 5, 0x11);
         c.settle().unwrap();
         assert_eq!(c.read_output(out), Value::new(0xFF, 8));
+    }
+
+    #[test]
+    fn test_probe_reads_net_value() {
+        let mut c = Circuit::new();
+        // A Probe is a passive sink: read_output returns the value on its input.
+        let src = c.add_component(Component::input(0x5A, 8));
+        let probe = c.add_component(Component::probe());
+        c.link(src, PinId::output(0), probe, PinId::input(0));
+        c.settle().unwrap();
+        assert_eq!(c.read_output(probe), Value::new(0x5A, 8));
+
+        // Unconnected probe reads Floating.
+        let lone = c.add_component(Component::probe());
+        assert_eq!(c.read_output(lone), Value::Floating);
     }
 
     // ── Subcircuits (Logic::Sub) ──────────────────────────────────────────────

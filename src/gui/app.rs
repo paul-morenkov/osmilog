@@ -949,6 +949,9 @@ impl OsmilogApp {
                         }
                     });
                 });
+                ui.menu_button("View", |ui| {
+                    ui.checkbox(&mut self.active_mut().signal_viewer.open, "Signal Viewer");
+                });
                 ui.menu_button("Debug", |ui| {
                     ui.checkbox(&mut self.show_profiler, "Profiler");
                 });
@@ -1035,6 +1038,12 @@ impl OsmilogApp {
             if ui.button("Output").clicked() {
                 self.active_mut().mode = InteractionMode::Placing {
                     spec: ComponentSpec::Output,
+                };
+            }
+            if ui.button("Probe").clicked() {
+                let name = self.active().next_probe_name();
+                self.active_mut().mode = InteractionMode::Placing {
+                    spec: ComponentSpec::Probe(Probe { name }),
                 };
             }
             egui::CollapsingHeader::new("Gates").show(ui, |ui| {
@@ -1419,6 +1428,21 @@ impl eframe::App for OsmilogApp {
                         }
                     });
             });
+
+        if self.active().signal_viewer.open {
+            egui::Panel::bottom("signal_viewer")
+                .resizable(true)
+                .default_size(180.0)
+                .show(ui, |ui| {
+                    let doc = self.active_mut();
+                    let clear = doc
+                        .signal_viewer
+                        .show(&doc.components, &doc.signal_log, theme, ui);
+                    if clear {
+                        doc.signal_log.clear();
+                    }
+                });
+        }
 
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let clip_rect = painter.clip_rect();

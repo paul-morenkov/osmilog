@@ -34,6 +34,7 @@ use crate::gui::gui_undo::GuiUndoAction;
 use crate::gui::history::{History, HistoryEntry};
 use crate::gui::memory_editor::{MemKind, MemoryEditor};
 use crate::gui::placed_component::PlacedComponent;
+use crate::gui::signal_viewer::{SignalLog, SignalViewer};
 use crate::gui::theme::Theme;
 use crate::gui::utils::CanvasCtx;
 use crate::gui::wiring::{NodeAttach, WireNodeKey, WireSegKey, Wiring};
@@ -81,6 +82,9 @@ pub struct Document {
     pub(crate) camera: Camera,
     pub(crate) selected: Option<Selection>,
     pub(crate) clock: Clock,
+    // Runtime-only probe history + viewer UI state; never saved.
+    pub(crate) signal_log: SignalLog,
+    pub(crate) signal_viewer: SignalViewer,
     pub(crate) memory_editor: MemoryEditor,
     // Distinct from OsmilogApp::io_error; the menu bar shows I/O errors first.
     pub(crate) settle_error: Option<String>,
@@ -100,6 +104,8 @@ impl Document {
             camera: Camera::default(),
             selected: None,
             clock: Clock::default(),
+            signal_log: SignalLog::default(),
+            signal_viewer: SignalViewer::default(),
             memory_editor: MemoryEditor::default(),
             settle_error: None,
         }
@@ -127,28 +133,67 @@ impl Document {
         }
     }
 
-    // Untracked: never lands on the undo stack (see Clock::step).
+    // Untracked: never lands on the undo stack (see Clock::step). Records one
+    // probe sample on a successful tick.
     pub(crate) fn tick_once(&mut self) {
         let result = self.clock.step(&mut self.circuit);
+        let ok = result.is_ok();
         self.record_settle_result(result);
+        if ok {
+            self.sample_probes();
+        }
     }
 
-    // Resets all sequential state to its power-on value (see Clock::stop).
+    // Resets all sequential state to its power-on value (see Clock::stop) and
+    // clears the probe history so the next run starts clean.
     pub(crate) fn stop_clock(&mut self) {
         let result = self.clock.stop(&mut self.circuit);
         self.record_settle_result(result);
+        self.signal_log.clear();
     }
 
-    // Bridges the frame clock (wasm-safe) into Clock::advance; all cadence
-    // logic lives on Clock.
+    // Bridges the frame clock (wasm-safe) into the cadence math on Clock, then
+    // fires and samples each due tick here so every tick lands in the history
+    // (Clock::poll may report several ticks in one late frame). Auto-pauses on a
+    // settle failure so we don't hammer a broken circuit every frame.
     pub(crate) fn advance_clock(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
-        let result = self.clock.advance(&mut self.circuit, now, |wait| {
+        let n_ticks = self.clock.poll(now, |wait| {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         });
-        if let Some(result) = result {
+        for _ in 0..n_ticks {
+            let result = self.clock.step(&mut self.circuit);
+            let failed = result.is_err();
             self.record_settle_result(result);
+            if failed {
+                self.clock.pause();
+                return;
+            }
+            self.sample_probes();
         }
+    }
+
+    // Appends the current value of every placed Probe to the signal log, one
+    // sample per clock tick. Reads three disjoint Document fields.
+    pub(crate) fn sample_probes(&mut self) {
+        let samples: Vec<(PlacedCompKey, Value)> = self
+            .components
+            .iter()
+            .filter(|(_, pc)| matches!(pc.spec, ComponentSpec::Probe(_)))
+            .map(|(&k, pc)| (k, self.circuit.read_output(pc.key)))
+            .collect();
+        self.signal_log.record(&samples);
+    }
+
+    // A suggested unique-ish name for a newly placed probe. Names need not be
+    // unique (like tunnels), so this is only a convenience default.
+    pub(crate) fn next_probe_name(&self) -> String {
+        let n = self
+            .components
+            .values()
+            .filter(|pc| matches!(pc.spec, ComponentSpec::Probe(_)))
+            .count();
+        format!("probe{}", n + 1)
     }
 
     // Like circuit.apply(), but also records the UndoAction into history.

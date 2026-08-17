@@ -207,6 +207,22 @@ pub(crate) fn show_component_properties(
             let val = doc.circuit.read_output(comp_key);
             ui.label(format!("Value: {}", fmt_val(val)));
         }
+        ComponentSpec::Probe(Probe { name }) => {
+            let val = doc.circuit.read_output(comp_key);
+            ui.label(format!("Value: {}", fmt_val(val)));
+            let mut name = name.clone();
+            ui.add_enabled_ui(structural_ok, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    if ui.text_edit_singleline(&mut name).changed() {
+                        edit = Some(PropGuiAction::Reconfigure(
+                            key,
+                            ComponentSpec::Probe(Probe { name: name.clone() }),
+                        ));
+                    }
+                });
+            });
+        }
         ComponentSpec::Gate(Gate {
             op,
             mut n_inputs,

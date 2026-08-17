@@ -53,6 +53,10 @@ const TUNNEL_W: u32 = 4;
 // wider footprint than Input/Output's bare IO_W box.
 const CONST_W: u32 = 4;
 
+// A Probe shows its name as a dynamic label, so it needs a wider box than the
+// bare IO_W, like a Constant.
+const PROBE_W: u32 = 4;
+
 const REG_W: u32 = 3;
 
 // Same width as Reg (fits "D"/"LD"/"SH"/"0" labels); ShiftReg's height instead
@@ -393,6 +397,10 @@ pub const fn constant_size() -> Vec2 {
     vec2(px(CONST_W), px(stack_h(1)))
 }
 
+pub const fn probe_size() -> Vec2 {
+    vec2(px(PROBE_W), px(stack_h(1)))
+}
+
 // Height scales off whichever side has more pins; each side packs from row 1
 // with its own pitch. Both pitch heights are even, so their max is too.
 pub fn subcircuit_size(n_in: usize, n_out: usize) -> Vec2 {
@@ -451,6 +459,23 @@ pub fn constant_shape() -> ComponentShape {
         output_anchors: vec![PinAnchor::right(CONST_W, center_row)],
         extra_strokes: vec![],
         output_bubbles: vec![false],
+        labels: vec![],
+        dynamic_label_pos: vec2(0.5, 0.5),
+    }
+}
+
+// Like Output (one left pin), but wider and with a dynamic label so its name
+// draws inside the box (see draw_component).
+pub fn probe_shape() -> ComponentShape {
+    let center_row = stack_h(1) / 2; // 1
+    ComponentShape {
+        size: probe_size(),
+        outline: rect_outline(),
+        fill_outline: None,
+        input_anchors: vec![PinAnchor::left(center_row)],
+        output_anchors: vec![],
+        extra_strokes: vec![],
+        output_bubbles: vec![],
         labels: vec![],
         dynamic_label_pos: vec2(0.5, 0.5),
     }

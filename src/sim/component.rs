@@ -89,6 +89,9 @@ impl Component {
     pub fn output() -> Self {
         Self::from_comb(LogicComb::Output)
     }
+    pub fn probe() -> Self {
+        Self::from_comb(LogicComb::Probe)
+    }
 
     pub fn gate(op: GateOp, n: usize, width: u8) -> Self {
         Self::from_comb(LogicComb::Gate(Gate {
@@ -316,6 +319,14 @@ impl Component {
     }
 }
 
+// A passive observer placed on a net: one input, no output, any width. Like an
+// Output, but it carries a user-set `name` and feeds the signal viewer. The name
+// lives only here (the live LogicComb::Probe is a unit, like Output).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Probe {
+    pub name: String,
+}
+
 // A component's construction params, enough to rebuild it via to_component(). Reused unmodified
 // as the GUI's placed-component record; gui::placed_component adds GUI-only display methods.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -323,6 +334,7 @@ pub enum ComponentSpec {
     Input(Input),
     Constant(Constant),
     Output,
+    Probe(Probe),
     Gate(Gate),
     Mux(Mux),
     Demux(Demux),
@@ -373,6 +385,7 @@ impl ComponentSpec {
             Self::Input(_) => 0,
             Self::Constant(_) => 0,
             Self::Output => 1,
+            Self::Probe(_) => 1,
             Self::Gate(g) => g.n_inputs(),
             Self::Mux(m) => m.n_inputs(),
             Self::Demux(d) => d.n_inputs(),
@@ -408,6 +421,7 @@ impl ComponentSpec {
             Self::Input(_) => 1,
             Self::Constant(_) => 1,
             Self::Output => 0,
+            Self::Probe(_) => 0,
             Self::Gate(g) => g.n_outputs(),
             Self::Mux(m) => m.n_outputs(),
             Self::Demux(d) => d.n_outputs(),
@@ -443,6 +457,7 @@ impl ComponentSpec {
             Self::Input(p) => Component::input(p.bits, p.width),
             Self::Constant(c) => Component::constant(c.bits, c.width),
             Self::Output => Component::output(),
+            Self::Probe(_) => Component::probe(),
             Self::Gate(g) => Component::gate(g.op, g.n_inputs, g.width),
             Self::Mux(m) => Component::mux(m.data_width, m.sel_width),
             Self::Demux(d) => Component::demux(d.data_width, d.sel_width),
@@ -628,6 +643,9 @@ pub enum LogicComb {
     Input(Input),
     Constant(Constant),
     Output,
+    // A passive observer: like Output, but marked distinctly so the GUI can read
+    // it for the signal viewer. Carries no state; its name lives in ComponentSpec.
+    Probe,
     Gate(Gate),
     Mux(Mux),
     Demux(Demux),
@@ -647,6 +665,7 @@ impl LogicComb {
             Self::Input(p) => p.n_inputs(),
             Self::Constant(c) => c.n_inputs(),
             Self::Output => 1,
+            Self::Probe => 1,
             Self::Gate(g) => g.n_inputs(),
             Self::Mux(m) => m.n_inputs(),
             Self::Demux(d) => d.n_inputs(),
@@ -666,6 +685,7 @@ impl LogicComb {
             Self::Input(p) => p.n_outputs(),
             Self::Constant(c) => c.n_outputs(),
             Self::Output => 0,
+            Self::Probe => 0,
             Self::Gate(g) => g.n_outputs(),
             Self::Mux(m) => m.n_outputs(),
             Self::Demux(d) => d.n_outputs(),
@@ -685,6 +705,7 @@ impl LogicComb {
             Self::Input(p) => p.evaluate(inputs),
             Self::Constant(c) => c.evaluate(inputs),
             Self::Output => vec![],
+            Self::Probe => vec![],
             Self::Gate(g) => g.evaluate(inputs),
             Self::Mux(m) => m.evaluate(inputs),
             Self::Demux(d) => d.evaluate(inputs),
@@ -704,6 +725,7 @@ impl LogicComb {
             Self::Input(p) => p.input_width(i),
             Self::Constant(c) => c.input_width(i),
             Self::Output => None,
+            Self::Probe => None,
             Self::Gate(g) => g.input_width(i),
             Self::Mux(m) => m.input_width(i),
             Self::Demux(d) => d.input_width(i),
@@ -723,6 +745,7 @@ impl LogicComb {
             Self::Input(p) => p.output_width(i),
             Self::Constant(c) => c.output_width(i),
             Self::Output => None,
+            Self::Probe => None,
             Self::Gate(g) => g.output_width(i),
             Self::Mux(m) => m.output_width(i),
             Self::Demux(d) => d.output_width(i),

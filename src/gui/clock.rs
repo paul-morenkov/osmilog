@@ -79,44 +79,27 @@ impl Clock {
         self.run = ClockRun::Paused;
     }
 
-    // Auto-advances the clock while Playing, given the current frame time `now`.
-    // Uses a fixed-timestep accumulator (`ticks_due`) that fires every interval
-    // elapsed this frame - not just one - so a late or coalesced repaint doesn't
-    // skip ticks. Returns `Some(result)` of the *last* tick fired this frame (for
-    // the caller to record), or `None` if no tick was due. A tick that fails to
-    // settle auto-pauses so we don't hammer a broken circuit every frame; on that
-    // path we return the failing result without requesting a further repaint.
-    // `request_repaint` is called with the delay until the next tick boundary so
-    // the frame loop stays alive between ticks (the app is otherwise reactive).
-    pub(crate) fn advance(
-        &mut self,
-        circuit: &mut Circuit,
-        now: f64,
-        request_repaint: impl FnOnce(f64),
-    ) -> Option<Result<(), SettleError>> {
+    // Reports how many ticks are due this frame while Playing, given the current
+    // frame time `now`, and requests a repaint at the next tick boundary. Uses a
+    // fixed-timestep accumulator (`ticks_due`) that counts every interval elapsed
+    // this frame - not just one - so a late or coalesced repaint doesn't skip
+    // ticks. The caller fires (and samples) each tick; cadence math lives here.
+    // Returns 0 when not Playing or no tick is due. `request_repaint` is called
+    // with the delay until the next tick boundary so the frame loop stays alive
+    // between ticks (the app is otherwise reactive).
+    pub(crate) fn poll(&mut self, now: f64, request_repaint: impl FnOnce(f64)) -> u32 {
         if self.run != ClockRun::Playing {
-            return None;
+            return 0;
         }
         let interval = self.interval();
         let (n_ticks, next) = ticks_due(now, self.last_tick_time, interval);
         self.last_tick_time = next;
 
-        let mut last = None;
-        for _ in 0..n_ticks {
-            let result = self.step(circuit);
-            let failed = result.is_err();
-            last = Some(result);
-            if failed {
-                self.run = ClockRun::Paused;
-                return last;
-            }
-        }
-
         // Wake right at the next boundary (in (0, interval]), not a full interval
         // from now, so repaint timing tracks the tick schedule.
         let wait = (self.last_tick_time + interval - now).max(0.0);
         request_repaint(wait);
-        last
+        n_ticks
     }
 }
 

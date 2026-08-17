@@ -211,6 +211,21 @@ pub(crate) fn draw_component(
         );
     }
 
+    // Drawn dynamically since the probe's name is user-set, not a &'static str.
+    if let ComponentSpec::Probe(probe) = &pc.spec {
+        let label_pos = egui::pos2(
+            rect.left() + shape.dynamic_label_pos.x * rect.width(),
+            rect.top() + shape.dynamic_label_pos.y * rect.height(),
+        );
+        painter.text(
+            label_pos,
+            Align2::CENTER_CENTER,
+            &probe.name,
+            FontId::monospace(camera.scale(LABEL_FONT_SIZE)),
+            theme.label_text,
+        );
+    }
+
     let pin_r = camera.scale(PIN_RADIUS);
     for i in 0..pc.spec.n_inputs() {
         let pos = comp_pin_pos(shape, pc.grid_pos, camera, PinId::input(i as u8));
